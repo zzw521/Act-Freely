@@ -1,0 +1,39 @@
+[package]
+name = "tongtian-tauri"
+version = "0.1.0"
+description = "通天办公 - Tauri 版（本地 AI 工作助手）"
+authors = ["TongTian Office Team"]
+edition = "2021"
+
+[lib]
+name = "tongtian_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# 三层架构演进 P0：SSE seq/重放契约开关（计划 D1 回滚保险）。
+# 默认开启；关闭后解析器忽略 id 行、seq 恒为 None（旧引擎语义，契约兼容）。
+default = ["tt-enable-seq"]
+tt-enable-seq = []
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "net", "time", "io-util", "sync", "macros", "rt-multi-thread"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+# 核心闭环补齐（占位清单第一批）：存储地基
+rusqlite = { version = "0.31", features = ["bundled"] }
+keyring = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

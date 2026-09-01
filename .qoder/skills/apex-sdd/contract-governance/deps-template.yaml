@@ -1,0 +1,39 @@
+# deps.yaml 标准模板
+# 使用说明：复制此模板到 server/<module>/deps.yaml 或 web/<module>/deps.yaml，
+# 填充实际的 provides/consumes 信息。
+
+metadata:
+  module_name: "<module-name>"
+  module_path: "<server|web>/<module-name>"
+  role: "<provider|consumer>"
+  created_date: "<YYYY-MM-DD>"
+
+provides:
+  - name: "<API名称>"
+    api_version: "<semver>"
+    contract_file: "<相对于项目根目录的 API 契约 YAML 路径，无则为 null>"
+    base_path: "<API 基础路径>"
+    operations:
+      - "<operationId_1>"
+      - "<operationId_2>"
+
+consumes:
+  - provider: "<依赖的服务名>"
+    contract_file: "<Provider 的 API 契约 YAML 路径，外部服务为 null>"
+    pinned_version: "<锁定的 Provider API 版本号，register --all 时自动回填>"
+    dependency_type: "<rest_api|event_consumer|event_publisher|external>"
+    operations:
+      - "<消费的 operationId_1>"
+      - "<消费的 operationId_2>"
+    optional: false
+    mock_strategy: "<Mock 开关配置说明>"
+
+phase_context:
+  spec:
+    - "<spec 阶段需加载的文档路径>"
+  plan:
+    - "<plan 阶段需加载的文档路径>"
+  build:
+    - "<build 阶段需加载的文档路径>"
+  test:
+    - "<test 阶段需加载的文档路径>"

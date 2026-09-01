@@ -1,0 +1,99 @@
+//! settings_kv 读写（settings_get / settings_set 的数据层）
+
+use crate::store::Store;
+
+/// 读取单个设置项
+pub fn get(store: &Store, key: &str) -> Result<Option<String>, String> {
+    store.with_conn(|c| {
+        let mut stmt = c
+            .prepare("SELECT value FROM settings_kv WHERE key = ?1")
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.query([key]).map_err(|e| e.to_string())?;
+        match rows.next().map_err(|e| e.to_string())? {
+            Some(row) => Ok(Some(row.get::<_, String>(0).map_err(|e| e.to_string())?)),
+            None => Ok(None),
+        }
+    })
+}
+
+/// 写入（覆盖）单个设置项
+pub fn set(store: &Store, key: &str, value: &str) -> Result<(), String> {
+    store.with_conn(|c| {
+        c.execute(
+            "INSERT INTO settings_kv (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    })
+}
+
+/// 读取全部设置项（settings_get 返回整体）
+pub fn all(store: &Store) -> Result<std::collections::HashMap<String, String>, String> {
+    store.with_conn(|c| {
+        let mut stmt = c
+            .prepare("SELECT key, value FROM settings_kv")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (k, v) = row.map_err(|e| e.to_string())?;
+            map.insert(k, v);
+        }
+        Ok(map)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_store(name: &str) -> (Store, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "tt-settings-{name}-{}",
+            crate::bridge::event_store::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(dir.join("t.db")).unwrap();
+        (store, dir)
+    }
+
+    #[test]
+    fn test_set_get_roundtrip() {
+        let (store, dir) = temp_store("rt");
+        set(&store, "theme", "dark").unwrap();
+        assert_eq!(get(&store, "theme").unwrap().as_deref(), Some("dark"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_overwrite() {
+        let (store, dir) = temp_store("ow");
+        set(&store, "lang", "zh").unwrap();
+        set(&store, "lang", "en").unwrap();
+        assert_eq!(get(&store, "lang").unwrap().as_deref(), Some("en"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_missing_key_none() {
+        let (store, dir) = temp_store("miss");
+        assert_eq!(get(&store, "nope").unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_all_returns_map() {
+        let (store, dir) = temp_store("all");
+        set(&store, "a", "1").unwrap();
+        set(&store, "b", "2").unwrap();
+        let map = all(&store).unwrap();
+        assert_eq!(map.get("a").map(String::as_str), Some("1"));
+        assert_eq!(map.get("b").map(String::as_str), Some("2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -1,0 +1,33 @@
+# 本地工具链（JDK / Maven 等自行下载的运行时）
+.tools/
+
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+target/
+
+# Secrets & local config
+.env
+.env.local
+
+# 含明文 API Key 的临时验证脚本，禁止入库（其中的 Key 需尽快吊销轮换）
+tongtian-tauri/tests/test.py
+
+# Logs & temp
+*.log
+.DS_Store
+
+# Python 运行产物与 Auth 服务运行时数据
+__pycache__/
+auth.db
+
+# 引擎本地会话数据（含真实对话内容，不入版本库）
+tongtian-tauri/.tools/
+
+# Qoder hooks 的运行时审计日志
+.qoder/hooks/logs/
+
+# 根目录临时截图（验证产物放 .qoder/canvases/）
+/*.png

@@ -29,7 +29,6 @@ const ScheduleView = lazy(() => import('./pages/ScheduleView'));
 const Settings = lazy(() => import('./pages/Settings'));
 const ConnectorCenter = lazy(() => import('./pages/ConnectorCenter'));
 const HooksManager = lazy(() => import('./pages/HooksManager'));
-const AwarenessPage = lazy(() => import('./pages/AwarenessPage'));
 const ComputerUsePanel = lazy(() => import('./pages/ComputerUsePanel'));
 const IMChannel = lazy(() => import('./pages/IMChannel'));
 const ArchiveView = lazy(() => import('./pages/ArchiveView'));
@@ -54,7 +53,8 @@ const App: React.FC = () => {
           <Route path="/schedule" element={<ScheduleView />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/hooks" element={<HooksManager />} />
-          <Route path="/awareness" element={<AwarenessPage />} />
+          {/* 意识内容已合并进设置页意识分区（?s=awareness），独立意识页移除 */}
+          <Route path="/awareness" element={<Navigate to="/settings?s=awareness" replace />} />
           <Route path="/computer-use" element={<ComputerUsePanel />} />
           <Route path="/im" element={<IMChannel />} />
           <Route path="/archive" element={<ArchiveView />} />

@@ -19,6 +19,12 @@ import {
   Menu,
   Divider,
   CircularProgress,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogContentText,
+  DialogActions,
+  Button,
   useTheme,
   useMediaQuery,
 } from '@mui/material';
@@ -36,10 +42,14 @@ import SettingsIcon from '@mui/icons-material/Settings';
 import MenuBookIcon from '@mui/icons-material/MenuBook';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import LogoutIcon from '@mui/icons-material/Logout';
+import LoginIcon from '@mui/icons-material/Login';
 import ChevronLeftIcon from '@mui/icons-material/ChevronLeft';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useWorkbenchStore } from '../../store/workbenchStore';
 import { useImChannelStore, IM_CHANNEL_META } from '../../stores/imChannelStore';
+import { useAuthStore } from '../../stores/useAuthStore';
+import { useAppStore } from '../../stores/useAppStore';
+import { useAppSettings } from '../../lib/use-app-settings';
 import { useShallow } from 'zustand/react/shallow';
 import { navPalette, type NavPaletteKey } from '../../theme/tokens';
 
@@ -94,8 +104,45 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
 
   const [extExpanded, setExtExpanded] = useState(true);
   const [userAnchor, setUserAnchor] = useState<null | HTMLElement>(null);
+  /** 退出登录确认弹窗 */
+  const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false);
   /** 任务/频道并排页签：软件端发起 → 任务；IM 发起 → 频道 */
   const [activeTab, setActiveTab] = useState<'tasks' | 'channels'>('tasks');
+
+  // 账号登录态（网页验证登录 · Loopback 方案）
+  const { loggedIn, profile, busy: authBusy, init: authInit, login: authLogin, logout: authLogout } = useAuthStore(
+    useShallow((s) => ({
+      loggedIn: s.loggedIn,
+      profile: s.profile,
+      busy: s.busy,
+      init: s.init,
+      login: s.login,
+      logout: s.logout,
+    })),
+  );
+  const showNotification = useAppStore((s) => s.showNotification);
+
+  useEffect(() => {
+    void authInit();
+  }, [authInit]);
+
+  /** 登录：Mock 直登；真实模式拉起浏览器网页登录 + loopback 回调 */
+  const handleLogin = async () => {
+    const ok = await authLogin();
+    if (ok) {
+      const nick = useAuthStore.getState().profile?.nickname ?? '';
+      showNotification(`登录成功${nick ? `：${nick}` : ''}`, 'success');
+    } else {
+      showNotification(useAuthStore.getState().error ?? '登录失败，请重试', 'error');
+    }
+  };
+
+  /** 退出登录（确认后清理登录态；本地任务/会话数据保留） */
+  const handleLogoutConfirm = async () => {
+    setLogoutConfirmOpen(false);
+    const ok = await authLogout();
+    showNotification(ok ? '已退出登录' : '退出失败，请重试', ok ? 'success' : 'error');
+  };
 
   // 多会话列表（侧边栏任务区：点击切换会话，支持多会话并行）
   const { conversations, newConversation, switchConversation } = useWorkbenchStore(
@@ -110,6 +157,10 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
   const { channelSessions, loadSessions } = useImChannelStore(
     useShallow((s) => ({ channelSessions: s.channelSessions, loadSessions: s.loadSessions })),
   );
+
+  // 头像色（个人资料设置真实生效）
+  const [appSettings] = useAppSettings();
+  const avatarColor = (appSettings.avatarColor as string) ?? '';
 
   useEffect(() => {
     loadSessions();
@@ -243,7 +294,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
           boxSizing: 'border-box',
           border: 'none',
           // 轻快多彩：柔和冷色渐变底 + 右侧细腻投影替代硬边框
-          background: 'linear-gradient(180deg, #FBFCFF 0%, #F6F8FE 55%, #F4F7FD 100%)',
+          background: 'var(--tt-sidebar-bg)',
           boxShadow: '4px 0 18px rgba(99, 102, 241, 0.05)',
           transition: theme.transitions.create(['width'], {
             easing: theme.transitions.easing.sharp,
@@ -315,7 +366,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
               </Typography>
             </Box>
             <Box sx={{ flexGrow: 1 }} />
-            <IconButton size="small" onClick={onDrawerToggle} sx={{ color: '#9AA3B2' }}>
+            <IconButton size="small" onClick={onDrawerToggle} sx={{ color: 'var(--tt-text-4)' }}>
               <ChevronLeftIcon sx={{ fontSize: 18 }} />
             </IconButton>
           </>
@@ -402,13 +453,13 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
               '&:hover': { background: 'rgba(99, 102, 241, 0.06)' },
             }}
           >
-            <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#5B6472', flexGrow: 1 }}>
+            <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', flexGrow: 1 }}>
               能力管理
             </Typography>
             <KeyboardArrowDownIcon
               sx={{
                 fontSize: 16,
-                color: '#9AA3B2',
+                color: 'var(--tt-text-4)',
                 transform: extExpanded ? 'rotate(180deg)' : 'none',
                 transition: 'transform 0.2s ease',
               }}
@@ -521,7 +572,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                   className="history-title"
                   sx={{
                     fontSize: '12.5px',
-                    color: '#4B5563',
+                    color: 'var(--tt-text-2)',
                     overflow: 'hidden',
                     textOverflow: 'ellipsis',
                     whiteSpace: 'nowrap',
@@ -534,7 +585,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
               </Box>
             ))
           ) : (
-            <Typography sx={{ fontSize: '12px', color: '#B6BCC8', px: 1, py: 1 }}>
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', px: 1, py: 1 }}>
               暂无任务，点击上方「新任务」开始
             </Typography>
           ))}
@@ -585,7 +636,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                     className="history-title"
                     sx={{
                       fontSize: '12.5px',
-                      color: '#4B5563',
+                      color: 'var(--tt-text-2)',
                       overflow: 'hidden',
                       textOverflow: 'ellipsis',
                       whiteSpace: 'nowrap',
@@ -599,7 +650,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
               );
             })
           ) : (
-            <Typography sx={{ fontSize: '12px', color: '#B6BCC8', px: 1, py: 1 }}>
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', px: 1, py: 1 }}>
               暂无 IM 会话，在「IM 频道」开通渠道后即可接收
             </Typography>
           ))}
@@ -608,7 +659,14 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
       {/* ── 底部用户卡片 ────────────────────────────────── */}
       <Box sx={{ p: isCollapsed ? 1 : 1.5 }}>
         <Box
-          onClick={(e) => setUserAnchor(e.currentTarget)}
+          onClick={(e) => {
+            // 未登录：点击直接触发网页验证登录；已登录：打开个人中心菜单
+            if (!loggedIn) {
+              void handleLogin();
+              return;
+            }
+            setUserAnchor(e.currentTarget);
+          }}
           sx={{
             display: 'flex',
             alignItems: 'center',
@@ -618,7 +676,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
             borderRadius: '14px',
             cursor: 'pointer',
             justifyContent: isCollapsed ? 'center' : 'flex-start',
-            background: '#FFFFFF',
+            background: 'var(--tt-surface)',
             border: '1px solid rgba(99, 102, 241, 0.10)',
             boxShadow: '0 2px 8px rgba(99, 102, 241, 0.06)',
             transition: 'box-shadow 0.18s ease, transform 0.15s ease',
@@ -628,30 +686,32 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
             },
           }}
         >
-          {/* 头像：渐变圆 */}
+          {/* 头像：设置头像色则用纯色，否则渐变圆 */}
           <Box
             sx={{
               width: 34,
               height: 34,
               borderRadius: '50%',
-              background: 'linear-gradient(135deg, #6366F1 0%, #A855F7 100%)',
-              boxShadow: '0 2px 8px rgba(139, 92, 246, 0.3)',
+              background: avatarColor || 'linear-gradient(135deg, #6366F1 0%, #A855F7 100%)',
+              boxShadow: avatarColor ? '0 2px 8px rgba(15, 23, 42, 0.2)' : '0 2px 8px rgba(139, 92, 246, 0.3)',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
               flexShrink: 0,
             }}
           >
-            <Typography sx={{ color: '#fff', fontSize: '14px', fontWeight: 700 }}>张</Typography>
+            <Typography sx={{ color: '#fff', fontSize: '14px', fontWeight: 700 }}>
+              {loggedIn ? profile?.nickname?.charAt(0) || '客' : '客'}
+            </Typography>
           </Box>
 
           {!isCollapsed && (
             <>
               <Box sx={{ flexGrow: 1, minWidth: 0 }}>
-                <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#1F2937', lineHeight: 1.35 }}>
-                  张先生
+                <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)', lineHeight: 1.35 }}>
+                  {loggedIn ? profile?.nickname ?? '未命名用户' : '未登录'}
                 </Typography>
-                {/* 套餐彩色胶囊 */}
+                {/* 套餐彩色胶囊（登录态动态展示；未登录提示点击登录） */}
                 <Box
                   component="span"
                   sx={{
@@ -659,15 +719,15 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                     mt: 0.15,
                     px: 0.75,
                     borderRadius: '999px',
-                    background: 'rgba(16, 185, 129, 0.10)',
+                    background: loggedIn ? 'rgba(16, 185, 129, 0.10)' : 'rgba(99, 102, 241, 0.10)',
                   }}
                 >
-                  <Typography component="span" sx={{ fontSize: '10px', fontWeight: 600, color: '#059669', lineHeight: 1.7 }}>
-                    个人免费版
+                  <Typography component="span" sx={{ fontSize: '10px', fontWeight: 600, color: loggedIn ? '#059669' : '#4F46E5', lineHeight: 1.7 }}>
+                    {loggedIn ? profile?.plan ?? '个人免费版' : authBusy ? '登录中…' : '点击登录网页验证'}
                   </Typography>
                 </Box>
               </Box>
-              <KeyboardArrowUpIcon sx={{ fontSize: 18, color: '#9AA3B2' }} />
+              <KeyboardArrowUpIcon sx={{ fontSize: 18, color: 'var(--tt-text-4)' }} />
             </>
           )}
         </Box>
@@ -688,15 +748,19 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
             boxShadow: '0 16px 48px rgba(30, 41, 59, 0.16)',
             mb: 0.5,
             p: 1,
-            background: '#FFFFFF',
+            background: 'var(--tt-surface)',
           },
         }}
       >
         {/* 版本信息 + 升级 */}
         <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', px: 1.5, py: 1 }}>
           <Box>
-            <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#1F2937' }}>张先生</Typography>
-            <Typography sx={{ fontSize: '11px', color: '#9AA3B2' }}>个人版</Typography>
+            <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)' }}>
+              {loggedIn ? profile?.nickname ?? '未命名用户' : '未登录'}
+            </Typography>
+            <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
+              {loggedIn ? profile?.plan ?? '个人版' : '完成网页验证即可登录'}
+            </Typography>
           </Box>
           <Box
             sx={{
@@ -717,9 +781,17 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
           </Box>
         </Box>
 
-        <Divider sx={{ my: 0.75, borderColor: '#F1F3F9' }} />
+        <Divider sx={{ my: 0.75, borderColor: 'var(--tt-border-soft)' }} />
 
-        {userMenuItems.map((item) => {
+        {/* 未登录时退出项替换为登录项 */}
+        {(loggedIn
+          ? userMenuItems
+          : userMenuItems.map((it) =>
+              it.id === 'logout'
+                ? { id: 'login', label: '登录', icon: LoginIcon, color: 'blue' as NavPaletteKey }
+                : it,
+            )
+        ).map((item) => {
           const Icon = item.icon;
           const isLogout = item.id === 'logout';
           const c = navPalette[item.color];
@@ -728,6 +800,14 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
               key={item.id}
               onClick={() => {
                 setUserAnchor(null);
+                if (item.id === 'logout') {
+                  setLogoutConfirmOpen(true);
+                  return;
+                }
+                if (item.id === 'login') {
+                  void handleLogin();
+                  return;
+                }
                 if (item.path) navigate(item.path);
               }}
               sx={{
@@ -771,6 +851,33 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
           );
         })}
       </Menu>
+
+      {/* ── 退出登录确认弹窗 ─────────────────────── */}
+      <Dialog
+        open={logoutConfirmOpen}
+        onClose={() => setLogoutConfirmOpen(false)}
+        PaperProps={{ sx: { borderRadius: '14px', minWidth: 320 } }}
+      >
+        <DialogTitle sx={{ fontSize: '15px', fontWeight: 700 }}>退出登录</DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ fontSize: '13px', color: 'var(--tt-text-2)' }}>
+            确定要在此设备退出登录吗？退出后本地任务与会话数据仍会保留，可随时重新登录。
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => setLogoutConfirmOpen(false)} sx={{ color: 'var(--tt-text-3)', fontSize: '13px' }}>
+            取消
+          </Button>
+          <Button
+            onClick={() => void handleLogoutConfirm()}
+            disabled={authBusy}
+            variant="contained"
+            sx={{ fontSize: '13px', bgcolor: '#EF4444', '&:hover': { bgcolor: '#DC2626' } }}
+          >
+            退出登录
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Drawer>
   );
 };

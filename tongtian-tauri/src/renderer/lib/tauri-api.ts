@@ -9,7 +9,14 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { ChatEvent, ChatControlReq, ChatSubmitReq } from '../../shared/types';
-import type { LeaseInfo, LeaseTakeoverResp, QuotaSnapshot } from '../../shared/contracts';
+import type {
+  AuthLoginResp,
+  AuthProfile,
+  AuthStatus,
+  LeaseInfo,
+  LeaseTakeoverResp,
+  QuotaSnapshot,
+} from '../../shared/contracts';
 import { EventStreamGuard } from './event-stream-guard';
 
 /** 全局事件流守卫（三层架构演进 P0：seq 去重/缺口检测，重放场景防重复渲染） */
@@ -80,6 +87,9 @@ export const tauriAPI = {
     }
     if (channel === 'settings:get') return invoke('settings_get');
     if (channel === 'settings:set') return invoke('settings_set', { key: args[0], value: args[1] });
+    if (channel === 'auth:status') return invoke('auth_status');
+    if (channel === 'auth:login') return invoke('auth_login');
+    if (channel === 'auth:logout') return invoke('auth_logout');
     return CHANNEL_FALLBACK[channel] ?? [];
   },
   send: () => undefined,
@@ -164,7 +174,37 @@ export const tauriAPI = {
     };
   },
 
-  // ── System ─────────────────────────────────────────────
+  // ── Auth（账号与登录态 · 网页验证登录 Loopback 方案） ──────
+  /** 登录态视图（settings_kv profile + keyring token） */
+  authStatus: (): Promise<AuthStatus> => invoke('auth_status') as Promise<AuthStatus>,
+
+  /** 登录：Mock 直登；真实模式拉起浏览器网页登录 + loopback 回调 */
+  authLogin: (): Promise<AuthLoginResp> => invoke('auth_login') as Promise<AuthLoginResp>,
+
+  /** 退出：尽力远端吊销 + 清理 keyring/profile（本地数据保留） */
+  authLogout: (): Promise<{ ok: boolean; wasLoggedIn: boolean }> =>
+    invoke('auth_logout') as Promise<{ ok: boolean; wasLoggedIn: boolean }>,
+
+  /** 订阅登录态变更事件（auth-event），返回取消订阅函数 */
+  onAuthEvent: (callback: (event: { type: 'login' | 'logout'; profile?: AuthProfile }) => void): (() => void) => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    listen<{ type: 'login' | 'logout'; profile?: AuthProfile }>('auth-event', (e) => {
+      if (!disposed) callback(e.payload);
+    }).then((un) => {
+      if (disposed) {
+        un();
+      } else {
+        unlisten = un;
+      }
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  },
+
+  // ── System ─────────────────────────────────────
   systemInfo: () => invoke('system_info'),
   systemHealth: () => invoke('agent_status'),
 };

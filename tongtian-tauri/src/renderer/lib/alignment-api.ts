@@ -89,7 +89,15 @@ const DEFAULT_SETTINGS: Partial<AppSettingsData> = {
 export async function getSettings(): Promise<AppSettingsData> {
   const api = getAPI();
   if (api) {
-    return (await api.invoke(IPC_CHANNELS.SETTINGS_GET)) as AppSettingsData;
+    try {
+      const r = await api.invoke(IPC_CHANNELS.SETTINGS_GET);
+      // 引擎直连等通道可能返回空数组/空对象，无效则回退本地持久层
+      if (r && typeof r === 'object' && !Array.isArray(r) && Object.keys(r).length > 0) {
+        return r as AppSettingsData;
+      }
+    } catch {
+      // ignore → 回退本地
+    }
   }
   return lsGet('settings', DEFAULT_SETTINGS as AppSettingsData);
 }
@@ -97,8 +105,13 @@ export async function getSettings(): Promise<AppSettingsData> {
 export async function setSettings(patch: Partial<AppSettingsData>): Promise<AppSettingsData> {
   const api = getAPI();
   if (api) {
-    return (await api.invoke(IPC_CHANNELS.SETTINGS_SET, patch)) as AppSettingsData;
+    try {
+      await api.invoke(IPC_CHANNELS.SETTINGS_SET, patch);
+    } catch {
+      // 引擎直连等无落地通道时忽略，交由本地兑底持久化
+    }
   }
+  // 本地 localStorage 兑底持久化：保证引擎直连等场景下刷新不丢设置
   const next = { ...lsGet('settings', DEFAULT_SETTINGS as AppSettingsData), ...patch };
   lsSet('settings', next);
   return next;

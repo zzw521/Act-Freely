@@ -18,6 +18,7 @@ import type {
   ChatStepPreview,
   AttachmentMeta,
 } from '../../shared/types';
+import type { AuthLoginResp, AuthStatus } from '../../shared/contracts';
 
 // ── 辅助函数 ─────────────────────────────────────────────────
 
@@ -175,6 +176,25 @@ export const fileAPI = {
   },
 };
 
+// ── Auth API（账号与登录态 · 网页验证登录 Loopback 方案） ──
+
+export const authAPI = {
+  /** 登录态视图（loggedIn/profile/mock） */
+  status(): Promise<AuthStatus> {
+    return getAPI().invoke(IPC_CHANNELS.AUTH_STATUS) as Promise<AuthStatus>;
+  },
+
+  /** 登录：Mock 直登；真实模式拉起浏览器网页登录 + loopback 回调 */
+  login(): Promise<AuthLoginResp> {
+    return getAPI().invoke(IPC_CHANNELS.AUTH_LOGIN) as Promise<AuthLoginResp>;
+  },
+
+  /** 退出：尽力远端吊销 + 清理 keyring/profile（本地任务/会话保留） */
+  logout(): Promise<{ ok: boolean; wasLoggedIn: boolean }> {
+    return getAPI().invoke(IPC_CHANNELS.AUTH_LOGOUT) as Promise<{ ok: boolean; wasLoggedIn: boolean }>;
+  },
+};
+
 // ── System API ───────────────────────────────────────────────
 
 export const systemAPI = {
@@ -240,6 +260,7 @@ export const api = {
   chat: chatAPI,
   model: modelAPI,
   file: fileAPI,
+  auth: authAPI,
   system: systemAPI,
   p0: p0API,
 };

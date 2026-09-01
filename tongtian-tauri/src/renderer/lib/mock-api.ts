@@ -248,6 +248,37 @@ function handleModelChannel(channel: string, arg: unknown): unknown {
 
 const mockSettings: Record<string, string> = { theme: 'light', language: 'zh-CN' };
 
+// ── 账号登录态 Mock（与 Rust 侧 TT_AUTH_MOCK 语义一致） ──────
+
+/** Mock 账号资料（与 Rust service::mock_profile 同步） */
+const MOCK_AUTH_PROFILE = {
+  uid: 'tt-mock-8f3a2c91',
+  nickname: '张先生',
+  email: 'mock@tongtian.local',
+  plan: '个人免费版',
+  mock: true,
+};
+
+/** 当前 Mock 登录态（初始未登录，便于验收登录/退出闭环） */
+let mockAuthProfile: typeof MOCK_AUTH_PROFILE | null = null;
+
+function handleAuthChannel(channel: string): unknown {
+  if (channel === 'auth:status') {
+    return { loggedIn: mockAuthProfile !== null, profile: mockAuthProfile, mock: true };
+  }
+  if (channel === 'auth:login') {
+    // 模拟网页登录往返（真实模式为浏览器 + loopback 回调）
+    mockAuthProfile = { ...MOCK_AUTH_PROFILE };
+    return { ok: true, profile: mockAuthProfile, mock: true };
+  }
+  if (channel === 'auth:logout') {
+    const wasLoggedIn = mockAuthProfile !== null;
+    mockAuthProfile = null;
+    return { ok: true, wasLoggedIn };
+  }
+  return null;
+}
+
 function handleFileChannel(channel: string, args: unknown[]): unknown {
   if (channel === 'file:browse') {
     return [
@@ -306,6 +337,7 @@ const mockAPI = {
       mockSettings[String(args[0])] = String(args[1]);
       return { ok: true };
     }
+    if (channel.startsWith('auth:')) return handleAuthChannel(channel);
     return channelMocks[channel] ?? [];
   },
   send: () => undefined,

@@ -38,8 +38,14 @@ import { useAppSettings, WORKBENCH_MODE_DEFS } from '../../lib/use-app-settings'
 import { useNavigate } from 'react-router-dom';
 
 interface ChatInputProps {
-  /** 发送消息回调（两阶段协议：附件暂存后随提交上送；modelBinding 为选中模型） */
-  onSend: (text: string, attachments?: AttachmentMeta[], modelBinding?: string) => void;
+  /** 发送消息回调（两阶段协议：附件暂存后随提交上送；modelBinding 为选中模型；
+   *  modelConfig 为自定义模型配置（models.json 条目，引擎真实调用其端点） */
+  onSend: (
+    text: string,
+    attachments?: AttachmentMeta[],
+    modelBinding?: string,
+    modelConfig?: { baseUrl: string; apiKey: string; modelName: string },
+  ) => void;
   /** 是否处于加载状态（思考/流式生成中） */
   loading?: boolean;
   /** 占位符文本 */
@@ -89,6 +95,16 @@ const BUILTIN_MODELS = [
   { id: 'economy', name: '经济', desc: '经济实惠，适合简单任务 · 0.1x', color: '#F59E0B', modelId: 'qwen-flash' },
 ];
 
+/** 模型选项（内置 + 自定义；customConfig 存在时引擎真实调用该端点） */
+type ModelOption = {
+  id: string;
+  name: string;
+  desc: string;
+  color: string;
+  modelId: string;
+  customConfig?: { baseUrl: string; apiKey: string; modelName: string };
+};
+
 const ChatInput: React.FC<ChatInputProps> = ({
   onSend,
   loading = false,
@@ -107,7 +123,38 @@ const ChatInput: React.FC<ChatInputProps> = ({
 
   // ── 模型选择（替换原「添加到队列」占位） ──
   const [modelAnchor, setModelAnchor] = useState<null | HTMLElement>(null);
-  const [selectedModel, setSelectedModel] = useState(BUILTIN_MODELS[0]);
+  const [selectedModel, setSelectedModel] = useState<ModelOption>(BUILTIN_MODELS[0]);
+  
+    // 自定义模型（来自设置页已保存模型 tt-custom-models，选中后引擎真实调用其端点）
+    const [customModels, setCustomModels] = useState<ModelOption[]>([]);
+    useEffect(() => {
+      try {
+        const raw = localStorage.getItem('tt-custom-models');
+        if (!raw) return;
+        const list = JSON.parse(raw) as Array<{
+          id: string;
+          name: string;
+          provider: string;
+          baseUrl?: string;
+          apiKey?: string;
+          modelName: string;
+        }>;
+        setCustomModels(
+          list.map((m) => ({
+            id: `custom-${m.id}`,
+            name: m.name,
+            desc: `${m.provider} · ${m.modelName}`,
+            color: '#0EA5E9',
+            modelId: m.modelName,
+            customConfig: m.baseUrl
+              ? { baseUrl: m.baseUrl, apiKey: m.apiKey ?? '', modelName: m.modelName }
+              : undefined,
+          })),
+        );
+      } catch {
+        // ignore
+      }
+    }, []);
 
   // ── 技能调用（魔棒按钮 + / 前缀，真实加载已安装+内置技能） ──
   const [skills, setSkills] = useState<SkillInfo[]>([]);
@@ -323,6 +370,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
       referencedSkill ? `/${referencedSkill.name} ${trimmed}` : trimmed,
       metas.length > 0 ? metas : undefined,
       selectedModel.modelId || undefined,
+      selectedModel.customConfig,
     );
     setValue('');
     setAttachments([]);
@@ -370,7 +418,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
     <Box>
     <Box
       sx={{
-        bgcolor: '#FFFFFF',
+        bgcolor: 'var(--tt-surface)',
         borderRadius: '20px',
         border: `1px solid ${focused ? '#14B8A6' : '#E5E7EB'}`,
         boxShadow: focused
@@ -497,8 +545,8 @@ const ChatInput: React.FC<ChatInputProps> = ({
               fontSize: '15px',
               lineHeight: 1.6,
               px: 0.5,
-              color: '#111827',
-              '&::placeholder': { color: '#9CA3AF' },
+              color: 'var(--tt-text-1)',
+              '&::placeholder': { color: 'var(--tt-text-4)' },
             },
           }}
           sx={{ flex: 1, minWidth: 0 }}
@@ -522,7 +570,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
           <Tooltip title="添加内容（文件 / 文件夹 / 技能）">
             <IconButton
               size="small"
-              sx={{ color: '#6B7280', width: 28, height: 28 }}
+              sx={{ color: 'var(--tt-text-3)', width: 28, height: 28 }}
               onClick={(e) => setAddContentAnchor(e.currentTarget)}
             >
               <AddIcon sx={{ fontSize: 17 }} />
@@ -540,14 +588,14 @@ const ChatInput: React.FC<ChatInputProps> = ({
               px: 1,
               py: 0.4,
               borderRadius: '999px',
-              border: '1px solid #E5E7EB',
+              border: '1px solid var(--tt-border)',
               cursor: 'pointer',
               transition: 'all 0.15s ease',
               '&:hover': { borderColor: '#14B8A6', background: 'rgba(20, 184, 166, 0.04)' },
             }}
           >
-            <Typography sx={{ fontSize: '12px', color: '#374151', fontWeight: 500 }}>{mode}</Typography>
-            <KeyboardArrowDownIcon sx={{ fontSize: 15, color: '#9CA3AF' }} />
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-2)', fontWeight: 500 }}>{mode}</Typography>
+            <KeyboardArrowDownIcon sx={{ fontSize: 15, color: 'var(--tt-text-4)' }} />
           </Box>
         </Box>
 
@@ -564,7 +612,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 px: 1,
                 py: 0.4,
                 borderRadius: '999px',
-                border: '1px solid #E5E7EB',
+                border: '1px solid var(--tt-border)',
                 cursor: 'pointer',
                 transition: 'all 0.15s ease',
                 '&:hover': { borderColor: '#8B5CF6', background: 'rgba(139, 92, 246, 0.04)' },
@@ -579,14 +627,14 @@ const ChatInput: React.FC<ChatInputProps> = ({
                   flexShrink: 0,
                 }}
               />
-              <Typography sx={{ fontSize: '12px', fontWeight: 500, color: '#374151' }}>{selectedModel.name}</Typography>
-              <KeyboardArrowDownIcon sx={{ fontSize: 15, color: '#9CA3AF' }} />
+              <Typography sx={{ fontSize: '12px', fontWeight: 500, color: 'var(--tt-text-2)' }}>{selectedModel.name}</Typography>
+              <KeyboardArrowDownIcon sx={{ fontSize: 15, color: 'var(--tt-text-4)' }} />
             </Box>
           </Tooltip>
 
           {/* 语音输入 */}
           <Tooltip title="语音输入">
-            <IconButton size="small" sx={{ color: '#6B7280', width: 30, height: 30 }}>
+            <IconButton size="small" sx={{ color: 'var(--tt-text-3)', width: 30, height: 30 }}>
               <MicIcon sx={{ fontSize: 18 }} />
             </IconButton>
           </Tooltip>
@@ -661,13 +709,13 @@ const ChatInput: React.FC<ChatInputProps> = ({
               <Typography sx={{ fontSize: '13.5px', fontWeight: 700, color: '#111827' }}>
                 /{referencedSkill.name}
               </Typography>
-              <Typography sx={{ fontSize: '11px', color: '#9CA3AF' }}>
+              <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
                 {referencedSkill.source === 'installed' ? '已安装技能' : '内置技能'}
               </Typography>
             </Box>
           </Box>
           {referencedSkill.description && (
-            <Typography sx={{ fontSize: '12px', color: '#6B7280', mt: 1, lineHeight: 1.6 }}>
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-3)', mt: 1, lineHeight: 1.6 }}>
               {referencedSkill.description}
             </Typography>
           )}
@@ -683,13 +731,13 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 textAlign: 'center',
                 py: 0.6,
                 borderRadius: '8px',
-                border: '1px solid #E5E7EB',
+                border: '1px solid var(--tt-border)',
                 cursor: 'pointer',
                 transition: 'all 0.15s ease',
                 '&:hover': { borderColor: '#8B5CF6', color: '#8B5CF6' },
               }}
             >
-              <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#374151' }}>重新选择</Typography>
+              <Typography sx={{ fontSize: '12px', fontWeight: 600, color: 'var(--tt-text-2)' }}>重新选择</Typography>
             </Box>
             <Box
               onClick={() => {
@@ -735,11 +783,11 @@ const ChatInput: React.FC<ChatInputProps> = ({
           },
         }}
       >
-        <Typography sx={{ fontSize: '11px', fontWeight: 600, color: '#9CA3AF', px: 1.25, py: 0.5 }}>
+        <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-text-4)', px: 1.25, py: 0.5 }}>
           选择技能（{filteredSkills.length}）
         </Typography>
         {filteredSkills.length === 0 && (
-          <Typography sx={{ fontSize: '12.5px', color: '#9CA3AF', px: 1.25, py: 1.5, textAlign: 'center' }}>
+          <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-4)', px: 1.25, py: 1.5, textAlign: 'center' }}>
             未找到匹配技能，可到扩展页安装
           </Typography>
         )}
@@ -779,7 +827,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 <Typography
                   sx={{
                     fontSize: '11px',
-                    color: '#9CA3AF',
+                    color: 'var(--tt-text-4)',
                     mt: 0.15,
                     overflow: 'hidden',
                     textOverflow: 'ellipsis',
@@ -825,7 +873,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
           },
         }}
       >
-        <Typography sx={{ fontSize: '11px', fontWeight: 600, color: '#9CA3AF', px: 1.25, py: 0.5 }}>
+        <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-text-4)', px: 1.25, py: 0.5 }}>
           内置模型
         </Typography>
         {BUILTIN_MODELS.map((m) => (
@@ -863,11 +911,60 @@ const ChatInput: React.FC<ChatInputProps> = ({
             </Box>
             <Box sx={{ flexGrow: 1, minWidth: 0 }}>
               <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#1F2937' }}>{m.name}</Typography>
-              <Typography sx={{ fontSize: '11px', color: '#9CA3AF', mt: 0.15 }}>{m.desc}</Typography>
+              <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)', mt: 0.15 }}>{m.desc}</Typography>
             </Box>
             {selectedModel.id === m.id && <CheckIcon sx={{ fontSize: 16, color: '#8B5CF6' }} />}
           </Box>
         ))}
+
+        {/* 自定义模型（来自设置页 models.json，选中后引擎真实调用其端点） */}
+        {customModels.length > 0 && (
+          <>
+            <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-text-4)', px: 1.25, py: 0.5, borderTop: '1px solid var(--tt-border-soft)', mt: 0.5 }}>
+              自定义模型
+            </Typography>
+            {customModels.map((m) => (
+              <Box
+                key={m.id}
+                onClick={() => {
+                  setSelectedModel(m);
+                  setModelAnchor(null);
+                }}
+                sx={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 1,
+                  px: 1.25,
+                  py: 0.9,
+                  borderRadius: '10px',
+                  cursor: 'pointer',
+                  transition: 'background 0.15s ease',
+                  '&:hover': { background: 'rgba(99, 102, 241, 0.06)' },
+                }}
+              >
+                <Box
+                  sx={{
+                    width: 26,
+                    height: 26,
+                    borderRadius: '8px',
+                    background: `${m.color}1A`,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    flexShrink: 0,
+                  }}
+                >
+                  <Typography sx={{ fontSize: '12px', fontWeight: 700, color: m.color }}>{m.name[0]}</Typography>
+                </Box>
+                <Box sx={{ flexGrow: 1, minWidth: 0 }}>
+                  <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#1F2937' }}>{m.name}</Typography>
+                  <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)', mt: 0.15, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.desc}</Typography>
+                </Box>
+                {selectedModel.id === m.id && <CheckIcon sx={{ fontSize: 16, color: '#8B5CF6' }} />}
+              </Box>
+            ))}
+          </>
+        )}
 
         <Box sx={{ borderTop: '1px solid #F3F4F6', mt: 0.5, pt: 0.5 }}>
           <Box
@@ -899,9 +996,9 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 flexShrink: 0,
               }}
             >
-              <AddIcon sx={{ fontSize: 15, color: '#6B7280' }} />
+              <AddIcon sx={{ fontSize: 15, color: 'var(--tt-text-3)' }} />
             </Box>
-            <Typography sx={{ fontSize: '13px', fontWeight: 500, color: '#374151' }}>添加模型</Typography>
+            <Typography sx={{ fontSize: '13px', fontWeight: 500, color: 'var(--tt-text-2)' }}>添加模型</Typography>
           </Box>
         </Box>
       </Menu>
@@ -922,7 +1019,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
           }}
           sx={{ fontSize: '13px', gap: 1 }}
         >
-          <AttachFileIcon sx={{ fontSize: 16, color: '#6B7280' }} /> 添加文件
+          <AttachFileIcon sx={{ fontSize: 16, color: 'var(--tt-text-3)' }} /> 添加文件
         </MenuItem>
         <MenuItem
           onClick={() => {
@@ -931,7 +1028,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
           }}
           sx={{ fontSize: '13px', gap: 1 }}
         >
-          <FolderOutlinedIcon sx={{ fontSize: 16, color: '#6B7280' }} /> 添加文件夹
+          <FolderOutlinedIcon sx={{ fontSize: 16, color: 'var(--tt-text-3)' }} /> 添加文件夹
         </MenuItem>
         <MenuItem
           onClick={() => {
@@ -941,7 +1038,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
           }}
           sx={{ fontSize: '13px', gap: 1 }}
         >
-          <AutoAwesomeIcon sx={{ fontSize: 16, color: '#6B7280' }} /> 调用技能
+          <AutoAwesomeIcon sx={{ fontSize: 16, color: 'var(--tt-text-3)' }} /> 调用技能
         </MenuItem>
       </Menu>
 

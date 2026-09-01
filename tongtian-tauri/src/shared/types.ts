@@ -277,6 +277,8 @@ export interface ChatSubmitReq {
   workDir?: string;
   /** 此前轮次对话历史（保障连续对话上下文） */
   history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+  /** 自定义模型配置（models.json 条目；存在 baseUrl 时引擎真实调用该端点） */
+  modelConfig?: { baseUrl: string; apiKey: string; modelName: string };
 }
 
 /** 步骤预览（用于 Plan 事件中的步骤概览） */

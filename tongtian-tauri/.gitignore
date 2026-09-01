@@ -12,3 +12,8 @@ src-tauri/target/
 # Logs & temp
 *.log
 .DS_Store
+
+# Python 运行产物与 Auth 服务运行时数据
+__pycache__/
+auth-server/auth.db
+

@@ -22,6 +22,7 @@ import argparse
 import asyncio
 import base64
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -91,6 +92,8 @@ class TaskSession:
         self.model_binding: str | None = None
         # 本任务工作目录（前端选择的工作目录，approve 重新执行时沿用）
         self.work_dir: Path | None = None
+        # 本任务自定义模型配置（models.json 条目，approve 重新执行时沿用）
+        self.model_config: dict | None = None
 
     def next_seq(self) -> int:
         self.seq += 1
@@ -296,7 +299,7 @@ def _diff_files(base: Path, before: dict, after: dict, exclude_dir: "Path | None
     return changed
 
 
-async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay_from: list, model_binding: str | None = None, work_dir: "Path | None" = None, history: list | None = None):
+async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay_from: list, model_binding: str | None = None, work_dir: "Path | None" = None, history: list | None = None, model_config: dict | None = None):
     """阶段二：执行流（status_change(executing) → Agent 事件 → deliver/done）。
     支持 pause/resume 门控与 rollback_to 语义；model_binding 为对话内选中的模型档位；
     work_dir 为前端选择的工作目录（工具操作与产物落盘均限定其中）；
@@ -312,9 +315,9 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
         yield sse("done", {})
         return
 
-    # 构建 Agent（模型配置错误在此暴露；模型档位随对话绑定；工具限定在工作目录）
+    # 构建 Agent（模型配置错误在此暴露；模型档位随对话绑定；工具限定在工作目录；model_config 支持自定义模型真实调用）
     try:
-        agent = build_agent(model_binding, eff_work_dir)
+        agent = build_agent(model_binding, eff_work_dir, model_config)
     except Exception as exc:
         yield sse("error", {"code": "ENGINE_CONFIG_ERROR", "message": str(exc)})
         yield sse("done", {})
@@ -476,15 +479,33 @@ SYS_PROMPT = """你是“通天办公”AI 工作助手，运行在用户的本�
 """
 
 
-def build_model_and_formatter(model_override: str | None = None):
+def build_model_and_formatter(model_override: str | None = None, model_config: dict | None = None):
     """按 .env 配置构建模型与 formatter（支持 DashScope 与 OpenAI 兼容端点）；
-    model_override 非空时覆盖模型名（对话内模型档位绑定）"""
+    model_override 非空时覆盖模型名（对话内模型档位绑定）；
+    model_config 为前端传入的自定义模型配置（models.json，含 baseUrl/apiKey/modelName），
+    存在 baseUrl 时走 OpenAI 兼容端点真实调用自定义模型"""
     from agentscope.model import DashScopeChatModel, OpenAIChatModel
     from agentscope.formatter import DashScopeChatFormatter, OpenAIChatFormatter
 
+    cfg = model_config or {}
+    custom_base = str(cfg.get("baseUrl") or "").strip()
+    custom_key = str(cfg.get("apiKey") or "").strip()
+    custom_model = str(cfg.get("modelName") or "").strip()
+
+    model_name = (model_override or "").strip() or custom_model or os.environ.get("TT_MODEL", "qwen-plus")
+    api_key = custom_key or os.environ.get("TT_API_KEY", "")
+
+    # 自定义模型（models.json 配置）：OpenAI 兼容端点真实调用
+    if custom_base:
+        model = OpenAIChatModel(
+            model_name=model_name,
+            api_key=api_key or "EMPTY",
+            stream=True,
+            client_kwargs={"base_url": custom_base},
+        )
+        return model, OpenAIChatFormatter()
+
     provider = os.environ.get("TT_PROVIDER", "dashscope").lower()
-    model_name = (model_override or "").strip() or os.environ.get("TT_MODEL", "qwen-plus")
-    api_key = os.environ.get("TT_API_KEY", "")
 
     if provider == "dashscope":
         if not api_key:
@@ -599,11 +620,11 @@ def build_toolkit(work_dir: Path):
     return toolkit
 
 
-def build_agent(model_binding: str | None = None, work_dir: "Path | None" = None):
+def build_agent(model_binding: str | None = None, work_dir: "Path | None" = None, model_config: dict | None = None):
     from agentscope.agent import ReActAgent
     from agentscope.memory import InMemoryMemory
 
-    model, formatter = build_model_and_formatter(model_binding)
+    model, formatter = build_model_and_formatter(model_binding, model_config)
     # 注入当前时间：模型涉及日期/“今天、本周”等概念及生成带日期文件名时以此为准
     weekdays = "一二三四五六日"
     now = time.localtime()
@@ -742,6 +763,11 @@ async def chat(request: Request):
     session = _get_or_create_session(task_id)
     if model_binding:
         session.model_binding = model_binding
+    # 自定义模型配置（models.json 条目：baseUrl/apiKey/modelName，存在 baseUrl 时真实调用该端点）
+    model_config_raw = payload.get("modelConfig")
+    model_config = model_config_raw if isinstance(model_config_raw, dict) else None
+    if model_config:
+        session.model_config = model_config
     # 前端选择的工作目录：工具操作与产物落盘均限定其中（approve 重跑沿用）
     work_dir_raw = str(payload.get("workDir") or "").strip()
     if work_dir_raw:
@@ -784,7 +810,7 @@ async def chat(request: Request):
     history = history_raw if isinstance(history_raw, list) else []
 
     return StreamingResponse(
-        _run_execution(session, task_id, goal, replay_from, model_binding, session.work_dir, history),
+        _run_execution(session, task_id, goal, replay_from, model_binding, session.work_dir, history, model_config),
         media_type="text/event-stream",
         headers=sse_headers,
     )
@@ -816,7 +842,7 @@ async def chat_review(request: Request):
 
     if action == "approve":
         return StreamingResponse(
-            _run_execution(session, task_id, session.goal or "", [], session.model_binding, session.work_dir),
+            _run_execution(session, task_id, session.goal or "", [], session.model_binding, session.work_dir, None, session.model_config),
             media_type="text/event-stream",
             headers=sse_headers,
         )
@@ -992,6 +1018,171 @@ async def files_content(path: str = ""):
         "py": "text/x-python", "js": "text/javascript", "ts": "text/typescript",
     }.get(suffix, "text/plain")
     return JSONResponse({"ok": True, "fileName": p.name, "mime": mime, "content": text})
+
+
+# ── 意识持久化：真实目录 ~/.tongtianwork/awareness/main ─────────────
+
+AWARENESS_FILE_NAMES = ("SOUL.md", "WORK_MANUAL.md", "USER_PROFILE.md", "MEMORY.md")
+
+# 意识能力文件默认模板：协作风格/工作手册/用户画像/长期记忆首次加载时初始化落盘
+AWARENESS_DEFAULTS = {
+    "SOUL.md": """# SOUL.md - 协作风格 - 高效极简
+
+用最少的话把事情做好。
+
+## 核心原则
+- **直接给结果。** 代码优于描述。能用一行说清的不用三段。
+- **不要复述问题。** 我知道我问了什么，直接回答。
+- **默认执行。** 方案明确时直接做，不用每步都确认。
+- **不确定时一句话确认。** 不要列出一堆选项让我选，给出你的判断，问我对不对。
+
+## 沟通风格
+- 回复尽可能简短
+- 跳过寒暄、过渡句和总结性废话
+- 代码注释只在逻辑不明显时添加
+- 用列表而非段落
+
+## 边界
+- 高风险操作前简短确认
+- 私密信息不外泄""",
+    "WORK_MANUAL.md": """# 工作手册
+
+## 工作规范
+- （在此补充你的规范）
+
+## 常用流程
+- （在此补充常用流程）""",
+    "USER_PROFILE.md": """# 用户画像
+
+## 基本信息
+- 称呼：
+
+## 偏好
+- （自动维护中）
+
+## 习惯
+- （自动维护中）""",
+    "MEMORY.md": """# 长期记忆
+
+（暂无记忆条目，对话中值得记住的事实将自动沉淀于此）""",
+}
+
+
+def _awareness_home() -> Path:
+    return Path.home() / ".tongtianwork" / "awareness" / "main"
+
+
+# ── 自定义模型配置文件：真实路径 ~/.tongtianwork/models.json ─────────
+
+def _models_config_path() -> Path:
+    return Path.home() / ".tongtianwork" / "models.json"
+
+
+@app.get("/api/models/config")
+async def models_config_get():
+    """读取自定义模型配置文件（真实存在，首次访问自动初始化）"""
+    p = _models_config_path()
+    if not p.exists():
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({"models": []}, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            return JSONResponse({"ok": False, "message": f"无法初始化配置文件: {exc}"}, status_code=500)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        data = {"models": []}
+    models = data.get("models") if isinstance(data, dict) else None
+    return JSONResponse({"ok": True, "path": str(p), "models": models if isinstance(models, list) else []})
+
+
+@app.post("/api/models/config")
+async def models_config_set(request: Request):
+    """将自定义模型列表整体写入配置文件（供后续对话真实调用）"""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "message": "无效 JSON"}, status_code=400)
+    models = payload.get("models")
+    if not isinstance(models, list):
+        return JSONResponse({"ok": False, "message": "models 必须为数组"}, status_code=400)
+    p = _models_config_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"models": models}, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        return JSONResponse({"ok": False, "message": f"写入失败: {exc}"}, status_code=500)
+    return JSONResponse({"ok": True, "path": str(p)})
+
+
+@app.get("/api/awareness/load")
+async def awareness_load():
+    """读取真实意识目录下的能力文件；四个能力文件（协作风格/工作手册/
+    用户画像/长期记忆）缺失时以默认模板初始化落盘，保证目录内真实存在"""
+    home = _awareness_home()
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    files: dict = {}
+    for name in AWARENESS_FILE_NAMES:
+        p = home / name
+        if not p.exists():
+            try:
+                p.write_text(AWARENESS_DEFAULTS.get(name, ""), encoding="utf-8")
+            except Exception:
+                continue
+        try:
+            files[name] = {
+                "content": p.read_text(encoding="utf-8"),
+                "updatedAt": time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(p.stat().st_mtime)),
+            }
+        except Exception:
+            continue
+    return JSONResponse({"ok": True, "path": str(home), "files": files})
+
+
+@app.post("/api/awareness/save")
+async def awareness_save(request: Request):
+    """意识能力文件真实落盘到 ~/.tongtianwork/awareness/main（文件名白名单防穿越）"""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "message": "无效 JSON"}, status_code=400)
+    name = Path(str(payload.get("fileName") or "")).name
+    if name not in AWARENESS_FILE_NAMES:
+        return JSONResponse({"ok": False, "message": f"未知意识文件: {name}"}, status_code=400)
+    home = _awareness_home()
+    home.mkdir(parents=True, exist_ok=True)
+    target = home / name
+    target.write_text(str(payload.get("content") or ""), encoding="utf-8")
+    return JSONResponse({"ok": True, "path": str(target)})
+
+
+@app.post("/api/files/open-folder")
+async def files_open_folder(request: Request):
+    """在系统文件管理器中打开目录（缺省意识目录；不存在时自动创建）"""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    raw = str(payload.get("path") or "").strip() or str(_awareness_home())
+    p = Path(raw).expanduser()
+    if not p.exists():
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return JSONResponse({"ok": False, "message": "目录不存在且无法创建"}, status_code=404)
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(str(p))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(p)])
+        else:
+            subprocess.Popen(["xdg-open", str(p)])
+    except Exception as exc:
+        return JSONResponse({"ok": False, "message": f"打开文件夹失败: {exc}"}, status_code=500)
+    return JSONResponse({"ok": True, "path": str(p)})
 
 
 # ── 入口 ───────────────────────────────────────────────────────

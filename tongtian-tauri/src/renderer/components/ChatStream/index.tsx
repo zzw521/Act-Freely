@@ -35,6 +35,7 @@ import RefreshIcon from '@mui/icons-material/Refresh';
 import Markdown from 'react-markdown';
 import { Message, Role, ChatEvent, StepType } from '../../../shared/types';
 import FilePreview from '../FilePreview';
+import { useAppSettings } from '../../lib/use-app-settings';
 
 // re-export for external usage of event types
 export type { ChatEvent } from '../../../shared/types';
@@ -62,6 +63,10 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   // 产物文件预览
   const [previewPath, setPreviewPath] = useState<string | null>(null);
+
+  // 对话字号（偏好设置「对话字号」真实生效）
+  const [appSettings] = useAppSettings();
+  const chatFontSize = (appSettings.chatFontSize as number) ?? 14;
 
   // 自动滚动到底部
   useEffect(() => {
@@ -117,7 +122,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
               }}
             />
           )}
-          <Typography sx={{ fontSize: '12px', color: '#64748B', mt: running ? 0.5 : 0 }}>
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-3)', mt: running ? 0.5 : 0 }}>
             正在执行: {event.description}…
           </Typography>
         </Box>
@@ -202,14 +207,14 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
         </Avatar>
         <Box sx={{ maxWidth: '80%', minWidth: 0, flexGrow: 1 }}>
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
-            <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#334155' }}>通天助手</Typography>
+            <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-2)' }}>通天助手</Typography>
           </Box>
           <Box
             sx={{
               px: 2,
               py: 1.5,
               borderRadius: '4px 16px 16px 16px',
-              bgcolor: '#FFFFFF',
+              bgcolor: 'var(--tt-surface)',
               border: '1px solid #E2E8F0',
               boxShadow: '0 1px 3px rgba(15, 23, 42, 0.04)',
             }}
@@ -227,13 +232,13 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                     py: 0.75,
                     borderRadius: '10px',
                     border: '1px solid #E2E8F0',
-                    background: '#FBFCFD',
+                    background: 'var(--tt-surface-2)',
                     cursor: 'pointer',
                     width: 'fit-content',
                     minWidth: 220,
                     maxWidth: '100%',
                     transition: 'background 0.15s ease',
-                    '&:hover': { background: '#F8FAFC' },
+                    '&:hover': { background: 'var(--tt-surface-2)' },
                   }}
                 >
                   {processRunning ? (
@@ -256,7 +261,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                   />
                 </Box>
                 <Collapse in={processOpen}>
-                  <Box sx={{ mt: 1, px: 1.5, py: 1, borderRadius: '10px', border: '1px solid #EEF2F6', background: '#FBFCFD' }}>
+                  <Box sx={{ mt: 1, px: 1.5, py: 1, borderRadius: '10px', border: '1px solid var(--tt-border-soft)', background: '#FBFCFD' }}>
                     {processEvents.map((e, i) => renderEventDetail(e, i, running))}
                   </Box>
                 </Collapse>
@@ -269,7 +274,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
               const finalText = (event as { final_text?: string }).final_text ?? '';
               if (arts.length === 0) {
                 return (
-                  <Box key={`deliver-${idx}`} className="markdown-body" sx={{ color: '#334155' }}>
+                  <Box key={`deliver-${idx}`} className="markdown-body" sx={{ color: 'var(--tt-text-2)', fontSize: chatFontSize }}>
                     <Markdown>{finalText || '任务完成'}</Markdown>
                   </Box>
                 );
@@ -283,7 +288,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                     </Typography>
                   </Box>
                   {finalText && (
-                    <Box className="markdown-body" sx={{ color: '#334155', mb: 1 }}>
+                    <Box className="markdown-body" sx={{ color: 'var(--tt-text-2)', fontSize: chatFontSize, mb: 1 }}>
                       <Markdown>{finalText}</Markdown>
                     </Box>
                   )}
@@ -359,7 +364,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
               {delivers.some((d) => (d.artifacts ?? []).length > 0) && (
                 <Tooltip title="分享产出文件">
                   <IconButton size="small" sx={{ width: 26, height: 26 }} onClick={() => setActionMsg('分享功能即将上线')}>
-                    <ShareIcon sx={{ fontSize: 15, color: '#9CA3AF' }} />
+                    <ShareIcon sx={{ fontSize: 15, color: 'var(--tt-text-4)' }} />
                   </IconButton>
                 </Tooltip>
               )}
@@ -371,7 +376,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                     disabled={regeneratingTurn != null}
                     onClick={() => onRegenerate?.(turnIdx)}
                   >
-                    <RefreshIcon sx={{ fontSize: 15, color: '#9CA3AF' }} />
+                    <RefreshIcon sx={{ fontSize: 15, color: 'var(--tt-text-4)' }} />
                   </IconButton>
                 </span>
               </Tooltip>
@@ -411,7 +416,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                   borderRadius: '16px 16px 4px 16px',
                   background: 'linear-gradient(135deg, #22C55E 0%, #16A34A 100%)',
                   color: '#fff',
-                  fontSize: '14px',
+                  fontSize: chatFontSize,
                   lineHeight: 1.6,
                   boxShadow: '0 2px 8px rgba(22, 163, 74, 0.25)',
                   whiteSpace: 'pre-wrap',
@@ -455,7 +460,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
 
           <Box sx={{ maxWidth: '80%', minWidth: 0 }}>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
-              <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#334155' }}>
+              <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-2)' }}>
                 {isAi ? '通天助手' : '工具调用'}
               </Typography>
               <Typography sx={{ fontSize: '11px', color: '#CBD5E1' }}>
@@ -486,7 +491,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                 boxShadow: '0 1px 3px rgba(15, 23, 42, 0.04)',
               }}
             >
-              <Box className="markdown-body" sx={{ color: '#334155' }}>
+              <Box className="markdown-body" sx={{ color: 'var(--tt-text-2)', fontSize: chatFontSize }}>
                 <Markdown>{msg.content as string}</Markdown>
               </Box>
 
@@ -498,7 +503,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                       label={`📎 ${file}`}
                       size="small"
                       variant="outlined"
-                      sx={{ fontSize: '11px', height: 22, borderColor: '#E2E8F0', color: '#64748B' }}
+                      sx={{ fontSize: '11px', height: 22, borderColor: '#E2E8F0', color: 'var(--tt-text-3)' }}
                     />
                   ))}
                 </Box>

@@ -13,7 +13,11 @@
 //! - model_list/add/update/delete/test/set_default（ModelHub 五件套）
 //! - file_list / file_read / file_preview / file_stage_attachment（文件能力 + 附件上传）
 //! - settings_get / settings_set（设置持久化）
+//!
+//! 账号与登录态（网页验证登录 · Loopback 方案，TT_AUTH_MOCK 开关）：
+//! - auth_status / auth_login / auth_logout
 
+mod auth;
 mod bridge;
 mod file;
 mod model;
@@ -817,7 +821,10 @@ pub fn run() {
             file_list,
             file_read,
             file_preview,
-            file_stage_attachment
+            file_stage_attachment,
+            auth::auth_status,
+            auth::auth_login,
+            auth::auth_logout
         ])
         .run(tauri::generate_context!())
         .expect("error while running tongtian-tauri")

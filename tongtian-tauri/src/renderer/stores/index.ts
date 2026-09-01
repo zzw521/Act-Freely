@@ -14,3 +14,4 @@ export { useModelStore } from './useModelStore';
 export { useModelUsageStore } from './useModelUsageStore';
 export { useWorkspaceStore } from './useWorkspaceStore';
 export { useAppStore } from './useAppStore';
+export { useAuthStore } from './useAuthStore';

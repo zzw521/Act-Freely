@@ -100,7 +100,7 @@ interface WorkbenchState {
   newConversation: () => void;
   /** 切换到指定会话 */
   switchConversation: (id: string) => void;
-  submitGoal: (goal: string, attachments?: import('../../shared/types').AttachmentMeta[], modelBinding?: string, workDir?: string) => Promise<void>;
+  submitGoal: (goal: string, attachments?: import('../../shared/types').AttachmentMeta[], modelBinding?: string, workDir?: string, modelConfig?: { baseUrl: string; apiKey: string; modelName: string }) => Promise<void>;
   /** 重新生成指定轮次的回复（重置该轮事件流后重新提交原目标） */
   regenerateTurn: (turnIdx: number) => Promise<void>;
   reviewPlan: (action: 'approve' | 'reject' | 'modify', patch?: Partial<Step>[]) => Promise<void>;
@@ -396,7 +396,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
 
     // ── 提交目标 ──────────────────────────────────────────────
 
-    submitGoal: async (goal: string, attachments?: import('../../shared/types').AttachmentMeta[], modelBinding?: string, workDir?: string) => {
+    submitGoal: async (goal: string, attachments?: import('../../shared/types').AttachmentMeta[], modelBinding?: string, workDir?: string, modelConfig?: { baseUrl: string; apiKey: string; modelName: string }) => {
       ensureRouter();
       let s = get();
       // 无激活会话则先创建（直接进入的兜底路径）
@@ -448,6 +448,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
           attachments,
           modelBinding,
           workDir,
+          modelConfig,
           history: history.length > 0 ? history : undefined,
         });
         // 记录 taskId → 轮次映射（后续事件精确归档到本轮）

@@ -65,7 +65,7 @@ const Section: React.FC<{
         }}
       >
         {icon}
-        <Typography sx={{ fontSize: '13px', fontWeight: 500, color: '#374151', flexGrow: 1 }}>
+        <Typography sx={{ fontSize: '13px', fontWeight: 500, color: 'var(--tt-text-2)', flexGrow: 1 }}>
           {title}
         </Typography>
         {badge != null && (
@@ -74,20 +74,20 @@ const Section: React.FC<{
               minWidth: 20,
               height: 20,
               borderRadius: '10px',
-              background: '#F3F4F6',
+              background: 'var(--tt-surface-3)',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
               px: 0.75,
             }}
           >
-            <Typography sx={{ fontSize: '11px', color: '#6B7280', fontWeight: 600 }}>{badge}</Typography>
+            <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-3)', fontWeight: 600 }}>{badge}</Typography>
           </Box>
         )}
         <KeyboardArrowDownIcon
           sx={{
             fontSize: 16,
-            color: '#9CA3AF',
+            color: 'var(--tt-text-4)',
             transform: open ? 'rotate(180deg)' : 'none',
             transition: 'transform 0.2s ease',
           }}
@@ -138,8 +138,8 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
         position: 'relative',
         width,
         flexShrink: 0,
-        borderLeft: '1px solid #EEF0F2',
-        background: '#FCFCFD',
+        borderLeft: '1px solid var(--tt-border-soft)',
+        background: 'var(--tt-surface)',
         display: 'flex',
         flexDirection: 'column',
         height: '100%',
@@ -150,7 +150,7 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
       <ResizeHandle side="right" width={width} min={260} max={560} onWidthChange={setWidth} />
       {/* 面板头：标题 + 放大/还原 + 隐藏 */}
       <Box sx={{ display: 'flex', alignItems: 'center', px: 2, py: 1.5 }}>
-        <Typography sx={{ fontSize: '14px', fontWeight: 600, color: '#111827', flexGrow: 1 }}>
+        <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'var(--tt-text-1)', flexGrow: 1 }}>
           任务监控
         </Typography>
         <Tooltip title={isWide ? '还原面板宽度' : '放大面板宽度'}>
@@ -172,7 +172,7 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
       <Box sx={{ flex: 1, overflowY: 'auto' }}>
         {/* 待办（计划步骤） */}
         <Section
-          icon={<FolderOutlinedIcon sx={{ fontSize: 16, color: '#6B7280' }} />}
+          icon={<FolderOutlinedIcon sx={{ fontSize: 16, color: 'var(--tt-text-3)' }} />}
           title="待办"
           badge={steps.length > 0 ? steps.length : undefined}
           defaultOpen={steps.length > 0}
@@ -188,14 +188,14 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
                 <Box key={s.id} sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.75, py: 0.5 }}>
                   {stepIcon(s.status)}
                   <Box sx={{ minWidth: 0 }}>
-                    <Typography sx={{ fontSize: '12px', color: '#374151', lineHeight: 1.4 }}>
+                    <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-2)', lineHeight: 1.4 }}>
                       {s.name}
                     </Typography>
                     {s.result && (
                       <Typography
                         sx={{
                           fontSize: '11px',
-                          color: '#9CA3AF',
+                          color: 'var(--tt-text-4)',
                           overflow: 'hidden',
                           textOverflow: 'ellipsis',
                           whiteSpace: 'nowrap',
@@ -237,7 +237,7 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
 
         {/* 产物 */}
         <Section
-          icon={<DescriptionOutlinedIcon sx={{ fontSize: 16, color: '#6B7280' }} />}
+          icon={<DescriptionOutlinedIcon sx={{ fontSize: 16, color: 'var(--tt-text-3)' }} />}
           title="产物"
           badge={fileOps.length > 0 ? fileOps.length : undefined}
           defaultOpen={fileOps.length > 0}
@@ -260,7 +260,7 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
                   }}
                 >
                   <DescriptionOutlinedIcon sx={{ fontSize: 14, color: '#9CA3AF' }} />
-                  <Typography className="file-name" sx={{ fontSize: '12px', color: '#374151', transition: 'color 0.15s ease' }}>
+                  <Typography className="file-name" sx={{ fontSize: '12px', color: 'var(--tt-text-2)', transition: 'color 0.15s ease' }}>
                     {f.fileName ?? f.srcPath}
                   </Typography>
                 </Box>
@@ -271,17 +271,17 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
 
         {/* 默认工作目录 */}
         <Section
-          icon={<FolderOutlinedIcon sx={{ fontSize: 16, color: '#6B7280' }} />}
+          icon={<FolderOutlinedIcon sx={{ fontSize: 16, color: 'var(--tt-text-3)' }} />}
           title="默认工作目录"
         >
-          <Typography sx={{ fontSize: '12px', color: '#6B7280', wordBreak: 'break-all' }}>
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-3)', wordBreak: 'break-all' }}>
             {workDir || '未设置（选择工作目录后生效）'}
           </Typography>
         </Section>
 
         {/* 技能（占位计数，P1 接 skill_list） */}
         <Section
-          icon={<BoltIcon sx={{ fontSize: 16, color: '#6B7280' }} />}
+          icon={<BoltIcon sx={{ fontSize: 16, color: 'var(--tt-text-3)' }} />}
           title="技能"
           badge={skillCount}
         >
@@ -292,7 +292,7 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
 
         {/* MCP 连接器（占位计数，P1 接 mcp_list） */}
         <Section
-          icon={<LinkIcon sx={{ fontSize: 16, color: '#6B7280' }} />}
+          icon={<LinkIcon sx={{ fontSize: 16, color: 'var(--tt-text-3)' }} />}
           title="MCP 连接器"
           badge={mcpCount}
         >

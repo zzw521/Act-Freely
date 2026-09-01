@@ -29,6 +29,15 @@ pub fn set(store: &Store, key: &str, value: &str) -> Result<(), String> {
     })
 }
 
+/// 删除单个设置项（auth 退出登录清理账号 profile 等）
+pub fn delete(store: &Store, key: &str) -> Result<(), String> {
+    store.with_conn(|c| {
+        c.execute("DELETE FROM settings_kv WHERE key = ?1", rusqlite::params![key])
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+}
+
 /// 读取全部设置项（settings_get 返回整体）
 pub fn all(store: &Store) -> Result<std::collections::HashMap<String, String>, String> {
     store.with_conn(|c| {
@@ -83,6 +92,17 @@ mod tests {
     fn test_missing_key_none() {
         let (store, dir) = temp_store("miss");
         assert_eq!(get(&store, "nope").unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_delete_key() {
+        let (store, dir) = temp_store("del");
+        set(&store, "auth.profile", "{}").unwrap();
+        delete(&store, "auth.profile").unwrap();
+        assert_eq!(get(&store, "auth.profile").unwrap(), None);
+        // 删除不存在的键不报错（幂等）
+        delete(&store, "auth.profile").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

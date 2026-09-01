@@ -228,6 +228,34 @@ export interface AuditQuery {
   offset?: number;
 }
 
+// ── Auth（账号与登录态 · 网页验证登录 Loopback 方案） ──
+
+/** 账号资料（auth_status/auth_login 返回） */
+export interface AuthProfile {
+  uid: string;
+  nickname: string;
+  email?: string;
+  /** 套餐文案（如“个人免费版”） */
+  plan?: string;
+  /** Mock 模式模拟用户标记 */
+  mock?: boolean;
+}
+
+/** 登录态视图（auth_status 返回） */
+export interface AuthStatus {
+  loggedIn: boolean;
+  profile: AuthProfile | null;
+  /** 当前是否处于 Mock 开关（TT_AUTH_MOCK） */
+  mock: boolean;
+}
+
+/** 登录结果（auth_login 返回） */
+export interface AuthLoginResp {
+  ok: boolean;
+  profile: AuthProfile;
+  mock: boolean;
+}
+
 // ── Schedule ─────────────────────────────────────────────────
 
 export interface ScheduleCreateReq {
@@ -581,6 +609,11 @@ export const IPC_CHANNELS = {
   LEASE_INFO: 'lease:info',
   LEASE_TAKEOVER: 'lease:takeover',
   EVENT_REPLAY: 'event:replay',
+
+  // ── 账号与登录态（网页验证登录，TT_AUTH_MOCK 开关） ──
+  AUTH_STATUS: 'auth:status',
+  AUTH_LOGIN: 'auth:login',
+  AUTH_LOGOUT: 'auth:logout',
 } as const;
 
 export type IPCChannel = typeof IPC_CHANNELS[keyof typeof IPC_CHANNELS];

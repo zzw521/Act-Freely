@@ -2,6 +2,38 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ── 双主题语义色变量：亮色默认，[data-theme="dark"] 全局覆盖 ──
+   组件内表面/边框/文字统一引用 var(--tt-*)，暗色模式全局生效 */
+:root {
+  --tt-bg: #f7f8fa;
+  --tt-surface: #ffffff;
+  --tt-surface-2: #f9fafb;
+  --tt-surface-3: #f3f4f6;
+  --tt-border: #e5e7eb;
+  --tt-border-soft: #eef2f6;
+  --tt-text-1: #111827;
+  --tt-text-2: #374151;
+  --tt-text-3: #6b7280;
+  --tt-text-4: #9ca3af;
+  --tt-shadow-card: 0 1px 3px rgba(15, 23, 42, 0.06);
+  --tt-sidebar-bg: linear-gradient(180deg, #fbfcff 0%, #f6f8fe 55%, #f4f7fd 100%);
+}
+
+html[data-theme='dark'] {
+  --tt-bg: #0f172a;
+  --tt-surface: #1e293b;
+  --tt-surface-2: #24324a;
+  --tt-surface-3: #2b3a55;
+  --tt-border: #334155;
+  --tt-border-soft: #2c3a52;
+  --tt-text-1: #f1f5f9;
+  --tt-text-2: #cbd5e1;
+  --tt-text-3: #94a3b8;
+  --tt-text-4: #64748b;
+  --tt-shadow-card: 0 1px 3px rgba(0, 0, 0, 0.35);
+  --tt-sidebar-bg: linear-gradient(180deg, #16213a 0%, #131c31 55%, #101828 100%);
+}
+
 @layer base {
   html {
     font-family:
@@ -22,8 +54,9 @@
     overflow: hidden;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-    background-color: #f7f8fa;
-    color: #0f172a;
+    background-color: var(--tt-bg);
+    color: var(--tt-text-1);
+    transition: background-color 0.25s ease, color 0.25s ease;
   }
 
   ::selection {

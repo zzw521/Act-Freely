@@ -21,8 +21,16 @@ import ChatInput from '../../components/ChatInput';
 import TaskMonitor from '../../components/TaskMonitor';
 import ViewSidebarIcon from '@mui/icons-material/ViewSidebar';
 import { useWorkbenchStore } from '../../store/workbenchStore';
+import { usePreferenceStore } from '../../stores/usePreferenceStore';
 import { useShallow } from 'zustand/react/shallow';
 import { TaskStatus, StepStatus } from '../../../shared/types';
+
+/** 对话宽度：偏好设置「对话宽度」真实生效（标准/宽/全宽） */
+function resolveChatMaxWidth(chatWidth: string): number | string {
+  if (chatWidth === '全宽') return '100%';
+  if (chatWidth === '宽') return 1100;
+  return 860; // 标准
+}
 
 /** 任务状态徽标（对齐设计图：绿色「已完成 N 个步骤」等） */
 const StatusBadge: React.FC<{
@@ -50,7 +58,7 @@ const StatusBadge: React.FC<{
           size="small"
           icon={<PauseCircleOutlineIcon sx={{ fontSize: 14 }} />}
           label="已暂停"
-          sx={{ bgcolor: '#F3F4F6', color: '#6B7280', fontSize: '12px', '& .MuiChip-icon': { color: '#6B7280' } }}
+          sx={{ bgcolor: '#F3F4F6', color: 'var(--tt-text-3)', fontSize: '12px', '& .MuiChip-icon': { color: 'var(--tt-text-3)' } }}
         />
       );
     case TaskStatus.BUDGET_PAUSED:
@@ -61,7 +69,7 @@ const StatusBadge: React.FC<{
           size="small"
           icon={<CancelOutlinedIcon sx={{ fontSize: 14 }} />}
           label="已取消"
-          sx={{ bgcolor: '#F3F4F6', color: '#6B7280', fontSize: '12px', '& .MuiChip-icon': { color: '#6B7280' } }}
+          sx={{ bgcolor: '#F3F4F6', color: 'var(--tt-text-3)', fontSize: '12px', '& .MuiChip-icon': { color: 'var(--tt-text-3)' } }}
         />
       );
     case TaskStatus.FAILED:
@@ -76,7 +84,7 @@ const StatusBadge: React.FC<{
         />
       );
     default:
-      return stepCount > 0 ? null : <Chip size="small" label="新任务" sx={{ bgcolor: '#F3F4F6', color: '#6B7280', fontSize: '12px' }} />;
+      return stepCount > 0 ? null : <Chip size="small" label="新任务" sx={{ bgcolor: '#F3F4F6', color: 'var(--tt-text-3)', fontSize: '12px' }} />;
   }
 };
 
@@ -179,6 +187,9 @@ const WelcomeView: React.FC<{
   onSelectWorkDir: (dir: string) => void;
 }> = ({ onSend, loading, initialText, workDir, onSelectWorkDir }) => {
   const navigate = useNavigate();
+  // 对话宽度（偏好设置真实生效）
+  const chatWidth = usePreferenceStore((s) => s.chatWidth);
+  const chatMaxWidth = resolveChatMaxWidth(chatWidth);
   // 推荐案例分批：每批 3 个，「换一换」循环切换
   const [batch, setBatch] = React.useState(0);
   const batchCount = Math.floor(SHOWCASE_POOL.length / 3);
@@ -190,7 +201,7 @@ const WelcomeView: React.FC<{
     navigate(`/?prompt=${encodeURIComponent(prompt)}`);
   };
   return (
-    <Box sx={{ maxWidth: 860, mx: 'auto', mt: '4vh', px: 2 }}>
+    <Box sx={{ maxWidth: chatMaxWidth, mx: 'auto', mt: '4vh', px: 2 }}>
       {/* Logo + 问候 */}
       <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', mb: 3 }}>
         <Box
@@ -208,10 +219,10 @@ const WelcomeView: React.FC<{
         >
           <Typography sx={{ color: '#fff', fontSize: '22px', fontWeight: 700 }}>通</Typography>
         </Box>
-        <Typography sx={{ fontSize: '26px', fontWeight: 700, color: '#111827', letterSpacing: '-0.01em' }}>
+        <Typography sx={{ fontSize: '26px', fontWeight: 700, color: 'var(--tt-text-1)', letterSpacing: '-0.01em' }}>
           {getGreeting()}，张先生
         </Typography>
-        <Typography sx={{ fontSize: '15px', color: '#6B7280', mt: 0.75, mb: 3 }}>有什么需要我搞定的？</Typography>
+        <Typography sx={{ fontSize: '15px', color: 'var(--tt-text-3)', mt: 0.75, mb: 3 }}>有什么需要我搞定的？</Typography>
 
         {/* 输入框（紧跟问候区，设计图对齐） */}
         <Box sx={{ width: '100%' }}>
@@ -221,7 +232,7 @@ const WelcomeView: React.FC<{
 
       {/* 推荐案例（换一换） */}
       <Box sx={{ mt: 5 }}>
-        <Typography sx={{ fontSize: '14px', fontWeight: 600, color: '#374151', mb: 1.5 }}>推荐案例</Typography>
+        <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 1.5 }}>推荐案例</Typography>
         <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 2 }}>
           {showcases.map((item) => (
             <Box
@@ -257,10 +268,10 @@ const WelcomeView: React.FC<{
             onClick={() => setBatch((b) => (b + 1) % batchCount)}
             sx={{ display: 'flex', alignItems: 'center', gap: 0.5, cursor: 'pointer', '&:hover .swap-text': { color: '#4F46E5' } }}
           >
-            <Typography className="swap-text" sx={{ fontSize: '12.5px', color: '#6B7280', transition: 'color 0.15s ease' }}>
+            <Typography className="swap-text" sx={{ fontSize: '12.5px', color: 'var(--tt-text-3)', transition: 'color 0.15s ease' }}>
               换一换
             </Typography>
-            <RefreshIcon className="swap-text" sx={{ fontSize: 15, color: '#6B7280', transition: 'color 0.15s ease' }} />
+            <RefreshIcon className="swap-text" sx={{ fontSize: 15, color: 'var(--tt-text-3)', transition: 'color 0.15s ease' }} />
           </Box>
         </Box>
       </Box>
@@ -284,10 +295,10 @@ const WelcomeView: React.FC<{
         }}
       >
         <Box sx={{ flexGrow: 1, minWidth: 0 }}>
-          <Typography sx={{ fontSize: '16px', fontWeight: 700, color: '#111827' }}>
+          <Typography sx={{ fontSize: '16px', fontWeight: 700, color: 'var(--tt-text-1)' }}>
             通过模版，开启你的第一个任务
           </Typography>
-          <Typography sx={{ fontSize: '12.5px', color: '#6B7280', mt: 0.5 }}>
+          <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-3)', mt: 0.5 }}>
             海量高品质任务模板，一键复制，快速发起任务。
           </Typography>
           <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#4F46E5', mt: 1.25 }}>
@@ -319,7 +330,7 @@ const WelcomeView: React.FC<{
                 justifyContent: 'center',
               }}
             >
-              <Typography sx={{ fontSize: '16px', fontWeight: 800, color: '#9CA3AF' }}>{c.label}</Typography>
+              <Typography sx={{ fontSize: '16px', fontWeight: 800, color: 'var(--tt-text-4)' }}>{c.label}</Typography>
             </Box>
           ))}
         </Box>
@@ -335,7 +346,7 @@ const WelcomeView: React.FC<{
       >
         <DialogTitle sx={{ pb: 0.5 }}>
           <Typography sx={{ fontSize: '16px', fontWeight: 700 }}>任务模板</Typography>
-          <Typography sx={{ fontSize: '12.5px', color: '#9CA3AF', mt: 0.25 }}>
+          <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-4)', mt: 0.25 }}>
             海量高品质任务模板，点击即可复制提示词，快速发起任务。
           </Typography>
         </DialogTitle>
@@ -373,6 +384,9 @@ const WelcomeView: React.FC<{
 const Workbench: React.FC = () => {
   // 工作目录：会话内容与产出物按对话时间建子目录存放于此
   const [workDir, setWorkDir] = React.useState('');
+  // 对话宽度（偏好设置真实生效）
+  const chatWidth = usePreferenceStore((s) => s.chatWidth);
+  const chatMaxWidth = resolveChatMaxWidth(chatWidth);
   // 右侧任务监控面板显隐
   const [monitorOpen, setMonitorOpen] = React.useState(true);
   const {
@@ -431,10 +445,15 @@ const Workbench: React.FC = () => {
 
   const hasConversation = messages.length > 0 || events.length > 0 || isLoading;
 
-  // ── 发送消息（支持附件 + 选中模型 + 工作目录） ──
+  // ── 发送消息（支持附件 + 选中模型 + 自定义模型配置 + 工作目录） ──
   const handleSend = useCallback(
-    (text: string, attachments?: import('../../../shared/types').AttachmentMeta[], modelBinding?: string) => {
-      submitGoal(text, attachments, modelBinding, workDir || undefined);
+    (
+      text: string,
+      attachments?: import('../../../shared/types').AttachmentMeta[],
+      modelBinding?: string,
+      modelConfig?: { baseUrl: string; apiKey: string; modelName: string },
+    ) => {
+      submitGoal(text, attachments, modelBinding, workDir || undefined, modelConfig);
     },
     [submitGoal, workDir],
   );
@@ -474,7 +493,7 @@ const Workbench: React.FC = () => {
     ].includes(taskStatus as TaskStatus);
 
   return (
-    <Box sx={{ display: 'flex', height: '100vh', bgcolor: '#FFFFFF', overflow: 'hidden' }}>
+    <Box sx={{ display: 'flex', height: '100vh', bgcolor: 'var(--tt-surface)', overflow: 'hidden' }}>
       {/* ── 中间聊天区 ── */}
       <Box sx={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', position: 'relative' }}>
         {/* 头部：任务标题 + 状态徽标 + 时间 + 控制按钮 */}
@@ -488,7 +507,7 @@ const Workbench: React.FC = () => {
             borderBottom: '1px solid #F3F4F6',
           }}
         >
-          <Typography sx={{ fontSize: '15px', fontWeight: 600, color: '#111827' }}>{taskTitle}</Typography>
+          <Typography sx={{ fontSize: '15px', fontWeight: 600, color: 'var(--tt-text-1)' }}>{taskTitle}</Typography>
           <StatusBadge taskStatus={taskStatus} isLoading={isLoading} stepCount={steps.length} doneSteps={doneSteps} />
           {hasConversation && (
             <Typography sx={{ fontSize: '12px', color: '#C0C4CA' }}>{timeStr}</Typography>
@@ -560,11 +579,11 @@ const Workbench: React.FC = () => {
                 size="small"
                 onClick={() => setMonitorOpen(true)}
                 sx={{
-                  color: '#6B7280',
-                  border: '1px solid #E5E7EB',
+                  color: 'var(--tt-text-3)',
+                  border: '1px solid var(--tt-border)',
                   width: 30,
                   height: 30,
-                  '&:hover': { bgcolor: '#F8FAFC', borderColor: '#8B5CF6', color: '#8B5CF6' },
+                  '&:hover': { bgcolor: 'var(--tt-surface-2)', borderColor: '#8B5CF6', color: '#8B5CF6' },
                 }}
               >
                 <ViewSidebarIcon sx={{ fontSize: 17 }} />
@@ -576,7 +595,7 @@ const Workbench: React.FC = () => {
         {/* 消息流 / 欢迎区（欢迎态输入框内置于 WelcomeView） */}
         <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', px: 3, pt: 2 }}>
           {hasConversation ? (
-            <Box sx={{ maxWidth: 860, mx: 'auto' }}>
+            <Box sx={{ maxWidth: chatMaxWidth, mx: 'auto' }}>
               <ChatStream
                 messages={messages}
                 events={events}
@@ -594,7 +613,7 @@ const Workbench: React.FC = () => {
         {/* 输入区（仅对话态：底部固定） */}
         {hasConversation && (
           <Box sx={{ px: 3, pb: 2, pt: 1 }}>
-            <Box sx={{ maxWidth: 860, mx: 'auto' }}>
+            <Box sx={{ maxWidth: chatMaxWidth, mx: 'auto' }}>
               <ChatInput onSend={handleSend} loading={isLoading} workDir={workDir} onSelectWorkDir={setWorkDir} />
             </Box>
           </Box>

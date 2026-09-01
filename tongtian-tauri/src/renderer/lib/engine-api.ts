@@ -70,6 +70,7 @@ export const engineAPI = {
     modelBinding?: string;
     workDir?: string;
     history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+    modelConfig?: { baseUrl: string; apiKey: string; modelName: string };
   }) => {
     const taskId = req.taskId || `task-${Date.now()}`;
     const resp = await postSSE('/api/chat', {
@@ -78,6 +79,7 @@ export const engineAPI = {
       modelBinding: req.modelBinding,
       workDir: req.workDir,
       history: req.history,
+      modelConfig: req.modelConfig,
     });
     if (resp.body) void pumpSSE(resp.body);
     return { taskId };

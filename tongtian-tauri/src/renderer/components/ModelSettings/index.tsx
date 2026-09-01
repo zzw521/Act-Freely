@@ -27,6 +27,7 @@ import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
 import VisibilityIcon from '@mui/icons-material/Visibility';
 import VisibilityOffIcon from '@mui/icons-material/VisibilityOff';
 import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
+import { ENGINE_DIRECT_URL } from '../../lib/engine-api';
 
 // ── 类型与常量 ──────────────────────────────────────────────────
 
@@ -34,6 +35,8 @@ interface SavedModel {
   id: string;
   name: string;
   provider: string;
+  /** 自定义接口地址（OpenAI 兼容 baseUrl） */
+  baseUrl?: string;
   apiKey: string;
   modelName: string;
   source: string;
@@ -42,6 +45,7 @@ interface SavedModel {
 const STORAGE_KEY = 'tt-custom-models';
 
 const PROVIDERS = [
+  '自定义 / Custom',
   '腾讯云 Token Plan',
   'OpenAI',
   'DeepSeek',
@@ -50,7 +54,13 @@ const PROVIDERS = [
   '通用 Token Plan（个人版）',
 ];
 
-const MODEL_NAMES = ['Auto', 'miMo-v2.5-pro', 'qwen3.6-plus', 'deepseek-chat', 'gpt-5'];
+/** 各提供方默认接口地址（自定义时作为占位提示，OpenAI 兼容 baseUrl） */
+const PROVIDER_URLS: Record<string, string> = {
+  'OpenAI': 'https://api.openai.com/v1',
+  'DeepSeek': 'https://api.deepseek.com/v1',
+  'Moonshot（Kimi）': 'https://api.moonshot.cn/v1',
+  '智谱 GLM': 'https://open.bigmodel.cn/api/paas/v4',
+};
 
 const seedModels: SavedModel[] = [
   {
@@ -87,6 +97,15 @@ function saveModels(models: SavedModel[]) {
   } catch {
     // ignore
   }
+}
+
+/** 自定义模型写入真实配置文件（引擎 ~/.tongtianwork/models.json，best-effort） */
+function persistModelsToDisk(models: SavedModel[]) {
+  fetch(`${ENGINE_DIRECT_URL}/api/models/config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ models }),
+  }).catch(() => undefined);
 }
 
 // ── 通用小组件 ──────────────────────────────────────────────────
@@ -133,27 +152,33 @@ interface ModelDialogProps {
 
 const ModelDialog: React.FC<ModelDialogProps> = ({ open, editing, onClose, onSave }) => {
   const [provider, setProvider] = useState(editing?.provider ?? PROVIDERS[0]);
+  const [baseUrl, setBaseUrl] = useState(editing?.baseUrl ?? '');
   const [apiKey, setApiKey] = useState(editing?.apiKey ?? '');
-  const [modelName, setModelName] = useState(editing?.modelName ?? 'Auto');
+  const [modelName, setModelName] = useState(editing?.modelName ?? '');
   const [showKey, setShowKey] = useState(false);
 
   // 打开时重置为编辑值
   React.useEffect(() => {
     if (open) {
       setProvider(editing?.provider ?? PROVIDERS[0]);
+      setBaseUrl(editing?.baseUrl ?? '');
       setApiKey(editing?.apiKey ?? '');
-      setModelName(editing?.modelName ?? 'Auto');
+      setModelName(editing?.modelName ?? '');
       setShowKey(false);
     }
   }, [open, editing]);
 
+  const isCustom = provider === '自定义 / Custom';
+  const urlPlaceholder = PROVIDER_URLS[provider] ?? 'https://api.example.com/v1';
+
   const handleSave = () => {
     onSave({
       id: editing?.id ?? `m-${Date.now()}`,
-      name: editing?.name ?? modelName === 'Auto' ? provider : modelName,
+      name: editing?.name ?? (modelName.trim() || provider),
       provider,
+      baseUrl: baseUrl.trim(),
       apiKey,
-      modelName,
+      modelName: modelName.trim() || 'Auto',
       source: '自定义',
     });
     onClose();
@@ -212,6 +237,24 @@ const ModelDialog: React.FC<ModelDialogProps> = ({ open, editing, onClose, onSav
         </Select>
       </Box>
 
+      {/* 接口地址：自定义模型的 API 接入地址（OpenAI 兼容 baseUrl） */}
+      <Box sx={{ mb: 2.5 }}>
+        <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#374151', mb: 1 }}>
+          接口地址{isCustom && <Box component="span" sx={{ color: '#EF4444', ml: 0.5 }}>*</Box>}
+        </Typography>
+        <TextField
+          fullWidth
+          size="small"
+          placeholder={urlPlaceholder}
+          value={baseUrl}
+          onChange={(e) => setBaseUrl(e.target.value)}
+          InputProps={{ sx: { borderRadius: '10px', fontSize: '13px', py: 0.25, fontFamily: 'Consolas, monospace' } }}
+        />
+        <Typography sx={{ fontSize: '11px', color: '#9CA3AF', mt: 0.5 }}>
+          {isCustom ? '填写 OpenAI 兼容协议的 API 地址，例如 https://api.example.com/v1' : '不填则使用提供方默认地址'}
+        </Typography>
+      </Box>
+
       {/* API Key */}
       <Box sx={{ mb: 2.5 }}>
         <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#374151', mb: 1 }}>API Key</Typography>
@@ -235,29 +278,17 @@ const ModelDialog: React.FC<ModelDialogProps> = ({ open, editing, onClose, onSav
         />
       </Box>
 
-      {/* 模型名称 */}
+      {/* 模型名称：自由输入，支持自定义模型参数值 */}
       <Box sx={{ mb: 3.5 }}>
         <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#374151', mb: 1 }}>模型名称</Typography>
-        <Select
-          value={modelName}
-          onChange={(e) => setModelName(e.target.value)}
+        <TextField
           fullWidth
           size="small"
-          IconComponent={KeyboardArrowDownIcon}
-          sx={{
-            borderRadius: '10px',
-            fontSize: '13px',
-            color: '#111827',
-            '& .MuiOutlinedInput-notchedOutline': { borderColor: '#E5E7EB' },
-            '& .MuiSelect-select': { py: 1.25, pl: 1.5, pr: 4 },
-          }}
-        >
-          {MODEL_NAMES.map((m) => (
-            <MenuItem key={m} value={m} sx={{ fontSize: '13px' }}>
-              {m}
-            </MenuItem>
-          ))}
-        </Select>
+          placeholder="输入模型参数值，例如 gpt-4o 或 openai/gpt-4o"
+          value={modelName}
+          onChange={(e) => setModelName(e.target.value)}
+          InputProps={{ sx: { borderRadius: '10px', fontSize: '13px', py: 0.25 } }}
+        />
       </Box>
 
       {/* 操作按钮 */}
@@ -302,10 +333,56 @@ const ModelSettings: React.FC = () => {
   const [models, setModels] = useState<SavedModel[]>(loadModels);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<SavedModel | null>(null);
+  // 真实配置文件路径（引擎返回，默认展示规范路径）
+  const [configPath, setConfigPath] = useState('%USERPROFILE%\\.tongtianwork\\models.json');
+  const [pathMsg, setPathMsg] = useState('');
+
+  // 挂载时从真实配置文件加载（磁盘为权威数据源；Mock 模式无引擎时回退本地）
+  React.useEffect(() => {
+    let cancelled = false;
+    fetch(`${ENGINE_DIRECT_URL}/api/models/config`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((json) => {
+        if (cancelled || !json || json.ok !== true) return;
+        if (json.path) setConfigPath(json.path);
+        if (Array.isArray(json.models) && json.models.length > 0) {
+          setModels(json.models as SavedModel[]);
+          saveModels(json.models as SavedModel[]);
+        } else {
+          // 磁盘为空：把本地已有模型同步落盘，保证配置文件内容与实际一致
+          persistModelsToDisk(loadModels());
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /** 打开配置文件所在目录 */
+  const openConfigFolder = () => {
+    const dir = configPath.replace(/[\\/][^\\/]*$/, '');
+    fetch(`${ENGINE_DIRECT_URL}/api/files/open-folder`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: dir }),
+    })
+      .then((r) => r.json())
+      .then((json) => {
+        if (!json || json.ok !== true) throw new Error((json && json.message) || '打开失败');
+        setPathMsg('已在文件管理器打开');
+        setTimeout(() => setPathMsg(''), 2500);
+      })
+      .catch((e) => {
+        setPathMsg(e instanceof Error ? e.message : '无可用引擎，无法打开');
+        setTimeout(() => setPathMsg(''), 3000);
+      });
+  };
 
   const updateModels = (next: SavedModel[]) => {
     setModels(next);
     saveModels(next);
+    persistModelsToDisk(next);
   };
 
   const handleSave = (model: SavedModel) => {
@@ -341,13 +418,16 @@ const ModelSettings: React.FC = () => {
           <Typography sx={{ fontSize: '13px', color: '#6B7280', lineHeight: 1.8 }}>
             你可以手动编辑本地配置文件来添加自定义模型
           </Typography>
-          <Typography sx={{ fontSize: '13px', mt: 1.5 }}>
+          <Typography sx={{ fontSize: '13px', mt: 1.5, display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
             <Box
               component="span"
-              sx={{ color: '#0EA5E9', cursor: 'pointer', '&:hover': { textDecoration: 'underline' } }}
+              onClick={openConfigFolder}
+              title="点击打开配置文件所在目录"
+              sx={{ color: '#0EA5E9', cursor: 'pointer', fontFamily: 'Consolas, monospace', fontSize: '12px', wordBreak: 'break-all', '&:hover': { textDecoration: 'underline' } }}
             >
-              %USERPROFILE%\workbuddy\models.json
+              {configPath}
             </Box>
+            {pathMsg && <Box component="span" sx={{ fontSize: '11px', color: '#0D9488' }}>{pathMsg}</Box>}
           </Typography>
           <Typography sx={{ fontSize: '12px', color: '#9CA3AF', mt: 2, lineHeight: 1.7 }}>
             修改完成后重启应用生效，请注意保持 JSON 格式正确

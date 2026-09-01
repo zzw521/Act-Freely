@@ -26,6 +26,23 @@ fi
 # ── [2/3] 启动服务 ──────────────────────────────────────────
 echo "[2/3] 启动服务..."
 MOCK_ENABLED="${MOCK_ENABLED:-true}"
+TT_AUTH_MOCK="${TT_AUTH_MOCK:-true}"
+
+# 联调模式（TT_AUTH_MOCK=false）：拉起本地 Auth 服务（网页登录/注册页）
+AUTH_URL="未启动（Mock 模式）"
+if [ "$TT_AUTH_MOCK" = "false" ]; then
+  PYTHON_BIN=$(command -v python3 || command -v python || true)
+  if [ -z "$PYTHON_BIN" ]; then
+    echo "  ✗ 未找到 Python，无法启动 Auth 服务（请设置 TT_AUTH_MOCK=true 或安装 Python）"
+    exit 1
+  fi
+  AUTH_PORT="${TT_AUTH_PORT:-18080}"
+  AUTH_URL="http://127.0.0.1:${AUTH_PORT}"
+  echo "  → 启动本地 Auth 服务（网页验证登录）: $AUTH_URL"
+  "$PYTHON_BIN" auth-server/server.py --port "$AUTH_PORT" &
+  AUTH_PID=$!
+  trap 'kill $AUTH_PID 2>/dev/null || true' EXIT
+fi
 
 if [ "$HAS_RUST" = "1" ]; then
   echo "  ✓ 检测到 Rust 工具链，启动 Tauri 桌面应用"
@@ -47,7 +64,9 @@ echo "[3/3] 启动完成！"
 echo "-----------------------------------------"
 echo "  前端地址:     http://localhost:7173"
 echo "  运行模式:     Mock 模式（VITE_MOCK=false 可关闭）"
+echo "  登录模式:     TT_AUTH_MOCK=$TT_AUTH_MOCK（false 时走网页验证登录）"
+echo "  Auth 服务:    $AUTH_URL"
 echo "  桌面应用:     tongtian-tauri (Tauri 2.x)"
-echo "  后端能力:     26 个 Tauri command（含两阶段审阅/模型五件套/文件能力/附件上传）"
-echo "  测试:         npx vitest run（前端）/ cargo test --lib（Rust）"
+echo "  后端能力:     29 个 Tauri command（含两阶段审阅/模型五件套/文件能力/附件上传/登录态三件套）"
+echo "  测试:         npx vitest run（前端）/ cargo test --lib（Rust）/ python auth-server/test_auth.py（Auth）"
 echo "-----------------------------------------"

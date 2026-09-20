@@ -47,7 +47,7 @@ import { useModelStore } from '../../stores';
 import { useModelUsageStore } from '../../stores/useModelUsageStore';
 import type { ModelConfig as StoreModelConfig } from '../../stores/useModelStore';
 import { ModelConfig, ModelSource, ModelTestReq, ModelTestResp } from '../../../shared/types';
-import { errorMessageOf } from '../../../shared/error-messages';
+import { errorTextOf } from '../../../shared/error-messages';
 import api from '../../lib/api';
 import { useShallow } from 'zustand/react/shallow';
 
@@ -165,8 +165,7 @@ const ModelHub: React.FC = () => {
       setDialogOpen(false);
       await loadModels();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setError(errorMessageOf(msg.split(':')[0]) + (msg.includes(':') ? `：${msg.split(':').slice(1).join(':')}` : ''));
+      setError(errorTextOf(err, '保存模型失败'));
     }
   };
 
@@ -182,12 +181,12 @@ const ModelHub: React.FC = () => {
         id: modelId,
       });
       if (!result.ok) {
-        setError(errorMessageOf((result.error ?? '').split(':')[0]) + (result.error ? `：${result.error.split(':').slice(1).join(':')}` : ''));
+        setError(errorTextOf(result.error, '模型连接测试失败'));
       } else {
         setError(null);
       }
     } catch (err) {
-      setError(`测试失败: ${err}`);
+      setError(errorTextOf(err, '模型连接测试失败'));
     } finally {
       setTesting(null);
     }

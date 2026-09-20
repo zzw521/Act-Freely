@@ -22,18 +22,25 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:* ipc: http://ipc.localhost; worker-src 'self' blob:"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "com.tongtian.office",
+    "resources": {
+      "../engine/server.py": "engine/server.py",
+      "../engine/requirements.txt": "engine/requirements.txt",
+      "../scripts/mock-agent.py": "scripts/mock-agent.py"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "useLocalToolsDir": true
   }
 }

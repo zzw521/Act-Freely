@@ -20,7 +20,7 @@ import type {
 } from '../../shared/types';
 import { Role, PlanStatus, StepStatus, FileOpType, FileOpStatus, TaskStatus } from '../../shared/types';
 import type { QuotaSnapshot } from '../../shared/contracts';
-import { errorMessageOf } from '../../shared/error-messages';
+import { errorMessageOf, errorTextOf } from '../../shared/error-messages';
 import { api } from '../lib/api';
 
 // ── 状态接口 ─────────────────────────────────────────────────
@@ -311,7 +311,12 @@ function applyEvent(conv: ConversationState, event: ChatEvent, turnIdx: number):
       return null; // 心跳仅保活，不产生 UI 变更
 
     case 'error':
-      return { ...base, isLoading: false, error: errorMessageOf(event.code) };
+      // 引擎事件带 message（多为 `错误码: 详情`）时优先展示详情，否则按 code 映射
+      return {
+        ...base,
+        isLoading: false,
+        error: event.message ? errorTextOf(event.message) : errorMessageOf(event.code),
+      };
 
     default:
       return base;
@@ -460,7 +465,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
       } catch (err: unknown) {
         patchConv(convId, {
           isLoading: false,
-          error: err instanceof Error ? err.message : '提交任务失败',
+          error: errorTextOf(err, '提交任务失败'),
         });
       }
     },
@@ -493,7 +498,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
       } catch (err: unknown) {
         patchConv(conv.id, {
           regeneratingTurn: null,
-          error: err instanceof Error ? err.message : '重新生成失败',
+          error: errorTextOf(err, '重新生成失败'),
           ...(isLast ? { isLoading: false } : {}),
         });
       }
@@ -527,7 +532,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
           set({ planVisible: true });
         }
       } catch (err: unknown) {
-        patchConv(conv.id, { error: err instanceof Error ? err.message : '审阅失败' });
+        patchConv(conv.id, { error: errorTextOf(err, '审阅失败') });
       }
     },
 
@@ -549,7 +554,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
           patchConv(conv.id, { taskStatus: TaskStatus.ROLLED_BACK, isLoading: false });
         }
       } catch (err: unknown) {
-        patchConv(conv.id, { error: err instanceof Error ? err.message : '控制任务失败' });
+        patchConv(conv.id, { error: errorTextOf(err, '控制任务失败') });
       }
     },
 
@@ -571,7 +576,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
           });
         }
       } catch (err: unknown) {
-        patchConv(conv.id, { error: err instanceof Error ? err.message : '取消任务失败' });
+        patchConv(conv.id, { error: errorTextOf(err, '取消任务失败') });
       }
     },
 

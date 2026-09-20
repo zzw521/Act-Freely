@@ -754,6 +754,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(agent::new_bridge_state())
         .setup(|app| {
+            // 随包资源根目录注入：安装后引擎脚本与嵌入式 Python 由此定位（开发模式无此目录）
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                bridge::python_env::init_resource_dir(resource_dir);
+            }
+
             // 存储地基：运行目录 SQLite（失败时回退 temp，保证应用可用）
             let store = match Store::open_default() {
                 Ok(s) => Arc::new(s),

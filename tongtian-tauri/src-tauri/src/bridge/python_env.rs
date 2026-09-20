@@ -6,8 +6,28 @@
 //! - ensure_workspace_dir: 工作区目录管理
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::process::Command;
+
+/// 随包资源根目录：打包后由 Tauri 提供（`resources` 配置的目标），开发模式不设置。
+/// 在 `setup` 钩子里通过 init_resource_dir 注入一次。
+static RESOURCE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn init_resource_dir(dir: PathBuf) {
+    let _ = RESOURCE_DIR.set(dir);
+}
+
+/// 随包嵌入式 Python 解释器（`vendor/python` → 打包后 `resources/python/`）
+fn bundled_python() -> Option<PathBuf> {
+    let dir = RESOURCE_DIR.get()?;
+    let cand = if cfg!(windows) {
+        dir.join("python").join("python.exe")
+    } else {
+        dir.join("python").join("bin").join("python3")
+    };
+    cand.exists().then_some(cand)
+}
 
 #[derive(Debug, Clone)]
 pub struct PythonInfo {
@@ -50,8 +70,18 @@ async fn python_version(python: &str) -> Option<String> {
     parse_python_version(&text)
 }
 
-/// 探测系统 Python 安装
+/// 探测 Python：随包嵌入式解释器优先，其次系统 PATH 与 Windows 常见安装路径
 pub async fn detect_python() -> Option<PythonInfo> {
+    if let Some(path) = bundled_python() {
+        let path_str = path.to_string_lossy().to_string();
+        if let Some(version) = python_version(&path_str).await {
+            return Some(PythonInfo {
+                path: path_str,
+                version,
+            });
+        }
+    }
+
     let candidates: Vec<&str> = if cfg!(windows) {
         vec!["python", "python3", "py"]
     } else {
@@ -163,14 +193,30 @@ pub fn agent_start_command(python_path: &str, port: u16, work_dir: &PathBuf) -> 
     ]
 }
 
-/// 定位项目内脚本（以可执行文件位置相对定位，dev: root/src-tauri/target/debug/exe）
+/// 定位随包/项目内脚本，两种布局依次尝试：
+/// 1) 安装布局 `<resource_dir>/<relative>`（tauri.conf.json bundle.resources 的目标）
+/// 2) 开发布局 `<项目根>/<relative>`（exe 位于 项目根/src-tauri/target/<profile>/）
 fn locate_project_script(relative: &str) -> Result<PathBuf, String> {
+    if let Some(dir) = RESOURCE_DIR.get() {
+        let packaged = dir.join(relative);
+        if packaged.exists() {
+            return Ok(packaged);
+        }
+    }
+
     let exe = std::env::current_exe().map_err(|e| format!("BRIDGE_EXE_PATH: {e}"))?;
-    exe.ancestors()
-        .nth(4) // exe(0) -> debug(1) -> target(2) -> src-tauri(3) -> 项目根(4)
-        .map(|root| root.join(relative))
-        .filter(|p| p.exists())
-        .ok_or_else(|| format!("BRIDGE_SCRIPT_NOT_FOUND: {relative} 未找到"))
+    if let Some(root) = exe.ancestors().nth(4) {
+        let dev = root.join(relative);
+        if dev.exists() {
+            return Ok(dev);
+        }
+    }
+
+    Err(format!(
+        "BRIDGE_SCRIPT_NOT_FOUND: {relative} 未找到（resource_dir={:?}, exe={}）",
+        RESOURCE_DIR.get(),
+        exe.display()
+    ))
 }
 
 /// Mock Agent 启动命令（TT_AGENT_MOCK=1）：
@@ -241,5 +287,35 @@ mod tests {
         let dir = workspace_dir("ws-test");
         assert!(dir.to_string_lossy().contains("ws-test"));
         assert!(dir.to_string_lossy().contains("workspaces"));
+    }
+
+    /// 安装布局下脚本应从 resource_dir 解析，而非 exe 上溯四层
+    #[test]
+    fn test_locate_script_prefers_resource_dir() {
+        let dir = std::env::temp_dir().join(format!("tt-res-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("engine")).unwrap();
+        std::fs::write(dir.join("engine").join("server.py"), b"# stub").unwrap();
+
+        init_resource_dir(dir.clone());
+        assert_eq!(
+            locate_project_script("engine/server.py").unwrap(),
+            dir.join("engine").join("server.py")
+        );
+        // 未随包的脚本不能被误定位
+        assert!(locate_project_script("engine/missing.py").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 声明为 resources 的文件必须真实存在，否则 tauri build 会在打包阶段失败
+    #[test]
+    fn test_bundled_resources_exist() {
+        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        for rel in ["engine/server.py", "engine/requirements.txt", "scripts/mock-agent.py"] {
+            assert!(
+                project_root.join(rel).exists(),
+                "bundle.resources 声明的文件缺失: {rel}"
+            );
+        }
     }
 }

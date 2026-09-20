@@ -23,6 +23,19 @@ else
   echo "  ✓ node_modules 已存在，跳过安装"
 fi
 
+# 引擎与 Auth 服务的 Python 依赖（缺失才装，保持幂等）
+PY=$(command -v python3 || command -v python || true)
+if [ -n "$PY" ]; then
+  if "$PY" -c "import fastapi, uvicorn, agentscope" 2>/dev/null; then
+    echo "  ✓ Python 引擎依赖已满足，跳过安装"
+  else
+    echo "  → 安装引擎 Python 依赖（engine/requirements.txt）"
+    "$PY" -m pip install -q -r engine/requirements.txt
+  fi
+else
+  echo "  ⚠ 未找到 Python：桌面应用的 Agent 引擎无法启动（需 Python 3.10+）"
+fi
+
 # ── [2/3] 启动服务 ──────────────────────────────────────────
 echo "[2/3] 启动服务..."
 MOCK_ENABLED="${MOCK_ENABLED:-true}"

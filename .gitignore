@@ -31,3 +31,6 @@ tongtian-tauri/.tools/
 
 # 根目录临时截图（验证产物放 .qoder/canvases/）
 /*.png
+
+# tauri-bundler 生成的 WiX 源文件（candle/light 编译产物，非源码）
+tongtian-tauri/src-tauri/*.wxs

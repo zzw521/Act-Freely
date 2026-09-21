@@ -24,6 +24,9 @@ __pycache__/
 auth.db
 
 # 引擎本地会话数据（含真实对话内容，不入版本库）
+# 注：sessions/ 是引擎按 --work-dir 落盘的真实会话目录，之前只写了 .tools/ 与注释不符，
+# 导致开发/测试在源码树里跑引擎时生成的 sessions/ 一直以未跟踪状态裸露在 git status 里。
+tongtian-tauri/sessions/
 tongtian-tauri/.tools/
 
 # Qoder hooks 的运行时审计日志

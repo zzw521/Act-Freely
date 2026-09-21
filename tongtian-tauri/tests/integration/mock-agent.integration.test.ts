@@ -10,12 +10,18 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const MOCK_AGENT = path.join(PROJECT_ROOT, 'scripts/mock-agent.py');
 const PORT = 18910; // 避开 18000-19000 运行时端口段
 const BASE = `http://127.0.0.1:${PORT}`;
+
+// mock agent 会在 --work-dir 下落盘 sessions/。早期直接传 PROJECT_ROOT，每跑一次测试就往源码树
+// 里塞一条假会话（开发规范要求测试数据隔离），故改用临时目录，结束时清理。
+const WORK_DIR = mkdtempSync(path.join(os.tmpdir(), 'tt-mock-agent-'));
 
 function pythonAvailable(): boolean {
   try {
@@ -74,7 +80,7 @@ describe.skipIf(!hasPython)('Mock Agent SSE 集成（黄金 fixture）', () => {
   let proc: ChildProcess;
 
   beforeAll(async () => {
-    proc = spawn('python', [MOCK_AGENT, '--port', String(PORT), '--work-dir', PROJECT_ROOT], {
+    proc = spawn('python', [MOCK_AGENT, '--port', String(PORT), '--work-dir', WORK_DIR], {
       stdio: 'ignore',
     });
     const ready = await waitForHealth();
@@ -83,6 +89,7 @@ describe.skipIf(!hasPython)('Mock Agent SSE 集成（黄金 fixture）', () => {
 
   afterAll(() => {
     proc?.kill();
+    rmSync(WORK_DIR, { recursive: true, force: true });
   });
 
   it('突发 500 事件：seq 单调递增且含 id 行（吞吐与丢失=0）', async () => {

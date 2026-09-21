@@ -9,6 +9,7 @@
 
 import { create } from 'zustand';
 import type { ModelUsageStats } from '../components/ModelStatsPanel';
+import { errorTextOf } from '../../shared/error-messages';
 
 // ── 类型定义 ──────────────────────────────────────────────────────
 
@@ -142,7 +143,7 @@ export const useModelUsageStore = create<ModelUsageState>((set, get) => ({
       set({ stats: mockStats });
     } catch (err) {
       set({
-        error: `加载用量数据失败: ${err instanceof Error ? err.message : '未知错误'}`,
+        error: `加载用量数据失败: ${errorTextOf(err)}`,
       });
     } finally {
       set({ loading: false });

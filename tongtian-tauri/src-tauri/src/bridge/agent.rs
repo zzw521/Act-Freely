@@ -186,6 +186,9 @@ pub async fn start_workspace(
         .args(&args[1..])
         .current_dir(&work_dir)
         .env("PYTHONUNBUFFERED", "1")
+        // Windows 下子进程 stdout 默认走 ANSI 代码页（GBK）：中文日志会让 pump_logs 的
+        // UTF-8 解码失败而停止转发，含 ✓/emoji 的日志更会让引擎自身编码报错。
+        .env("PYTHONIOENCODING", "utf-8")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

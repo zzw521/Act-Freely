@@ -25,6 +25,7 @@ import TuneIcon from '@mui/icons-material/Tune';
 import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
 import { SandboxPolicy } from '../../../shared/types';
+import { errorTextOf } from '../../../shared/error-messages';
 
 interface SandboxPolicyFormProps {
   workspaceId: string;
@@ -63,7 +64,7 @@ const SandboxPolicyForm: React.FC<SandboxPolicyFormProps> = ({
       await onSave(policy);
       setMessage({ type: 'success', text: '策略配置已保存' });
     } catch (err) {
-      setMessage({ type: 'error', text: `保存失败: ${err instanceof Error ? err.message : '未知错误'}` });
+      setMessage({ type: 'error', text: `保存失败: ${errorTextOf(err)}` });
     } finally {
       setSaving(false);
     }

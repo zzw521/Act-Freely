@@ -32,7 +32,8 @@
     "resources": {
       "../engine/server.py": "engine/server.py",
       "../engine/requirements.txt": "engine/requirements.txt",
-      "../scripts/mock-agent.py": "scripts/mock-agent.py"
+      "../scripts/mock-agent.py": "scripts/mock-agent.py",
+      "../vendor/python": "python"
     },
     "icon": [
       "icons/32x32.png",

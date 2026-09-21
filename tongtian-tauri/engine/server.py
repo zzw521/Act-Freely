@@ -509,7 +509,9 @@ def build_model_and_formatter(model_override: str | None = None, model_config: d
 
     if provider == "dashscope":
         if not api_key:
-            raise RuntimeError("缺少 TT_API_KEY（DashScope API Key，请在项目根 .env 中配置）")
+            # 引导去设置页配自定义模型（models.json 随请求 modelConfig 下发）；安装版没有
+            # "项目根 .env" 这个概念，.env 只是开发/内网联调时的兜底通道。
+            raise RuntimeError("未配置可用模型：请在「设置 → 模型与用量」中添加模型（或配置 TT_API_KEY 兜底）")
         # 联网搜索：调研类任务可获取实时网络信息（TT_ENABLE_SEARCH=false 可关闭）
         enable_search = os.environ.get("TT_ENABLE_SEARCH", "true").lower() != "false"
         model = DashScopeChatModel(model_name=model_name, api_key=api_key, stream=True, enable_search=enable_search)
@@ -737,13 +739,15 @@ except Exception:
 
 @app.get("/health")
 async def health():
-    has_key = bool(os.environ.get("TT_API_KEY"))
+    # 只如实报告 .env 兜底 key 是否存在：自定义模型（models.json）由前端随每次请求以
+    # modelConfig 传入，引擎既不掌握也不应假装掌握"用户是否已配好可用模型"。
+    has_env_key = bool(os.environ.get("TT_API_KEY"))
     return JSONResponse({
         "status": "ok",
         "version": ENGINE_VERSION,
         "api_version": "1",
         "engine": "agentscope",
-        "model_configured": has_key,
+        "env_api_key": has_env_key,
         "uptime": time.time(),
     })
 

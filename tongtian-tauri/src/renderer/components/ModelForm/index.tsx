@@ -26,6 +26,7 @@ import DeleteIcon from '@mui/icons-material/Delete';
 import EditIcon from '@mui/icons-material/Edit';
 import SettingsIcon from '@mui/icons-material/Settings';
 import { ModelConfig, ModelSource, ModelTestReq, ModelTestResp } from '../../../shared/types';
+import { errorTextOf } from '../../../shared/error-messages';
 
 interface ModelFormProps {
   initialData?: Partial<ModelConfig>;
@@ -88,7 +89,7 @@ const ModelForm: React.FC<ModelFormProps> = ({
       });
       setTestResult(result);
     } catch (err) {
-      setError(`测试失败: ${err instanceof Error ? err.message : '未知错误'}`);
+      setError(`测试失败: ${errorTextOf(err)}`);
     } finally {
       setTesting(false);
     }

@@ -34,3 +34,9 @@ tongtian-tauri/.tools/
 
 # tauri-bundler 生成的 WiX 源文件（candle/light 编译产物，非源码）
 tongtian-tauri/src-tauri/*.wxs
+
+# 随包 Python 运行时（scripts/prepare-python.sh 生成，200MB 级二进制，不入库）
+tongtian-tauri/vendor/
+
+# 早期探索遗留的 embeddable 压缩包（已被 scripts 中带 SHA 校验的下载取代）
+tongtian-tauri/src-tauri/vendor/

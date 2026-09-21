@@ -18,6 +18,7 @@ import SecurityIcon from '@mui/icons-material/Security';
 import WarningIcon from '@mui/icons-material/Warning';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import { DataSensitivity } from '../../../shared/types';
+import { errorTextOf } from '../../../shared/error-messages';
 
 interface DataScanResult {
   sensitivity: DataSensitivity;
@@ -63,7 +64,7 @@ const DataClassification: React.FC<DataClassificationProps> = ({
       const result = await onScan(inputText);
       setScanResult(result);
     } catch (err) {
-      setError(`检测失败: ${err instanceof Error ? err.message : '未知错误'}`);
+      setError(`检测失败: ${errorTextOf(err)}`);
     } finally {
       setScanning(false);
     }

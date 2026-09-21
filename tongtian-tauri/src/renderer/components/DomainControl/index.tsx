@@ -24,6 +24,7 @@ import RefreshIcon from '@mui/icons-material/Refresh';
 import WarningIcon from '@mui/icons-material/Warning';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import BlockIcon from '@mui/icons-material/Block';
+import { errorTextOf } from '../../../shared/error-messages';
 
 interface DomainControlConfig {
   enabled: boolean;
@@ -66,7 +67,7 @@ const DomainControl: React.FC<DomainControlProps> = ({
       await onSave(config);
       setMessage({ type: 'success', text: '配置已保存' });
     } catch (err) {
-      setMessage({ type: 'error', text: `保存失败: ${err instanceof Error ? err.message : '未知错误'}` });
+      setMessage({ type: 'error', text: `保存失败: ${errorTextOf(err)}` });
     } finally {
       setSaving(false);
     }
@@ -81,7 +82,7 @@ const DomainControl: React.FC<DomainControlProps> = ({
       await onReset();
       setMessage({ type: 'success', text: '已重置为默认配置' });
     } catch (err) {
-      setMessage({ type: 'error', text: `重置失败: ${err instanceof Error ? err.message : '未知错误'}` });
+      setMessage({ type: 'error', text: `重置失败: ${errorTextOf(err)}` });
     } finally {
       setLoading(false);
     }

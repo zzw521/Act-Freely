@@ -36,8 +36,8 @@ else
   echo "  ⚠ 未找到 Python：桌面应用的 Agent 引擎无法启动（需 Python 3.10+）"
 fi
 
-# ── [2/3] 启动服务 ──────────────────────────────────────────
-echo "[2/3] 启动服务..."
+# ── [2/3] 按阶段准备服务（联调阶段才拉起本地 Auth 服务） ────
+echo "[2/3] 准备服务..."
 MOCK_ENABLED="${MOCK_ENABLED:-true}"
 TT_AUTH_MOCK="${TT_AUTH_MOCK:-true}"
 
@@ -59,24 +59,25 @@ fi
 
 if [ "$HAS_RUST" = "1" ]; then
   echo "  ✓ 检测到 Rust 工具链，启动 Tauri 桌面应用"
-  if [ "$MOCK_ENABLED" = "true" ]; then
-    echo "  ✓ Mock 模式开启（VITE_MOCK 默认启用）"
-    npm run tauri dev
-  else
-    echo "  ⚠ Mock 模式关闭，将调用真实后端 command"
-    VITE_MOCK=false npm run tauri dev
-  fi
+  LAUNCH_DESC="Tauri 桌面应用（Ctrl+C 结束）"
 else
   echo "  ⚠ 未检测到 Rust，降级为浏览器 Mock 模式（仅前端自测）"
   echo "  提示：安装 Rust 后可运行完整桌面应用 (https://rustup.rs)"
-  npm run dev
+  LAUNCH_DESC="浏览器前端（http://localhost:7173，Ctrl+C 结束）"
 fi
 
-# ── [3/3] 访问信息（浏览器降级模式下可见） ─────────────────
-echo "[3/3] 启动完成！"
+# ── [3/3] 访问信息（必须在启动前打印） ──────────────────────
+# `npm run tauri dev` / `npm run dev` 都是前台阻塞进程，放在它们之后打印等于"退出后才可见"，
+# 用户在整个开发过程中看不到端口与模式，故先打印再拉起。
+if [ "$MOCK_ENABLED" = "true" ]; then
+  echo "  ✓ Mock 模式开启（VITE_MOCK 默认启用）"
+else
+  echo "  ⚠ Mock 模式关闭，将调用真实后端 command"
+fi
+echo "[3/3] 即将启动：$LAUNCH_DESC"
 echo "-----------------------------------------"
 echo "  前端地址:     http://localhost:7173"
-echo "  运行模式:     Mock 模式（VITE_MOCK=false 可关闭）"
+echo "  运行模式:     Mock 模式（MOCK_ENABLED=false 走真实后端 command）"
 echo "  登录模式:     TT_AUTH_MOCK=$TT_AUTH_MOCK（false 时走网页验证登录）"
 echo "  Auth 服务:    $AUTH_URL"
 echo "  桌面应用:     tongtian-tauri (Tauri 2.x)"
@@ -84,3 +85,11 @@ echo "  打包随包运行时: bash scripts/prepare-python.sh（发布前必须�
 echo "  后端能力:     29 个 Tauri command（含两阶段审阅/模型五件套/文件能力/附件上传/登录态三件套）"
 echo "  测试:         npx vitest run（前端）/ cargo test --lib（Rust）/ python auth-server/test_auth.py（Auth）"
 echo "-----------------------------------------"
+
+if [ "$MOCK_ENABLED" = "true" ]; then
+  if [ "$HAS_RUST" = "1" ]; then npm run tauri dev; else npm run dev; fi
+else
+  if [ "$HAS_RUST" = "1" ]; then VITE_MOCK=false npm run tauri dev; else VITE_MOCK=false npm run dev; fi
+fi
+
+echo "  ✓ 已退出 $LAUNCH_DESC"

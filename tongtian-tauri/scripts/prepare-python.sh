@@ -114,7 +114,7 @@ else
   echo "$LOCK_HASH" > "$MARKER"
 fi
 
-# ── [4/6] 剔除运行时用不到的内容 ────────────────────────────
+# ── [4/6] 精简 + 补齐（让随包运行时自给自足） ────────────────
 # 只删“引擎导入链证明用不到”的东西：numpy / sqlalchemy / grpc 已实测为 agentscope
 # 导入期硬依赖，必须保留；__pycache__ 保留（安装目录可能只读，去掉会让每次启动重编译）。
 prune_dead_weight() {
@@ -135,12 +135,33 @@ prune_dead_weight() {
   # pywin32 的 _pth 条目里 pythonwin 已被剔除，保留条目不影响导入（多余路径会被忽略）
   echo "  剔除 ${pruned} KB"
 }
-echo "[4/6] 剔除随包运行时用不到的内容..."
+
+# pywin32 把 pywintypes312.dll / pythoncom312.dll 放在 pywin32_system32/，指望安装后由
+# pywin32.pth 里的 `import pywin32_bootstrap` 去 os.add_dll_directory 注册——而 embeddable 的
+# ._pth 不执行 site.main()，这个 .pth 永远不会生效。后果：win32api / win32job / win32file 这类
+# 扩展模块在没有“先导入 pywintypes 预热”的进程里直接 DLL load failed（mcp/os/win32/utilities.py
+# 恰好按 pywintypes → win32api 的顺序导入才侥幸不报错，是顺序依赖的隐雷）。
+# 把两个 DLL 复制到扩展模块所在目录 win32/，Windows 加载器天然会搜该目录，代价约 800KB。
+patch_portable_pywin32() {
+  local src="$SITE/pywin32_system32" dst="$SITE/win32" copied=0
+  [ -d "$src" ] || return 0
+  for dll in "$src"/*.dll; do
+    [ -e "$dll" ] || continue
+    cp -f "$dll" "$dst/" && copied=$((copied + 1))
+  done
+  [ "$copied" -gt 0 ] || { echo "  ✗ 未找到 pywin32_system32 下的 DLL，随包运行时可能缺件" >&2; exit 1; }
+  echo "  补齐 pywin32 DLL ${copied} 个 → win32/（绕开不执行的 pywin32.pth）"
+}
+echo "[4/6] 剔除随包运行时用不到的内容，并补齐 pywin32 DLL..."
 prune_dead_weight
+patch_portable_pywin32
 echo "[5/6] 冒烟测试（真实引擎导入路径）..."
 PYTHONIOENCODING=utf-8 "$VENDOR/python.exe" - <<'PY'
 import importlib, sys
-for mod in ("ssl", "sqlite3", "pywintypes", "uvicorn", "fastapi", "multipart", "agentscope", "dashscope", "openai"):
+# win32api 必须排在 pywintypes 之前：这个“冷启动”顺序正是修复前 DLL load failed 的场景，
+# 谁把它挪到 pywintypes 后面，这一步就会连同顺序隐雷一起失效。
+for mod in ("ssl", "sqlite3", "win32api", "win32job", "win32file", "pywintypes",
+            "uvicorn", "fastapi", "multipart", "agentscope", "dashscope", "openai"):
     importlib.import_module(mod)
 import mcp.client.streamable_http as sh
 assert hasattr(sh, "streamablehttp_client"), "mcp 版本与 agentscope 不兼容"

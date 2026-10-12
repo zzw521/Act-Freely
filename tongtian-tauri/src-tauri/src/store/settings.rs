@@ -56,6 +56,21 @@ pub fn all(store: &Store) -> Result<std::collections::HashMap<String, String>, S
     })
 }
 
+/// 设置值 → 库内字符串（写入侧统一 JSON 编码；字符串原样存避免双重转义）
+pub fn encode_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// 库内字符串 → 设置值（读取侧还原类型；非 JSON 文本回退字符串，
+/// 避免 "false" 这类文本在渲染进程被当成真值）
+pub fn decode_value(raw: &str) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +130,20 @@ mod tests {
         assert_eq!(map.get("a").map(String::as_str), Some("1"));
         assert_eq!(map.get("b").map(String::as_str), Some("2"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip_types() {
+        use serde_json::json;
+        // 布尔/数字/对象经编码后读取还原类型（"false" 不再被当作真值）
+        assert_eq!(decode_value(&encode_value(&json!(false))), json!(false));
+        assert_eq!(decode_value(&encode_value(&json!(true))), json!(true));
+        assert_eq!(decode_value(&encode_value(&json!(30))), json!(30));
+        assert_eq!(decode_value(&encode_value(&json!({"k": 1}))), json!({"k": 1}));
+        // 普通字符串原样存、原样读（不额外加引号）
+        assert_eq!(encode_value(&json!("跟随系统")), "跟随系统");
+        assert_eq!(decode_value("跟随系统"), json!("跟随系统"));
+        // 历史裸文本（非 JSON）回退字符串，不报错
+        assert_eq!(decode_value("not-json"), json!("not-json"));
     }
 }

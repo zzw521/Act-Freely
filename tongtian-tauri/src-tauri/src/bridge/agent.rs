@@ -37,11 +37,11 @@ const CATCHUP_POLL_MS: u64 = 500;
 /// 断线补齐总超时（引擎窗口 10min，桌面侧 30s 轮询预算足够）
 const CATCHUP_TIMEOUT_MS: u64 = 30_000;
 
-/// 共享 HTTP client（无锁，reqwest::Client 内部 Arc；移出全局 Mutex 热路径）
-static SHARED_HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-
-pub fn http_client() -> &'static reqwest::Client {
-    SHARED_HTTP.get_or_init(reqwest::Client::new)
+/// 本机引擎通信的 HTTP client（reqwest::Client 内部 Arc，克隆代价极低）。
+/// 引擎监听 127.0.0.1 随机端口，这类请求必须直连：若跟随「网络代理」设置，
+/// 系统代理未配置 loopback bypass 时会把桌面端与引擎之间的链路切断。
+fn http_client() -> reqwest::Client {
+    crate::proxy::loopback_client()
 }
 
 /// 前端事件名
@@ -65,6 +65,8 @@ struct Instance {
     pid: u32,
     status: InstanceStatus,
     health_fail_count: u32,
+    /// 启动时注入的代理配置指纹（设置变更后旧进程仍是旧代理，据此提示需重启）
+    proxy_fingerprint: String,
 }
 
 pub struct AgentBridge {
@@ -81,7 +83,7 @@ pub fn new_bridge_state() -> BridgeState {
         python: None,
         instances: HashMap::new(),
         used_ports: HashSet::new(),
-        http: reqwest::Client::new(),
+        http: crate::proxy::loopback_client(),
     }))
 }
 
@@ -104,6 +106,24 @@ async fn find_free_port(used: &HashSet<u16>) -> Option<u16> {
 
 fn health_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/health")
+}
+
+/// 运行中但代理配置已变化的引擎实例数。
+/// 引擎子进程的代理来自启动时注入的环境变量，httpx 在 client 创建时即解析完毕，
+/// 因此保存新代理后旧实例仍是旧代理 —— 设置页据此如实提示「需重启后生效」。
+pub async fn proxy_stale_instances(bridge: &BridgeState) -> usize {
+    let fingerprint = crate::proxy::current().fingerprint();
+    let b = bridge.lock().await;
+    b.instances
+        .values()
+        .filter(|i| {
+            matches!(
+                i.status,
+                InstanceStatus::Starting | InstanceStatus::Ready | InstanceStatus::Busy
+            )
+        })
+        .filter(|i| i.proxy_fingerprint != fingerprint)
+        .count()
 }
 
 fn emit_status(app: &AppHandle, workspace_id: &str, status: InstanceStatus) {
@@ -182,6 +202,10 @@ pub async fn start_workspace(
     // spawn 子进程
     log(&format!("spawning agent for {workspace_id} on port {port}: {}", args.join(" ")));
 
+    // 引擎出网（模型调用、联网检索）由 httpx trust_env 读取代理变量：
+    // 跟随系统 = 不注入（继承父进程环境）；不使用 = 清空；自定义 = 写入并保留回环直连
+    let proxy_spec = crate::proxy::current();
+
     let mut child = tokio::process::Command::new(&args[0])
         .args(&args[1..])
         .current_dir(&work_dir)
@@ -189,6 +213,7 @@ pub async fn start_workspace(
         // Windows 下子进程 stdout 默认走 ANSI 代码页（GBK）：中文日志会让 pump_logs 的
         // UTF-8 解码失败而停止转发，含 ✓/emoji 的日志更会让引擎自身编码报错。
         .env("PYTHONIOENCODING", "utf-8")
+        .envs(proxy_spec.env_vars())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -215,6 +240,7 @@ pub async fn start_workspace(
                 pid,
                 status: InstanceStatus::Starting,
                 health_fail_count: 0,
+                proxy_fingerprint: proxy_spec.fingerprint(),
             },
         );
     }
@@ -402,12 +428,72 @@ fn kill_pid(pid: u32) {
 
 // ── 发送消息（SSE 流式） ─────────────────────────────────────
 
-/// 三层架构演进 P0 上下文：事件持久化 + 配额计量 + 任务注册表（均可选，Mock/测试场景可缺省）
+/// 三层架构演进 P0 上下文：事件持久化 + 配额计量 + 任务注册表 + 存储
+/// （均可选，Mock/测试场景可缺省）
 #[derive(Clone, Default)]
 pub struct P0Context {
     pub events: Option<Arc<super::event_store::EventStore>>,
     pub quota: Option<Arc<crate::task::quota::QuotaGate>>,
     pub registry: Option<Arc<crate::task::registry::TaskRegistry>>,
+    /// 模型用量台账落库用（usage 事件带 model 字段时记账）
+    pub store: Option<Arc<crate::store::Store>>,
+    /// 安全工作环境开关（设置项 secureEnv，引擎据此把任务隔离进 environment/ 目录）
+    pub secure_env: bool,
+}
+
+/// 对话内选择的覆盖项：模型档位、自定义模型、工作目录、上下文历史。
+/// 由 `chat_submit` 从渲染层参数装配，随提交下发给引擎（缺失的键不写入，
+/// 避免把「本轮没选」误当成「清空引擎会话上已有的设置」）。
+#[derive(Debug, Clone, Default)]
+pub struct SubmitOverrides {
+    /// 模型档位（高级/基础/经济 → 具体模型名；Auto 时前端不下发）
+    pub model_binding: Option<String>,
+    /// 自定义模型配置（models.json 条目：baseUrl / apiKey / modelName）
+    pub model_config: Option<Value>,
+    /// 自选工作目录（经 Rust 侧存在性校验后的绝对路径）
+    pub work_dir: Option<String>,
+    /// 此前轮次的 user/assistant 历史（保障连续对话上下文）
+    pub history: Vec<Value>,
+}
+
+impl SubmitOverrides {
+    /// 写入 /api/chat 请求体，键名与 engine/server.py 的读取口径一致（camelCase）
+    fn apply_to(&self, body: &mut Value) {
+        let Some(map) = body.as_object_mut() else {
+            return;
+        };
+        if let Some(mb) = &self.model_binding {
+            map.insert("modelBinding".into(), json!(mb));
+        }
+        if let Some(mc) = &self.model_config {
+            map.insert("modelConfig".into(), mc.clone());
+        }
+        if let Some(wd) = &self.work_dir {
+            map.insert("workDir".into(), json!(wd));
+        }
+        if !self.history.is_empty() {
+            map.insert("history".into(), json!(self.history));
+        }
+    }
+}
+
+/// 引擎 /api/chat 请求体（两阶段协议：提交固定 stage=plan，approve 后走 /api/chat/review）
+fn chat_request_body(
+    task_id: &str,
+    goal: &str,
+    attachments: Vec<Value>,
+    secure_env: bool,
+    overrides: &SubmitOverrides,
+) -> Value {
+    let mut body = json!({
+        "message": goal,
+        "task_id": task_id,
+        "stage": "plan",
+        "attachments": attachments,
+        "secureEnv": secure_env,
+    });
+    overrides.apply_to(&mut body);
+    body
 }
 
 /// 向 Agent 提交消息，流式消费 SSE 并通过 tauri event 转发 ChatEvent
@@ -419,7 +505,17 @@ pub async fn send_message(
     goal: &str,
     p0: P0Context,
 ) -> Result<(), String> {
-    send_message_with_attachments(app, bridge, workspace_id, task_id, goal, Vec::new(), p0).await
+    send_message_with_attachments(
+        app,
+        bridge,
+        workspace_id,
+        task_id,
+        goal,
+        Vec::new(),
+        SubmitOverrides::default(),
+        p0,
+    )
+    .await
 }
 
 /// 携带附件的提交（交互补设计 §3 附件模式：AttachmentMeta 透传引擎）
@@ -430,6 +526,7 @@ pub async fn send_message_with_attachments(
     task_id: &str,
     goal: &str,
     attachments: Vec<Value>,
+    overrides: SubmitOverrides,
     p0: P0Context,
 ) -> Result<(), String> {
     // 取出端口并置 busy
@@ -447,7 +544,7 @@ pub async fn send_message_with_attachments(
     };
     emit_status(app, workspace_id, InstanceStatus::Busy);
 
-    let result = stream_chat(app, workspace_id, task_id, goal, port, attachments, p0).await;
+    let result = stream_chat(app, task_id, goal, port, attachments, overrides, p0).await;
 
     // 恢复 ready
     {
@@ -606,7 +703,62 @@ async fn forward_events(
     }
 }
 
-/// 事件持久化（event_store，24h）+ 配额计量（step_done/deliver 的 usage 字段）
+/// 从事件 `usage` 字段解析 (prompt, completion, model)；兼容 snake_case
+fn usage_of(ev: &super::sse::AgentEvent) -> Option<(u64, u64, Option<String>)> {
+    let u = ev.data.get("usage")?;
+    let field = |camel: &str, snake: &str| -> u64 {
+        u.get(camel)
+            .or_else(|| u.get(snake))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
+    let model = u
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|m| !m.trim().is_empty());
+    Some((
+        field("promptTokens", "prompt_tokens"),
+        field("completionTokens", "completion_tokens"),
+        model,
+    ))
+}
+
+/// 从 deliver 事件 data 提取（回复正文, 摘要, 交付物清单）
+fn deliver_parts(ev: &super::sse::AgentEvent) -> (String, String, Vec<String>) {
+    let text = |keys: &[&str]| -> String {
+        keys.iter()
+            .find_map(|k| ev.data.get(*k).and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string()
+    };
+    let artifacts = ev
+        .data
+        .get("artifacts")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .or_else(|| {
+                            v.get("path")
+                                .or_else(|| v.get("name"))
+                                .and_then(|p| p.as_str())
+                                .map(str::to_string)
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (
+        text(&["final_text", "finalText"]),
+        text(&["summary"]),
+        artifacts,
+    )
+}
+
+/// 事件持久化（event_store，24h）+ 模型用量台账 + 配额计量（usage 字段）
 async fn persist_and_meter(
     ev: &super::sse::AgentEvent,
     task_id: &str,
@@ -616,25 +768,33 @@ async fn persist_and_meter(
     if let Some(store) = &p0.events {
         store.append(task_id, &ev.kind, ev.seq, ev.data.clone());
     }
+    let usage = usage_of(ev);
+
+    // 会话正文落库：事件流只留 24h，交付正文要跨重启可恢复
+    if ev.kind == "deliver" {
+        if let Some(store) = &p0.store {
+            let (final_text, summary, artifacts) = deliver_parts(ev);
+            if let Err(e) = crate::store::messages::record_assistant_reply(
+                store,
+                task_id,
+                &final_text,
+                &summary,
+                &artifacts,
+                crate::bridge::event_store::now_ms() as i64,
+            ) {
+                eprintln!("[store] deliver persist failed: {e}");
+            }
+        }
+    }
+
+    // 模型用量台账（model_usage 表，按「模型 × UTC 日」增量累加）
+    if let (Some(store), Some((prompt, completion, Some(model)))) = (&p0.store, usage.as_ref()) {
+        crate::model::usage::record_quiet(store, model, *prompt, *completion);
+    }
+
     if let Some(gate) = &p0.quota {
-        // 从 usage 字段累计 token（promptTokens + completionTokens，兼容 snake_case）
-        let tokens = ev
-            .data
-            .get("usage")
-            .map(|u| {
-                let prompt = u
-                    .get("promptTokens")
-                    .or_else(|| u.get("prompt_tokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let completion = u
-                    .get("completionTokens")
-                    .or_else(|| u.get("completion_tokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                prompt + completion
-            })
-            .unwrap_or(0);
+        // 从 usage 字段累计 token（promptTokens + completionTokens）
+        let tokens = usage.map(|(p, c, _)| p + c).unwrap_or(0);
         if tokens > 0 {
             if let crate::task::quota::TierTransition::Entered(snap) = gate.add_usage(tokens) {
                 // 档位跃迁产出 quota_warning 事件（去抖：同档不重复）
@@ -686,22 +846,16 @@ async fn persist_and_meter(
 
 async fn stream_chat(
     app: &AppHandle,
-    workspace_id: &str,
     task_id: &str,
     goal: &str,
     port: u16,
     attachments: Vec<Value>,
+    overrides: SubmitOverrides,
     p0: P0Context,
 ) -> Result<(), String> {
     // 两阶段协议（核心闭环补齐）：提交时仅生成计划待审阅（stage=plan），
     // approve 后经 review_task 进入执行流
-    let _ = workspace_id;
-    let body = json!({
-        "message": goal,
-        "task_id": task_id,
-        "stage": "plan",
-        "attachments": attachments,
-    });
+    let body = chat_request_body(task_id, goal, attachments, p0.secure_env, &overrides);
     stream_post(app, task_id, port, "/api/chat", body, p0).await
 }
 
@@ -854,6 +1008,8 @@ mod p0_tests {
             events: None,
             quota: Some(Arc::clone(&gate)),
             registry: Some(Arc::clone(&registry)),
+            store: None,
+            secure_env: false,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(16);
 
@@ -907,6 +1063,8 @@ mod p0_tests {
             events: Some(Arc::clone(&store)),
             quota: None,
             registry: None,
+            store: None,
+            secure_env: false,
         };
         let (tx, _rx) = tokio::sync::mpsc::channel::<Value>(16);
         let ev = super::super::sse::AgentEvent {
@@ -918,6 +1076,50 @@ mod p0_tests {
         let replay = store.replay("t-store", 0);
         assert_eq!(replay.len(), 1);
         assert_eq!(replay[0].seq, Some(7));
+    }
+
+    /// 模型用量台账：usage 事件带 model 时按模型落库；缺 model 不记账（不归到空模型）
+    #[tokio::test]
+    async fn test_persist_and_meter_records_model_usage() {
+        let dir = std::env::temp_dir().join(format!(
+            "tt-agent-usage-test-{}",
+            crate::bridge::event_store::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(crate::store::Store::open(dir.join("t.db")).unwrap());
+        let p0 = P0Context {
+            events: None,
+            quota: None,
+            registry: None,
+            store: Some(Arc::clone(&store)),
+            secure_env: false,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Value>(16);
+
+        let events = [
+            // 引擎执行流格式（camelCase + model）
+            ("usage", serde_json::json!({ "usage": { "promptTokens": 10, "completionTokens": 5, "model": "qwen-plus" } })),
+            // 无 model 字段：不记账
+            ("step_done", serde_json::json!({ "usage": { "promptTokens": 99, "completionTokens": 99 } })),
+            // snake_case 兼容
+            ("usage", serde_json::json!({ "usage": { "prompt_tokens": 1, "completion_tokens": 2, "model": "qwen-max" } })),
+        ];
+        for (i, (kind, data)) in events.into_iter().enumerate() {
+            let ev = super::super::sse::AgentEvent {
+                kind: kind.into(),
+                data,
+                seq: Some(i as u64 + 1),
+            };
+            persist_and_meter(&ev, "t-usage", &p0, &tx).await;
+        }
+
+        let rows = crate::model::usage::query(&store, "daily").unwrap();
+        assert_eq!(rows.len(), 2, "仅带 model 的事件入账");
+        let plus = rows.iter().find(|r| r.model_name == "qwen-plus").unwrap();
+        assert_eq!((plus.prompt_tokens, plus.completion_tokens, plus.calls), (10, 5, 1));
+        let max = rows.iter().find(|r| r.model_name == "qwen-max").unwrap();
+        assert_eq!(max.tokens_used, 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -944,4 +1146,89 @@ pub async fn bridge_status(bridge: &BridgeState) -> Value {
     };
 
     json!({ "python": python, "instances": instances })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn overrides(
+        model_binding: Option<&str>,
+        model_config: Option<Value>,
+        work_dir: Option<&str>,
+        history: Vec<Value>,
+    ) -> SubmitOverrides {
+        SubmitOverrides {
+            model_binding: model_binding.map(str::to_string),
+            model_config,
+            work_dir: work_dir.map(str::to_string),
+            history,
+        }
+    }
+
+    fn body(overrides: &SubmitOverrides) -> Value {
+        chat_request_body("task-1", "写周报", vec![json!({ "fileName": "a.md" })], false, overrides)
+    }
+
+    #[test]
+    fn base_body_keeps_two_phase_contract() {
+        let b = body(&SubmitOverrides::default());
+        assert_eq!(b["message"], "写周报");
+        assert_eq!(b["task_id"], "task-1");
+        assert_eq!(b["stage"], "plan");
+        assert_eq!(b["secureEnv"], json!(false));
+        assert_eq!(b["attachments"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn selected_model_and_work_dir_reach_engine() {
+        // 桌面端曾把这几项丢掉：输入框选的模型档位、自定义模型、工作目录必须出现在请求体里
+        let b = body(&overrides(
+            Some("qwen-max"),
+            Some(json!({ "baseUrl": "https://x.example/v1", "apiKey": "sk-1", "modelName": "m1" })),
+            Some("D:/work/reports"),
+            vec![json!({ "role": "user", "content": "上一轮提问" })],
+        ));
+        assert_eq!(b["modelBinding"], "qwen-max");
+        assert_eq!(b["modelConfig"]["modelName"], "m1");
+        assert_eq!(b["workDir"], "D:/work/reports");
+        assert_eq!(b["history"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn engine_reads_the_camel_case_keys() {
+        // 引擎按 camelCase 读取（engine/server.py: payload.get("modelBinding") 等），
+        // 键名写成 snake_case 会被静默忽略，等同没有透传
+        let b = body(&overrides(
+            Some("basic"),
+            Some(json!({ "baseUrl": "https://x/v1" })),
+            Some("D:/w"),
+            vec![json!({ "role": "assistant", "content": "hi" })],
+        ));
+        let map = b.as_object().unwrap();
+        for key in ["modelBinding", "modelConfig", "workDir", "history", "secureEnv"] {
+            assert!(map.contains_key(key), "请求体缺少引擎读取的键 {key}：{map:?}");
+        }
+        for legacy in ["model_binding", "model_config", "work_dir"] {
+            assert!(!map.contains_key(legacy), "不应下发 snake_case 键 {legacy}");
+        }
+    }
+
+    #[test]
+    fn absent_selections_are_not_sent_as_empty() {
+        // 未选择不写入键：空串/空数组会让引擎把已存的会话设置当成被清空
+        let b = body(&SubmitOverrides::default());
+        let map = b.as_object().unwrap();
+        assert!(!map.contains_key("modelBinding"));
+        assert!(!map.contains_key("modelConfig"));
+        assert!(!map.contains_key("workDir"));
+        assert!(!map.contains_key("history"));
+    }
+
+    #[test]
+    fn secure_env_flag_follows_settings() {
+        let b = chat_request_body("task-2", "g", vec![], true, &SubmitOverrides::default());
+        assert_eq!(b["secureEnv"], json!(true));
+        assert_eq!(b["attachments"].as_array().unwrap().len(), 0);
+    }
 }

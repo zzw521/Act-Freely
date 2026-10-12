@@ -255,7 +255,15 @@ pub fn adapt_to_chat_event(event: &AgentEvent, task_id: &str) -> Option<Value> {
                 .and_then(|a| a.as_array())
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .filter_map(|v| {
+                            v.as_str().map(str::to_string).or_else(|| {
+                                // 引擎产物也可能是 {path/name} 结构对象
+                                v.get("path")
+                                    .or_else(|| v.get("name"))
+                                    .and_then(|p| p.as_str())
+                                    .map(str::to_string)
+                            })
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -263,6 +271,9 @@ pub fn adapt_to_chat_event(event: &AgentEvent, task_id: &str) -> Option<Value> {
                 "type": "deliver",
                 "taskId": task_id,
                 "summary": str_field(&["summary"]),
+                // 模型最终回复文本：界面正文、轮内搜索、重新生成的上下文都读这个字段，
+                // 此前只透传 summary 导致桌面端回复退化成「任务完成」
+                "final_text": str_field(&["final_text", "finalText"]),
                 "artifacts": artifacts,
             })))
         }
@@ -379,12 +390,31 @@ mod tests {
     fn test_adapt_deliver_event() {
         let event = AgentEvent {
             kind: "deliver".into(),
-            data: serde_json::json!({ "artifacts": ["a.md", "b.xlsx"], "summary": "完成" }),
+            data: serde_json::json!({
+                "artifacts": ["a.md", { "path": "b.xlsx" }],
+                "summary": "完成",
+                "final_text": "这是模型的真实回复正文"
+            }),
             seq: None,
         };
         let chat = adapt_to_chat_event(&event, "t-9").unwrap();
         assert_eq!(chat["taskId"], "t-9");
         assert_eq!(chat["artifacts"].as_array().unwrap().len(), 2);
+        assert_eq!(chat["artifacts"][1], "b.xlsx");
+        // 回复正文必须透传：丢失会让桌面端退化成「任务完成」，轮内搜索也搜不到答案
+        assert_eq!(chat["final_text"], "这是模型的真实回复正文");
+    }
+
+    #[test]
+    fn test_adapt_deliver_without_final_text() {
+        let event = AgentEvent {
+            kind: "deliver".into(),
+            data: serde_json::json!({ "artifacts": [], "summary": "完成" }),
+            seq: None,
+        };
+        let chat = adapt_to_chat_event(&event, "t-9").unwrap();
+        // 字段存在但为空串：界面按摘要/占位降级，不伪造正文
+        assert_eq!(chat["final_text"], "");
     }
 
     #[test]

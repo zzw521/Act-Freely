@@ -9,10 +9,20 @@
  */
 
 import React, { Suspense, useState } from 'react';
-import { Box, CircularProgress, useMediaQuery, useTheme } from '@mui/material';
+import {
+  Alert,
+  Box,
+  CircularProgress,
+  Snackbar,
+  useMediaQuery,
+  useTheme,
+} from '@mui/material';
 import { Outlet, useLocation } from 'react-router-dom';
 import Sidebar from './Sidebar';
 import ResizeHandle from './ResizeHandle';
+import TaskSearchDialog from '../TaskSearchDialog';
+import { useAppStore } from '../../stores/useAppStore';
+import { useAppShortcuts } from '../../lib/use-app-shortcuts';
 
 /** 懒加载页面占位 */
 const PageLoader: React.FC = () => (
@@ -24,20 +34,31 @@ const PageLoader: React.FC = () => (
 const MainLayout: React.FC = () => {
   const theme = useTheme();
   const isMobile = useMediaQuery(theme.breakpoints.down('md'));
-  // 桌面端侧边栏常驻展开（对齐设计图）；仅窄屏默认收起可手动展开
+  // 窄屏默认收起可手动展开；桌面端折叠状态放在 store，Ctrl+\ 快捷键与折叠按钮共用同一份
   const [open, setOpen] = useState(true);
+  const sidebarCollapsed = useAppStore((s) => s.sidebarCollapsed);
+  const toggleSidebar = useAppStore((s) => s.toggleSidebar);
   // 侧边栏宽度：右边界长按拖拽调宽（200~400）
   const [sidebarWidth, setSidebarWidth] = useState(240);
   const location = useLocation();
   // Workbench（/）采用全高三栏布局，无外层 padding；其他页面保留内边距
   const isWorkbench = location.pathname === '/';
+  // 全局通知：各页 `showNotification` 写入 store，由此处统一渲染（否则调用方点了没反应）
+  const notification = useAppStore((s) => s.notification);
+  const closeNotification = useAppStore((s) => s.closeNotification);
+  // 全局任务搜索（Ctrl + G）：挂在布局层，任何页面都能拉起
+  const taskSearchOpen = useAppStore((s) => s.taskSearchOpen);
+  const setTaskSearchOpen = useAppStore((s) => s.setTaskSearchOpen);
+  // 应用内快捷键在此统一注册（设置页快捷键分区展示的就是这份清单）
+  useAppShortcuts();
 
   const handleDrawerToggle = () => {
-    setOpen(!open);
+    if (isMobile) setOpen(!open);
+    else toggleSidebar();
   };
 
-  // 窄屏使用临时抽屉，桌面端永久展开
-  const drawerOpen = isMobile ? open : true;
+  // 窄屏使用临时抽屉，桌面端跟随 store 折叠状态
+  const drawerOpen = isMobile ? open : !sidebarCollapsed;
 
   return (
     <Box sx={{ display: 'flex', height: '100vh', overflow: 'hidden', background: theme.palette.background.default }}>
@@ -80,6 +101,26 @@ const MainLayout: React.FC = () => {
           </Box>
         )}
       </Box>
+
+      {/* 全局通知条：notification 为 null 时不渲染 */}
+      <Snackbar
+        open={Boolean(notification?.open)}
+        autoHideDuration={4000}
+        onClose={closeNotification}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+      >
+        <Alert
+          severity={notification?.severity ?? 'info'}
+          variant="filled"
+          onClose={closeNotification}
+          sx={{ fontSize: 13 }}
+        >
+          {notification?.message ?? ''}
+        </Alert>
+      </Snackbar>
+
+      {/* 全局任务搜索面板：Ctrl + G 拉起，Enter 切到命中的会话 */}
+      <TaskSearchDialog open={taskSearchOpen} onClose={() => setTaskSearchOpen(false)} />
     </Box>
   );
 };

@@ -36,6 +36,8 @@ interface AuditLogProps {
   logs: AuditLogEntry[];
   onExport: (format: 'csv' | 'json') => Promise<void>;
   onDeleteOldLogs?: (days: number) => Promise<void>;
+  /** 重新拉取审计日志（不整页刷新） */
+  onRefresh?: () => Promise<void>;
   isLoading?: boolean;
 }
 
@@ -43,6 +45,7 @@ const AuditLog: React.FC<AuditLogProps> = ({
   logs,
   onExport,
   onDeleteOldLogs,
+  onRefresh,
   isLoading,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
@@ -298,9 +301,14 @@ const AuditLog: React.FC<AuditLogProps> = ({
 
           {/* 刷新按钮 */}
           <Tooltip title="刷新日志">
-            <IconButton onClick={() => window.location.reload()}>
-              <RefreshIcon />
-            </IconButton>
+            <span>
+              <IconButton
+                onClick={() => void onRefresh?.()}
+                disabled={!onRefresh || isLoading}
+              >
+                <RefreshIcon />
+              </IconButton>
+            </span>
           </Tooltip>
         </Stack>
       </Paper>

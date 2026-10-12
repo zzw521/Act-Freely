@@ -3,12 +3,15 @@
  *
  * 功能:
  * - 页面标题（跟随路由）
- * - 运行模式指示
+ * - 合规硬开关指示（读取 compliance:status，点击写入同一份出域控制策略）
  * - 工作区切换入口
  * - 设置入口
+ *
+ * 注意：当前 MainLayout 采用「Sidebar + 页面自带头部」结构，未挂载本组件；
+ *      开关状态一律来自合规通道，不再使用本地假状态。
  */
 
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Box,
   Typography,
@@ -25,6 +28,8 @@ import {
   KeyboardArrowDown as ArrowDownIcon,
 } from '@mui/icons-material';
 import { useNavigate, useLocation } from 'react-router-dom';
+import { useSecurityStore } from '../../store/securityStore';
+import { errorTextOf } from '../../../shared/error-messages';
 
 // ── 路由标题映射 ──────────────────────────────────────────────────────
 
@@ -45,18 +50,43 @@ interface TopBarProps {
   open: boolean;
   onDrawerToggle: () => void;
   currentWorkspace?: string;
-  hardSwitchOff: boolean;
 }
 
 const TopBar: React.FC<TopBarProps> = ({
   currentWorkspace = '默认工作区',
-  hardSwitchOff,
 }) => {
   const theme = useTheme();
   const navigate = useNavigate();
   const location = useLocation();
 
   const title = routeTitles[location.pathname] ?? '通天办公';
+
+  // 合规硬开关：与合规概览/出域控制共用同一份策略，不维护本地副本
+  const compliance = useSecurityStore((s) => s.compliance);
+  const loadCompliance = useSecurityStore((s) => s.loadCompliance);
+  const updateCompliance = useSecurityStore((s) => s.updateCompliance);
+  const [switching, setSwitching] = useState(false);
+  const [switchError, setSwitchError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void loadCompliance();
+  }, [loadCompliance]);
+
+  const known = compliance != null;
+  const hardSwitchOn = Boolean(compliance?.hardSwitchEnabled);
+
+  const toggleHardSwitch = async () => {
+    if (switching) return;
+    try {
+      setSwitching(true);
+      setSwitchError(null);
+      await updateCompliance({ hardSwitchEnabled: !hardSwitchOn });
+    } catch (err) {
+      setSwitchError(errorTextOf(err, '合规策略更新失败'));
+    } finally {
+      setSwitching(false);
+    }
+  };
 
   // 工作区菜单
   const [anchorEl, setAnchorEl] = React.useState<null | HTMLElement>(null);
@@ -109,36 +139,61 @@ const TopBar: React.FC<TopBarProps> = ({
 
       {/* 右侧：模式指示 + 操作按钮 */}
       <Stack direction="row" spacing={1} alignItems="center">
-        {/* 运行模式指示 */}
-        <Box
-          sx={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 0.75,
-            px: 1.25,
-            py: 0.5,
-            borderRadius: '999px',
-            background: hardSwitchOff ? 'rgba(245, 158, 11, 0.1)' : 'rgba(34, 197, 94, 0.1)',
-          }}
+        {/* 合规模式指示：点击切换硬开关（禁用所有外部模型 API） */}
+        <Tooltip
+          title={
+            switchError ??
+            (known
+              ? hardSwitchOn
+                ? '合规模式：外部模型 API 已被硬开关拦截，点击恢复正常模式'
+                : '正常模式：点击开启合规模式（一键禁用所有外部模型 API）'
+              : '合规状态尚未加载，暂不可切换')
+          }
         >
           <Box
+            role="button"
+            aria-pressed={hardSwitchOn}
+            onClick={() => (known && !switching ? void toggleHardSwitch() : undefined)}
             sx={{
-              width: 6,
-              height: 6,
-              borderRadius: '50%',
-              backgroundColor: hardSwitchOff ? '#F59E0B' : '#22C55E',
-            }}
-          />
-          <Typography
-            sx={{
-              fontSize: '12px',
-              fontWeight: 600,
-              color: hardSwitchOff ? '#B45309' : '#15803D',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 0.75,
+              px: 1.25,
+              py: 0.5,
+              borderRadius: '999px',
+              cursor: known && !switching ? 'pointer' : 'default',
+              background: !known
+                ? 'rgba(100, 116, 139, 0.1)'
+                : hardSwitchOn
+                  ? 'rgba(245, 158, 11, 0.1)'
+                  : 'rgba(34, 197, 94, 0.1)',
             }}
           >
-            {hardSwitchOff ? '合规模式' : '正常模式'}
-          </Typography>
-        </Box>
+            <Box
+              sx={{
+                width: 6,
+                height: 6,
+                borderRadius: '50%',
+                backgroundColor: !known ? '#94A3B8' : hardSwitchOn ? '#F59E0B' : '#22C55E',
+              }}
+            />
+            <Typography
+              sx={{
+                fontSize: '12px',
+                fontWeight: 600,
+                color: !known ? '#64748B' : hardSwitchOn ? '#B45309' : '#15803D',
+              }}
+            >
+              {switching
+                ? '切换中…'
+                : !known
+                  ? '合规状态未知'
+                  : hardSwitchOn
+                    ? '合规模式'
+                    : '正常模式'}
+            </Typography>
+          </Box>
+        </Tooltip>
 
         {/* 设置入口 */}
         <Tooltip title="设置">

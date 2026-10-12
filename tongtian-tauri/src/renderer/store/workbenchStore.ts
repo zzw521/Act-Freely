@@ -21,7 +21,28 @@ import type {
 import { Role, PlanStatus, StepStatus, FileOpType, FileOpStatus, TaskStatus } from '../../shared/types';
 import type { QuotaSnapshot } from '../../shared/contracts';
 import { errorMessageOf, errorTextOf } from '../../shared/error-messages';
+import { archiveTask, getSettings, listArchived } from '../lib/alignment-api';
+import {
+  feedbackOfTurns,
+  fetchConversationMessages,
+  fetchConversations,
+  groupTurns,
+  recordConversationMessage,
+  replayProcessEvents,
+  restoredTurnEvents,
+  restoredUserMessages,
+  saveFeedback,
+  taskTurnMapOf,
+  titleOf,
+} from '../lib/conversation-store';
+import type { RestoredTurn } from '../lib/conversation-store';
 import { api } from '../lib/api';
+import {
+  claimNoticeKey,
+  noticeKindFor,
+  notifyTaskEvent,
+  type NoticeKind,
+} from '../lib/notify-local';
 
 // ── 状态接口 ─────────────────────────────────────────────────
 
@@ -47,6 +68,12 @@ export interface ConversationState {
   taskTurnMap: Record<string, number>;
   /** 正在重新生成的轮次索引（无则 null） */
   regeneratingTurn: number | null;
+  /**
+   * 轮次 → 回复评价（点赞/点踩互斥，未评价的轮次不出现在表里）。
+   * 按 (会话, 轮次) 归属，与 Rust chat_feedback 同一口径：重新生成同一轮不会换键，
+   * 切会话也不串轮。
+   */
+  feedbackByTurn: Record<number, 'up' | 'down'>;
   plan: Plan | null;
   fileOps: FileOp[];
   taskId: string | null;
@@ -55,6 +82,11 @@ export interface ConversationState {
   quotaSnapshot: QuotaSnapshot | null;
   isLoading: boolean;
   error: string | null;
+  /**
+   * 由正文库重建、尚未补齐过程明细的会话（刷新后首次切到时按任务回放事件流补齐）。
+   * 事件流只留存 24h，超窗的会话保持「正文 + 无过程明细」，此处不做补齐假数据。
+   */
+  pendingProcess?: boolean;
 }
 
 /** 会话摘要（侧边栏列表用） */
@@ -90,25 +122,48 @@ interface WorkbenchState {
   historyTasks: unknown[];
   /** 当前激活会话正在重新生成的轮次（镜像） */
   regeneratingTurn: number | null;
+  /** 当前激活会话的轮次评价表（镜像） */
+  feedbackByTurn: Record<number, 'up' | 'down'>;
 
   // ── UI 状态 ──
   planVisible: boolean;
   filePanelOpen: boolean;
+  /**
+   * 输入框里选中的模型（选项 id，'auto' 为缺省）。
+   * 放在 store 而不是 ChatInput 内部：欢迎页与对话态各挂一个 ChatInput 实例，
+   * 首轮发送后组件重挂，写在实例 state 里的选择会被无声重置成 Auto，
+   * 于是第二轮起悄悄用默认模型跑（用户以为还在所选档位）。
+   */
+  chatModelId: string;
 
   // ── Actions ──
   /** 新任务：创建并激活新会话（当前为空会话则复用） */
   newConversation: () => void;
   /** 切换到指定会话 */
   switchConversation: (id: string) => void;
+  /**
+   * 归档会话：向 task:archive 写归档标记，侧边栏不再展示。
+   * 任务本体（tasks 表行、会话目录文件）不动，归档页可恢复。
+   * 失败时抛错，由调用方提示（不静默移除会话）。
+   */
+  archiveConversation: (id: string) => Promise<void>;
   submitGoal: (goal: string, attachments?: import('../../shared/types').AttachmentMeta[], modelBinding?: string, workDir?: string, modelConfig?: { baseUrl: string; apiKey: string; modelName: string }) => Promise<void>;
   /** 重新生成指定轮次的回复（重置该轮事件流后重新提交原目标） */
   regenerateTurn: (turnIdx: number) => Promise<void>;
+  /**
+   * 给某轮回复点赞/点踩（kind 为 null 时取消评价）。
+   * 评价按 (会话, 轮次) 落库：桌面端写 SQLite chat_feedback，Mock/浏览器写本地台账。
+   * 落库失败时抛错，由调用方提示（界面不留下一个没存住的选中态）。
+   */
+  setTurnFeedback: (convId: string, turnIdx: number, kind: 'up' | 'down' | null) => Promise<void>;
   reviewPlan: (action: 'approve' | 'reject' | 'modify', patch?: Partial<Step>[]) => Promise<void>;
   controlTask: (action: 'pause' | 'resume' | 'rollback_to', stepId?: string) => Promise<void>;
   cancelTask: () => Promise<void>;
   loadHistory: () => Promise<void>;
   togglePlanPanel: () => void;
   toggleFilePanel: () => void;
+  /** 记住输入框选中的模型（跨 ChatInput 实例重挂不丢） */
+  setChatModelId: (id: string) => void;
   clearError: () => void;
   reset: () => void;
 }
@@ -150,6 +205,7 @@ function emptyConv(): ConversationState {
     turnEvents: [],
     taskTurnMap: {},
     regeneratingTurn: null,
+    feedbackByTurn: {},
     plan: null,
     fileOps: [],
     taskId: null,
@@ -170,6 +226,7 @@ function mirrorOf(c: ConversationState | undefined) {
     events: conv.events,
     turnEvents: conv.turnEvents,
     regeneratingTurn: conv.regeneratingTurn,
+    feedbackByTurn: conv.feedbackByTurn,
     plan: conv.plan,
     fileOps: conv.fileOps,
     taskId: conv.taskId,
@@ -186,6 +243,45 @@ function summariesOf(convs: Record<string, ConversationState>, order: string[]):
     .map((id) => convs[id])
     .filter((c) => c && c.messages.length > 0)
     .map((c) => ({ id: c.id, title: c.title, createdAt: c.createdAt, isLoading: c.isLoading }));
+}
+
+/** 正文库轮次 → 交付物面板条目（与 applyEvent('deliver') 同一构造口径） */
+function restoredFileOps(turns: RestoredTurn[]): FileOp[] {
+  const out: FileOp[] = [];
+  for (const t of turns) {
+    t.artifacts.forEach((path, i) => {
+      out.push({
+        id: `fop-${t.taskId || 'restored'}-${i}`,
+        taskId: t.taskId,
+        op: FileOpType.WRITE,
+        srcPath: path,
+        fileName: path.split(/[/\\]/).pop(),
+        status: FileOpStatus.SUCCESS,
+      });
+    });
+  }
+  return out;
+}
+
+/**
+ * 正文库 → 会话状态（刷新/重启后重建侧边栏与对话正文）。
+ * 过程明细此刻不补齐：事件流按任务回放，等到首次切进该会话再做，避免启动时打一堆回放。
+ */
+function restoredConv(convId: string, title: string, createdAtMs: number, turns: RestoredTurn[]): ConversationState {
+  const base = emptyConv();
+  return {
+    ...base,
+    id: convId,
+    title,
+    createdAt: createdAtMs || base.createdAt,
+    messages: restoredUserMessages(turns),
+    turnEvents: restoredTurnEvents(turns),
+    taskTurnMap: taskTurnMapOf(turns),
+    feedbackByTurn: feedbackOfTurns(turns),
+    fileOps: restoredFileOps(turns),
+    taskId: turns.length ? turns[turns.length - 1].taskId : null,
+    pendingProcess: true,
+  };
 }
 
 /** 从 ChatStepPreview 构建 Plan 骨架 */
@@ -210,6 +306,23 @@ function buildPlanFromEvent(planId: string, steps: ChatStepPreview[], taskId: st
 // ── 全局事件路由（按 taskId 分发到对应会话，支持并行） ─────────
 
 let routerRegistered = false;
+
+/** 正在补齐过程明细的会话（避免同一会话并发回放） */
+const hydrating = new Set<string>();
+
+/**
+ * 任务事件 → 系统通知/提示音（设置页两个开关的消费方）。
+ * 触发口径与去重都在 notify-local，页面与测试共用同一份规则。
+ */
+async function notifyForEvent(kind: NoticeKind, title: string, taskId: string | null) {
+  if (!claimNoticeKey(`${taskId ?? title}:${kind}`)) return;
+  const s = await getSettings().catch(() => null);
+  notifyTaskEvent(kind, title, {
+    desktopNotify: s?.desktopNotify !== false,
+    soundNotify: Boolean(s?.soundNotify),
+    focusCheck: () => (typeof document === 'undefined' ? false : document.hasFocus()),
+  });
+}
 
 function applyEvent(conv: ConversationState, event: ChatEvent, turnIdx: number): Partial<ConversationState> | null {
   // 事件归档到指定轮次分组（越界时夹取到合法范围）
@@ -355,9 +468,61 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
         evTaskId != null && target.taskTurnMap[evTaskId] != null
           ? target.taskTurnMap[evTaskId]
           : target.turnEvents.length - 1;
+      if (event.type === 'deliver') {
+        // 回复正文落库（Mock / 浏览器直连引擎；桌面端由 Rust 写 SQLite，此处自动跳过）
+        const deliver = event as { final_text?: string; summary?: string; artifacts?: string[] };
+        const content = deliver.final_text?.trim() ? deliver.final_text : deliver.summary ?? '';
+        recordConversationMessage({
+          convId: target.id,
+          turnIndex: turnIdx,
+          role: 'assistant',
+          taskId: evTaskId ?? '',
+          content,
+          artifacts: deliver.artifacts ?? [],
+          tsMs: Date.now(),
+        });
+      }
       const patch = applyEvent(target, event, turnIdx);
       if (patch) patchConv(target.id, patch);
+      // 系统通知/提示音：任务到了需要用户回来的节点才响（设置关了就完全静默）
+      const notice = noticeKindFor(event);
+      if (notice) void notifyForEvent(notice, target.title || '任务', evTaskId ?? null);
     });
+  };
+
+  /** 补齐重建会话的过程明细：按本轮任务回放事件流（24h 窗口外如实为空，不造假） */
+  const hydrateProcess = async (convId: string) => {
+    if (hydrating.has(convId)) return;
+    hydrating.add(convId);
+    try {
+      const conv = get().convs[convId];
+      if (!conv?.pendingProcess) return;
+      const rows = await fetchConversationMessages(convId, 200);
+      const turns = groupTurns(rows);
+      const latest = get().convs[convId];
+      // 回放期间用户可能已经在这个会话里发起新任务：轮次对不上就说明界面已是最新，不覆盖
+      if (!latest || latest.isLoading || latest.turnEvents.length !== turns.length) return;
+      const processByTask: Record<string, ChatEvent[]> = {};
+      for (const t of turns) {
+        if (!t.taskId) continue;
+        const resp = await api.p0
+          .eventReplay(t.taskId)
+          .catch(() => ({ taskId: t.taskId, events: [] as unknown[] }));
+        const evts = replayProcessEvents(resp);
+        if (evts.length) processByTask[t.taskId] = evts;
+      }
+      const after = get().convs[convId];
+      if (!after || after.isLoading || after.turnEvents.length !== turns.length) return;
+      patchConv(convId, {
+        turnEvents: restoredTurnEvents(turns, processByTask),
+        taskTurnMap: { ...after.taskTurnMap, ...taskTurnMapOf(turns) },
+        pendingProcess: false,
+      });
+    } catch {
+      // 过程明细补齐失败不影响正文展示，会话保持「仅正文」
+    } finally {
+      hydrating.delete(convId);
+    }
   };
 
   return {
@@ -369,6 +534,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
     historyTasks: [],
     planVisible: false,
     filePanelOpen: true,
+    chatModelId: 'auto',
 
     // ── 会话管理 ──────────────────────────────────────────────
 
@@ -397,6 +563,35 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
       const conv = s.convs[id];
       if (!conv || id === s.activeId) return;
       set({ activeId: id, ...mirrorOf(conv) });
+      // 刷新后重建出来的会话：首次切到时按任务回放事件流补齐「执行过程」明细
+      if (conv.pendingProcess) void hydrateProcess(id);
+    },
+
+    // ── 归档会话（task:archive 的生产者） ────────────────────
+
+    archiveConversation: async (id: string) => {
+      const s = get();
+      const conv = s.convs[id];
+      if (!conv) return;
+      // 会话未提交过任务时以会话 id 为归档键，保证本地通道仍可标记与恢复
+      await archiveTask(conv.taskId ?? id, { title: conv.title });
+
+      const nextOrder = s.convOrder.filter((k) => k !== id);
+      const nextConvs: Record<string, ConversationState> = {};
+      Object.entries(s.convs).forEach(([k, v]) => {
+        if (k !== id) nextConvs[k] = v;
+      });
+      const activeId = s.activeId === id ? null : s.activeId;
+      set((st) => ({
+        convs: nextConvs,
+        convOrder: nextOrder,
+        activeId,
+        conversations: summariesOf(nextConvs, nextOrder),
+        ...mirrorOf(activeId ? nextConvs[activeId] : undefined),
+        planVisible: false,
+        error: st.error,
+      }));
+      if (nextOrder.length === 0) get().newConversation();
     },
 
     // ── 提交目标 ──────────────────────────────────────────────
@@ -420,6 +615,9 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
       };
 
       const conv = get().convs[convId];
+      // 本轮轮次号（0 起）：正文库与后端按它定位本轮回复，重新生成时覆盖同一轮
+      const turnIndex = conv.turnEvents.length;
+      const userTs = Date.now();
 
       // 组装此前轮次对话历史（同会话上下文保持；截断压缩由引擎侧完成）
       const history: Array<{ role: 'user' | 'assistant'; content: string }> = [];
@@ -446,7 +644,23 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
         title: conv.messages.length === 0 ? goal.slice(0, 20) : conv.title,
       });
 
+      // 提问正文先落库（桌面端由 Rust 随任务写入，这里服务 Mock / 浏览器直连引擎）：
+      // 即便随后提交失败，刷新后这轮提问仍在会话里，与界面所见一致
+      recordConversationMessage({
+        convId,
+        turnIndex,
+        role: 'user',
+        taskId: '',
+        content: goal,
+        artifacts: [],
+        tsMs: userTs,
+      });
+
       try {
+        // 提交前合规闸门：判定与真实出站同源，被策略拒绝时不发起任务（错误进 conv.error）
+        await api.compliance.check(goal, modelConfig?.baseUrl);
+        // 安全工作环境开关：桌面端 Rust 自读 settings_kv，引擎直连由此处随请求下发
+        const secureEnv = (await getSettings().catch(() => null))?.secureEnv;
         const { taskId } = await api.chat.submit({
           taskId: get().convs[convId].taskId ?? undefined,
           goal,
@@ -454,13 +668,26 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
           modelBinding,
           workDir,
           modelConfig,
+          secureEnv,
           history: history.length > 0 ? history : undefined,
+          conversationId: convId,
+          turnIndex,
         });
         // 记录 taskId → 轮次映射（后续事件精确归档到本轮）
         const latest = get().convs[convId];
         patchConv(convId, {
           taskId,
           taskTurnMap: { ...latest.taskTurnMap, [taskId]: latest.turnEvents.length - 1 },
+        });
+        // 本轮任务 id 回填正文行（过程明细按它回放）
+        recordConversationMessage({
+          convId,
+          turnIndex,
+          role: 'user',
+          taskId,
+          content: goal,
+          artifacts: [],
+          tsMs: userTs,
         });
       } catch (err: unknown) {
         patchConv(convId, {
@@ -490,10 +717,24 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
       });
 
       try {
-        const { taskId } = await api.chat.submit({ goal });
+        // 重新生成同样把原文发给模型：合规闸门一并生效
+        await api.compliance.check(goal);
+        const secureEnv = (await getSettings().catch(() => null))?.secureEnv;
+        // 带原会话键与轮次号提交：后端覆盖的是「同一轮的回复」，而不是新增一轮
+        const { taskId } = await api.chat.submit({ goal, secureEnv, conversationId: conv.id, turnIndex: turnIdx });
         patchConv(conv.id, {
           taskId,
           taskTurnMap: { ...get().convs[conv.id].taskTurnMap, [taskId]: turnIdx },
+        });
+        // 本地通道同样把本轮重新绑到新任务（与 Rust 主键覆盖语义一致）
+        recordConversationMessage({
+          convId: conv.id,
+          turnIndex: turnIdx,
+          role: 'user',
+          taskId,
+          content: goal,
+          artifacts: [],
+          tsMs: Date.now(),
         });
       } catch (err: unknown) {
         patchConv(conv.id, {
@@ -501,6 +742,29 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
           error: errorTextOf(err, '重新生成失败'),
           ...(isLast ? { isLoading: false } : {}),
         });
+      }
+    },
+
+    // ── 回复评价（点赞/点踩） ──────────────────────────────
+
+    setTurnFeedback: async (convId: string, turnIdx: number, kind: 'up' | 'down' | null) => {
+      const conv = get().convs[convId];
+      if (!conv) return;
+      const before = conv.feedbackByTurn[turnIdx] ?? null;
+      if (before === kind) return;
+      const next = { ...conv.feedbackByTurn };
+      if (kind) next[turnIdx] = kind;
+      else delete next[turnIdx];
+      patchConv(convId, { feedbackByTurn: next });
+      try {
+        await saveFeedback(convId, turnIdx, kind);
+      } catch (err: unknown) {
+        // 落库失败回滚界面状态，避免留下一个刷新后就消失的选中态
+        const rollback = { ...get().convs[convId]?.feedbackByTurn };
+        if (before) rollback[turnIdx] = before;
+        else delete rollback[turnIdx];
+        patchConv(convId, { feedbackByTurn: rollback });
+        throw err instanceof Error ? err : new Error(String(err));
       }
     },
 
@@ -580,7 +844,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
       }
     },
 
-    // ── 历史任务加载（保留兼容） ──────────────────────────────
+    // ── 历史加载：任务列表（兼容字段）+ 会话重建（刷新/重启不丢对话） ──
 
     loadHistory: async () => {
       try {
@@ -589,12 +853,49 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
       } catch {
         // 历史加载失败不阻断主流程
       }
+
+      const rows = await fetchConversations().catch(() => []);
+      if (!rows.length) return;
+      // 归档的会话不回任务列表（正文仍在库内，归档页可恢复）
+      const archived = await listArchived().catch(() => []);
+      const archivedKeys = new Set(archived.map((a) => a.taskId).filter(Boolean));
+      const visible = rows.filter(
+        (r) => !archivedKeys.has(r.convId) && !(r.lastTaskId && archivedKeys.has(r.lastTaskId))
+      );
+      const bodies = await Promise.all(
+        visible.map(async (r) => {
+          try {
+            return { row: r, turns: groupTurns(await fetchConversationMessages(r.convId, 200)) };
+          } catch {
+            return { row: r, turns: [] as RestoredTurn[] };
+          }
+        })
+      );
+
+      const s = get();
+      const convs = { ...s.convs };
+      const order = [...s.convOrder];
+      let changed = false;
+      for (const { row, turns } of bodies) {
+        // 本次运行已存在的会话（含运行中）以内存态为准，不用库内数据覆盖
+        if (convs[row.convId]) continue;
+        // 没有任何提问记录的轮次无法作为对话轮渲染（旧版本任务只落了回复）：不硬凑一条假提问
+        if (!turns.some((t) => t.userContent)) continue;
+        convs[row.convId] = restoredConv(row.convId, titleOf(row.firstGoal), row.createdAtMs, turns);
+        if (!order.includes(row.convId)) order.push(row.convId);
+        changed = true;
+      }
+      if (!changed) return;
+      // 侧边栏按最近活跃倒序（与会话列表口径一致）
+      const sorted = [...order].sort((a, b) => (convs[b]?.createdAt ?? 0) - (convs[a]?.createdAt ?? 0));
+      set({ convs, convOrder: sorted, conversations: summariesOf(convs, sorted) });
     },
 
     // ── UI 切换 ───────────────────────────────────────────────
 
     togglePlanPanel: () => set((s) => ({ planVisible: !s.planVisible })),
     toggleFilePanel: () => set((s) => ({ filePanelOpen: !s.filePanelOpen })),
+    setChatModelId: (id: string) => set({ chatModelId: id }),
 
     clearError: () => {
       const s = get();

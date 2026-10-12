@@ -1,8 +1,12 @@
 //! task 模块 — 三层架构演进 P0：任务注册表 / 租约 / 配额闸门
+//! + 定时任务（schedule：任务定义、下次执行时间、执行记录）
+//! + 保持系统唤醒（keep_awake：真实阻止系统睡眠）
 
+pub mod keep_awake;
 pub mod lease;
 pub mod quota;
 pub mod registry;
+pub mod schedule;
 
 /// 14 态状态字面值（与 src/shared/types.ts TaskStatus 对齐，契约镜像）
 pub mod status {

@@ -2,9 +2,10 @@
  * 通天办公 - 文件管理页面（核心闭环补齐 · 流 4）
  *
  * 功能（真实接入 file_list / file_read / file_preview）：
- * - 工作区文件目录浏览（白名单内）
+ * - 工作区文件目录浏览（白名单内，面包屑逐级回退）
  * - 文本文件预览（txt/md/csv/json，2MB 上限）
- * - docx/xlsx/pdf 显式提示「转换能力下批落地」（不静默）
+ * - Office 文档预览（docx/xlsx/pptx 由 Rust 抽正文；pdf 给页数/文档信息 + 尽力抽取正文）
+ * - 拿不到正文时展示 Rust 回传的原因（FILE_*: 详情），不静默
  */
 
 import React, { useCallback, useEffect, useState } from 'react';
@@ -13,6 +14,7 @@ import {
   Box,
   Breadcrumbs,
   Button,
+  Link,
   List,
   ListItemButton,
   ListItemIcon,
@@ -26,6 +28,8 @@ import InsertDriveFileIcon from '@mui/icons-material/InsertDriveFile';
 import NavigateNextIcon from '@mui/icons-material/NavigateNext';
 import api from '../../lib/api';
 import type { FileItem } from '../../lib/api';
+import type { FilePreview } from '../../../shared/contracts';
+import { errorTextOf } from '../../../shared/error-messages';
 
 const TEXT_EXT = ['txt', 'md', 'csv', 'json'];
 
@@ -38,7 +42,7 @@ const FilePanel: React.FC = () => {
   const theme = useTheme();
   const [items, setItems] = useState<FileItem[]>([]);
   const [currentPath, setCurrentPath] = useState(''); // 空串=工作区文件根
-  const [pathStack, setPathStack] = useState<string[]>([]);
+  const [pathStack, setPathStack] = useState<Array<{ name: string; path: string }>>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<{ path: string; content: string } | null>(null);
@@ -67,21 +71,20 @@ const FilePanel: React.FC = () => {
   }, [loadDir]);
 
   const enterDir = (item: FileItem) => {
-    setPathStack((prev) => [...prev, item.name]);
+    setPathStack((prev) => [...prev, { name: item.name, path: item.path }]);
     loadDir(item.path);
   };
 
+  /** 回到根（index=-1）或某一层目录（栈里存了真实路径，可逐级回退） */
   const gotoBreadcrumb = (index: number) => {
-    // index=-1 表示根目录
-    if (index === -1) {
+    if (index < 0) {
       setPathStack([]);
       loadDir('');
       return;
     }
-    // 逐级回退到目标层级：需要祖先路径；简化处理：从当前条目中无法反推，
-    // 因此面包屑仅支持回到根（其余层级提示）
-    setPathStack([]);
-    loadDir('');
+    const target = pathStack[index];
+    setPathStack(pathStack.slice(0, index + 1));
+    loadDir(target.path);
   };
 
   const openFile = async (item: FileItem) => {
@@ -92,17 +95,18 @@ const FilePanel: React.FC = () => {
         const res = await api.file.read(item.path);
         setPreview(res);
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        setError(errorTextOf(e, '文件读取失败'));
       }
       return;
     }
-    // 非文本：走 preview 获取显式提示（转换能力下批落地）
+    // 其余走 file:preview：Rust 侧对 docx/xlsx/pptx/pdf 抽正文，失败时回传原因
     try {
-      const previews = (await api.file.preview([item.path])) as Array<{ note?: string }>;
-      setPreview(null);
-      setPreviewNote(previews[0]?.note ?? '该格式暂不支持预览');
+      const previews = await api.file.preview([item.path]);
+      const p: FilePreview | undefined = previews[0];
+      setPreview(p && p.content ? { path: p.path, content: p.content } : null);
+      setPreviewNote(p?.note ? errorTextOf(p.note, '该格式暂不支持预览') : null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorTextOf(e, '文档预览失败'));
     }
   };
 
@@ -117,11 +121,23 @@ const FilePanel: React.FC = () => {
         <Button size="small" onClick={() => gotoBreadcrumb(-1)} sx={{ textTransform: 'none' }}>
           工作区文件
         </Button>
-        {pathStack.map((seg, i) => (
-          <Typography key={i} variant="body2" color="text.secondary">
-            {seg}
-          </Typography>
-        ))}
+        {pathStack.map((seg, i) =>
+          i === pathStack.length - 1 ? (
+            <Typography key={seg.path} variant="body2" sx={{ fontWeight: 600 }}>
+              {seg.name}
+            </Typography>
+          ) : (
+            <Link
+              key={seg.path}
+              component="button"
+              variant="body2"
+              onClick={() => gotoBreadcrumb(i)}
+              sx={{ textTransform: 'none' }}
+            >
+              {seg.name}
+            </Link>
+          ),
+        )}
       </Breadcrumbs>
 
       {error && (
@@ -212,7 +228,7 @@ const FilePanel: React.FC = () => {
             </>
           ) : (
             <Typography variant="body2" color="text.secondary">
-              选择左侧文件查看预览（支持 txt/md/csv/json；Office/PDF 转换能力下批落地）
+              选择左侧文件查看预览（txt/md/csv/json 直读；docx/xlsx/pptx 抽取正文；pdf 给页数与文档信息）
             </Typography>
           )}
         </Paper>

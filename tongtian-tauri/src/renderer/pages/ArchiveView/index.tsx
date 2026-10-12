@@ -22,6 +22,8 @@ import ArchiveIcon from '@mui/icons-material/Archive';
 import RestoreIcon from '@mui/icons-material/Restore';
 import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
 import { listArchived, unarchiveTask, deleteArchivedTask, clearArchived } from '../../lib/alignment-api';
+import { errorTextOf } from '../../../shared/error-messages';
+import { useAppStore } from '../../stores/useAppStore';
 
 interface ArchiveRecord {
   taskId: string;
@@ -35,9 +37,10 @@ const ArchiveView: React.FC = () => {
   const [deleteTarget, setDeleteTarget] = useState<ArchiveRecord | null>(null);
   const [clearOpen, setClearOpen] = useState(false);
   const [confirmText, setConfirmText] = useState('');
+  const showNotification = useAppStore((s) => s.showNotification);
 
-  // 从持久层加载归档列表（真实 IPC）
-  useEffect(() => {
+  // 从持久层加载归档列表（真实 IPC）；操作后重新拉取，避免界面与台账不一致
+  const load = () =>
     listArchived()
       .then((list) =>
         setRecords(
@@ -45,30 +48,46 @@ const ArchiveView: React.FC = () => {
             taskId: r.taskId,
             title: r.title,
             workspaceName: r.workspaceId,
-            archivedAt: r.archivedAt,
+            archivedAt: r.archivedAt.slice(0, 16).replace('T', ' '),
           })),
         ),
       )
-      .catch(() => setRecords([]));
+      .catch((err: unknown) => {
+        setRecords([]);
+        showNotification(errorTextOf(err, '归档列表加载失败'), 'error');
+      });
+
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleDelete = () => {
+  const handleDelete = async () => {
     if (!deleteTarget) return;
     const id = deleteTarget.taskId;
-    setRecords((rs) => rs.filter((r) => r.taskId !== id));
     setDeleteTarget(null);
-    deleteArchivedTask(id).catch(() => undefined);
+    try {
+      await deleteArchivedTask(id);
+      await load();
+      showNotification(`已彻底删除：${deleteTarget.title}`, 'success');
+    } catch (err: unknown) {
+      showNotification(errorTextOf(err, '删除归档任务失败'), 'error');
+    }
   };
 
-  const handleClearAll = () => {
+  const handleClearAll = async () => {
     if (confirmText !== 'DELETE') return;
-    clearArchived('DELETE')
-      .then((ok) => {
-        if (ok) setRecords([]);
-      })
-      .catch(() => undefined);
     setClearOpen(false);
     setConfirmText('');
+    try {
+      const ok = await clearArchived('DELETE');
+      if (ok) {
+        await load();
+        showNotification('已清空归档清单（任务本体保留）', 'success');
+      }
+    } catch (err: unknown) {
+      showNotification(errorTextOf(err, '清空归档清单失败'), 'error');
+    }
   };
 
   return (
@@ -89,7 +108,7 @@ const ArchiveView: React.FC = () => {
         )}
       </Box>
       <Typography sx={{ fontSize: '13px', color: '#9CA3AF', mb: 2.5 }}>
-        归档的任务可在此恢复或彻底删除。彻底删除不可撤销。
+        归档的任务可在此恢复或彻底删除。「全部删除」只清空归档清单，任务本体仍保留；单条「删除」不可撤销。
       </Typography>
 
       <Box sx={{ maxWidth: 860 }}>
@@ -125,8 +144,11 @@ const ArchiveView: React.FC = () => {
               size="small"
               startIcon={<RestoreIcon sx={{ fontSize: 15 }} />}
               onClick={() => {
-                setRecords((rs) => rs.filter((x) => x.taskId !== r.taskId));
-                unarchiveTask(r.taskId).catch(() => undefined);
+                unarchiveTask(r.taskId)
+                  .then(() => load())
+                  .catch((err: unknown) =>
+                    showNotification(errorTextOf(err, '恢复失败'), 'error'),
+                  );
               }}
               sx={{ color: '#0D9488', fontSize: '12px' }}
             >
@@ -164,10 +186,10 @@ const ArchiveView: React.FC = () => {
 
       {/* 全部删除强确认 */}
       <Dialog open={clearOpen} onClose={() => setClearOpen(false)} maxWidth="xs">
-        <DialogTitle sx={{ fontSize: '15px', fontWeight: 700 }}>清空全部归档？</DialogTitle>
+        <DialogTitle sx={{ fontSize: '15px', fontWeight: 700 }}>清空归档清单？</DialogTitle>
         <DialogContent>
           <Typography sx={{ fontSize: '13px', color: '#6B7280', mb: 1.5 }}>
-            将彻底删除全部 {records.length} 条归档任务，不可撤销。请输入 DELETE 确认。
+            将移除全部 {records.length} 条归档标记，任务本体与文件仍保留在本地。请输入 DELETE 确认。
           </Typography>
           <TextField
             size="small"

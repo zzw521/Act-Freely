@@ -40,6 +40,9 @@ import { useAppSettings } from '../../lib/use-app-settings';
 // re-export for external usage of event types
 export type { ChatEvent } from '../../../shared/types';
 
+/** 评价表默认值（模块级常量，避免每次渲染新建对象） */
+const EMPTY_FEEDBACK: Record<number, 'up' | 'down'> = {};
+
 interface ChatStreamProps {
   messages: Message[];
   /** 当前轮事件（保留兼容） */
@@ -51,14 +54,21 @@ interface ChatStreamProps {
   regeneratingTurn?: number | null;
   /** 重新生成回调（真实重跑原目标） */
   onRegenerate?: (turnIdx: number) => void;
+  /**
+   * 轮次 → 回复评价（会话状态提供，组件不再本地记账）：
+   * 切会话不串轮，刷新/重启后按正文库恢复。
+   */
+  feedback?: Record<number, 'up' | 'down'>;
+  /** 评价回调（kind 为 null 即取消评价），落库失败时 reject */
+  onFeedback?: (turnIdx: number, kind: 'up' | 'down' | null) => Promise<void>;
+  /** Ctrl+F 会话内查找当前定位到的轮次（0 基，与 data-turn 一致） */
+  highlightTurn?: number | null;
 }
 
-const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, isLoading, regeneratingTurn, onRegenerate }) => {
+const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, isLoading, regeneratingTurn, onRegenerate, feedback = EMPTY_FEEDBACK, onFeedback, highlightTurn }) => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   // 每轮执行过程默认折叠，点击展开查看详情
   const [openTurns, setOpenTurns] = useState<Record<number, boolean>>({});
-  // 回复操作栏：点赞/点踩（互斥）、已复制反馈、提示消息
-  const [feedback, setFeedback] = useState<Record<number, 'up' | 'down' | null>>({});
   const [copiedTurn, setCopiedTurn] = useState<number | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   // 产物文件预览
@@ -79,18 +89,25 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
 
   // ── 回复操作栏 ─────────────────────────────────────────
 
-  /** 点赞/点踩（互斥，再次点击取消） */
-  const toggleFeedback = (turnIdx: number, kind: 'up' | 'down') => {
-    setFeedback((prev) => ({ ...prev, [turnIdx]: prev[turnIdx] === kind ? null : kind }));
+  /** 点赞/点踩（互斥，再次点击取消）；评价由会话状态持有并落库，失败时提示 */
+  const toggleFeedback = async (turnIdx: number, kind: 'up' | 'down') => {
+    if (!onFeedback) return;
+    try {
+      await onFeedback(turnIdx, feedback[turnIdx] === kind ? null : kind);
+    } catch (err: unknown) {
+      setActionMsg(err instanceof Error ? err.message : '评价保存失败');
+    }
   };
 
-  /** 复制回复内容（交付摘要 + 产物路径） */
+  /** 复制回复内容（回复正文，缺正文时退回交付摘要 + 产物路径） */
   const copyTurn = (turnIdx: number, evts: ChatEvent[]) => {
     const text = evts
       .filter((e) => e.type === 'deliver')
       .map((e) => {
         const summary = (e as { summary?: string }).summary ?? '';
-        return [summary, ...(e.artifacts ?? [])].filter(Boolean).join('\n');
+        // 界面气泡显的是 final_text，复制必须与所见一致
+        const finalText = (e as { final_text?: string }).final_text ?? '';
+        return [finalText || summary, ...(e.artifacts ?? [])].filter(Boolean).join('\n');
       })
       .join('\n')
       .trim() || '任务完成';
@@ -199,7 +216,17 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
           : `执行过程 · ${doneCount} 个步骤已完成`;
 
     return (
-      <Box key={`turn-${turnIdx}`} sx={{ display: 'flex', gap: 1.5, mb: 2.5, alignItems: 'flex-start' }}>
+      <Box
+        key={`turn-${turnIdx}`}
+        sx={{
+          display: 'flex',
+          gap: 1.5,
+          mb: 2.5,
+          alignItems: 'flex-start',
+          // 查找命中轮次：描边标出位置，不改布局
+          ...(highlightTurn === turnIdx ? { outline: '2px solid #0D9488', outlineOffset: 4, borderRadius: '10px' } : {}),
+        }}
+      >
         <Avatar
           sx={{ width: 32, height: 32, flexShrink: 0, bgcolor: '#16A34A', boxShadow: '0 2px 8px rgba(22, 163, 74, 0.3)' }}
         >
@@ -405,9 +432,20 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
       if (isUser) {
         turnIdx += 1;
         const currentTurn = turnIdx;
-        // 用户消息：右对齐气泡
+        // 用户消息：右对齐气泡（本轮锚点：即使助手尚未产出节点，Ctrl+F 也能定位到这一轮）
         nodes.push(
-          <Box key={msg.id} sx={{ display: 'flex', justifyContent: 'flex-end', mb: 2.5 }}>
+          <Box
+            key={msg.id}
+            data-turn={currentTurn}
+            sx={{
+              display: 'flex',
+              justifyContent: 'flex-end',
+              mb: 2.5,
+              ...(highlightTurn === currentTurn
+                ? { outline: '2px solid #0D9488', outlineOffset: 4, borderRadius: '16px' }
+                : {}),
+            }}
+          >
             <Box sx={{ maxWidth: '75%' }}>
               <Box
                 sx={{

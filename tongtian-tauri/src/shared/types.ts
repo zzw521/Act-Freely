@@ -279,6 +279,18 @@ export interface ChatSubmitReq {
   history?: Array<{ role: 'user' | 'assistant'; content: string }>;
   /** 自定义模型配置（models.json 条目；存在 baseUrl 时引擎真实调用该端点） */
   modelConfig?: { baseUrl: string; apiKey: string; modelName: string };
+  /**
+   * 安全工作环境开关。桌面端由 Rust 从设置读取后下发，此处仅服务于浏览器直连引擎通道；
+   * 开启且未自选 workDir 时，任务执行落在 {workDir}/environment/{taskId} 隔离目录。
+   */
+  secureEnv?: boolean;
+  /**
+   * 会话键（工作台的一个会话 = 侧边栏一条任务）。桌面端随任务提交下发，
+   * Rust 用它把本轮正文写进 chat_messages；缺省时后端以任务 id 作为会话键。
+   */
+  conversationId?: string;
+  /** 本轮在会话内的轮次序号（0 起）；重新生成同一轮时覆盖本轮回复 */
+  turnIndex?: number;
 }
 
 /** 步骤预览（用于 Plan 事件中的步骤概览） */
@@ -300,7 +312,15 @@ export type ChatEvent =
   | { type: 'step_progress'; stepId: string; progress: number; message: string; seq?: number; taskId?: string }
   | { type: 'step_done'; stepId: string; output: string; usage?: { promptTokens?: number; completionTokens?: number }; seq?: number; taskId?: string }
   | { type: 'step_failed'; stepId: string; error: string; seq?: number; taskId?: string }
-  | { type: 'deliver'; taskId: string; summary: string; artifacts: string[]; seq?: number }
+  | {
+      type: 'deliver';
+      taskId: string;
+      summary: string;
+      artifacts: string[];
+      /** 模型最终回复正文（引擎/Rust 透传；无正文时界面按摘要降级） */
+      final_text?: string;
+      seq?: number;
+    }
   | { type: 'done'; taskId: string; seq?: number }
   | { type: 'error'; code: string; message: string; seq?: number; taskId?: string }
   // ── 三层架构演进新增事件 ──
@@ -318,16 +338,6 @@ export interface ChatControlReq {
   taskId: string;
   action: 'pause' | 'resume' | 'rollback_to';
   stepId?: string;
-}
-
-/** 模型使用统计 */
-export interface UsageStats {
-  modelId: string;
-  modelName: string;
-  tokens?: number;
-  calls?: number;
-  latency?: number;
-  timestamp?: string;
 }
 
 // === 安全相关 ===

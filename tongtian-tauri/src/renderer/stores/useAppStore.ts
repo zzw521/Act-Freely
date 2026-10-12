@@ -1,11 +1,15 @@
 /**
  * 通天办公 - 全局应用状态管理
- * 
+ *
  * 管理功能:
  * - 主题模式 (亮色/暗色)
- * - 硬开关状态 (合规模式)
  * - 侧边栏折叠状态
+ * - 工作台右侧任务监控面板显隐
+ * - 全局任务搜索面板 / 会话内查找条显隐
  * - 全局加载状态
+ *
+ * 合规硬开关不在这里：它是安全策略，权威在 Rust 出域控制表，
+ * 由 `store/securityStore` 经 `compliance:status/update` 通道读写。
  */
 
 import { create } from 'zustand';
@@ -16,10 +20,14 @@ import type { PaletteMode } from '@mui/material';
 interface AppState {
   /** 主题模式 */
   themeMode: PaletteMode;
-  /** 硬开关状态 (true = 合规模式开启, 禁止外部网络) */
-  hardSwitchOff: boolean;
   /** 侧边栏是否折叠 */
   sidebarCollapsed: boolean;
+  /** 工作台右侧任务监控面板是否展开（快捷键 Ctrl + / 切换） */
+  taskMonitorOpen: boolean;
+  /** 全局任务搜索面板是否打开（快捷键 Ctrl + G） */
+  taskSearchOpen: boolean;
+  /** 当前会话内的查找条是否打开（快捷键 Ctrl + F） */
+  findBarOpen: boolean;
   /** 全局加载状态 */
   globalLoading: boolean;
   /** 全局加载提示文字 */
@@ -37,14 +45,18 @@ interface AppState {
   toggleThemeMode: () => void;
   /** 设置主题模式 */
   setThemeMode: (mode: PaletteMode) => void;
-  /** 切换硬开关 */
-  toggleHardSwitch: () => void;
-  /** 设置硬开关状态 */
-  setHardSwitchOff: (off: boolean) => void;
   /** 切换侧边栏 */
   toggleSidebar: () => void;
   /** 设置侧边栏状态 */
   setSidebarCollapsed: (collapsed: boolean) => void;
+  /** 切换任务监控面板 */
+  toggleTaskMonitor: () => void;
+  /** 设置任务监控面板显隐 */
+  setTaskMonitorOpen: (open: boolean) => void;
+  /** 设置全局任务搜索面板显隐 */
+  setTaskSearchOpen: (open: boolean) => void;
+  /** 设置会话内查找条显隐 */
+  setFindBarOpen: (open: boolean) => void;
   /** 设置全局加载 */
   setGlobalLoading: (loading: boolean, message?: string) => void;
   /** 显示通知 */
@@ -57,8 +69,10 @@ interface AppState {
 
 export const useAppStore = create<AppState>((set) => ({
   themeMode: 'light',
-  hardSwitchOff: false,
   sidebarCollapsed: false,
+  taskMonitorOpen: true,
+  taskSearchOpen: false,
+  findBarOpen: false,
   globalLoading: false,
   loadingMessage: '',
   notification: null,
@@ -73,16 +87,6 @@ export const useAppStore = create<AppState>((set) => ({
     set({ themeMode: mode });
   },
 
-  toggleHardSwitch: () => {
-    set((state) => ({
-      hardSwitchOff: !state.hardSwitchOff,
-    }));
-  },
-
-  setHardSwitchOff: (off: boolean) => {
-    set({ hardSwitchOff: off });
-  },
-
   toggleSidebar: () => {
     set((state) => ({
       sidebarCollapsed: !state.sidebarCollapsed,
@@ -91,6 +95,22 @@ export const useAppStore = create<AppState>((set) => ({
 
   setSidebarCollapsed: (collapsed: boolean) => {
     set({ sidebarCollapsed: collapsed });
+  },
+
+  toggleTaskMonitor: () => {
+    set((state) => ({ taskMonitorOpen: !state.taskMonitorOpen }));
+  },
+
+  setTaskMonitorOpen: (open: boolean) => {
+    set({ taskMonitorOpen: open });
+  },
+
+  setTaskSearchOpen: (open: boolean) => {
+    set({ taskSearchOpen: open });
+  },
+
+  setFindBarOpen: (open: boolean) => {
+    set({ findBarOpen: open });
   },
 
   setGlobalLoading: (loading: boolean, message = '') => {

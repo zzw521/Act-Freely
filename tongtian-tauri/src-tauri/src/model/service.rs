@@ -357,7 +357,8 @@ pub async fn test(req: ModelTestReq) -> ModelTestResp {
             available_models: None,
         };
     }
-    let client = crate::bridge::agent::http_client();
+    // 走「网络代理」设置：本地模型（localhost/127.0.0.1）由 ALWAYS_BYPASS 保证直连
+    let client = crate::proxy::client();
     let body = serde_json::json!({
         "model": req.model_name,
         "messages": [{ "role": "user", "content": "ping" }],
@@ -378,7 +379,7 @@ pub async fn test(req: ModelTestReq) -> ModelTestResp {
     match result {
         Ok(Ok(resp)) if resp.status().is_success() => {
             // 顺带拉取可用模型列表（失败不影响主结果）
-            let available = fetch_models(client, base, &req.api_key).await;
+            let available = fetch_models(&client, base, &req.api_key).await;
             ModelTestResp {
                 ok: true,
                 latency_ms: latency,

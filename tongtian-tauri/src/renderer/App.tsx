@@ -27,7 +27,6 @@ const WorkspacePanel = lazy(() => import('./pages/WorkspacePanel'));
 const FilePanel = lazy(() => import('./pages/FilePanel'));
 const ScheduleView = lazy(() => import('./pages/ScheduleView'));
 const Settings = lazy(() => import('./pages/Settings'));
-const ConnectorCenter = lazy(() => import('./pages/ConnectorCenter'));
 const HooksManager = lazy(() => import('./pages/HooksManager'));
 const ComputerUsePanel = lazy(() => import('./pages/ComputerUsePanel'));
 const IMChannel = lazy(() => import('./pages/IMChannel'));

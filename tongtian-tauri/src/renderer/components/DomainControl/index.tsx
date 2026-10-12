@@ -25,15 +25,7 @@ import WarningIcon from '@mui/icons-material/Warning';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import BlockIcon from '@mui/icons-material/Block';
 import { errorTextOf } from '../../../shared/error-messages';
-
-interface DomainControlConfig {
-  enabled: boolean;
-  mode: 'whitelist' | 'blacklist';
-  allowedDomains: string[];
-  blockedDomains: string[];
-  forceLocalForConfidential: boolean;
-  hardDisableExternalAPI: boolean;
-}
+import type { DomainControlConfig } from '../../store/securityStore';
 
 interface DomainControlProps {
   initialConfig?: Partial<DomainControlConfig>;

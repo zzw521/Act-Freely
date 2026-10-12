@@ -2,10 +2,11 @@
  * 通天办公 - 任务监控面板（设计图对齐版 · 右侧栏）
  *
  * 折叠分区：待办（计划步骤 + 审阅操作）/ 产物 / 默认工作目录 / 技能 / MCP 连接器
- * 数据源：workbenchStore 的 plan / fileOps；技能与连接器计数为占位（P1 接入）
+ * 数据源：workbenchStore 的 plan / fileOps；技能与连接器取三通道真实台账
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Box, Button, Chip, Collapse, IconButton, Tooltip, Typography } from '@mui/material';
 import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
@@ -18,8 +19,11 @@ import DescriptionOutlinedIcon from '@mui/icons-material/DescriptionOutlined';
 import OpenInFullIcon from '@mui/icons-material/OpenInFull';
 import CloseFullscreenIcon from '@mui/icons-material/CloseFullscreen';
 import ViewSidebarIcon from '@mui/icons-material/ViewSidebar';
+import RefreshIcon from '@mui/icons-material/Refresh';
 import type { Plan, FileOp } from '../../../shared/types';
 import { PlanStatus, StepStatus } from '../../../shared/types';
+import type { InstalledSkill, McpServer } from '../../../shared/contracts';
+import { mcpAPI, skillAPI } from '../../lib/api';
 import ResizeHandle from '../Layout/ResizeHandle';
 import FilePreview from '../FilePreview';
 
@@ -31,12 +35,65 @@ interface TaskMonitorProps {
   plan: Plan | null;
   fileOps: FileOp[];
   workDir?: string;
-  skillCount?: number;
-  mcpCount?: number;
   onReview?: (action: 'approve' | 'reject' | 'modify') => void;
   /** 隐藏面板（由工作台提供重新展开入口） */
   onHide?: () => void;
 }
+
+/**
+ * 技能与连接器台账。
+ * 计数只来自真实清单：读取中/读取失败都不给数字，避免把「未知」显示成 3 和 2。
+ */
+function useCapabilityLedger() {
+  const [skills, setSkills] = useState<InstalledSkill[] | null>(null);
+  const [servers, setServers] = useState<McpServer[] | null>(null);
+  const [failed, setFailed] = useState<{ skills: boolean; servers: boolean }>({
+    skills: false,
+    servers: false,
+  });
+
+  const reload = useCallback(async () => {
+    const [s, m] = await Promise.allSettled([skillAPI.list(), mcpAPI.list()]);
+    setSkills(s.status === 'fulfilled' ? s.value : null);
+    setServers(m.status === 'fulfilled' ? m.value : null);
+    setFailed({ skills: s.status !== 'fulfilled', servers: m.status !== 'fulfilled' });
+  }, []);
+
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  return { skills, servers, failed, reload };
+}
+
+/** 清单区底部：读取中 / 失败重试，都是真实状态而非占位文案 */
+const LedgerFooter: React.FC<{
+  loading: boolean;
+  failed: boolean;
+  onRetry: () => void;
+  failedText: string;
+}> = ({ loading, failed, onRetry, failedText }) => {
+  if (failed) {
+    return (
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mt: 0.5 }}>
+        <Typography sx={{ fontSize: '12px', color: '#B45309' }}>{failedText}</Typography>
+        <Box
+          onClick={onRetry}
+          sx={{ display: 'flex', alignItems: 'center', gap: 0.25, cursor: 'pointer' }}
+        >
+          <RefreshIcon sx={{ fontSize: 13, color: '#0D9488' }} />
+          <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#0D9488' }}>重试</Typography>
+        </Box>
+      </Box>
+    );
+  }
+  if (loading) {
+    return (
+      <Typography sx={{ fontSize: '12px', color: '#9CA3AF', mt: 0.5 }}>正在读取清单…</Typography>
+    );
+  }
+  return null;
+};
 
 /** 折叠分区头（defaultOpen 后续变真时自动展开，如计划步骤到达） */
 const Section: React.FC<{
@@ -118,14 +175,14 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
   plan,
   fileOps,
   workDir,
-  skillCount = 3,
-  mcpCount = 2,
   onReview,
   onHide,
 }) => {
   const steps = plan?.steps ?? [];
   const doneCount = steps.filter((s) => s.status === StepStatus.SUCCESS).length;
   const awaitingReview = plan?.status === PlanStatus.PENDING_REVIEW && !plan.reviewed;
+  const navigate = useNavigate();
+  const { skills, servers, failed, reload } = useCapabilityLedger();
   // 面板宽度：放大/还原快捷切换 + 左边界长按拖拽调宽（260~560）
   const [width, setWidth] = useState(MONITOR_WIDTH_NORMAL);
   const isWide = width >= MONITOR_WIDTH_WIDE;
@@ -279,26 +336,103 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
           </Typography>
         </Section>
 
-        {/* 技能（占位计数，P1 接 skill_list） */}
+        {/* 技能（真实台账：{data_home}/skills 目录扫描结果） */}
         <Section
           icon={<BoltIcon sx={{ fontSize: 16, color: 'var(--tt-text-3)' }} />}
           title="技能"
-          badge={skillCount}
+          badge={skills?.length}
         >
-          <Typography sx={{ fontSize: '12px', color: '#9CA3AF' }}>
-            技能市场即将上线，当前为内置技能
-          </Typography>
+          {skills && skills.length === 0 ? (
+            <Box
+              onClick={() => navigate('/extensions?tab=skills')}
+              sx={{ display: 'flex', alignItems: 'center', gap: 0.5, cursor: 'pointer' }}
+            >
+              <Typography sx={{ fontSize: '12px', color: '#9CA3AF' }}>尚未安装技能，</Typography>
+              <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#0D9488' }}>去技能页安装</Typography>
+            </Box>
+          ) : skills ? (
+            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+              {skills.map((s) => (
+                <Tooltip key={s.id} title={s.description ?? s.name}>
+                  <Chip
+                    size="small"
+                    label={s.readable ? s.name : `${s.name}（需重装）`}
+                    onClick={() => navigate('/extensions?tab=skills')}
+                    sx={{
+                      maxWidth: '100%',
+                      fontSize: '11.5px',
+                      height: 22,
+                      bgcolor: s.enabled ? '#E6F7F4' : '#F3F4F6',
+                      color: s.enabled ? '#0D9488' : '#6B7280',
+                    }}
+                  />
+                </Tooltip>
+              ))}
+            </Box>
+          ) : (
+            <Typography sx={{ fontSize: '12px', color: '#9CA3AF' }}>技能清单暂不可用</Typography>
+          )}
+          <LedgerFooter
+            loading={!skills && !failed.skills}
+            failed={failed.skills}
+            onRetry={() => void reload()}
+            failedText="技能清单读取失败"
+          />
         </Section>
 
-        {/* MCP 连接器（占位计数，P1 接 mcp_list） */}
+        {/* MCP 连接器（真实台账：mcp_servers 登记 + 握手状态） */}
         <Section
           icon={<LinkIcon sx={{ fontSize: 16, color: 'var(--tt-text-3)' }} />}
           title="MCP 连接器"
-          badge={mcpCount}
+          badge={servers?.length}
         >
-          <Typography sx={{ fontSize: '12px', color: '#9CA3AF' }}>
-            连接器中心即将上线
-          </Typography>
+          {servers && servers.length === 0 ? (
+            <Box
+              onClick={() => navigate('/extensions?tab=connectors')}
+              sx={{ display: 'flex', alignItems: 'center', gap: 0.5, cursor: 'pointer' }}
+            >
+              <Typography sx={{ fontSize: '12px', color: '#9CA3AF' }}>尚未登记连接器，</Typography>
+              <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#0D9488' }}>去连接器页添加</Typography>
+            </Box>
+          ) : servers ? (
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.25 }}>
+              {servers.map((s) => (
+                <Box key={s.serverId} sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                  <Typography
+                    sx={{ fontSize: '12px', color: 'var(--tt-text-2)', flexGrow: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                  >
+                    {s.name}
+                  </Typography>
+                  <Typography
+                    sx={{
+                      fontSize: '11px',
+                      fontWeight: 600,
+                      color:
+                        s.status === 'connected'
+                          ? '#0D9488'
+                          : s.status === 'failed'
+                            ? '#B45309'
+                            : '#9CA3AF',
+                    }}
+                  >
+                    {s.status === 'connected'
+                      ? '已连接'
+                      : s.status === 'failed'
+                        ? '连接失败'
+                        : '未连接'}
+                  </Typography>
+                </Box>
+              ))}
+            </Box>
+          ) : (
+            <Typography sx={{ fontSize: '12px', color: '#9CA3AF' }}>连接器清单暂不可用</Typography>
+          )}
+          <LedgerFooter
+            loading={!servers && !failed.servers}
+            failed={failed.servers}
+            onRetry={() => void reload()}
+            failedText="连接器清单读取失败"
+          />
         </Section>
       </Box>
 

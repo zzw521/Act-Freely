@@ -14,18 +14,41 @@ import type {
   ModelConfig,
   ModelTestReq,
   ModelTestResp,
-  UsageStats,
   ChatStepPreview,
   AttachmentMeta,
 } from '../../shared/types';
-import type { AuthLoginResp, AuthStatus } from '../../shared/contracts';
+import type {
+  AuthLoginResp,
+  AuthStatus,
+  CompliancePatch,
+  ComplianceCheckResp,
+  ComplianceStatus,
+  ComplianceUpdateResp,
+  FilePreview,
+  InstalledSkill,
+  InstalledSuite,
+  MCPTool,
+  McpAddReq,
+  McpServer,
+  ModelUsageView,
+  SandboxEnvClearResult,
+  SandboxEnvUsage,
+  SkillInstallReq,
+  SkillRootInfo,
+  SuiteInstallReq,
+  SuiteRootInfo,
+  UsagePeriod,
+  UsageReport,
+  UsageStats,
+  WorkspaceInfo,
+} from '../../shared/contracts';
 
 // ── 辅助函数 ─────────────────────────────────────────────────
 
 function getAPI() {
   const api = window.tongtianAPI;
   if (!api) {
-    throw new Error('tongtianAPI is not available. Are you running inside Electron?');
+    throw new Error('tongtianAPI is not available. 请从桌面版通天办公或已注入通道的页面打开');
   }
   return api;
 }
@@ -143,9 +166,9 @@ export const modelAPI = {
     return getAPI().invoke(IPC_CHANNELS.MODEL_SET_DEFAULT, { id }) as Promise<void>;
   },
 
-  /** 获取模型用量统计 */
-  usage(): Promise<UsageStats[]> {
-    return getAPI().invoke(IPC_CHANNELS.MODEL_USAGE) as Promise<UsageStats[]>;
+  /** 获取模型用量统计（真实台账；period: daily/monthly/total） */
+  usage(period: UsagePeriod = 'monthly'): Promise<ModelUsageView> {
+    return getAPI().invoke(IPC_CHANNELS.MODEL_USAGE, period) as Promise<ModelUsageView>;
   },
 };
 
@@ -170,14 +193,178 @@ export const fileAPI = {
     return getAPI().invoke('file:read', filePath, workspaceId) as Promise<{ path: string; content: string }>;
   },
 
-  /** 批量预览（docx/xlsx/pdf 返回转换未落地提示，不静默） */
-  preview(filePaths: string[], workspaceId?: string): Promise<unknown[]> {
-    return getAPI().invoke('file:preview', filePaths, workspaceId) as Promise<unknown[]>;
+  /** 批量预览（txt/md/csv/json 直读；docx/xlsx/pptx 抽正文；pdf 给页数与文档信息） */
+  preview(filePaths: string[], workspaceId?: string): Promise<FilePreview[]> {
+    return getAPI().invoke('file:preview', filePaths, workspaceId) as Promise<FilePreview[]>;
+  },
+};
+
+// ── Workspace API（工作空间：桌面端以磁盘目录为权威，浏览器通道为本地台账） ──
+
+export const workspaceAPI = {
+  /** 列出工作空间（default 恒在；含 Agent 运行态） */
+  list(): Promise<WorkspaceInfo[]> {
+    return getAPI().invoke(IPC_CHANNELS.WORKSPACE_LIST) as Promise<WorkspaceInfo[]>;
+  },
+
+  /** 创建工作空间（幂等；标识非法返回 WORKSPACE_INVALID_ID） */
+  create(workspaceId: string): Promise<WorkspaceInfo> {
+    return getAPI().invoke(IPC_CHANNELS.WORKSPACE_CREATE, { workspaceId }) as Promise<WorkspaceInfo>;
+  },
+};
+
+// ── Skill API（技能：桌面端以 {data_home}/skills/*/SKILL.md 为事实来源） ──
+
+export const skillAPI = {
+  /** 技能运行目录（桌面端返回真实路径；浏览器通道 supported=false） */
+  root(): Promise<SkillRootInfo> {
+    return getAPI().invoke(IPC_CHANNELS.SKILL_ROOT) as Promise<SkillRootInfo>;
+  },
+
+  /** 列出已安装技能（含禁用状态；浏览器通道返回空列表） */
+  list(): Promise<InstalledSkill[]> {
+    return getAPI().invoke(IPC_CHANNELS.SKILL_LIST) as Promise<InstalledSkill[]>;
+  },
+
+  /** 从本地目录/文件安装技能（市场与 URL 来源当前不支持，如实返回 SKILL_UNSUPPORTED） */
+  install(req: SkillInstallReq): Promise<InstalledSkill> {
+    return getAPI().invoke(IPC_CHANNELS.SKILL_INSTALL, req) as Promise<InstalledSkill>;
+  },
+
+  /** 卸载技能（目录移入 skills_removed 回收目录，不物理删除） */
+  uninstall(skillId: string): Promise<{ removed: string; trashPath: string }> {
+    return getAPI().invoke(IPC_CHANNELS.SKILL_UNINSTALL, { skillId }) as Promise<{
+      removed: string;
+      trashPath: string;
+    }>;
+  },
+
+  /** 启用/禁用技能（禁用清单落 settings_kv，技能文件保持不动） */
+  toggle(skillId: string, enabled: boolean): Promise<{ ok: boolean; id: string; enabled: boolean }> {
+    return getAPI().invoke(IPC_CHANNELS.SKILL_TOGGLE, { skillId, enabled }) as Promise<{
+      ok: boolean;
+      id: string;
+      enabled: boolean;
+    }>;
+  },
+};
+
+// ── 专家套件 API（桌面端落 suites/；浏览器通道走本地台账） ──
+
+export const suiteAPI = {
+  /** 套件运行目录（桌面端返回真实路径；浏览器通道 supported=false） */
+  root(): Promise<SuiteRootInfo> {
+    return getAPI().invoke(IPC_CHANNELS.SUITE_ROOT) as Promise<SuiteRootInfo>;
+  },
+
+  /** 列出已安装套件（以 manifest.json / 本地台账为事实来源） */
+  list(): Promise<InstalledSuite[]> {
+    return getAPI().invoke(IPC_CHANNELS.SUITE_LIST) as Promise<InstalledSuite[]>;
+  },
+
+  /** 安装套件包（.zip 字节 base64；plugin.json 校验不过即拒绝，不产生半成品） */
+  install(req: SuiteInstallReq): Promise<InstalledSuite> {
+    return getAPI().invoke(IPC_CHANNELS.SUITE_INSTALL, req) as Promise<InstalledSuite>;
+  },
+
+  /** 卸载套件（桌面端移入 suites_removed 回收目录，不物理删除） */
+  uninstall(suiteId: string): Promise<{ removed: string; trashPath: string }> {
+    return getAPI().invoke(IPC_CHANNELS.SUITE_UNINSTALL, { suiteId }) as Promise<{
+      removed: string;
+      trashPath: string;
+    }>;
+  },
+};
+
+// ── MCP 连接器 API（配置落 mcp_servers；连接由 Rust 发起真实握手） ──
+
+export const mcpAPI = {
+  /** 列出已登记的连接器（无登记时为空数组；env/header 只暴露键名） */
+  list(): Promise<McpServer[]> {
+    return getAPI().invoke(IPC_CHANNELS.MCP_LIST_SERVERS) as Promise<McpServer[]>;
+  },
+
+  /** 登记连接器（重名拒绝 MCP_SERVER_EXISTS；状态从「未连接」开始） */
+  add(req: McpAddReq): Promise<McpServer> {
+    return getAPI().invoke(IPC_CHANNELS.MCP_ADD_SERVER, req) as Promise<McpServer>;
+  },
+
+  /** 移除连接器登记（只删这一条登记，不动任务与审计存量数据） */
+  remove(serverId: string): Promise<{ ok: boolean; serverId: string; name: string }> {
+    return getAPI().invoke(IPC_CHANNELS.MCP_REMOVE_SERVER, { serverId }) as Promise<{
+      ok: boolean;
+      serverId: string;
+      name: string;
+    }>;
+  },
+
+  /** 连接：initialize → initialized → tools/list 的真实往返，失败带原因 */
+  connect(serverId: string): Promise<McpServer> {
+    return getAPI().invoke(IPC_CHANNELS.MCP_CONNECT, { serverId }) as Promise<McpServer>;
+  },
+
+  /** 断开：清除已验证状态与工具缓存，配置保留可随时再连 */
+  disconnect(serverId: string): Promise<McpServer> {
+    return getAPI().invoke(IPC_CHANNELS.MCP_DISCONNECT, { serverId }) as Promise<McpServer>;
+  },
+
+  /** 已缓存的工具清单（未连接时为空数组，不伪造工具） */
+  tools(serverId: string): Promise<MCPTool[]> {
+    return getAPI().invoke(IPC_CHANNELS.MCP_LIST_TOOLS, { serverId }) as Promise<MCPTool[]>;
+  },
+};
+
+// ── Compliance API（合规聚合视图：与出域控制/模型台账/审计同一份权威） ──
+
+export const complianceAPI = {
+  /** 合规状态：硬开关 + 出域控制摘要 + 按策略评估的模型名单 + 最近数据分级留痕 */
+  status(): Promise<ComplianceStatus> {
+    return getAPI().invoke(IPC_CHANNELS.COMPLIANCE_STATUS) as Promise<ComplianceStatus>;
+  },
+
+  /** 更新合规策略（只改传入字段）；空 patch 只读不写，changed=false */
+  update(patch: CompliancePatch): Promise<ComplianceUpdateResp> {
+    return getAPI().invoke(IPC_CHANNELS.COMPLIANCE_UPDATE, patch) as Promise<ComplianceUpdateResp>;
+  },
+
+  /**
+   * 提交前合规闸门：正文分级 + 目标端点出域校验。
+   * 判定与真实出站调用同源，被拒时以 `CODE: 原因` 抛错，调用方据此阻断提交。
+   */
+  check(goal: string, baseUrl?: string): Promise<ComplianceCheckResp> {
+    return getAPI().invoke(IPC_CHANNELS.COMPLIANCE_CHECK, goal, baseUrl) as Promise<ComplianceCheckResp>;
+  },
+};
+
+// ── Sandbox API（安全工作环境：工作环境文件的磁盘事实与清理） ──
+
+export const sandboxAPI = {
+  /** 工作环境目录磁盘实测用量（桌面端汇总所有工作空间，引擎直连为引擎自身目录） */
+  envUsage(): Promise<SandboxEnvUsage> {
+    return getAPI().invoke(IPC_CHANNELS.SANDBOX_ENV_USAGE) as Promise<SandboxEnvUsage>;
+  },
+
+  /** 清理工作环境文件，仅删除 workspaces/{id}/environment 内的条目 */
+  envClear(): Promise<SandboxEnvClearResult> {
+    return getAPI().invoke(IPC_CHANNELS.SANDBOX_ENV_CLEAR) as Promise<SandboxEnvClearResult>;
+  },
+};
+
+// ── Usage API（用量总览与报表：与 model:usage 同一台账的两种读法） ──
+
+export const usageAPI = {
+  /** 周期汇总（顶部总览条；period: daily/monthly/total） */
+  stats(period: UsagePeriod = 'monthly'): Promise<UsageStats> {
+    return getAPI().invoke(IPC_CHANNELS.USAGE_STATS, period) as Promise<UsageStats>;
+  },
+
+  /** 周期报表（按日趋势 + 每模型明细 + 汇总，可复制成文本） */
+  report(period: UsagePeriod = 'monthly'): Promise<UsageReport> {
+    return getAPI().invoke(IPC_CHANNELS.USAGE_REPORT, period) as Promise<UsageReport>;
   },
 };
 
 // ── Auth API（账号与登录态 · 网页验证登录 Loopback 方案） ──
-
 export const authAPI = {
   /** 登录态视图（loggedIn/profile/mock） */
   status(): Promise<AuthStatus> {
@@ -260,6 +447,12 @@ export const api = {
   chat: chatAPI,
   model: modelAPI,
   file: fileAPI,
+  workspace: workspaceAPI,
+  skill: skillAPI,
+  mcp: mcpAPI,
+  compliance: complianceAPI,
+  sandbox: sandboxAPI,
+  usage: usageAPI,
   auth: authAPI,
   system: systemAPI,
   p0: p0API,

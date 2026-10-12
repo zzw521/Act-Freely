@@ -7,6 +7,7 @@
 //! 运行目录：`TONGTIAN_HOME` 环境变量覆盖，缺省 `%APPDATA%\tongtian-office`（双目录设计规范）
 
 pub mod db;
+pub mod messages;
 pub mod migrate;
 pub mod settings;
 pub mod tasks;

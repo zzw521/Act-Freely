@@ -10,30 +10,30 @@ import type {
   ModelTestReq,
   ModelTestResp,
   WorkspaceCreateReq,
+  WorkspaceInfo,
   AgentDelegateReq,
   AgentDelegateResp,
+  InstalledSkill,
   SkillInstallReq,
-  AuditQuery,
-  ScheduleCreateReq,
-  ScheduleUpdateReq,
   MCPTool,
+  McpAddReq,
+  McpServer,
+  ScheduledTask,
   AppError,
+  AuditQuery,
+  UsagePeriod,
+  UsageReport,
   UsageStats,
   ComplianceStatus,
   TaskSummary,
   FileInfo,
   FilePreview,
   ResourceReport,
+  ScheduleCreateReq,
+  ScheduleUpdateReq,
 } from '../shared/contracts';
 
-import type {
-  ModelConfig,
-  Workspace,
-  Skill,
-  MCPServer,
-  SandboxPolicy,
-  ScheduleTask,
-} from '../shared/types';
+import type { ModelConfig, SandboxPolicy } from '../shared/types';
 
 interface TongtianAPI {
   /**
@@ -94,24 +94,24 @@ interface TongtianAPI {
   fileOrganize(srcPaths: string[], dstDir: string, strategy: string): Promise<void>;
 
   // Workspace
-  workspaceList(): Promise<Workspace[]>;
-  workspaceCreate(req: WorkspaceCreateReq): Promise<Workspace>;
-  workspaceUpdate(id: string, data: Partial<Workspace>): Promise<Workspace>;
+  workspaceList(): Promise<WorkspaceInfo[]>;
+  workspaceCreate(req: WorkspaceCreateReq): Promise<WorkspaceInfo>;
+  workspaceUpdate(id: string, data: Partial<WorkspaceInfo>): Promise<WorkspaceInfo>;
   workspaceDelete(id: string): Promise<void>;
   workspaceDelegate(req: AgentDelegateReq): Promise<AgentDelegateResp>;
 
   // Skill
-  skillList(): Promise<Skill[]>;
-  skillInstall(req: SkillInstallReq): Promise<Skill>;
+  skillList(): Promise<InstalledSkill[]>;
+  skillInstall(req: SkillInstallReq): Promise<InstalledSkill>;
   skillUninstall(id: string): Promise<void>;
   skillToggle(id: string, enabled: boolean): Promise<void>;
 
-  // MCP
-  mcpListServers(): Promise<MCPServer[]>;
-  mcpAddServer(config: Partial<MCPServer>): Promise<MCPServer>;
-  mcpRemoveServer(id: string): Promise<void>;
-  mcpConnect(id: string): Promise<void>;
-  mcpDisconnect(id: string): Promise<void>;
+  // MCP（配置落 mcp_servers；连接由后端发起真实握手）
+  mcpListServers(): Promise<McpServer[]>;
+  mcpAddServer(req: McpAddReq): Promise<McpServer>;
+  mcpRemoveServer(serverId: string): Promise<{ ok: boolean; serverId: string; name: string }>;
+  mcpConnect(serverId: string): Promise<McpServer>;
+  mcpDisconnect(serverId: string): Promise<McpServer>;
   mcpListTools(serverId: string): Promise<MCPTool[]>;
 
   // Sandbox
@@ -123,9 +123,9 @@ interface TongtianAPI {
   auditExport(query: AuditQuery, format: string): Promise<string>;
 
   // Schedule
-  scheduleList(): Promise<ScheduleTask[]>;
-  scheduleCreate(req: ScheduleCreateReq): Promise<ScheduleTask>;
-  scheduleUpdate(req: ScheduleUpdateReq): Promise<ScheduleTask>;
+  scheduleList(): Promise<ScheduledTask[]>;
+  scheduleCreate(req: ScheduleCreateReq): Promise<ScheduledTask>;
+  scheduleUpdate(req: ScheduleUpdateReq): Promise<ScheduledTask>;
   scheduleDelete(id: string): Promise<void>;
   scheduleToggle(id: string, enabled: boolean): Promise<void>;
 
@@ -133,9 +133,9 @@ interface TongtianAPI {
   complianceStatus(): Promise<ComplianceStatus>;
   complianceUpdate(data: Partial<ComplianceStatus>): Promise<ComplianceStatus>;
 
-  // Usage
-  usageStats(modelId?: string): Promise<UsageStats[]>;
-  usageReport(startTime: string, endTime: string): Promise<string>;
+  // Usage（真实 token 台账；与 usage:stats / usage:report 通道同返回体）
+  usageStats(period?: UsagePeriod): Promise<UsageStats>;
+  usageReport(period?: UsagePeriod): Promise<UsageReport>;
 
   // System
   systemInfo(): Promise<Record<string, unknown>>;

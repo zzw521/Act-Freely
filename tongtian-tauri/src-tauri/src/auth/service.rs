@@ -164,7 +164,7 @@ pub async fn wait_loopback_callback(
 
 /// 授权码换 token（Auth 服务 /api/auth/exchange）
 pub async fn exchange_code(base_url: &str, code: &str, state: &str) -> Result<Value, String> {
-    let resp = reqwest::Client::new()
+    let resp = crate::proxy::client()
         .post(format!("{base_url}/api/auth/exchange"))
         .json(&json!({ "code": code, "state": state }))
         .timeout(std::time::Duration::from_secs(10))
@@ -188,7 +188,7 @@ pub async fn exchange_code(base_url: &str, code: &str, state: &str) -> Result<Va
 
 /// 尽力而为的远端 session 吊销（Auth 服务不可达时不阻断本地退出）
 pub async fn revoke_remote(base_url: &str, refresh_token: &str) {
-    let _ = reqwest::Client::new()
+    let _ = crate::proxy::client()
         .post(format!("{base_url}/api/auth/logout"))
         .json(&json!({ "refreshToken": refresh_token }))
         .timeout(std::time::Duration::from_secs(5))

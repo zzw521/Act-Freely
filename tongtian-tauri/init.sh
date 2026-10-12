@@ -82,7 +82,7 @@ echo "  登录模式:     TT_AUTH_MOCK=$TT_AUTH_MOCK（false 时走网页验证�
 echo "  Auth 服务:    $AUTH_URL"
 echo "  桌面应用:     tongtian-tauri (Tauri 2.x)"
 echo "  打包随包运行时: bash scripts/prepare-python.sh（发布前必须执行，否则 tauri build 缺 resources/python）"
-echo "  后端能力:     29 个 Tauri command（含两阶段审阅/模型五件套/文件能力/附件上传/登录态三件套）"
+echo "  后端能力:     37 个 Tauri command（含两阶段审阅/模型五件套+用量统计/文件能力/附件上传/登录态三件套/安全治理七件套）"
 echo "  测试:         npx vitest run（前端）/ cargo test --lib（Rust）/ python auth-server/test_auth.py（Auth）"
 echo "-----------------------------------------"
 

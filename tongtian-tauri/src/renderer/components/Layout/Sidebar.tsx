@@ -44,6 +44,7 @@ import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import LogoutIcon from '@mui/icons-material/Logout';
 import LoginIcon from '@mui/icons-material/Login';
 import ChevronLeftIcon from '@mui/icons-material/ChevronLeft';
+import ArchiveIcon from '@mui/icons-material/Archive';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useWorkbenchStore } from '../../store/workbenchStore';
 import { useImChannelStore, IM_CHANNEL_META } from '../../stores/imChannelStore';
@@ -51,6 +52,7 @@ import { useAuthStore } from '../../stores/useAuthStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { useAppSettings } from '../../lib/use-app-settings';
 import { useShallow } from 'zustand/react/shallow';
+import { errorTextOf } from '../../../shared/error-messages';
 import { navPalette, type NavPaletteKey } from '../../theme/tokens';
 
 // ── 导航项定义 ──────────────────────────────────────────────────────
@@ -145,13 +147,24 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
   };
 
   // 多会话列表（侧边栏任务区：点击切换会话，支持多会话并行）
-  const { conversations, newConversation, switchConversation } = useWorkbenchStore(
+  const { conversations, newConversation, switchConversation, archiveConversation } = useWorkbenchStore(
     useShallow((s) => ({
       conversations: s.conversations,
       newConversation: s.newConversation,
       switchConversation: s.switchConversation,
+      archiveConversation: s.archiveConversation,
     })),
   );
+
+  /** 归档会话：写归档标记后从任务列表移除（归档页可恢复） */
+  const handleArchive = async (id: string, title: string) => {
+    try {
+      await archiveConversation(id);
+      showNotification(`已归档：${title || '未命名任务'}，可在「已归档」恢复`, 'success');
+    } catch (err) {
+      showNotification(errorTextOf(err, '归档失败'), 'error');
+    }
+  };
 
   // IM 频道会话列表（频道页签数据源）
   const { channelSessions, loadSessions } = useImChannelStore(
@@ -561,6 +574,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                     background: 'rgba(79, 70, 229, 0.06)',
                     borderLeftColor: '#A5B4FC',
                     '& .history-title': { color: '#4338CA' },
+                    '& .conv-archive-btn': { opacity: 1 },
                   },
                 }}
               >
@@ -577,11 +591,32 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                     textOverflow: 'ellipsis',
                     whiteSpace: 'nowrap',
                     minWidth: 0,
+                    flexGrow: 1,
                     transition: 'color 0.15s ease',
                   }}
                 >
                   {t.title || '新任务'}
                 </Typography>
+                {/* hover 显现归档入口（写入 task:archive 通道） */}
+                <Tooltip title="归档" placement="left">
+                  <IconButton
+                    className="conv-archive-btn"
+                    size="small"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void handleArchive(t.id, t.title);
+                    }}
+                    sx={{
+                      opacity: 0,
+                      color: 'var(--tt-text-4)',
+                      flexShrink: 0,
+                      transition: 'opacity 0.15s ease, color 0.15s ease',
+                      '&:hover': { color: '#4F46E5', bgcolor: 'transparent' },
+                    }}
+                  >
+                    <ArchiveIcon sx={{ fontSize: 14 }} />
+                  </IconButton>
+                </Tooltip>
               </Box>
             ))
           ) : (

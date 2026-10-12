@@ -19,9 +19,11 @@ import RefreshIcon from '@mui/icons-material/Refresh';
 import ChatStream from '../../components/ChatStream';
 import ChatInput from '../../components/ChatInput';
 import TaskMonitor from '../../components/TaskMonitor';
+import TaskFindBar from '../../components/TaskFindBar';
 import ViewSidebarIcon from '@mui/icons-material/ViewSidebar';
 import { useWorkbenchStore } from '../../store/workbenchStore';
 import { usePreferenceStore } from '../../stores/usePreferenceStore';
+import { useAppStore } from '../../stores/useAppStore';
 import { useShallow } from 'zustand/react/shallow';
 import { TaskStatus, StepStatus } from '../../../shared/types';
 
@@ -387,14 +389,22 @@ const Workbench: React.FC = () => {
   // 对话宽度（偏好设置真实生效）
   const chatWidth = usePreferenceStore((s) => s.chatWidth);
   const chatMaxWidth = resolveChatMaxWidth(chatWidth);
-  // 右侧任务监控面板显隐
-  const [monitorOpen, setMonitorOpen] = React.useState(true);
+  // 右侧任务监控面板显隐：状态放在 app store，Ctrl + / 快捷键与头部按钮共用同一份
+  const monitorOpen = useAppStore((s) => s.taskMonitorOpen);
+  const setMonitorOpen = useAppStore((s) => s.setTaskMonitorOpen);
+  // 会话内查找条（Ctrl + F）：显隐由 store 提供，快捷键与查找条共用；高亮轮次由查找条回报
+  const findBarOpen = useAppStore((s) => s.findBarOpen);
+  const setFindBarOpen = useAppStore((s) => s.setFindBarOpen);
+  const [highlightTurn, setHighlightTurn] = React.useState<number | null>(null);
   const {
     messages,
     events,
     turnEvents,
     regeneratingTurn,
     regenerateTurn,
+    feedbackByTurn,
+    setTurnFeedback,
+    activeId,
     plan,
     fileOps,
     isLoading,
@@ -413,6 +423,9 @@ const Workbench: React.FC = () => {
       turnEvents: s.turnEvents,
       regeneratingTurn: s.regeneratingTurn,
       regenerateTurn: s.regenerateTurn,
+      feedbackByTurn: s.feedbackByTurn,
+      setTurnFeedback: s.setTurnFeedback,
+      activeId: s.activeId,
       plan: s.plan,
       fileOps: s.fileOps,
       isLoading: s.isLoading,
@@ -593,21 +606,38 @@ const Workbench: React.FC = () => {
         </Box>
 
         {/* 消息流 / 欢迎区（欢迎态输入框内置于 WelcomeView） */}
-        <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', px: 3, pt: 2 }}>
-          {hasConversation ? (
-            <Box sx={{ maxWidth: chatMaxWidth, mx: 'auto' }}>
-              <ChatStream
-                messages={messages}
-                events={events}
-                turnEvents={turnEvents}
-                isLoading={isLoading}
-                regeneratingTurn={regeneratingTurn}
-                onRegenerate={regenerateTurn}
-              />
-            </Box>
-          ) : (
-            <WelcomeView onSend={handleSend} loading={isLoading} initialText={initialPrompt} workDir={workDir} onSelectWorkDir={setWorkDir} />
+        <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', px: 3, pt: 2 }}>
+          {/* 查找条占消息流上方一行：滚动区之外，既不会被滚走，也不靠魔法留白躲开首轮提问 */}
+          {hasConversation && findBarOpen && (
+            <TaskFindBar
+              messages={messages}
+              turnEvents={turnEvents}
+              onClose={() => setFindBarOpen(false)}
+              onActiveTurn={setHighlightTurn}
+            />
           )}
+          <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
+            {hasConversation ? (
+              <Box sx={{ maxWidth: chatMaxWidth, mx: 'auto' }}>
+                <ChatStream
+                  messages={messages}
+                  events={events}
+                  turnEvents={turnEvents}
+                  isLoading={isLoading}
+                  regeneratingTurn={regeneratingTurn}
+                  onRegenerate={regenerateTurn}
+                  feedback={feedbackByTurn}
+                  onFeedback={async (turnIdx, kind) => {
+                    if (!activeId) return;
+                    await setTurnFeedback(activeId, turnIdx, kind);
+                  }}
+                  highlightTurn={highlightTurn}
+                />
+              </Box>
+            ) : (
+              <WelcomeView onSend={handleSend} loading={isLoading} initialText={initialPrompt} workDir={workDir} onSelectWorkDir={setWorkDir} />
+            )}
+          </Box>
         </Box>
 
         {/* 输入区（仅对话态：底部固定） */}

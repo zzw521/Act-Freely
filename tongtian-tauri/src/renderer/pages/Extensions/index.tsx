@@ -2,14 +2,17 @@
  * 通天办公 - 扩展页面（设计图对齐版）
  *
  * 智能体能力由两部分构成：技能、连接器
- * - 连接器：内置工具（随应用内置）+ MCP 市场/已安装（P2 接 connector_*）
- * - 技能：SKILL.md 注入（P1 接 skill_list，当前 Mock 数据）
+ * - 连接器：内置工具（随应用内置）+ MCP 连接器（mcp_* 通道：登记落 mcp_servers，
+ *   「连接」由 Rust 发起真实 JSON-RPC 握手，失败会显示服务器返回的原因）
+ * - 技能：运行目录 `{data_home}/skills/<id>/SKILL.md` 真实扫描（skill_list），
+ *   支持本地安装 / 启停 / 卸载（卸载移入回收目录，不物理删除）；
+ *   浏览器通道无落盘能力，写操作如实拒绝（SKILL_UNSUPPORTED）
  *
  * 标签页由 URL 查询参数驱动：/extensions?tab=skills|connectors
  */
 
 import React, { useEffect, useState } from 'react';
-import { Box, Button, Tab, Tabs, Tooltip, Typography, Snackbar, Alert, Menu, Dialog, DialogTitle, DialogContent, Select, MenuItem, TextField, IconButton } from '@mui/material';
+import { Box, Button, Tab, Tabs, Tooltip, Typography, Snackbar, Alert, Menu, Dialog, DialogTitle, DialogContent, DialogActions, Select, MenuItem, TextField, IconButton, Switch } from '@mui/material';
 import FolderOutlinedIcon from '@mui/icons-material/FolderOutlined';
 import DescriptionOutlinedIcon from '@mui/icons-material/DescriptionOutlined';
 import TerminalIcon from '@mui/icons-material/Terminal';
@@ -27,11 +30,21 @@ import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
 import ContentPasteIcon from '@mui/icons-material/ContentPaste';
 import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
 import { useSearchParams, useNavigate } from 'react-router-dom';
+import type { InstalledSkill, McpAddReq, McpServer, SkillRootInfo } from '../../../shared/contracts';
+import { errorTextOf } from '../../../shared/error-messages';
+import { mcpAPI, skillAPI } from '../../lib/api';
+import { parseMcpJsonConfig, TRANSPORT_LABEL_TEXT } from '../../lib/mcp-local';
+import { isTauri } from '../../lib/tauri-api';
 
-// ── 对话创建技能的预置提示词（create-skill 流程，保存目录与设计目录对应） ──
+// ── 对话创建技能的预置提示词（create-skill 流程，落盘目录与 skill:list 扫描目录同源） ──
 
-const SKILL_CREATE_PROMPT =
-  '帮我使用 create-skill 创建技能。请先检测当前运行环境，将技能保存到正确路径：虚拟机环境下保存到 /root/.tongtianwork/skills/，否则保存到 ~/.tongtianwork/skills/。首先问我技能应该做什么。';
+/** 用运行目录拼出真实落盘路径；通道未上报目录时如实描述位置 */
+function skillCreatePrompt(skillsRoot: string | null): string {
+  const target = skillsRoot
+    ? `将技能保存到 ${skillsRoot}/（每个技能一个子目录，内含 SKILL.md）`
+    : '将技能保存到通天办公运行目录下的 skills/ 子目录（每个技能一个子目录，内含 SKILL.md）';
+  return `帮我使用 create-skill 创建技能。请检测当前运行环境，${target}。首先问我技能应该做什么。`;
+}
 
 // ── 连接器（MCP 服务器）手动配置模型 ───────────────────
 
@@ -62,13 +75,6 @@ const JSON_IMPORT_PLACEHOLDER = `// You can use either format:
   }
 }`;
 
-/** 原始 tongtianAPI（skill:list 等通用 channel 走 invoke） */
-function rawInvoke(channel: string): Promise<unknown> {
-  const apiObj = (window as unknown as { tongtianAPI?: { invoke: (c: string) => Promise<unknown> } }).tongtianAPI;
-  if (!apiObj) return Promise.resolve([]);
-  return apiObj.invoke(channel);
-}
-
 type TabKey = 'skills' | 'connectors';
 
 // ── 内置工具（随应用内置） ──────────────────────────────
@@ -81,7 +87,7 @@ const BUILTIN_TOOLS = [
   { id: 'data-ops', name: '数据分析', desc: '汇总数据、生成图表与统计摘要', icon: InsightsIcon },
 ];
 
-// ── 连接器市场（P2 接入 connector_*，当前展示 + 占位安装） ──
+// ── 连接器市场目录（仅作浏览入口：点「登记」打开手动配置弹窗，真实登记走 mcp_add_server） ──
 
 const CONNECTORS = [
   { id: 'browser', name: '浏览器自动化', category: '系统级', desc: '连接 Puppeteer 浏览器，实现网页自动化、截图与数据抓取。', icon: PublicIcon },
@@ -92,89 +98,162 @@ const CONNECTORS = [
   { id: 'github', name: 'GitHub', category: '开发', desc: '读取仓库、Issue、PR，与 GitHub API 交互。', icon: TerminalIcon },
 ];
 
-interface SkillItem {
-  id: string;
-  name: string;
-  description?: string;
-  injected?: boolean;
-}
-
-/** 缺省技能数据（Tauri 模式 skill_list 未落地时兜底展示，标注示例） */
-const FALLBACK_SKILLS: SkillItem[] = [
-  { id: 'local-cli', name: 'local-cli', description: '本地 CLI 与系统查询', injected: true },
-];
-
 const ExtensionsPage: React.FC = () => {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const tab = (searchParams.get('tab') as TabKey) || 'connectors';
-  const [skills, setSkills] = useState<SkillItem[]>([]);
+  const [skills, setSkills] = useState<InstalledSkill[]>([]);
   const [skillsLoaded, setSkillsLoaded] = useState(false);
+  const [skillsError, setSkillsError] = useState<string | null>(null);
+  const [skillRoot, setSkillRoot] = useState<SkillRootInfo | null>(null);
   const [toast, setToast] = useState<string | null>(null);
-  const [installed, setInstalled] = useState<Record<string, boolean>>({ fs: true });
+  // MCP 连接器登记台账（mcp:listServers 的真实结果：桌面端读 SQLite，浏览器通道读本地台账）
+  const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
+  const [mcpLoaded, setMcpLoaded] = useState(false);
+  const [mcpError, setMcpError] = useState<string | null>(null);
+  const [mcpBusyId, setMcpBusyId] = useState<string | null>(null);
+  // 移除确认（只删除这一条连接器登记，不动任务/审计等存量数据）
+  const [serverToRemove, setServerToRemove] = useState<McpServer | null>(null);
   // 支持 URL 指定连接器子页签（侧边栏专家套件入口 → sub=builtin）
   const [connectorTab, setConnectorTab] = useState<'builtin' | 'market' | 'installed'>(() => {
     const sub = searchParams.get('sub');
     return sub === 'market' || sub === 'installed' ? sub : 'builtin';
   });
 
-  // 技能列表（skill:list；未落地时兜底示例数据）
-  useEffect(() => {
-    (async () => {
-      try {
-        const list = (await rawInvoke('skill:list')) as unknown as SkillItem[];
-        setSkills(Array.isArray(list) && list.length > 0 ? list : FALLBACK_SKILLS);
-      } catch {
-        setSkills(FALLBACK_SKILLS);
-      } finally {
-        setSkillsLoaded(true);
-      }
-    })();
+  const refreshSkills = React.useCallback(async () => {
+    try {
+      const list = await skillAPI.list();
+      setSkills(Array.isArray(list) ? list : []);
+      setSkillsError(null);
+    } catch (e) {
+      // 如实反映读取失败，不再用示例数据掩盖空态
+      setSkills([]);
+      setSkillsError(errorTextOf(e, '技能列表读取失败'));
+    } finally {
+      setSkillsLoaded(true);
+    }
   }, []);
+
+  // 技能列表 + 运行目录（桌面端扫描 {data_home}/skills/*/SKILL.md，浏览器通道为空）
+  useEffect(() => {
+    void refreshSkills();
+    skillAPI
+      .root()
+      .then(setSkillRoot)
+      .catch(() => setSkillRoot(null));
+  }, [refreshSkills]);
+
+  const refreshMcp = React.useCallback(async () => {
+    try {
+      const list = await mcpAPI.list();
+      setMcpServers(Array.isArray(list) ? list : []);
+      setMcpError(null);
+    } catch (e) {
+      // 如实反映读取失败，不用示例连接器掩盖空态
+      setMcpServers([]);
+      setMcpError(errorTextOf(e, '连接器列表读取失败'));
+    } finally {
+      setMcpLoaded(true);
+    }
+  }, []);
+
+  // MCP 连接器登记台账（mcp_servers / 本地台账；无登记时页面渲染真实空态）
+  useEffect(() => {
+    void refreshMcp();
+  }, [refreshMcp]);
 
   const switchTab = (next: TabKey) => {
     setSearchParams({ tab: next });
   };
 
-  // ── 技能「+ 添加」：下拉菜单 + 上传弹窗状态 ──
+  // ── 技能「+ 添加」：下拉菜单 + 安装弹窗状态 ──
   const [skillAddAnchor, setSkillAddAnchor] = useState<null | HTMLElement>(null);
   const [skillUploadOpen, setSkillUploadOpen] = useState(false);
-  const [skillUploadFile, setSkillUploadFile] = useState<File | null>(null);
-  const [skillDragOver, setSkillDragOver] = useState(false);
+  const [skillSourcePath, setSkillSourcePath] = useState<string | null>(null);
+  const [skillInstalling, setSkillInstalling] = useState(false);
+  // 卸载确认（破坏性操作：目录移入 skills_removed 回收目录，不物理删除）
+  const [skillToRemove, setSkillToRemove] = useState<InstalledSkill | null>(null);
+  const [skillBusyId, setSkillBusyId] = useState<string | null>(null);
 
-  // 通过对话创建技能：跳转新任务对话窗口并预置 create-skill 提示词
+  // 通过对话创建技能：跳转新任务对话窗口并预置 create-skill 提示词（落盘目录取真实运行目录）
   const handleCreateSkillByChat = () => {
     setSkillAddAnchor(null);
-    navigate(`/?prompt=${encodeURIComponent(SKILL_CREATE_PROMPT)}`);
+    navigate(`/?prompt=${encodeURIComponent(skillCreatePrompt(skillRoot?.skillsRoot ?? null))}`);
   };
 
-  // 上传技能：选择/拖拽 .zip 或 SKILL.md
-  const handlePickSkillFile = (file: File | undefined | null) => {
-    if (!file) return;
-    const name = file.name.toLowerCase();
-    if (!name.endsWith('.zip') && name !== 'skill.md') {
-      setToast('仅支持包含 SKILL.md 的 .zip 压缩包或 SKILL.md 文件');
+  const openSkillUploadDialog = () => {
+    setSkillAddAnchor(null);
+    setSkillSourcePath(null);
+    setSkillUploadOpen(true);
+  };
+
+  /** 桌面端通过原生对话框选择 SKILL.md 或含 SKILL.md 的技能目录 */
+  const handlePickSkillSource = async (directory: boolean) => {
+    if (!isTauri()) {
+      setToast(errorTextOf('SKILL_UNSUPPORTED'));
       return;
     }
-    setSkillUploadFile(file);
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const picked = await open({
+        multiple: false,
+        directory,
+        title: directory ? '选择包含 SKILL.md 的技能目录' : '选择技能的 SKILL.md 文件',
+        filters: directory ? undefined : [{ name: 'SKILL.md', extensions: ['md', 'markdown'] }],
+      });
+      if (typeof picked === 'string' && picked.trim()) setSkillSourcePath(picked);
+    } catch (e) {
+      setToast(errorTextOf(e, '文件选择失败'));
+    }
   };
 
-  // 安装上传的技能（Mock 开关：开发阶段本地模拟，联调阶段接本地安装流程）
-  const handleInstallSkillUpload = () => {
-    if (!skillUploadFile) return;
-    if (mockEnabled) {
+  /** 安装技能：本地 SKILL.md 复制到 skills/{id}/（已存在则拒绝覆盖） */
+  const handleInstallSkill = async () => {
+    if (!skillSourcePath || skillInstalling) return;
+    setSkillInstalling(true);
+    try {
+      const s = await skillAPI.install({ source: 'local', localPath: skillSourcePath });
       setSkillUploadOpen(false);
-      setSkillUploadFile(null);
-      setToast(`「${skillUploadFile.name}」校验通过，将安装到 skills 目录（本地安装流程即将上线）`);
-      return;
+      setSkillSourcePath(null);
+      await refreshSkills();
+      setToast(`技能「${s.name}」安装完成`);
+    } catch (e) {
+      setToast(errorTextOf(e, '技能安装失败'));
+    } finally {
+      setSkillInstalling(false);
     }
-    // 联调阶段：真实技能安装接口接入位（校验 SKILL.md 后安装到 skills 目录）
-    setSkillUploadOpen(false);
-    setSkillUploadFile(null);
   };
 
-  /** Mock 开关（技能上传安装的开发阶段模拟） */
-  const mockEnabled = import.meta.env.VITE_MOCK !== 'false';
+  /** 启用/禁用技能：只改状态位，技能文件保持不动 */
+  const handleToggleSkill = async (s: InstalledSkill, enabled: boolean) => {
+    setSkillBusyId(s.id);
+    try {
+      await skillAPI.toggle(s.id, enabled);
+      setSkills((prev) => prev.map((item) => (item.id === s.id ? { ...item, enabled } : item)));
+      setToast(enabled ? `技能「${s.name}」已启用` : `技能「${s.name}」已禁用`);
+    } catch (e) {
+      setToast(errorTextOf(e, '技能状态更新失败'));
+    } finally {
+      setSkillBusyId(null);
+    }
+  };
+
+  /** 确认卸载：目录移出运行目录进入回收目录 */
+  const handleConfirmUninstall = async () => {
+    const target = skillToRemove;
+    if (!target || skillBusyId === target.id) return;
+    setSkillBusyId(target.id);
+    try {
+      await skillAPI.uninstall(target.id);
+      setSkills((prev) => prev.filter((item) => item.id !== target.id));
+      setSkillToRemove(null);
+      setToast(`技能「${target.name}」已卸载（目录移入回收目录，可人工找回）`);
+    } catch (e) {
+      setToast(errorTextOf(e, '技能卸载失败'));
+    } finally {
+      setSkillBusyId(null);
+    }
+  };
 
   // ── 连接器「+ 添加」：手动配置 / JSON 导入 ──
   const [connAddAnchor, setConnAddAnchor] = useState<null | HTMLElement>(null);
@@ -188,33 +267,139 @@ const ExtensionsPage: React.FC = () => {
   const [mcpTimeout, setMcpTimeout] = useState('60');
   const [jsonOpen, setJsonOpen] = useState(false);
   const [jsonText, setJsonText] = useState('');
+  const [mcpSaving, setMcpSaving] = useState(false);
+
+  /** 打开手动配置弹窗（市场卡片入口会预填连接器名称） */
+  const openMcpDialog = (name?: string) => {
+    setConnAddAnchor(null);
+    if (name) setMcpName(name);
+    setMcpOpen(true);
+  };
 
   // 手动配置必填校验：名称 + （STDIO 命令 / 远程地址）
   const mcpValid =
     mcpName.trim().length > 0 && (mcpType === 'STDIO' ? mcpCommand.trim().length > 0 : mcpUrl.trim().length > 0);
 
-  // 提交手动配置（Mock 开关：开发阶段本地模拟，联调阶段接 MCP 注册流程）
-  const handleAddMcp = () => {
-    if (!mcpValid) return;
-    setMcpOpen(false);
-    setToast(`「${mcpName.trim()}」配置校验通过，连接器添加流程即将上线（MCP 接入 P2）`);
+  /** 环境变量/请求头键值对 → 映射（空键名丢弃；值只交给后端，不回显） */
+  const kvPairsToMap = (pairs: KvPair[]): Record<string, string> => {
+    const out: Record<string, string> = {};
+    pairs.forEach((p) => {
+      const k = p.key.trim();
+      if (k) out[k] = p.value;
+    });
+    return out;
   };
 
-  // JSON 导入：解析校验后提交
-  const handleImportJson = () => {
-    const text = jsonText.trim();
-    if (!text) return;
+  const mcpReqFromDialog = (): McpAddReq => ({
+    name: mcpName.trim(),
+    transport: mcpType === 'STDIO' ? 'stdio' : mcpType === 'SSE' ? 'sse' : 'streamable_http',
+    command: mcpCommand.trim(),
+    url: mcpUrl.trim(),
+    env: kvPairsToMap(envVars),
+    headers: kvPairsToMap(headers),
+    timeoutSecs: Number(mcpTimeout) || undefined,
+  });
+
+  // 提交手动配置：登记落 mcp_servers（重名/校验失败由后端拒绝并显示原因）
+  const handleAddMcp = async () => {
+    if (!mcpValid || mcpSaving) return;
+    setMcpSaving(true);
     try {
-      JSON.parse(text);
-      setJsonOpen(false);
-      setJsonText('');
-      setToast('JSON 配置校验通过，连接器导入流程即将上线（MCP 接入 P2）');
-    } catch {
-      setToast('JSON 格式无效，请检查后重试');
+      const row = await mcpAPI.add(mcpReqFromDialog());
+      setMcpOpen(false);
+      await refreshMcp();
+      setConnectorTab('installed');
+      setToast(`连接器「${row.name}」已登记，点击「连接」完成握手`);
+    } catch (e) {
+      setToast(errorTextOf(e, '连接器登记失败'));
+    } finally {
+      setMcpSaving(false);
     }
   };
 
-  const installedCount = Object.values(installed).filter(Boolean).length;
+  // JSON 导入：解析社区配置并逐个登记（只解析结构，不执行命令也不联网）
+  const handleImportJson = async () => {
+    const text = jsonText.trim();
+    if (!text || mcpSaving) return;
+    let reqs: McpAddReq[];
+    try {
+      reqs = parseMcpJsonConfig(text);
+    } catch (e) {
+      setToast(errorTextOf(e, 'JSON 格式无效，请检查后重试'));
+      return;
+    }
+    setMcpSaving(true);
+    const failed: string[] = [];
+    let added = 0;
+    for (const req of reqs) {
+      try {
+        await mcpAPI.add(req);
+        added += 1;
+      } catch (e) {
+        failed.push(`${req.name}：${errorTextOf(e, '登记失败')}`);
+      }
+    }
+    setMcpSaving(false);
+    if (added > 0) {
+      setJsonOpen(false);
+      setJsonText('');
+      await refreshMcp();
+      setConnectorTab('installed');
+    }
+    setToast(
+      failed.length
+        ? `${added} 个连接器已登记，${failed.length} 个被拒绝 —— ${failed[0]}`
+        : `${added} 个连接器已登记，点击「连接」完成握手`,
+    );
+  };
+
+  /** 连接：后端按配置真实握手，失败时把服务器返回的原因留在卡片上 */
+  const handleConnectMcp = async (s: McpServer) => {
+    setMcpBusyId(s.serverId);
+    try {
+      const row = await mcpAPI.connect(s.serverId);
+      setMcpServers((prev) => prev.map((item) => (item.serverId === row.serverId ? row : item)));
+      setToast(`连接器「${row.name}」已连接（${row.tools.length} 个工具）`);
+    } catch (e) {
+      setToast(errorTextOf(e, '连接器握手失败'));
+      await refreshMcp();
+    } finally {
+      setMcpBusyId(null);
+    }
+  };
+
+  /** 断开：清除已验证状态与工具缓存，配置保留可随时再连 */
+  const handleDisconnectMcp = async (s: McpServer) => {
+    setMcpBusyId(s.serverId);
+    try {
+      const row = await mcpAPI.disconnect(s.serverId);
+      setMcpServers((prev) => prev.map((item) => (item.serverId === row.serverId ? row : item)));
+      setToast(`连接器「${row.name}」已断开，配置保留`);
+    } catch (e) {
+      setToast(errorTextOf(e, '连接器断开失败'));
+    } finally {
+      setMcpBusyId(null);
+    }
+  };
+
+  /** 确认移除：只删这一条登记（不影响任务与审计存量数据） */
+  const handleConfirmRemoveMcp = async () => {
+    const target = serverToRemove;
+    if (!target) return;
+    setMcpBusyId(target.serverId);
+    try {
+      await mcpAPI.remove(target.serverId);
+      setServerToRemove(null);
+      await refreshMcp();
+      setToast(`连接器「${target.name}」的登记已移除`);
+    } catch (e) {
+      setToast(errorTextOf(e, '连接器移除失败'));
+    } finally {
+      setMcpBusyId(null);
+    }
+  };
+
+  const installedCount = mcpServers.length;
 
   return (
     <Box sx={{ maxWidth: 1080, mx: 'auto' }}>
@@ -314,11 +499,7 @@ const ExtensionsPage: React.FC = () => {
               </Box>
             </Box>
             <Box
-              onClick={() => {
-                setSkillAddAnchor(null);
-                setSkillUploadFile(null);
-                setSkillUploadOpen(true);
-              }}
+              onClick={openSkillUploadDialog}
               sx={{
                 display: 'flex',
                 gap: 1.25,
@@ -347,13 +528,13 @@ const ExtensionsPage: React.FC = () => {
               <Box sx={{ minWidth: 0 }}>
                 <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#1F2937' }}>上传技能</Typography>
                 <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF', mt: 0.25 }}>
-                  导入技能文件，仅本地化安装
+                  从本地 SKILL.md 安装，仅落地到运行目录
                 </Typography>
               </Box>
             </Box>
           </Menu>
 
-          {/* 上传技能弹窗 */}
+          {/* 安装技能弹窗（本地 SKILL.md 增量安装，桌面端原生对话框选择） */}
           <Dialog
             open={skillUploadOpen}
             onClose={() => setSkillUploadOpen(false)}
@@ -361,70 +542,83 @@ const ExtensionsPage: React.FC = () => {
           >
             <DialogTitle sx={{ fontSize: '16px', fontWeight: 700, pb: 1 }}>安装技能</DialogTitle>
             <DialogContent sx={{ pt: '8px !important' }}>
-              {/* 拖拽/点击上传区 */}
+              {/* 来源选择区：点击唤起原生对话框 */}
               <Box
-                component="label"
-                onDragOver={(e) => {
-                  e.preventDefault();
-                  setSkillDragOver(true);
-                }}
-                onDragLeave={() => setSkillDragOver(false)}
-                onDrop={(e) => {
-                  e.preventDefault();
-                  setSkillDragOver(false);
-                  handlePickSkillFile(e.dataTransfer.files?.[0]);
-                }}
+                onClick={() => void handlePickSkillSource(false)}
                 sx={{
                   display: 'flex',
                   flexDirection: 'column',
                   alignItems: 'center',
                   gap: 1,
-                  py: 4,
+                  py: 3.5,
                   borderRadius: '12px',
-                  border: skillDragOver ? '1.5px dashed #8B5CF6' : '1.5px dashed #D1D5DB',
-                  background: skillDragOver ? 'rgba(139, 92, 246, 0.04)' : '#FAFBFC',
+                  border: '1.5px dashed #D1D5DB',
+                  background: '#FAFBFC',
                   cursor: 'pointer',
-                  transition: 'border-color 0.15s ease, background 0.15s ease',
+                  transition: 'border-color 0.15s ease',
                   '&:hover': { borderColor: '#8B5CF6' },
                 }}
               >
-                <CloudUploadOutlinedIcon sx={{ fontSize: 32, color: skillUploadFile ? '#8B5CF6' : '#9CA3AF' }} />
-                <Typography sx={{ fontSize: '13px', color: skillUploadFile ? '#4C1D95' : '#6B7280', fontWeight: skillUploadFile ? 600 : 400 }}>
-                  {skillUploadFile ? skillUploadFile.name : '拖放 .zip 或 SKILL.md 文件，或点击选择'}
+                <CloudUploadOutlinedIcon sx={{ fontSize: 32, color: skillSourcePath ? '#8B5CF6' : '#9CA3AF' }} />
+                <Typography
+                  sx={{
+                    fontSize: '13px',
+                    color: skillSourcePath ? '#4C1D95' : '#6B7280',
+                    fontWeight: skillSourcePath ? 600 : 400,
+                    px: 2,
+                    textAlign: 'center',
+                    wordBreak: 'break-all',
+                  }}
+                >
+                  {skillSourcePath ?? '点击选择技能的 SKILL.md 文件'}
                 </Typography>
-                <input
-                  type="file"
-                  accept=".zip,.md"
-                  hidden
-                  onChange={(e) => handlePickSkillFile(e.target.files?.[0])}
-                />
+                {isTauri() && (
+                  <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF' }}>
+                    也可安装技能目录：
+                    <Box
+                      component="span"
+                      onClick={(e: React.MouseEvent) => {
+                        e.stopPropagation();
+                        void handlePickSkillSource(true);
+                      }}
+                      sx={{ color: '#6366F1', cursor: 'pointer', ml: 0.5 }}
+                    >
+                      选择包含 SKILL.md 的目录
+                    </Box>
+                  </Typography>
+                )}
               </Box>
 
-              {/* 文件要求说明 */}
+              {/* 文件要求说明（与 Rust 安装校验同口径，不夸大能力） */}
               <Box sx={{ mt: 2 }}>
                 <Typography sx={{ fontSize: '12px', color: '#6B7280', lineHeight: 1.7 }}>
                   文件要求：
                 </Typography>
                 <Typography sx={{ fontSize: '12px', color: '#9CA3AF', lineHeight: 1.7 }}>
-                  · 包含 SKILL.md 文件的 .zip 压缩包
+                  · 仅支持 SKILL.md 单文件，或内含 SKILL.md 的技能目录（暂不支持 .zip）
                 </Typography>
                 <Typography sx={{ fontSize: '12px', color: '#9CA3AF', lineHeight: 1.7 }}>
-                  · 或直接插入 SKILL.md 文件
+                  · 技能标识取自来源目录名，重名技能需先卸载（安装不会覆盖既有技能）
                 </Typography>
                 <Typography sx={{ fontSize: '12px', color: '#9CA3AF', lineHeight: 1.7 }}>
-                  · 安装目录与设计目录对应：~/.tongtianwork/skills/（虚拟机环境为 /root/.tongtianwork/skills/）
+                  · 安装目录：{skillRoot?.skillsRoot ?? '（桌面版通天办公运行目录下的 skills/）'}
                 </Typography>
+                {!isTauri() && (
+                  <Typography sx={{ fontSize: '12px', color: '#B45309', lineHeight: 1.7, mt: 0.5 }}>
+                    浏览器预览通道不支持技能增删，请在桌面版通天办公中管理技能
+                  </Typography>
+                )}
               </Box>
 
-              {/* 安装按钮：未选择文件时禁用 */}
+              {/* 安装按钮：未选择来源时禁用 */}
               <Box sx={{ display: 'flex', justifyContent: 'flex-end', mt: 2.5, mb: 1 }}>
                 <Button
                   variant="contained"
-                  disabled={!skillUploadFile}
-                  onClick={handleInstallSkillUpload}
+                  disabled={!skillSourcePath || skillInstalling}
+                  onClick={() => void handleInstallSkill()}
                   sx={{
-                    bgcolor: skillUploadFile ? '#111827' : '#E5E7EB',
-                    color: skillUploadFile ? '#fff' : '#9CA3AF',
+                    bgcolor: skillSourcePath ? '#111827' : '#E5E7EB',
+                    color: skillSourcePath ? '#fff' : '#9CA3AF',
                     borderRadius: '10px',
                     textTransform: 'none',
                     fontSize: '13px',
@@ -434,16 +628,56 @@ const ExtensionsPage: React.FC = () => {
                     '&.Mui-disabled': { bgcolor: '#E5E7EB', color: '#9CA3AF' },
                   }}
                 >
-                  安装
+                  {skillInstalling ? '安装中…' : '安装'}
                 </Button>
               </Box>
             </DialogContent>
           </Dialog>
 
-          {skillsLoaded && skills.length === 0 ? (
-            <Typography sx={{ fontSize: '13px', color: '#9CA3AF', p: 4, textAlign: 'center' }}>
-              暂无技能，技能市场即将上线
-            </Typography>
+          {/* 卸载确认弹窗（目录移入回收目录，可人工找回） */}
+          <Dialog
+            open={Boolean(skillToRemove)}
+            onClose={() => setSkillToRemove(null)}
+            PaperProps={{ sx: { width: 420, borderRadius: '16px', p: 1 } }}
+          >
+            <DialogTitle sx={{ fontSize: '16px', fontWeight: 700 }}>卸载技能</DialogTitle>
+            <DialogContent sx={{ pt: '8px !important' }}>
+              <Typography sx={{ fontSize: '13px', color: '#4B5563', lineHeight: 1.7 }}>
+                确认卸载「{skillToRemove?.name}」？技能目录会被移出运行目录并放入回收目录
+                {skillRoot?.trashRoot ? `（${skillRoot.trashRoot}）` : ''}，不会物理删除，可随时人工找回。
+              </Typography>
+            </DialogContent>
+            <DialogActions sx={{ px: 3, pb: 2 }}>
+              <Button onClick={() => setSkillToRemove(null)} sx={{ textTransform: 'none', fontSize: '13px' }}>
+                取消
+              </Button>
+              <Button
+                variant="contained"
+                color="error"
+                disabled={skillBusyId === skillToRemove?.id}
+                onClick={() => void handleConfirmUninstall()}
+                sx={{ textTransform: 'none', fontSize: '13px', borderRadius: '10px', px: 2.5 }}
+              >
+                {skillBusyId === skillToRemove?.id ? '卸载中…' : '确认卸载'}
+              </Button>
+            </DialogActions>
+          </Dialog>
+
+          {skillsError && (
+            <Alert severity="error" sx={{ mb: 2, fontSize: '13px' }} onClose={() => setSkillsError(null)}>
+              {skillsError}
+            </Alert>
+          )}
+
+          {skillsLoaded && skills.length === 0 && !skillsError ? (
+            <Box sx={{ p: 4, textAlign: 'center' }}>
+              <Typography sx={{ fontSize: '13px', color: '#9CA3AF' }}>
+                运行目录下暂无技能（{skillRoot?.skillsRoot ?? 'skills/'}）
+              </Typography>
+              <Typography sx={{ fontSize: '12px', color: '#B0B7C3', mt: 0.75 }}>
+                点击右上角「添加」，通过对话创建或直接安装本地 SKILL.md
+              </Typography>
+            </Box>
           ) : (
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
               {skills.map((s) => (
@@ -474,24 +708,67 @@ const ExtensionsPage: React.FC = () => {
                     <StarIcon sx={{ fontSize: 20, color: '#fff' }} />
                   </Box>
                   <Box sx={{ flexGrow: 1, minWidth: 0 }}>
-                    <Typography sx={{ fontSize: '14px', fontWeight: 600, color: '#111827' }}>{s.name}</Typography>
-                    {s.description && (
-                      <Typography sx={{ fontSize: '12px', color: '#6B7280', mt: 0.25 }}>{s.description}</Typography>
-                    )}
-                  </Box>
-                  {s.injected && (
-                    <Box
-                      sx={{
-                        px: 1.25,
-                        py: 0.4,
-                        borderRadius: '8px',
-                        background: '#E6F7F4',
-                        border: '1px solid rgba(20, 184, 166, 0.25)',
-                      }}
-                    >
-                      <Typography sx={{ fontSize: '11px', fontWeight: 600, color: '#0D9488' }}>已注入</Typography>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                      <Typography sx={{ fontSize: '14px', fontWeight: 600, color: '#111827' }}>{s.name}</Typography>
+                      {!s.enabled && (
+                        <Box
+                          sx={{
+                            px: 1,
+                            py: 0.2,
+                            borderRadius: '6px',
+                            background: '#F3F4F6',
+                          }}
+                        >
+                          <Typography sx={{ fontSize: '11px', fontWeight: 600, color: '#6B7280' }}>已禁用</Typography>
+                        </Box>
+                      )}
+                      {!s.readable && (
+                        <Box sx={{ px: 1, py: 0.2, borderRadius: '6px', background: '#FEF3C7' }}>
+                          <Tooltip title="SKILL.md 读取失败或超出大小上限，请卸载后重新安装">
+                            <Typography sx={{ fontSize: '11px', fontWeight: 600, color: '#B45309' }}>
+                              不可读
+                            </Typography>
+                          </Tooltip>
+                        </Box>
+                      )}
                     </Box>
-                  )}
+                    <Typography sx={{ fontSize: '12px', color: '#6B7280', mt: 0.25 }}>
+                      {s.description ?? '（SKILL.md 未填写描述）'}
+                    </Typography>
+                    <Tooltip title={s.path}>
+                      <Typography
+                        sx={{
+                          fontSize: '11px',
+                          color: '#B0B7C3',
+                          mt: 0.25,
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                          maxWidth: 520,
+                        }}
+                      >
+                        {s.path}
+                      </Typography>
+                    </Tooltip>
+                  </Box>
+                  <Tooltip title={s.enabled ? '禁用后对话中不可调用，技能文件保持不动' : '启用后可在对话中调用'}>
+                    <Switch
+                      checked={s.enabled}
+                      disabled={!isTauri() || skillBusyId === s.id}
+                      onChange={(_, checked) => void handleToggleSkill(s, checked)}
+                    />
+                  </Tooltip>
+                  <Tooltip title={isTauri() ? '卸载（移入回收目录）' : '浏览器通道不支持卸载'}>
+                    <span>
+                      <IconButton
+                        size="small"
+                        disabled={!isTauri() || skillBusyId === s.id}
+                        onClick={() => setSkillToRemove(s)}
+                      >
+                        <DeleteOutlineIcon sx={{ fontSize: 18, color: '#9CA3AF' }} />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
                 </Box>
               ))}
             </Box>
@@ -758,7 +1035,7 @@ const ExtensionsPage: React.FC = () => {
               <Button
                 fullWidth
                 variant="contained"
-                disabled={!mcpValid}
+                disabled={!mcpValid || mcpSaving}
                 onClick={handleAddMcp}
                 sx={{
                   mt: 1,
@@ -773,7 +1050,7 @@ const ExtensionsPage: React.FC = () => {
                   '&.Mui-disabled': { bgcolor: '#E5E7EB', color: '#9CA3AF' },
                 }}
               >
-                添加
+                {mcpSaving ? '登记中…' : '添加'}
               </Button>
             </DialogContent>
           </Dialog>
@@ -808,7 +1085,7 @@ const ExtensionsPage: React.FC = () => {
               <Button
                 fullWidth
                 variant="contained"
-                disabled={!jsonText.trim()}
+                disabled={!jsonText.trim() || mcpSaving}
                 onClick={handleImportJson}
                 sx={{
                   mt: 2,
@@ -823,7 +1100,7 @@ const ExtensionsPage: React.FC = () => {
                   '&.Mui-disabled': { bgcolor: '#E5E7EB', color: '#9CA3AF' },
                 }}
               >
-                导入
+                {mcpSaving ? '导入中…' : '导入'}
               </Button>
             </DialogContent>
           </Dialog>
@@ -895,15 +1172,16 @@ const ExtensionsPage: React.FC = () => {
             </Box>
           )}
 
-          {/* MCP 连接器卡片网格 */}
-          {connectorTab !== 'builtin' && (
+          {/* 市场目录：点开即打开手动配置弹窗并预填名称（市场自动安装未接入，不伪造「已安装」） */}
+          {connectorTab === 'market' && (
+            <Typography sx={{ fontSize: '12px', color: '#9CA3AF', mb: 1.5 }}>
+              目录内连接器需在下方弹窗填写真实启动命令或服务地址后登记；登记完成即可点击「连接」握手取工具清单。
+            </Typography>
+          )}
+          {connectorTab !== 'builtin' && connectorTab !== 'installed' && (
           <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 2 }}>
-            {(connectorTab === 'market'
-              ? CONNECTORS
-              : CONNECTORS.filter((c) => installed[c.id])
-            ).map((c) => {
+            {CONNECTORS.map((c) => {
               const Icon = c.icon;
-              const isInstalled = !!installed[c.id];
               return (
                 <Box
                   key={c.id}
@@ -927,15 +1205,92 @@ const ExtensionsPage: React.FC = () => {
                     {c.desc}
                   </Typography>
                   <Box sx={{ display: 'flex', justifyContent: 'flex-end', mt: 0.5 }}>
-                    {isInstalled ? (
-                      <Box sx={{ px: 1.5, py: 0.5, borderRadius: '8px', background: '#E6F7F4' }}>
-                        <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#0D9488' }}>已安装</Typography>
-                      </Box>
+                    <Button
+                      size="small"
+                      variant="contained"
+                      onClick={() => openMcpDialog(c.name)}
+                      sx={{
+                        bgcolor: '#111827',
+                        borderRadius: '8px',
+                        textTransform: 'none',
+                        fontSize: '12px',
+                        px: 2,
+                        '&:hover': { bgcolor: '#1F2937' },
+                      }}
+                    >
+                      登记
+                    </Button>
+                  </Box>
+                </Box>
+              );
+            })}
+          </Box>
+          )}
+
+          {/* 已安装 = 真实登记在册的 MCP 连接器（mcp_servers / 本地台账），含握手状态与工具数 */}
+          {connectorTab === 'installed' && mcpServers.length > 0 && (
+            <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 2 }}>
+              {mcpServers.map((s) => (
+                <Box
+                  key={s.serverId}
+                  sx={{
+                    border: '1px solid #EEF0F2',
+                    borderRadius: '14px',
+                    p: 2,
+                    background: '#FFFFFF',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 1,
+                  }}
+                >
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <TerminalIcon sx={{ fontSize: 18, color: '#374151' }} />
+                    <Typography sx={{ fontSize: '14px', fontWeight: 600, color: '#111827' }}>{s.name}</Typography>
+                    <Box sx={{ flexGrow: 1 }} />
+                    <Typography sx={{ fontSize: '11px', color: '#9CA3AF' }}>
+                      {TRANSPORT_LABEL_TEXT[s.transport] ?? s.transport}
+                    </Typography>
+                  </Box>
+                  <Typography sx={{ fontSize: '12px', color: '#6B7280', lineHeight: 1.6 }}>
+                    {s.transport === 'stdio'
+                      ? `启动命令：${s.command}${s.args.length ? ` ${s.args.join(' ')}` : ''}`
+                      : `服务地址：${s.url}`}
+                  </Typography>
+                  {s.status === 'connected' ? (
+                    <Typography sx={{ fontSize: '12px', color: '#0D9488', fontWeight: 600 }}>
+                      已连接 · {s.tools.length} 个工具
+                    </Typography>
+                  ) : s.status === 'failed' ? (
+                    <Typography sx={{ fontSize: '12px', color: '#DC2626', lineHeight: 1.6 }}>
+                      上次连接失败：{s.lastError || '未知原因'}
+                    </Typography>
+                  ) : (
+                    <Typography sx={{ fontSize: '12px', color: '#9CA3AF' }}>
+                      未连接（配置已保存，握手后才会显示工具清单）
+                    </Typography>
+                  )}
+                  {(s.envKeys.length > 0 || s.headerKeys.length > 0) && (
+                    <Typography sx={{ fontSize: '11px', color: '#9CA3AF' }}>
+                      凭据项：{[...s.envKeys, ...s.headerKeys].join('、')}（值仅存本机，不回显）
+                    </Typography>
+                  )}
+                  <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1, mt: 0.5 }}>
+                    {s.status === 'connected' ? (
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        disabled={mcpBusyId === s.serverId}
+                        onClick={() => void handleDisconnectMcp(s)}
+                        sx={{ borderRadius: '8px', textTransform: 'none', fontSize: '12px' }}
+                      >
+                        断开
+                      </Button>
                     ) : (
                       <Button
                         size="small"
                         variant="contained"
-                        onClick={() => setToast(`「${c.name}」安装能力即将上线（MCP 接入 P2）`)}
+                        disabled={mcpBusyId === s.serverId}
+                        onClick={() => void handleConnectMcp(s)}
                         sx={{
                           bgcolor: '#111827',
                           borderRadius: '8px',
@@ -945,20 +1300,51 @@ const ExtensionsPage: React.FC = () => {
                           '&:hover': { bgcolor: '#1F2937' },
                         }}
                       >
-                        安装
+                        {mcpBusyId === s.serverId ? '握手中…' : '连接'}
                       </Button>
                     )}
+                    <IconButton
+                      size="small"
+                      onClick={() => setServerToRemove(s)}
+                      sx={{ color: '#9CA3AF', '&:hover': { color: '#DC2626' } }}
+                    >
+                      <DeleteOutlineIcon sx={{ fontSize: 16 }} />
+                    </IconButton>
                   </Box>
                 </Box>
-              );
-            })}
-          </Box>
+              ))}
+            </Box>
           )}
-          {connectorTab === 'installed' && installedCount === 0 && (
+          {connectorTab === 'installed' && mcpLoaded && mcpServers.length === 0 && (
             <Typography sx={{ fontSize: '13px', color: '#9CA3AF', p: 4, textAlign: 'center' }}>
-              暂无已安装连接器
+              {mcpError ?? '暂无已登记的 MCP 连接器，点击「+ 添加」手动配置或用 JSON 导入'}
             </Typography>
           )}
+
+          {/* 移除连接器确认（只删这一条登记，不动任务与审计存量数据） */}
+          <Dialog open={!!serverToRemove} onClose={() => setServerToRemove(null)} maxWidth="xs" fullWidth>
+            <DialogTitle sx={{ fontSize: '16px', fontWeight: 700 }}>移除连接器登记</DialogTitle>
+            <DialogContent>
+              <Typography sx={{ fontSize: '13px', color: '#6B7280', lineHeight: 1.7 }}>
+                将移除「{serverToRemove?.name}」的连接配置{serverToRemove?.status === 'connected' ? '（当前处于已连接状态）' : ''}。
+                历史任务与审计记录不受影响，之后可用相同配置重新登记。
+              </Typography>
+            </DialogContent>
+            <DialogActions sx={{ px: 3, pb: 2 }}>
+              <Button onClick={() => setServerToRemove(null)} sx={{ textTransform: 'none', fontSize: '13px' }}>
+                取消
+              </Button>
+              <Button
+                variant="contained"
+                color="error"
+                disabled={mcpBusyId === serverToRemove?.serverId}
+                onClick={() => void handleConfirmRemoveMcp()}
+                sx={{ textTransform: 'none', fontSize: '13px', borderRadius: '8px' }}
+              >
+                确认移除
+              </Button>
+            </DialogActions>
+          </Dialog>
         </Box>
       )}
 

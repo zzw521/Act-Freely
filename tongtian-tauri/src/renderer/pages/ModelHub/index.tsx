@@ -6,6 +6,7 @@
  * - 模型配置管理 (增删改查)
  * - 模型连通性测试
  * - 本地/云端模型切换
+ * - 用量统计（每模型明细 + 周期总览 + 按需报表，数据源为真实 token 台账）
  */
 
 import React, { useState, useEffect } from 'react';
@@ -43,6 +44,7 @@ import {
 } from '@mui/icons-material';
 import ModelForm from '../../components/ModelForm';
 import ModelStatsPanel from '../../components/ModelStatsPanel';
+import UsageOverviewPanel from '../../components/UsageOverviewPanel';
 import { useModelStore } from '../../stores';
 import { useModelUsageStore } from '../../stores/useModelUsageStore';
 import type { ModelConfig as StoreModelConfig } from '../../stores/useModelStore';
@@ -89,20 +91,31 @@ const ModelHub: React.FC = () => {
   const [rawModels, setRawModels] = useState<ModelConfig[]>([]);
 
   // 用量统计 store
-  const { stats, period, setPeriod, loadUsageStats } = useModelUsageStore(
+  const {
+    stats,
+    period,
+    setPeriod,
+    loadUsageStats,
+    error: usageError,
+  } = useModelUsageStore(
     useShallow((state) => ({
       stats: state.stats,
       period: state.period,
       setPeriod: state.setPeriod,
       loadUsageStats: state.loadUsageStats,
+      error: state.error,
     }))
   );
 
   // 加载模型列表
   useEffect(() => {
     loadModels();
-    loadUsageStats();
   }, []);
+
+  // 用量统计：进入用量页签时拉取真实台账（避免展示陈旧数据）
+  useEffect(() => {
+    if (activeTab === 1) loadUsageStats();
+  }, [activeTab]);
 
   const loadModels = async () => {
     try {
@@ -295,6 +308,9 @@ const ModelHub: React.FC = () => {
         </Paper>
       )}
 
+      {/* 用量总览与报表（usage:stats / usage:report） */}
+      {activeTab === 1 && <UsageOverviewPanel />}
+
       {/* 模型列表 / 用量统计 */}
       <Grid container spacing={2}>
         {activeTab === 0 ? (
@@ -394,7 +410,18 @@ const ModelHub: React.FC = () => {
           )
         ) : (
           /* 用量统计 */
-          stats.length === 0 ? (
+          usageError ? (
+            <Grid item xs={12}>
+              <Paper sx={{ p: 4, textAlign: 'center', borderRadius: '16px' }}>
+                <Typography variant="body1" color="error">
+                  {usageError}
+                </Typography>
+                <Button sx={{ mt: 2 }} onClick={() => loadUsageStats()}>
+                  重新加载
+                </Button>
+              </Paper>
+            </Grid>
+          ) : stats.length === 0 ? (
             <Grid item xs={12}>
               <Paper sx={{ p: 6, textAlign: 'center', borderRadius: '16px' }}>
                 <Typography variant="h6" color="text.secondary">

@@ -101,9 +101,9 @@ const ModelStatsPanel: React.FC<ModelStatsPanelProps> = ({ stats, onSetLimit }) 
             </Typography>
           </Box>
           
-          <Tooltip title={`${stats.usagePercent.toFixed(1)}%`}>
+          <Tooltip title={stats.tokensLimit ? `${stats.usagePercent.toFixed(1)}%` : '未设置限额'}>
             <LinearProgress
-              variant={stats.tokensLimit ? 'determinate' : 'indeterminate'}
+              variant="determinate"
               value={stats.usagePercent}
               color={getProgressColor()}
               sx={{

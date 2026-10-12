@@ -27,6 +27,8 @@ import DesktopWindowsIcon from '@mui/icons-material/DesktopWindows';
 import HubIcon from '@mui/icons-material/Hub';
 import StorefrontIcon from '@mui/icons-material/Storefront';
 import { listConnectors, authorizeConnector, revokeConnector } from '../../lib/alignment-api';
+import { errorTextOf } from '../../../shared/error-messages';
+import { useAppStore } from '../../stores/useAppStore';
 
 // ── 连接器数据（开发阶段 Mock，联调阶段替换为远端市场 API） ──────────
 
@@ -166,8 +168,9 @@ const ConnectorCenter: React.FC = () => {
   const [tab, setTab] = useState<'builtin' | 'market'>('builtin');
   const [statuses, setStatuses] = useState<Record<string, AuthStatus>>({});
   const [authTarget, setAuthTarget] = useState<ConnectorDef | null>(null);
+  const showNotification = useAppStore((s) => s.showNotification);
 
-  // 从持久层加载连接器授权状态（Electron 走 sqlite，浏览器回退 localStorage）
+  // 从持久层加载连接器授权状态（Tauri 走 sqlite，浏览器回退本地台账）
   useEffect(() => {
     listConnectors()
       .then((list) => {
@@ -177,7 +180,11 @@ const ConnectorCenter: React.FC = () => {
         });
         setStatuses(map);
       })
-      .catch(() => setStatuses({}));
+      .catch((err: unknown) => {
+        setStatuses({});
+        showNotification(errorTextOf(err, '连接器状态加载失败'), 'error');
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleAuthorize = useCallback(() => {
@@ -189,8 +196,11 @@ const ConnectorCenter: React.FC = () => {
     // 持久化授权状态（真实 IPC）
     authorizeConnector(id, category)
       .then(() => setStatuses((s) => ({ ...s, [id]: 'authorized' })))
-      .catch(() => setStatuses((s) => ({ ...s, [id]: 'none' })));
-  }, [authTarget]);
+      .catch((err: unknown) => {
+        setStatuses((s) => ({ ...s, [id]: 'none' }));
+        showNotification(errorTextOf(err, '授权失败'), 'error');
+      });
+  }, [authTarget, showNotification]);
 
   const defs = tab === 'builtin' ? builtinConnectors : marketConnectors;
 
@@ -225,7 +235,10 @@ const ConnectorCenter: React.FC = () => {
             onConnect={() => setAuthTarget(def)}
             onRevoke={() => {
               setStatuses((s) => ({ ...s, [def.id]: 'none' }));
-              revokeConnector(def.id).catch(() => undefined);
+              revokeConnector(def.id).catch((err: unknown) => {
+                setStatuses((s) => ({ ...s, [def.id]: 'authorized' }));
+                showNotification(errorTextOf(err, '断开失败'), 'error');
+              });
             }}
           />
         ))}

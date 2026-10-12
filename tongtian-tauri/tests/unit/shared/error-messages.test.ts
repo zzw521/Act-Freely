@@ -77,6 +77,11 @@ describe('错误码文案：Bridge 码全覆盖（Rust 侧抛出的码不得裸�
 
 /** 递归收集 src-tauri/src 下 Rust 源码里出现的 BRIDGE_* 错误码字面量 */
 function rustBridgeCodes(): string[] {
+  return rustCodesMatching(/BRIDGE_[A-Z][A-Z_]*/g, (c) => c !== 'BRIDGE_CHAT_HTTP_');
+}
+
+/** 递归收集 Rust 源码中的错误码字面量（可传过滤谓词） */
+function rustCodesMatching(pattern: RegExp, keep: (c: string) => boolean = () => true): string[] {
   const root = fileURLToPath(new URL('../../../src-tauri/src', import.meta.url));
   const found = new Set<string>();
   const walk = (dir: string) => {
@@ -84,14 +89,181 @@ function rustBridgeCodes(): string[] {
       const p = join(dir, entry.name);
       if (entry.isDirectory()) walk(p);
       else if (entry.name.endsWith('.rs')) {
-        for (const m of readFileSync(p, 'utf8').matchAll(/BRIDGE_[A-Z][A-Z_]*/g)) found.add(m[0]);
+        for (const m of readFileSync(p, 'utf8').matchAll(pattern)) found.add(m[0]);
       }
     }
   };
   walk(root);
-  // BRIDGE_CHAT_HTTP_ 为动态码前缀，由前缀分支单独覆盖
-  return [...found].filter((c) => c !== 'BRIDGE_CHAT_HTTP_').sort();
+  return [...found].filter(keep).sort();
 }
+
+describe('错误码文案：安全与治理码全覆盖（Rust security 模块抛出的码不得裸奔）', () => {
+  const emitted = rustCodesMatching(/(?:POLICY|AUDIT)_[A-Z][A-Z_]*/g);
+
+  it('Rust security 源码扫描命中错误码（防止路径配置失效导致空集合假通过）', () => {
+    expect(emitted.length).toBeGreaterThan(0);
+  });
+
+  it.each(emitted.map((c) => [c, c]))('Rust 抛出码 %s 有用户文案', (code) => {
+    expect(errorMessageOf(code)).not.toContain('发生错误（');
+  });
+
+  it('ErrorCode 枚举中的安全码均已登记文案', () => {
+    const safety = Object.values(ErrorCode).filter(
+      (c) => c.startsWith('POLICY_') || c.startsWith('AUDIT_'),
+    );
+    expect(safety.length).toBeGreaterThan(0);
+    for (const code of safety) {
+      expect(errorMessageOf(code)).not.toContain('发生错误（');
+    }
+  });
+});
+
+describe('错误码文案：模型用量码全覆盖（Rust model::usage 抛出的码不得裸奔）', () => {
+  const emitted = rustCodesMatching(/USAGE_[A-Z][A-Z_]*/g);
+
+  it('Rust 用量模块源码扫描命中错误码（防止路径配置失效导致空集合假通过）', () => {
+    expect(emitted.length).toBeGreaterThan(0);
+  });
+
+  it.each(emitted.map((c) => [c, c]))('Rust 抛出码 %s 有用户文案', (code) => {
+    expect(errorMessageOf(code)).not.toContain('发生错误（');
+  });
+
+  it('ErrorCode 枚举中的用量码均已登记文案', () => {
+    const usage = Object.values(ErrorCode).filter((c) => c.startsWith('USAGE_'));
+    expect(usage.length).toBeGreaterThan(0);
+    for (const code of usage) {
+      expect(errorMessageOf(code)).not.toContain('发生错误（');
+    }
+  });
+});
+
+describe('错误码文案：定时任务码全覆盖（Rust task::schedule / keep_awake 抛出的码不得裸奔）', () => {
+  // 只收「字符串字面量」中的码（lookbehind 要求紧跟双引号）：避免把常量名当成错误码
+  const emitted = rustCodesMatching(/(?<=")SCHEDULE_[A-Z][A-Z_]*/g);
+
+  it('Rust 定时任务源码扫描命中错误码（防止路径配置失效导致空集合假通过）', () => {
+    expect(emitted.length).toBeGreaterThan(0);
+    // 常量名误入即视为扫描失效
+    expect(emitted).not.toContain('SCHEDULE_RUN');
+  });
+
+  it.each(emitted.map((c) => [c, c]))('Rust 抛出码 %s 有用户文案', (code) => {
+    expect(errorMessageOf(code)).not.toContain('发生错误（');
+  });
+
+  it('ErrorCode 枚举中的定时任务码均已登记文案', () => {
+    const schedule = Object.values(ErrorCode).filter((c) => c.startsWith('SCHEDULE_'));
+    expect(schedule.length).toBeGreaterThan(0);
+    for (const code of schedule) {
+      expect(errorMessageOf(code)).not.toContain('发生错误（');
+    }
+  });
+
+  it('关键拒绝路径文案可读（非法时刻/频率/重复执行）', () => {
+    expect(errorMessageOf(ErrorCode.SCHEDULE_INVALID_TIME)).toContain('24 小时制');
+    expect(errorMessageOf(ErrorCode.SCHEDULE_INVALID_FREQ)).toContain('每小时');
+    expect(errorMessageOf(ErrorCode.SCHEDULE_ALREADY_RUNNING)).toContain('正在执行中');
+  });
+});
+
+describe('错误码文案：技能码全覆盖（Rust skill 模块抛出的码不得裸奔）', () => {
+  // 只收字符串字面量中的码，避免把 DISABLED_KEY 之类常量名当成错误码
+  const emitted = rustCodesMatching(/(?<=")SKILL_[A-Z][A-Z_]*/g);
+
+  it('Rust 技能源码扫描命中错误码（防止路径配置失效导致空集合假通过）', () => {
+    expect(emitted.length).toBeGreaterThan(0);
+    expect(emitted).not.toContain('SKILL_LIST');
+  });
+
+  it.each(emitted.map((c) => [c, c]))('Rust 抛出码 %s 有用户文案', (code) => {
+    expect(errorMessageOf(code)).not.toContain('发生错误（');
+  });
+
+  it('ErrorCode 枚举中的技能码均已登记文案', () => {
+    const skills = Object.values(ErrorCode).filter((c) => c.startsWith('SKILL_'));
+    expect(skills.length).toBeGreaterThan(0);
+    for (const code of skills) {
+      expect(errorMessageOf(code)).not.toContain('发生错误（');
+    }
+  });
+
+  it('关键拒绝路径文案指向可操作动作', () => {
+    expect(errorMessageOf(ErrorCode.SKILL_INCOMPATIBLE)).toContain('SKILL.md');
+    expect(errorMessageOf(ErrorCode.SKILL_UNSUPPORTED)).toContain('桌面版');
+    expect(errorMessageOf(ErrorCode.SKILL_INSTALL_FAILED)).toContain('写入权限');
+  });
+});
+
+describe('错误码文案：MCP 连接器码全覆盖（Rust mcp 模块抛出的码不得裸奔）', () => {
+  // 只收字符串字面量中的码，避免把 TRANSPORT_STDIO 之类的常量名当成错误码
+  const emitted = rustCodesMatching(/(?<=")MCP_[A-Z][A-Z_]*/g);
+
+  it('Rust MCP 源码扫描命中错误码（防止路径配置失效导致空集合假通过）', () => {
+    expect(emitted.length).toBeGreaterThan(0);
+    expect(emitted).not.toContain('MCP_LIST_SERVERS');
+  });
+
+  it.each(emitted.map((c) => [c, c]))('Rust 抛出码 %s 有用户文案', (code) => {
+    expect(errorMessageOf(code)).not.toContain('发生错误（');
+  });
+
+  it('ErrorCode 枚举中的 MCP 码均已登记文案', () => {
+    const mcp = Object.values(ErrorCode).filter((c) => c.startsWith('MCP_'));
+    expect(mcp.length).toBeGreaterThan(0);
+    for (const code of mcp) {
+      expect(errorMessageOf(code)).not.toContain('发生错误（');
+    }
+  });
+
+  it('关键拒绝路径文案指向可操作动作', () => {
+    expect(errorMessageOf(ErrorCode.MCP_INVALID_TRANSPORT)).toContain('STDIO');
+    expect(errorMessageOf(ErrorCode.MCP_INVALID_URL)).toContain('http');
+    expect(errorMessageOf(ErrorCode.MCP_SERVER_EXISTS)).toContain('同名');
+    expect(errorMessageOf(ErrorCode.MCP_SERVER_NOT_FOUND)).toContain('刷新');
+    expect(errorMessageOf(ErrorCode.MCP_TIMEOUT)).toContain('超时');
+    expect(errorMessageOf(ErrorCode.MCP_UNSUPPORTED)).toContain('桌面');
+  });
+});
+
+describe('错误码文案：文件与文档预览码全覆盖（Rust file 模块抛出的码不得裸奔）', () => {
+  // 只收字符串字面量中的码，避免把 SANDBOX_FILE_BLOCKED 之类常量名当成错误码
+  const emitted = rustCodesMatching(/(?<=")FILE_[A-Z][A-Z_]*/g);
+
+  it('Rust 文件源码扫描命中错误码（防止路径配置失效导致空集合假通过）', () => {
+    expect(emitted.length).toBeGreaterThan(0);
+    expect(emitted).toContain('FILE_CONVERSION_FAILED');
+  });
+
+  it.each(emitted.map((c) => [c, c]))('Rust 抛出码 %s 有用户文案', (code) => {
+    expect(errorMessageOf(code)).not.toContain('发生错误（');
+  });
+
+  it('ErrorCode 枚举中的文件码均已登记文案', () => {
+    const fileCodes = Object.values(ErrorCode).filter((c) => c.startsWith('FILE_'));
+    expect(fileCodes.length).toBeGreaterThanOrEqual(9);
+    for (const code of fileCodes) {
+      expect(errorMessageOf(code)).not.toContain('发生错误（');
+    }
+  });
+
+  it('关键拒绝路径文案指向可操作动作', () => {
+    expect(errorMessageOf(ErrorCode.FILE_NOT_FOUND)).toContain('刷新');
+    expect(errorMessageOf(ErrorCode.FILE_ACCESS_DENIED)).toContain('白名单');
+    expect(errorMessageOf(ErrorCode.FILE_CONVERSION_FAILED)).toContain('docx');
+    expect(errorMessageOf(ErrorCode.FILE_TOO_LARGE)).toContain('拆分');
+    expect(errorMessageOf(ErrorCode.FILE_UNSUPPORTED)).toContain('桌面');
+  });
+
+  it('转换失败携带中文原因时不丢诊断信息（原因内无 ASCII 冒号，原样拼进文案）', () => {
+    const text = errorTextOf(
+      'FILE_CONVERSION_FAILED: 旧版二进制 Office 格式（.doc/.xls/.ppt）暂无解析能力，请另存为 docx/xlsx/pptx 后预览',
+    );
+    expect(text.startsWith('文档正文提取失败')).toBe(true);
+    expect(text).toContain('旧版二进制 Office 格式');
+  });
+});
 
 describe('errorTextOf：Tauri command 拒绝值归一', () => {
   it('Rust Err(String) 以裸字符串拒绝时仍能映射（非 Error 实例）', () => {

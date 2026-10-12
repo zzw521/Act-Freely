@@ -34,7 +34,7 @@ pub struct FilePreview {
     pub path: String,
     pub content: String,
     pub mime_type: String,
-    /// 是否可直接预览（docx/xlsx/pdf 本批无转换能力，显式标注不静默）
+    /// 是否可展示正文（Office/PDF 抽不出可信正文时为 false，配合 note 说明原因）
     pub supported: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -204,12 +204,19 @@ fn mime_of(path: &Path) -> &'static str {
         Some("json") => "application/json",
         Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         Some("pdf") => "application/pdf",
+        Some("doc") => "application/msword",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("ppt") => "application/vnd.ms-powerpoint",
         _ => "application/octet-stream",
     }
 }
 
-/// 批量预览：txt/md/csv/json 直读；docx/xlsx/pdf 返回元信息 + 转换未落地提示（不静默）
+/// 容器（Office/PDF）读取上限：与附件上限一致，超出直接说明而不静默返回空正文
+const MAX_PREVIEW_BYTES: u64 = 50 * 1024 * 1024;
+
+/// 批量预览：txt/md/csv/json 直读；docx/xlsx/pptx/pdf 走 office::extract 抽正文
 pub fn preview_in(
     home: &Path,
     store: &Store,
@@ -239,31 +246,73 @@ pub fn preview_in(
                 }),
             }
         } else {
-            out.push(FilePreview {
-                path: fp.clone(),
-                content: String::new(),
-                mime_type: mime.to_string(),
-                supported: false,
-                note: Some("FILE_CONVERSION_FAILED: 格式转换能力下批落地，当前仅可查看元信息".into()),
-            });
+            out.push(preview_document(&path, fp, mime));
         }
     }
     Ok(out)
+}
+
+/// 二进制文档预览：读盘 + 抽正文；任何失败都以 `FILE_CONVERSION_FAILED: <原因>` 显式呈现
+fn preview_document(path: &Path, file_path: &str, mime: &str) -> FilePreview {
+    let failed = |reason: String| FilePreview {
+        path: file_path.to_string(),
+        content: String::new(),
+        mime_type: mime.to_string(),
+        supported: false,
+        note: Some(reason),
+    };
+    let size = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(e) => return failed(format!("FILE_NOT_FOUND: {file_path}（{e}）")),
+    };
+    if size > MAX_PREVIEW_BYTES {
+        return failed(format!(
+            "FILE_TOO_LARGE: 文档超出 {}MB 预览上限（{size} bytes）",
+            MAX_PREVIEW_BYTES / 1024 / 1024
+        ));
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => return failed(format!("FILE_READ_FAILED: 文档读取失败（{e}）")),
+    };
+    match super::office::extract(mime, &bytes) {
+        Ok(ex) => FilePreview {
+            path: file_path.to_string(),
+            content: ex.content,
+            mime_type: mime.to_string(),
+            supported: ex.supported,
+            note: ex.note,
+        },
+        Err(e) => failed(e),
+    }
 }
 
 pub fn preview(store: &Store, workspace_id: &str, file_paths: &[String]) -> Result<Vec<FilePreview>, String> {
     preview_in(&data_home(), store, workspace_id, file_paths)
 }
 
-/// 数据分级检测（简化版：关键词匹配，镜像 spec §6.3 敏感规则）
-fn detect_sensitivity(content_sample: &str, file_name: &str) -> &'static str {
+/// 数据分级检测：统一由 `security::classify` 裁定（避免文件侧与安全页两套敏感规则并存）。
+/// 文件名与内容抽样一起送检，合同/证件/手机号等关键词同样命中。
+fn detect_sensitivity(content_sample: &str, file_name: &str) -> String {
     let hay = format!("{file_name}\n{content_sample}");
-    if hay.contains("绝密") || hay.contains("机密") {
-        "confidential"
-    } else if hay.contains("内部") || hay.contains("秘密") {
-        "internal"
-    } else {
-        "public"
+    crate::security::classify::classify(&hay).sensitivity
+}
+
+/// 分级取样：文本直读前 8K 字；二进制文档先抽正文再取样（抽取失败降级为「仅文件名」）
+fn classify_sample(path: &Path, mime: &str) -> String {
+    const SAMPLE_CHARS: usize = 8192;
+    if let Ok(text) = std::fs::read_to_string(path) {
+        return text.chars().take(SAMPLE_CHARS).collect();
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return String::new();
+    };
+    if bytes.len() as u64 > MAX_PREVIEW_BYTES {
+        return String::new();
+    }
+    match super::office::extract(mime, &bytes) {
+        Ok(ex) => ex.content.chars().take(SAMPLE_CHARS).collect(),
+        Err(_) => String::new(),
     }
 }
 
@@ -321,10 +370,8 @@ pub fn stage_attachment_in(
     let dest = dest_dir.join(&file_name);
     std::fs::copy(src, &dest).map_err(|e| format!("FILE_BACKUP_FAILED: 附件复制失败 {e}"))?;
 
-    // 敏感度抽样检测（读前 8KB 文本）
-    let sample = std::fs::read_to_string(&dest)
-        .map(|s| s.chars().take(8192).collect::<String>())
-        .unwrap_or_default();
+    // 敏感度抽样检测（文本读前 8KB；Office/PDF 先抽正文再取样，避免二进制附件只按文件名分级）
+    let sample = classify_sample(&dest, mime);
     let sensitivity = detect_sensitivity(&sample, &file_name);
 
     Ok(AttachmentMeta {
@@ -332,7 +379,7 @@ pub fn stage_attachment_in(
         staged_path: dest.to_string_lossy().to_string(),
         size_bytes: size,
         mime: mime.to_string(),
-        sensitivity: sensitivity.to_string(),
+        sensitivity,
     })
 }
 
@@ -403,9 +450,75 @@ mod tests {
         cleanup(&home);
     }
 
+    /// docx 走真实正文抽取（ZIP + document.xml），不再是「转换未落地」
     #[test]
-    fn test_preview_binary_reports_conversion_not_ready() {
-        let (home, ws, files, store) = temp_home("bin");
+    fn test_preview_docx_extracts_body() {
+        let (home, ws, files, store) = temp_home("docx");
+        let zip = crate::file::office::zip_build(&[(
+            "word/document.xml",
+            "<w:document><w:body><w:p><w:r><w:t>季度营收说明</w:t></w:r></w:p></w:body></w:document>".as_bytes(),
+            8,
+        )]);
+        std::fs::write(files.join("说明.docx"), &zip).unwrap();
+        let previews = preview_in(
+            &home,
+            &store,
+            &ws,
+            &[files.join("说明.docx").to_str().unwrap().to_string()],
+        )
+        .unwrap();
+        assert!(previews[0].supported, "{:?}", previews[0].note);
+        assert!(previews[0].content.contains("季度营收说明"), "{:?}", previews[0]);
+        assert_eq!(
+            previews[0].mime_type,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        );
+        cleanup(&home);
+    }
+
+    #[test]
+    fn test_preview_xlsx_extracts_cells() {
+        let (home, ws, files, store) = temp_home("xlsx");
+        let zip = crate::file::office::zip_build(&[
+            (
+                "xl/workbook.xml",
+                "<workbook><sheets><sheet name=\"费用\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>".as_bytes(),
+                0,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                b"<Relationships><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>",
+                0,
+            ),
+            (
+                "xl/sharedStrings.xml",
+                "<sst><si><t>差旅</t></si></sst>".as_bytes(),
+                8,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                b"<worksheet><sheetData><row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c><c r=\"B1\"><v>3200</v></c></row></sheetData></worksheet>",
+                8,
+            ),
+        ]);
+        std::fs::write(files.join("费用.xlsx"), &zip).unwrap();
+        let previews = preview_in(
+            &home,
+            &store,
+            &ws,
+            &[files.join("费用.xlsx").to_str().unwrap().to_string()],
+        )
+        .unwrap();
+        assert!(previews[0].supported, "{:?}", previews[0].note);
+        assert!(previews[0].content.contains("【费用】"), "{:?}", previews[0]);
+        assert!(previews[0].content.contains("差旅\t3200"), "{:?}", previews[0]);
+        cleanup(&home);
+    }
+
+    /// 损坏的 Office 容器：note 必须给出原因，且不伪装成正文
+    #[test]
+    fn test_preview_broken_container_reports_reason() {
+        let (home, ws, files, store) = temp_home("broken");
         std::fs::write(files.join("doc.docx"), b"PK\x03\x04fake").unwrap();
         let previews = preview_in(
             &home,
@@ -415,7 +528,77 @@ mod tests {
         )
         .unwrap();
         assert!(!previews[0].supported);
-        assert!(previews[0].note.as_ref().unwrap().contains("FILE_CONVERSION_FAILED"));
+        assert!(previews[0].content.is_empty());
+        let note = previews[0].note.as_ref().unwrap();
+        assert!(note.starts_with("FILE_CONVERSION_FAILED"), "{note}");
+        cleanup(&home);
+    }
+
+    /// 旧版二进制 Office 与未知格式：给出可操作说明，不再出现「下批落地」
+    #[test]
+    fn test_preview_legacy_and_unknown_formats() {
+        let (home, ws, files, store) = temp_home("legacy");
+        std::fs::write(files.join("old.doc"), b"\xd0\xcf\x11\xe0ole").unwrap();
+        std::fs::write(files.join("tool.exe"), b"MZ\x90\x00").unwrap();
+        let previews = preview_in(
+            &home,
+            &store,
+            &ws,
+            &[
+                files.join("old.doc").to_str().unwrap().to_string(),
+                files.join("tool.exe").to_str().unwrap().to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(previews.len(), 2);
+        assert!(previews[0].note.as_ref().unwrap().contains("旧版二进制"), "{:?}", previews[0]);
+        assert!(previews[1].note.as_ref().unwrap().contains("另存为"), "{:?}", previews[1]);
+        for p in &previews {
+            assert!(!p.note.as_ref().unwrap().contains("下批落地"));
+        }
+        cleanup(&home);
+    }
+
+    /// 白名单内但不存在的文档：note 以 FILE_NOT_FOUND 说明；白名单外整体拒绝
+    #[test]
+    fn test_preview_missing_file_is_explicit() {
+        let (home, ws, files, store) = temp_home("missing");
+        let previews = preview_in(
+            &home,
+            &store,
+            &ws,
+            &[files.join("ghost.pdf").to_str().unwrap().to_string()],
+        )
+        .unwrap();
+        assert!(!previews[0].supported);
+        assert!(
+            previews[0].note.as_ref().unwrap().starts_with("FILE_NOT_FOUND"),
+            "{:?}",
+            previews[0]
+        );
+        let denied = preview_in(
+            &home,
+            &store,
+            &ws,
+            &[std::env::temp_dir().join("out-of-whitelist.pdf").to_str().unwrap().to_string()],
+        );
+        assert!(denied.unwrap_err().starts_with("FILE_ACCESS_DENIED"));
+        cleanup(&home);
+    }
+
+    /// 附件分级：docx 二进制正文里的「合同」也必须命中 confidential（旧实现只读文本会漏判）
+    #[test]
+    fn test_stage_attachment_classifies_office_body() {
+        let (home, ws, _files, _store) = temp_home("stageoffice");
+        let zip = crate::file::office::zip_build(&[(
+            "word/document.xml",
+            "<w:document><w:body><w:p><w:r><w:t>本季度采购合同条款清单</w:t></w:r></w:p></w:body></w:document>".as_bytes(),
+            8,
+        )]);
+        let src = home.join("采购.docx");
+        std::fs::write(&src, &zip).unwrap();
+        let meta = stage_attachment_in(&home, &ws, "task-o", src.to_str().unwrap()).unwrap();
+        assert_eq!(meta.sensitivity, "confidential", "{:?}", meta);
         cleanup(&home);
     }
 
@@ -442,6 +625,17 @@ mod tests {
         assert!(Path::new(&meta.staged_path).exists());
         assert_eq!(meta.sensitivity, "internal"); // 关键词命中
         assert!(files.join("attachments").exists());
+        cleanup(&home);
+    }
+
+    /// 分级规则已统一到 security::classify：商业机密关键词（合同）也判 confidential
+    #[test]
+    fn test_stage_attachment_sensitivity_follows_security_rules() {
+        let (home, ws, _files, _store) = temp_home("sens");
+        let src = home.join("采购合同.txt");
+        std::fs::write(&src, "本季度采购合同条款清单").unwrap();
+        let meta = stage_attachment_in(&home, &ws, "task-s", src.to_str().unwrap()).unwrap();
+        assert_eq!(meta.sensitivity, "confidential");
         cleanup(&home);
     }
 

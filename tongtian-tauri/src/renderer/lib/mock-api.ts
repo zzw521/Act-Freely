@@ -11,10 +11,29 @@
  * 文件能力、附件暂存、设置持久化全部提供全真模拟。
  */
 
-import type { ChatEvent } from '../../shared/types';
+import type { ChatEvent, ChatSubmitReq } from '../../shared/types';
 import { isTauri, tauriAPI, createProxiedAPI } from './tauri-api';
 import { engineAPI, ENGINE_DIRECT_URL } from './engine-api';
 import type { LeaseInfo, LeaseTakeoverResp, QuotaSnapshot } from '../../shared/contracts';
+import { handleLocalSecurityChannel } from './security-local';
+import { handleLocalScheduleChannel } from './schedule-local';
+import { handleLocalAlignmentChannel } from './alignment-local';
+import { handleLocalAwarenessChannel } from './awareness-local';
+import { handleLocalConversationChannel } from './conversation-local';
+import { handleLocalWorkspaceChannel } from './workspace-local';
+import { handleLocalSkillChannel } from './skill-local';
+import { handleLocalSuiteChannel } from './suite-local';
+import { handleLocalMcpChannel } from './mcp-local';
+import { assertProxyPatchAcceptable, localProxyStatus } from './proxy-local';
+import { localAutostart } from './system-local';
+import { handleLocalPermissionChannel } from './permissions-local';
+import {
+  localReportView,
+  localUsageRows,
+  normalizePeriod,
+  recordLocalUsage,
+  statsFromRows,
+} from './usage-local';
 
 type EventCallback = (event: ChatEvent) => void;
 
@@ -39,6 +58,11 @@ interface MockTaskState {
   createdAt: number;
   /** 会话子目录（工作目录下按对话时间创建，存放会话内容与产出物） */
   sessionDir: string;
+  /**
+   * 本轮对话选中的模型（用量归属随选择，而不是选了「经济」仍记到默认模型头上）。
+   * Auto / 未匹配到清单时回落默认模型，与引擎的 modelBinding 覆盖语义一致。
+   */
+  model?: { modelName: string; displayName: string };
 }
 
 /** 按对话时间生成会话子目录名：YYYY-MM-DD_HH-MM-SS */
@@ -70,6 +94,38 @@ function mockQuotaSnapshot(): QuotaSnapshot {
   };
 }
 
+/** 当前 Mock 默认模型（用量归属：与 Rust 侧按 model_configs.model_name 归属同口径） */
+function mockActiveModel(): { modelName: string; displayName: string } {
+  const m = mockModels.find((x) => x.isDefault) ?? mockModels[0];
+  return { modelName: m?.modelName || 'mock-model', displayName: m?.name || 'Mock 模型' };
+}
+
+/** 对话内选择的模型 → 用量归属对象。
+ * 优先级与引擎 build_model_and_formatter 一致：档位绑定 > 自定义模型名 > 默认模型；
+ * 档位未在清单里（如内置的 qwen-flash）时按所选名称归属，而不是回落默认——
+ * 否则 Mock 态的用量统计会与用户在输入框选中的模型不符。 */
+function resolveMockModel(
+  modelBinding?: string,
+  modelConfig?: { modelName?: string },
+): { modelName: string; displayName: string } {
+  const selected = (modelBinding ?? '').trim() || (modelConfig?.modelName ?? '').trim();
+  if (selected) {
+    const hit = mockModels.find((m) => m.modelName === selected || m.id === selected);
+    return { modelName: selected, displayName: hit?.name ?? selected };
+  }
+  return mockActiveModel();
+}
+
+/** Mock 用量记账：写入本地台账（Mock 通道权威数据源，供 model:usage 查询） */
+function recordMockUsage(
+  promptTokens: number,
+  completionTokens: number,
+  model?: { modelName: string; displayName: string },
+): void {
+  const { modelName, displayName } = model ?? mockActiveModel();
+  recordLocalUsage(modelName, promptTokens, completionTokens, { displayName });
+}
+
 function defaultSteps(title: string) {
   return [
     { id: 'step-1', order: 1, description: `解析任务目标：${title.slice(0, 20)}`, type: 'llm_call' },
@@ -85,6 +141,12 @@ function schedulePlanFlow(task: MockTaskState) {
     [50, () => emit(seqEvent(task.taskId, { type: 'status_change', status: 'queued', queuePosition: 0 }))],
     [120, () => emit(seqEvent(task.taskId, { type: 'status_change', status: 'planning' }))],
     [700, () => emit(seqEvent(task.taskId, { type: 'plan', planId, steps: task.steps }))],
+    // 计划生成的真实 token 用量（与引擎同位置：plan 之后、pending_review 之前）
+    [730, () => {
+      const modelName = task.model?.modelName ?? mockActiveModel().modelName;
+      recordMockUsage(600, 300, task.model);
+      emit(seqEvent(task.taskId, { type: 'usage', usage: { promptTokens: 600, completionTokens: 300, model: modelName } }));
+    }],
     [760, () => {
       task.status = 'pending_review';
       emit(seqEvent(task.taskId, { type: 'status_change', status: 'pending_review' }));
@@ -100,7 +162,10 @@ function scheduleExecutionFlow(task: MockTaskState) {
   const timeline: Array<[number, () => void]> = [
     [80, () => emit(seqEvent(task.taskId, { type: 'status_change', status: 'executing' }))],
     [300, () => emit(seqEvent(task.taskId, { type: 'step_start', stepId: 'step-1', stepType: 'llm_call', description: task.steps[0]?.description ?? '执行步骤 1' }))],
-    [1100, () => emit(seqEvent(task.taskId, { type: 'step_done', stepId: 'step-1', output: '目标解析完成', usage: { promptTokens: 800, completionTokens: 400 } }))],
+    [1100, () => {
+      recordMockUsage(800, 400, task.model);
+      emit(seqEvent(task.taskId, { type: 'step_done', stepId: 'step-1', output: '目标解析完成', usage: { promptTokens: 800, completionTokens: 400 } }));
+    }],
     [1200, () => {
       // 配额预警示例：跨越 70% 档触发 quota_warning
       mockUsedTokens = Math.max(mockUsedTokens, Math.floor(MOCK_QUOTA_TOKENS * 0.72));
@@ -108,12 +173,20 @@ function scheduleExecutionFlow(task: MockTaskState) {
       emit(seqEvent(task.taskId, { type: 'quota_warning', level: snap.tier, action: snap.action, usedTokens: snap.usedTokens, quotaTokens: snap.quotaTokens }));
     }],
     [1500, () => emit(seqEvent(task.taskId, { type: 'step_start', stepId: 'step-2', stepType: 'llm_call', description: '生成执行计划草稿' }))],
-    [2300, () => emit(seqEvent(task.taskId, { type: 'step_done', stepId: 'step-2', output: '处理完成', usage: { promptTokens: 1200, completionTokens: 600 } }))],
+    [2300, () => {
+      recordMockUsage(1200, 600, task.model);
+      emit(seqEvent(task.taskId, { type: 'step_done', stepId: 'step-2', output: '处理完成', usage: { promptTokens: 1200, completionTokens: 600 } }));
+    }],
     [2600, () => emit(seqEvent(task.taskId, { type: 'step_start', stepId: 'step-3', stepType: 'file_write', description: '产出交付文件' }))],
-    [3400, () => emit(seqEvent(task.taskId, { type: 'step_done', stepId: 'step-3', output: '文件已写入工作区', usage: { promptTokens: 900, completionTokens: 500 } }))],
+    [3400, () => {
+      recordMockUsage(900, 500, task.model);
+      emit(seqEvent(task.taskId, { type: 'step_done', stepId: 'step-3', output: '文件已写入工作区', usage: { promptTokens: 900, completionTokens: 500 } }));
+    }],
     [3800, () => emit(seqEvent(task.taskId, {
       type: 'deliver',
       summary: '任务完成',
+      // 助手回复正文：界面气泡取 final_text（与引擎/Rust deliver 同字段），Mock 同样给真正文
+      final_text: `已按目标「${task.title}」完成分析与处理，交付文件见下方附件。`,
       // 产出物落在会话子目录（工作目录/对话时间）
       artifacts: ['成果报告.md', '数据摘要.xlsx'].map((f) => `${task.sessionDir}/${f}`),
     }))],
@@ -188,6 +261,19 @@ function handleModelChannel(channel: string, arg: unknown): unknown {
   if (channel === 'model:list') {
     return mockModels;
   }
+  // 用量统计：本地台账（Mock 通道权威数据源；与 Rust model_usage 同结构）
+  if (channel === 'model:usage') {
+    const period = normalizePeriod(arg);
+    return { period, rows: localUsageRows(period) };
+  }
+  // 用量总览 / 报表：同一本地台账，映射函数与引擎直连通道共用（口径不漂移）
+  if (channel === 'usage:stats') {
+    const period = normalizePeriod(arg);
+    return statsFromRows(period, localUsageRows(period));
+  }
+  if (channel === 'usage:report') {
+    return localReportView(normalizePeriod(arg));
+  }
   if (channel === 'model:create') {
     const req = (arg ?? {}) as Partial<MockModel> & { apiKey?: string };
     const model: MockModel = {
@@ -246,7 +332,40 @@ function handleModelChannel(channel: string, arg: unknown): unknown {
 
 // ── 文件/附件/设置 Mock ──────────────────────────────────
 
-const mockSettings: Record<string, string> = { theme: 'light', language: 'zh-CN' };
+const MOCK_SETTINGS_LS_KEY = 'tt:settings';
+
+function readMockSettingsSnapshot(): Record<string, unknown> {
+  try {
+    if (typeof localStorage === 'undefined') return {};
+    const raw = localStorage.getItem(MOCK_SETTINGS_LS_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function persistMockSettings(settings: Record<string, unknown>): void {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(MOCK_SETTINGS_LS_KEY, JSON.stringify(settings));
+    }
+  } catch {
+    // 受限环境（node/隐私模式）只保留内存台账
+  }
+}
+
+/**
+ * 设置台账。与真实 Rust `settings_kv` 同语义：保存即持久，刷新不丢
+ * （否则开发预览里改完主题一刷新就回退，无法自测设置的生效链路）。
+ */
+const mockSettings: Record<string, unknown> = {
+  theme: 'light',
+  language: 'zh-CN',
+  ...readMockSettingsSnapshot(),
+};
 
 // ── 账号登录态 Mock（与 Rust 侧 TT_AUTH_MOCK 语义一致） ──────
 
@@ -279,6 +398,21 @@ function handleAuthChannel(channel: string): unknown {
   return null;
 }
 
+// Mock 侧 MIME 判定与 Rust `mime_of` 同表（前端按扩展名展示，不参与安全裁定）
+const MIME_BY_EXT: Record<string, string> = {
+  '.txt': 'text/plain',
+  '.md': 'text/markdown',
+  '.csv': 'text/csv',
+  '.json': 'application/json',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.pdf': 'application/pdf',
+  '.doc': 'application/msword',
+  '.xls': 'application/vnd.ms-excel',
+  '.ppt': 'application/vnd.ms-powerpoint',
+};
+
 function handleFileChannel(channel: string, args: unknown[]): unknown {
   if (channel === 'file:browse') {
     return [
@@ -291,27 +425,32 @@ function handleFileChannel(channel: string, args: unknown[]): unknown {
   }
   if (channel === 'file:preview') {
     const paths = (args[0] as string[]) ?? [];
-    return paths.map((p) => ({
-      path: p,
-      content: p.endsWith('.md') || p.endsWith('.txt') ? 'Mock 预览内容' : '',
-      mimeType: p.endsWith('.md') ? 'text/markdown' : 'application/octet-stream',
-      supported: p.endsWith('.md') || p.endsWith('.txt'),
-      note: p.endsWith('.md') || p.endsWith('.txt') ? undefined : 'FILE_CONVERSION_FAILED: 格式转换能力下批落地',
-    }));
+    return paths.map((p) => {
+      const lower = p.toLowerCase();
+      const textLike = /\.(md|txt|csv|json)$/.test(lower);
+      if (textLike) {
+        return {
+          path: p,
+          content: '# 示例文档\n\n这是 Mock 模式下的文件正文。',
+          mimeType: MIME_BY_EXT[lower.slice(lower.lastIndexOf('.'))] ?? 'text/plain',
+          supported: true,
+        };
+      }
+      // 本机文档正文只有桌面版（Rust + office 解析）拿得到，这里不伪造「已提取」
+      return {
+        path: p,
+        content: '',
+        mimeType: MIME_BY_EXT[lower.slice(lower.lastIndexOf('.'))] ?? 'application/octet-stream',
+        supported: false,
+        note: 'FILE_UNSUPPORTED: 当前运行通道无法读取本机文档正文，请在桌面版通天办公中预览',
+      };
+    });
   }
   return [];
 }
 
 /** 常用 channel 的 Mock 返回值 */
 const channelMocks: Record<string, unknown> = {
-  'model:usage': [],
-  'workspace:list': [],
-  'skill:list': [
-    { id: 'local-cli', name: 'local-cli', description: '本地 CLI 与系统查询', injected: true },
-  ],
-  'mcp:list': [],
-  'schedule:list': [],
-  'audit:query': [],
   'system:info': { platform: 'mock', version: '0.1.0' },
   'system:health': { ok: true, details: { mock: true } },
 };
@@ -321,7 +460,61 @@ const mockAPI = {
   invoke: async (channel: string, ...args: unknown[]): Promise<unknown> => {
     console.info('[mock-api] invoke', channel);
     if (channel.startsWith('model:')) return handleModelChannel(channel, args[0]);
+    // 用量总览/报表与模型用量同源，交给同一个本地台账处理函数
+    if (channel === 'usage:stats' || channel === 'usage:report') {
+      return handleModelChannel(channel, args[0]);
+    }
     if (channel.startsWith('file:')) return handleFileChannel(channel, args);
+    if (
+      channel.startsWith('security:') ||
+      channel.startsWith('compliance:') ||
+      channel.startsWith('sandbox:') ||
+      channel.startsWith('audit:')
+    ) {
+      // 与浏览器直连引擎通道共用同一份本地实现（无 Rust 后端时的 Mock 开关兜底）
+      const local = handleLocalSecurityChannel(channel, args);
+      return local.handled ? local.value : [];
+    }
+    // 定时任务：与浏览器直连引擎通道共用同一份本地实现（任务定义/执行记录/立即执行）
+    if (channel.startsWith('schedule:') || channel === 'keepAwake:status') {
+      const local = handleLocalScheduleChannel(channel, args);
+      return local.handled ? local.value : [];
+    }
+    // 对齐整改通道（Hooks/连接器/归档/电脑操控）：与引擎直连共用本地权威实现
+    {
+      const local = handleLocalAlignmentChannel(channel, args);
+      if (local.handled) return local.value;
+    }
+    // 工作空间：与引擎直连共用本地台账（桌面端由 Rust 以磁盘目录为权威）
+    {
+      const local = handleLocalWorkspaceChannel(channel, args);
+      if (local.handled) return local.value;
+    }
+    // 技能：浏览器通道无落盘能力，列表如实为空、写操作明确拒绝（桌面端由 Rust 扫描 skills 目录）
+    {
+      const local = handleLocalSkillChannel(channel, args);
+      if (local.handled) return local.value;
+    }
+    // 专家套件：浏览器通道不写盘，但同一个 .zip 包照解析、台账照维护
+    {
+      const local = handleLocalSuiteChannel(channel, args);
+      if (local.handled) return local.value;
+    }
+    // MCP 连接器：浏览器通道无握手能力，走本地登记台账（连接如实拒绝，不伪造已连接/工具清单）
+    {
+      const local = handleLocalMcpChannel(channel, args);
+      if (local.handled) return local.value;
+    }
+    // 意识（画像/能力文件/长期记忆）：浏览器通道无落盘能力，走本地台账（桌面端由 Rust 读写意识目录）
+    {
+      const local = handleLocalAwarenessChannel(channel, args);
+      if (local.handled) return local.value;
+    }
+    // 会话正文（刷新恢复）：浏览器通道无 SQLite，走本地台账，与 Rust 同口径
+    {
+      const local = handleLocalConversationChannel(channel, args);
+      if (local.handled) return local.value;
+    }
     if (channel === 'chat:history') {
       return mockHistory.map((t) => ({
         id: t.taskId,
@@ -333,9 +526,25 @@ const mockAPI = {
       }));
     }
     if (channel === 'settings:get') return { ...mockSettings };
+    if (channel === 'proxy:status') return localProxyStatus(mockSettings);
+    // 浏览器预览环境写不了系统启动项：如实报 supported=false，勾了也不算已生效
+    if (channel === 'system:autostart') return localAutostart(mockSettings);
+    // 系统权限：清单同 Rust 表，状态只问系统能回答的项；浏览器不能拉起系统设置
+    {
+      const local = handleLocalPermissionChannel(channel, args);
+      if (local.handled) return local.value;
+    }
     if (channel === 'settings:set') {
-      mockSettings[String(args[0])] = String(args[1]);
-      return { ok: true };
+      // 设置页以对象 patch 整体提交（与 Rust settings_set_many 同口径）
+      const patch = (args[0] ?? {}) as Record<string, unknown>;
+      // 代理三键按「补丁叠加现值」整组校验后再落库，与 Rust 一致：
+      // 自定义却没填地址 → 整批拒绝，不留半个生效配置
+      assertProxyPatchAcceptable(mockSettings, patch);
+      Object.entries(patch).forEach(([k, v]) => {
+        mockSettings[k] = v;
+      });
+      persistMockSettings(mockSettings);
+      return { ok: true, keys: Object.keys(patch) };
     }
     if (channel.startsWith('auth:')) return handleAuthChannel(channel);
     return channelMocks[channel] ?? [];
@@ -346,7 +555,7 @@ const mockAPI = {
   removeAllListeners: () => undefined,
 
   // ── Chat（两阶段协议 Mock） ────────────────────────────
-  chatSubmit: async (req: { goal: string; workDir?: string }) => {
+  chatSubmit: async (req: ChatSubmitReq) => {
     // 配额闸门 Mock：100% 档阻断新提交
     if (mockQuotaSnapshot().action === 'block') {
       throw new Error('QUOTA_EXCEEDED: 配额已用尽，新任务被阻断');
@@ -363,6 +572,8 @@ const mockAPI = {
       steps: defaultSteps(req?.goal ?? '新任务'),
       createdAt: now,
       sessionDir: `${baseDir}/${sessionDirName(now)}`,
+      // 对话内选择的模型随提交生效（用量归属与选择一致）
+      model: resolveMockModel(req?.modelBinding, req?.modelConfig),
     };
     activeMockTask = task;
     schedulePlanFlow(task);

@@ -9,7 +9,7 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import { Box, Typography, Switch } from '@mui/material';
+import { Box, Typography } from '@mui/material';
 import MonitorIcon from '@mui/icons-material/Monitor';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import RadioButtonUncheckedIcon from '@mui/icons-material/RadioButtonUnchecked';
@@ -18,9 +18,13 @@ import PhotoCameraIcon from '@mui/icons-material/PhotoCamera';
 import DescriptionIcon from '@mui/icons-material/Description';
 import TouchAppIcon from '@mui/icons-material/TouchApp';
 import VerifiedIcon from '@mui/icons-material/Verified';
-import { getComputerUsePolicy, setComputerUsePolicy, getSettings, setSettings } from '../../lib/alignment-api';
+import { getComputerUsePolicy, setComputerUsePolicy } from '../../lib/alignment-api';
+import type { ComputerUsePolicy } from '../../../shared/contracts';
+import { errorTextOf } from '../../../shared/error-messages';
+import { api } from '../../lib/api';
+import { useAppStore } from '../../stores/useAppStore';
 
-type Policy = 'ask_every_time' | 'auto' | 'disabled';
+type Policy = ComputerUsePolicy;
 
 const policies: { id: Policy; label: string; desc: string }[] = [
   { id: 'ask_every_time', label: '每次询问（默认）', desc: 'AI 每次需要操控桌面时都会先征求你的确认' },
@@ -43,32 +47,84 @@ const warnings = [
   '验证码与二步验证需人工介入——AI 无法完成 CAPTCHA、短信验证码、人脸识别',
 ];
 
-const tealSwitch = {
-  '& .MuiSwitch-switchBase.Mui-checked': { color: '#14B8A6' },
-  '& .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track': { backgroundColor: '#14B8A6' },
+/**
+ * 系统权限引导（按真实平台事实呈现，不伪造授权状态）
+ */
+type PermissionState = 'ready' | 'manual' | 'unknown';
+
+interface PermissionGuide {
+  id: string;
+  label: string;
+  desc: string;
+  state: PermissionState;
+}
+
+function permissionGuide(platform: string): PermissionGuide[] {
+  const p = platform.toLowerCase();
+  const isWindows = p === 'windows' || p === 'win32';
+  const isMac = p === 'macos' || p === 'darwin';
+  const state: PermissionState = isWindows ? 'ready' : isMac ? 'manual' : 'unknown';
+  const note = (macText: string, winText: string) =>
+    isWindows ? winText : isMac ? macText : '未在桌面应用内运行时无法探测系统权限';
+  return [
+    {
+      id: 'screen',
+      label: '截屏权限',
+      desc: note(
+        '需在「系统设置 › 隐私与安全性 › 屏幕录制」勾选通天办公后重启应用',
+        'Windows 截屏无需系统授权，可直接使用',
+      ),
+      state,
+    },
+    {
+      id: 'access',
+      label: '辅助功能权限',
+      desc: note(
+        '需在「系统设置 › 隐私与安全性 › 辅助功能」勾选通天办公后重启应用',
+        'Windows 模拟键鼠无需系统授权，可直接使用',
+      ),
+      state,
+    },
+  ];
+}
+
+const PERMISSION_BADGE: Record<PermissionState, { label: string; color: string; bg: string }> = {
+  ready: { label: '无需授权', color: '#0D9488', bg: '#E6F7F4' },
+  manual: { label: '需手动勾选', color: '#D97706', bg: '#FEF3C7' },
+  unknown: { label: '未知', color: '#6B7280', bg: '#F3F4F6' },
 };
 
 const ComputerUsePanel: React.FC = () => {
   const [policy, setPolicy] = useState<Policy>('ask_every_time');
-  const [screenGranted, setScreenGranted] = useState(true);
-  const [accessGranted, setAccessGranted] = useState(false);
+  /** 系统权限引导按真实平台呈现（不做假授权状态点亮） */
+  const [platform, setPlatform] = useState<string>('');
+  const showNotification = useAppStore((s) => s.showNotification);
 
   // 从持久层加载操控策略（真实 IPC）
   useEffect(() => {
     getComputerUsePolicy()
-      .then((p) => setPolicy(p as Policy))
-      .catch(() => undefined);
-  }, []);
+      .then((p) => setPolicy(p))
+      .catch((err: unknown) =>
+        showNotification(errorTextOf(err, '操控策略加载失败'), 'error'),
+      );
+    api.system
+      .info()
+      .then((info) => setPlatform(String(info.platform ?? '')))
+      .catch(() => setPlatform(''));
+  }, [showNotification]);
 
   const handlePolicyChange = (p: Policy) => {
     setPolicy(p);
-    setComputerUsePolicy(p).catch(() => undefined);
+    setComputerUsePolicy(p).catch((err: unknown) => {
+      // 档位未被接受时回到原选择，避免界面显示与持久层不一致
+      getComputerUsePolicy()
+        .then(setPolicy)
+        .catch(() => undefined);
+      showNotification(errorTextOf(err, '操控策略保存失败'), 'error');
+    });
   };
 
-  const permissions = [
-    { id: 'screen', label: '截屏权限', desc: '用于屏幕内容识别与操控感知', granted: screenGranted, onGrant: () => setScreenGranted(true) },
-    { id: 'access', label: '辅助功能权限', desc: '用于模拟点击、输入等桌面操作', granted: accessGranted, onGrant: () => setAccessGranted(true) },
-  ];
+  const permissions = permissionGuide(platform);
 
   return (
     <Box sx={{ height: 'calc(100vh - 104px)', overflowY: 'auto', pr: 1 }}>
@@ -138,25 +194,16 @@ const ComputerUsePanel: React.FC = () => {
               <Typography sx={{ fontSize: '13.5px', fontWeight: 600, color: '#111827' }}>{perm.label}</Typography>
               <Typography sx={{ fontSize: '12px', color: '#9CA3AF', mt: 0.25 }}>{perm.desc}</Typography>
             </Box>
-            {perm.granted ? (
-              <Box sx={{ px: 1.25, py: 0.4, borderRadius: '6px', bgcolor: '#E6F7F4' }}>
-                <Typography sx={{ fontSize: '11.5px', fontWeight: 600, color: '#0D9488' }}>已授权</Typography>
-              </Box>
-            ) : (
-              <Box
-                onClick={perm.onGrant}
-                sx={{
-                  px: 1.75,
-                  py: 0.5,
-                  borderRadius: '8px',
-                  bgcolor: '#111827',
-                  cursor: 'pointer',
-                  '&:hover': { opacity: 0.85 },
-                }}
-              >
-                <Typography sx={{ fontSize: '11.5px', fontWeight: 600, color: '#fff' }}>去授权</Typography>
-              </Box>
-            )}
+            {(() => {
+              const badge = PERMISSION_BADGE[perm.state];
+              return (
+                <Box sx={{ px: 1.25, py: 0.4, borderRadius: '6px', bgcolor: badge.bg, flexShrink: 0 }}>
+                  <Typography sx={{ fontSize: '11.5px', fontWeight: 600, color: badge.color }}>
+                    {badge.label}
+                  </Typography>
+                </Box>
+              );
+            })()}
           </Box>
         ))}
 

@@ -17,6 +17,7 @@ use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_opener::OpenerExt;
 
 use crate::P0Services;
+use crate::security::audit;
 
 /// 并发登录互斥：同一时刻仅允许一条登录流程（loopback 端口/state 唯一性）
 static LOGIN_BUSY: Mutex<bool> = Mutex::new(false);
@@ -57,6 +58,13 @@ pub async fn auth_login(
         // 开发自测（Mock 开关规范）：不发浏览器不起回调，直接模拟登录
         let profile = service::mock_profile();
         service::save_session(&p0.store, &profile, "mock-refresh-token")?;
+        audit::record_quiet(
+            &p0.store,
+            audit::ACTION_USER_LOGIN,
+            audit::SEV_INFO,
+            profile.get("nickname").and_then(|v| v.as_str()).unwrap_or(""),
+            "登录成功（Mock 模式）",
+        );
         let _ = app.emit(
             service::EVENT_AUTH,
             json!({ "type": "login", "profile": profile }),
@@ -65,10 +73,36 @@ pub async fn auth_login(
     }
 
     if !try_begin_login() {
+        audit::record_quiet(
+            &p0.store,
+            audit::ACTION_USER_LOGIN,
+            audit::SEV_WARNING,
+            "auth",
+            "登录被拒：已有登录流程进行中",
+        );
         return Err("AUTH_LOGIN_IN_PROGRESS: 已有登录流程进行中".into());
     }
     let result = real_login(&app, &p0).await;
     end_login();
+    // 成功/失败均留痕（失败原因即错误码，不记录回调 code/token 等敏感值）
+    match &result {
+        Ok(_) => audit::record_quiet(
+            &p0.store,
+            audit::ACTION_USER_LOGIN,
+            audit::SEV_INFO,
+            &service::load_profile(&p0.store)
+                .and_then(|p| p.get("nickname").and_then(|v| v.as_str()).map(String::from))
+                .unwrap_or_default(),
+            "网页验证登录成功",
+        ),
+        Err(e) => audit::record_quiet(
+            &p0.store,
+            audit::ACTION_USER_LOGIN,
+            audit::SEV_ERROR,
+            "auth",
+            &format!("登录失败：{e}"),
+        ),
+    }
     result
 }
 
@@ -134,6 +168,17 @@ pub async fn auth_logout(
             service::revoke_remote(&service::auth_server_url(), &refresh).await;
         }
     }
+
+    // 留痕需在清理 profile 之前（清理后已无从得知操作者）
+    audit::record_quiet(
+        &p0.store,
+        audit::ACTION_USER_LOGOUT,
+        audit::SEV_INFO,
+        &service::load_profile(&p0.store)
+            .and_then(|p| p.get("nickname").and_then(|v| v.as_str()).map(String::from))
+            .unwrap_or_default(),
+        if was_logged_in { "退出登录（本地数据保留）" } else { "未登录状态下调用退出" },
+    );
 
     service::clear_session(&p0.store);
     let _ = app.emit(service::EVENT_AUTH, json!({ "type": "logout" }));

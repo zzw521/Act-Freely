@@ -6,6 +6,7 @@
  * - 出域控制开关
  * - 审计日志查看与导出
  * - 沙箱策略配置
+ * - 合规概览（硬开关 / 模型可达性 / 最近分级留痕的聚合视图）
  */
 
 import React, { useState, useEffect } from 'react';
@@ -24,12 +25,15 @@ import {
   NetworkCheck as NetworkCheckIcon,
   History as HistoryIcon,
   Policy as PolicyIcon,
+  VerifiedUser as ComplianceIcon,
 } from '@mui/icons-material';
 import DataClassification from '../../components/DataClassification';
 import DomainControl from '../../components/DomainControl';
 import AuditLog from '../../components/AuditLog';
 import SandboxPolicy from '../../components/SandboxPolicy';
-import { useSecurityStore } from '../../store/securityStore';
+import CompliancePanel from '../../components/CompliancePanel';
+import { useSecurityStore, type DomainControlConfig } from '../../store/securityStore';
+import { errorTextOf } from '../../../shared/error-messages';
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -56,51 +60,63 @@ const SecurityPage: React.FC = () => {
 
   // Security store
   const {
-    lastScanResult,
-    domainControlEnabled,
+    domainControl,
+    domainControlPersisted,
     auditLogs,
     logLoading,
     sandboxPolicy,
     scanData,
+    loadDomainControl,
     updateDomainControl,
+    loadCompliance,
     loadAuditLogs,
     exportAuditLogs,
     saveSandboxPolicy,
     loadSandboxPolicy,
   } = useSecurityStore();
 
-  // 加载审计日志和沙箱策略
+  const workspaceId = 'default-workspace';
+
+  // 首次进入加载出域控制/合规状态/审计日志/沙箱策略（真实后端或本地 Mock）
   useEffect(() => {
-    loadAuditLogs();
-    loadSandboxPolicy('default-workspace');
+    void Promise.all([
+      loadDomainControl().catch((e) => setError(`加载出域控制失败: ${errorTextOf(e)}`)),
+      loadCompliance(),
+      loadAuditLogs().catch((e) => setError(`加载审计日志失败: ${errorTextOf(e)}`)),
+      loadSandboxPolicy(workspaceId).catch((e) => setError(`加载沙箱策略失败: ${errorTextOf(e)}`)),
+    ]);
   }, []);
 
-  // 切换标签页
+  // 切换标签页（审计页每次进入都重新拉取，避免展示过期日志；合规概览同理）
   const handleTabChange = (event: React.SyntheticEvent, newValue: number) => {
     setTabIndex(newValue);
     setError(null);
+    if (newValue === 2) {
+      void loadAuditLogs().catch((e) => setError(`加载审计日志失败: ${errorTextOf(e)}`));
+    }
+    if (newValue === 4) {
+      void loadCompliance();
+    }
   };
 
   // 数据分级检测
-  const handleScanData = async (text: string): Promise<any> => {
+  const handleScanData = async (text: string) => {
     try {
       setError(null);
-      const result = await scanData(text);
-      console.log('数据分级结果:', result);
-      return result;
+      return await scanData(text);
     } catch (err) {
-      setError(`数据分级检测失败: ${err}`);
+      setError(`数据分级检测失败: ${errorTextOf(err)}`);
       throw err;
     }
   };
 
-  // 出域控制保存
-  const handleDomainControlSave = async (config: any): Promise<void> => {
+  // 出域控制保存（后端归一化结果回写 store）
+  const handleDomainControlSave = async (config: DomainControlConfig): Promise<void> => {
     try {
       setError(null);
-      updateDomainControl(config);
-    } catch (err: any) {
-      setError(`更新出域控制配置失败: ${err}`);
+      await updateDomainControl(config);
+    } catch (err) {
+      setError(`更新出域控制配置失败: ${errorTextOf(err)}`);
       throw err;
     }
   };
@@ -110,8 +126,8 @@ const SecurityPage: React.FC = () => {
     try {
       setError(null);
       await exportAuditLogs(format);
-    } catch (err: any) {
-      setError(`导出日志失败: ${err}`);
+    } catch (err) {
+      setError(`导出日志失败: ${errorTextOf(err)}`);
       throw err;
     }
   };
@@ -121,8 +137,8 @@ const SecurityPage: React.FC = () => {
     try {
       setError(null);
       await saveSandboxPolicy(policy);
-    } catch (err: any) {
-      setError(`保存沙箱策略失败: ${err}`);
+    } catch (err) {
+      setError(`保存沙箱策略失败: ${errorTextOf(err)}`);
       throw err;
     }
   };
@@ -187,6 +203,12 @@ const SecurityPage: React.FC = () => {
             label="沙箱策略"
             sx={{ textTransform: 'none', minHeight: 64 }}
           />
+          <Tab
+            icon={<ComplianceIcon />}
+            iconPosition="start"
+            label="合规概览"
+            sx={{ textTransform: 'none', minHeight: 64 }}
+          />
         </Tabs>
 
         {/* 数据分级 */}
@@ -199,14 +221,29 @@ const SecurityPage: React.FC = () => {
         {/* 出域控制 */}
         <TabPanel value={tabIndex} index={1}>
           <Box sx={{ p: 3 }}>
-            <DomainControl onSave={handleDomainControlSave} />
+            <DomainControl
+              // 配置为异步加载：key 随归一化配置变化重挂载，保证表单拿到已落库值
+              key={JSON.stringify(domainControl ?? {})}
+              initialConfig={domainControl ?? undefined}
+              onSave={handleDomainControlSave}
+            />
+            {!domainControlPersisted && (
+              <Alert severity="info" sx={{ mt: 2 }}>
+                当前展示的是默认配置，尚未保存到本地。开启出域控制并保存后生效。
+              </Alert>
+            )}
           </Box>
         </TabPanel>
 
         {/* 审计日志 */}
         <TabPanel value={tabIndex} index={2}>
           <Box sx={{ p: 3 }}>
-            <AuditLog logs={auditLogs} onExport={handleExportLogs} isLoading={logLoading} />
+            <AuditLog
+              logs={auditLogs}
+              onExport={handleExportLogs}
+              onRefresh={() => loadAuditLogs()}
+              isLoading={logLoading}
+            />
           </Box>
         </TabPanel>
 
@@ -214,10 +251,18 @@ const SecurityPage: React.FC = () => {
         <TabPanel value={tabIndex} index={3}>
           <Box sx={{ p: 3 }}>
             <SandboxPolicy
-              workspaceId="default-workspace"
+              key={`${workspaceId}-${sandboxPolicy ? 'persisted' : 'default'}`}
+              workspaceId={workspaceId}
               initialPolicy={sandboxPolicy || undefined}
               onSave={handleSaveSandboxPolicy}
             />
+          </Box>
+        </TabPanel>
+
+        {/* 合规概览：硬开关 + 出域摘要 + 模型可达性 + 最近分级留痕（同源聚合，无独立存储） */}
+        <TabPanel value={tabIndex} index={4}>
+          <Box sx={{ p: 3 }}>
+            <CompliancePanel />
           </Box>
         </TabPanel>
       </Paper>

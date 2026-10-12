@@ -11,7 +11,6 @@ import React, { useState, useEffect } from 'react';
 import {
   Box,
   Typography,
-  Switch,
   Button,
   TextField,
   MenuItem,
@@ -20,6 +19,8 @@ import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import AddIcon from '@mui/icons-material/Add';
 import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
 import { getHooks, setHooks, testHook } from '../../lib/alignment-api';
+import { errorTextOf } from '../../../shared/error-messages';
+import { useAppStore } from '../../stores/useAppStore';
 import type { HookConfigStore, HookEventName } from '../../../shared/contracts';
 
 // ── 事件定义（对齐 QwenWork 12 类事件） ───────────────────────────
@@ -54,34 +55,15 @@ interface HookItem {
   matcher: string;
   command: string;
   timeout: number;
-  enabled: boolean;
 }
 
-// 内置模板（首次启动时若持久层为空则写入）
-const initialHooks: HookItem[] = [
-  {
-    id: 'h1',
-    event: 'PreToolUse',
-    matcher: 'Bash',
-    command: '~/.tongtian/hooks/block-dangerous.ps1',
-    timeout: 60,
-    enabled: true,
-  },
-  {
-    id: 'h2',
-    event: 'PostToolUse',
-    matcher: 'Write | Edit',
-    command: '~/.tongtian/hooks/auto-lint.ps1',
-    timeout: 60,
-    enabled: true,
-  },
-];
+// HookConfigStore 与 QwenWork settings.json 同构：挂载即存在、卸载即移除，无 enabled 字段。
+// 因此页面不做「内置模板预置」——持久层为空就是空，避免把不存在的脚本当成用户配置保存并执行。
 
 /** HookItem[] → HookConfigStore（持久化结构，对齐 QwenWork settings.json） */
 function toConfigStore(items: HookItem[]): HookConfigStore {
   const hooks: HookConfigStore['hooks'] = {};
   items.forEach((h) => {
-    if (!h.enabled) return;
     const ev = h.event as HookEventName;
     const groups = hooks[ev] ?? [];
     let group = groups.find((g) => (g.matcher ?? '*') === (h.matcher || '*'));
@@ -108,7 +90,6 @@ function fromConfigStore(store: HookConfigStore): HookItem[] {
           matcher: g.matcher ?? '*',
           command: h.command,
           timeout: h.timeout ?? 60,
-          enabled: true,
         });
       });
     });
@@ -116,32 +97,29 @@ function fromConfigStore(store: HookConfigStore): HookItem[] {
   return items;
 }
 
-const tealSwitch = {
-  '& .MuiSwitch-switchBase.Mui-checked': { color: '#14B8A6' },
-  '& .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track': { backgroundColor: '#14B8A6' },
-};
-
 // ── 主页面 ────────────────────────────────────────────────────────
 
 const HooksManager: React.FC = () => {
   const [selectedEvent, setSelectedEvent] = useState('PreToolUse');
-  const [hooks, setHooksState] = useState<HookItem[]>(initialHooks);
+  const [hooks, setHooksState] = useState<HookItem[]>([]);
   const [editing, setEditing] = useState<HookItem | null>(null);
   const [testResult, setTestResult] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const showNotification = useAppStore((s) => s.showNotification);
 
-  // 从持久层加载 Hooks 配置（真实 IPC：sqlite hook_configs）
+  // 从持久层加载 Hooks 配置（真实 IPC：sqlite hook_configs；浏览器通道为同口径本地台账）
   useEffect(() => {
     getHooks()
-      .then((store) => {
-        const loaded = fromConfigStore(store);
-        if (loaded.length > 0) setHooksState(loaded);
-      })
-      .catch(() => undefined);
-  }, []);
+      .then((store) => setHooksState(fromConfigStore(store)))
+      .catch((err: unknown) => showNotification(errorTextOf(err, 'Hook 配置读取失败'), 'error'))
+      .finally(() => setLoaded(true));
+  }, [showNotification]);
 
-  // 持久化当前 hooks 状态
+  // 持久化当前 hooks 状态（校验失败必须可见：静默丢弃会让用户以为已保存）
   const persist = (items: HookItem[]) => {
-    setHooks(toConfigStore(items)).catch(() => undefined);
+    setHooks(toConfigStore(items)).catch((err: unknown) => {
+      showNotification(errorTextOf(err, 'Hook 配置保存失败'), 'error');
+    });
   };
 
   const eventDef = hookEvents.find((e) => e.name === selectedEvent)!;
@@ -154,7 +132,6 @@ const HooksManager: React.FC = () => {
       matcher: '*',
       command: '',
       timeout: 60,
-      enabled: true,
     };
     const next = [...hooks, item];
     setHooksState(next);
@@ -163,6 +140,10 @@ const HooksManager: React.FC = () => {
 
   const handleSave = () => {
     if (!editing) return;
+    if (!editing.command.trim()) {
+      showNotification('Hook 命令不能为空（留空不会触发任何脚本）', 'error');
+      return;
+    }
     const next = hooks.map((h) => (h.id === editing.id ? editing : h));
     setHooksState(next);
     setEditing(null);
@@ -180,7 +161,7 @@ const HooksManager: React.FC = () => {
         }`,
       );
     } catch (e) {
-      setTestResult(`执行失败: ${String(e)}`);
+      setTestResult(errorTextOf(e, 'Hook 试运行失败'));
     }
   };
 
@@ -261,9 +242,11 @@ const HooksManager: React.FC = () => {
           </Box>
 
           {/* Hook 列表 */}
-          {eventHooks.length === 0 && !editing && (
+          {loaded && eventHooks.length === 0 && !editing && (
             <Box sx={{ border: '1px dashed #E5E7EB', borderRadius: '14px', p: 4, textAlign: 'center' }}>
-              <Typography sx={{ fontSize: '13px', color: '#9CA3AF' }}>该事件暂无 Hook 配置</Typography>
+              <Typography sx={{ fontSize: '13px', color: '#9CA3AF' }}>
+                该事件暂无 Hook 配置 · 未配置则不会执行任何脚本
+              </Typography>
             </Box>
           )}
           {eventHooks.map((h) =>
@@ -296,17 +279,6 @@ const HooksManager: React.FC = () => {
                     {h.command || '(未配置命令)'} · 超时 {h.timeout}s
                   </Typography>
                 </Box>
-                <Switch
-                  size="small"
-                  checked={h.enabled}
-                  onClick={(e) => e.stopPropagation()}
-                  onChange={(e) => {
-                    const next = hooks.map((x) => (x.id === h.id ? { ...x, enabled: e.target.checked } : x));
-                    setHooksState(next);
-                    persist(next);
-                  }}
-                  sx={tealSwitch}
-                />
                 <DeleteOutlineIcon
                   sx={{ fontSize: 17, color: '#9CA3AF', '&:hover': { color: '#EF4444' } }}
                   onClick={(e) => {

@@ -6,6 +6,8 @@
 - POST /api/chat          → 执行任务，流式输出 SSE 事件（plan/step_*/deliver/done/error）
 - GET  /api/events/replay → 事件重放（三层架构演进 P0：seq + 重放窗口 ≥10min）
 - POST /api/chat/cancel   → 取消任务（cancelled 事件 + done）
+- GET  /api/sandbox/environment/usage → 工作环境文件磁盘用量
+- POST /api/sandbox/environment/clear → 清理工作环境文件（保留对话记录与工作产物）
 
 三层架构演进 P0（需求分析报告）：
 - 每任务单调递增 seq，SSE 输出 `id: {task_id}:{seq}` 行，seq 同时写入 data
@@ -21,7 +23,9 @@
 import argparse
 import asyncio
 import base64
+import inspect
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -92,8 +96,12 @@ class TaskSession:
         self.model_binding: str | None = None
         # 本任务工作目录（前端选择的工作目录，approve 重新执行时沿用）
         self.work_dir: Path | None = None
+        # 安全工作环境开关（true 且未自选工作目录时，任务落在 environment/{taskId} 隔离目录）
+        self.secure_env: bool = False
         # 本任务自定义模型配置（models.json 条目，approve 重新执行时沿用）
         self.model_config: dict | None = None
+        # 此前轮次对话历史（两阶段协议下 plan 阶段带上来，approve 执行时沿用）
+        self.history: list = []
 
     def next_seq(self) -> int:
         self.seq += 1
@@ -120,6 +128,144 @@ def _get_or_create_session(task_id: str) -> TaskSession:
         session = TaskSession(task_id)
         _TASK_SESSIONS[task_id] = session
     return session
+
+
+# ── 模型用量台账（真实 token 采集） ────────────────────────────
+#
+# 权威持久化在 Rust 侧 model_usage 表（按 usage 事件记账，见 bridge/agent.rs）；
+# 本台账服务于浏览器直连模式（无 Rust）与计划阶段用量展示，进程重启即清零。
+
+def _utc_day(ms: int | None = None) -> str:
+    """UTC 日期 yyyy-mm-dd（与 Rust 台账同口径：跨日按 UTC 分桶）"""
+    ts = time.time() if ms is None else ms / 1000
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+def _utc_month(ms: int | None = None) -> str:
+    return _utc_day(ms)[:7]
+
+
+class UsageLedger:
+    """进程内用量台账：按「模型 × 日」累计 prompt/completion token 与调用次数"""
+
+    def __init__(self) -> None:
+        # key = (model_name, day) → row
+        self.rows: dict[tuple[str, str], dict] = {}
+
+    def add(self, model_name: str, prompt_tokens: int, completion_tokens: int) -> dict:
+        name = (model_name or "").strip() or "unknown"
+        day = _utc_day()
+        row = self.rows.get((name, day))
+        if row is None:
+            row = {
+                "modelName": name,
+                "day": day,
+                "promptTokens": 0,
+                "completionTokens": 0,
+                "calls": 0,
+                "lastUsedAtMs": 0,
+            }
+            self.rows[(name, day)] = row
+        row["promptTokens"] += max(0, int(prompt_tokens))
+        row["completionTokens"] += max(0, int(completion_tokens))
+        row["calls"] += 1
+        row["lastUsedAtMs"] = int(time.time() * 1000)
+        return row
+
+    def aggregate(self, period: str) -> list[dict]:
+        """按周期聚合为「模型一行」（daily=今日 / monthly=本月 / total=全部）"""
+        if period == "daily":
+            match = lambda day: day == _utc_day()  # noqa: E731
+        elif period == "monthly":
+            month = _utc_month()
+            match = lambda day: day.startswith(month)  # noqa: E731
+        else:  # total（含非法值降级：引擎侧不阻断只读查询）
+            match = lambda day: True  # noqa: E731
+
+        agg: dict[str, dict] = {}
+        for (name, day), row in self.rows.items():
+            if not match(day):
+                continue
+            cur = agg.get(name)
+            if cur is None:
+                cur = {
+                    "modelName": name,
+                    "promptTokens": 0,
+                    "completionTokens": 0,
+                    "tokensUsed": 0,
+                    "calls": 0,
+                    "lastUsedAtMs": 0,
+                }
+                agg[name] = cur
+            cur["promptTokens"] += row["promptTokens"]
+            cur["completionTokens"] += row["completionTokens"]
+            cur["tokensUsed"] += row["promptTokens"] + row["completionTokens"]
+            cur["calls"] += row["calls"]
+            cur["lastUsedAtMs"] = max(cur["lastUsedAtMs"], row["lastUsedAtMs"])
+        return sorted(agg.values(), key=lambda r: r["tokensUsed"], reverse=True)
+
+    def _match(self, period: str):
+        if period == "daily":
+            day = _utc_day()
+            return lambda d: d == day
+        if period == "monthly":
+            month = _utc_month()
+            return lambda d: d.startswith(month)
+        return lambda d: True
+
+    def days(self, period: str) -> list[dict]:
+        """按 UTC 日分桶的趋势点（升序），口径与 aggregate 同一周期过滤"""
+        match = self._match(period)
+        buckets: dict[str, dict] = {}
+        for (name, day), row in self.rows.items():
+            if not match(day):
+                continue
+            cur = buckets.get(day)
+            if cur is None:
+                cur = {"day": day, "tokensUsed": 0, "calls": 0, "models": 0, "_names": set()}
+                buckets[day] = cur
+            cur["tokensUsed"] += row["promptTokens"] + row["completionTokens"]
+            cur["calls"] += row["calls"]
+            cur["_names"].add(name)
+        out = []
+        for day in sorted(buckets):
+            point = buckets[day]
+            point["models"] = len(point.pop("_names"))
+            out.append(point)
+        return out
+
+    def totals(self, period: str, models: list[dict] | None = None) -> dict:
+        """周期汇总（不含延迟/成本：台账未采集延迟与单价，避免伪造数字）"""
+        rows = models if models is not None else self.aggregate(period)
+        return {
+            "promptTokens": sum(r["promptTokens"] for r in rows),
+            "completionTokens": sum(r["completionTokens"] for r in rows),
+            "tokensUsed": sum(r["tokensUsed"] for r in rows),
+            "calls": sum(r["calls"] for r in rows),
+            "activeModels": len(rows),
+            "lastUsedAtMs": max((r["lastUsedAtMs"] for r in rows), default=0),
+        }
+
+
+USAGE_LEDGER = UsageLedger()
+
+
+def _usage_of(resp) -> tuple[int, int] | None:
+    """从 ChatResponse 取真实 usage（缺失/异常返回 None，不阻断主流程）
+
+    注意：agentscope 的 ChatResponse 是 DictMixin(dict) 子类，属性即字典键，
+    对缺失键调用 hasattr/getattr(..., default) 会抛 KeyError 而非返回默认值，
+    故这里按 dict 取值。"""
+    usage = resp.get("usage") if isinstance(resp, dict) else getattr(resp, "usage", None)
+    if usage is None:
+        return None
+    try:
+        return int(usage["input_tokens"] or 0), int(usage["output_tokens"] or 0)
+    except Exception:
+        try:
+            return int(getattr(usage, "input_tokens") or 0), int(getattr(usage, "output_tokens") or 0)
+        except Exception:
+            return None
 
 
 def _parse_last_event_id(header_value: str | None) -> tuple[str, int] | None:
@@ -177,6 +323,33 @@ def _materialize_artifacts(session_dir: "Path | None", data: dict) -> dict:
     return {**data, "artifacts": paths}
 
 
+def _preserve_artifacts_in_session(session_dir: "Path | None", task_dir: Path, paths: list) -> list:
+    """把隔离环境内的产物复制进会话目录归档，返回副本路径。
+
+    environment/ 整体可被「清理工作环境文件」删除，产物只有落在会话目录里才谈得上保留。
+    单条复制失败时保留原路径并打印告警，不静默丢产物。"""
+    if session_dir is None or not paths:
+        return paths
+    kept_root = session_dir / "artifacts"
+    out: list = []
+    for raw in paths:
+        src = Path(str(raw))
+        try:
+            rel = src.relative_to(task_dir)
+        except ValueError:
+            out.append(str(src))
+            continue
+        dst = kept_root / rel
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            out.append(str(dst))
+        except OSError as exc:
+            print(f"[engine] 产物归档到会话目录失败: {exc}", flush=True)
+            out.append(str(src))
+    return out
+
+
 # ── 两阶段协议：计划生成（流 3.1，核心闭环补齐） ────────────────
 
 PLAN_PROMPT = """请将用户目标拆解为 2-5 个执行步骤，仅输出 JSON 数组，格式：
@@ -193,10 +366,22 @@ def _fallback_plan(goal: str) -> list:
     ]
 
 
-async def _generate_plan(goal: str) -> list:
-    """单次 LLM 调用生成计划 steps；任何异常/解析失败均回退兜底计划"""
+async def _generate_plan(goal: str) -> tuple[list, dict | None]:
+    """单次 LLM 调用生成计划 steps；任何异常/解析失败均回退兜底计划。
+    返回 (steps, usage)：usage 为该次计划生成的真实 token 用量（缺省 None）。"""
+    captured: list = []
+
+    def _capture(prompt: int, completion: int, model_name: str) -> None:
+        captured.append({
+            "promptTokens": prompt,
+            "completionTokens": completion,
+            "model": model_name,
+        })
+
     try:
-        model, formatter = build_model_and_formatter()
+        # 计划需按完整响应解析 JSON，故以非流式调用（流式下 await model(...) 得到的是
+        # 异步生成器，取不到 content，此前恒回退兜底计划）
+        model, formatter = build_model_and_formatter(stream=False, on_usage=_capture)
         from agentscope.message import Msg
         msgs = [
             Msg(name="user", content=PLAN_PROMPT.format(goal=goal), role="user"),
@@ -217,10 +402,10 @@ async def _generate_plan(goal: str) -> list:
                             "description": str(s.get("description") or f"步骤 {i + 1}"),
                         })
                 if norm:
-                    return norm
+                    return norm, (captured[-1] if captured else None)
     except Exception as exc:
         print(f"[engine] plan 生成失败，回退兜底计划: {exc}", flush=True)
-    return _fallback_plan(goal)
+    return _fallback_plan(goal), (captured[-1] if captured else None)
 
 
 def _sse_formatter(session: "TaskSession", task_id: str):
@@ -251,18 +436,47 @@ def _replay_prefix(session: "TaskSession", task_id: str, replay_from: list):
 
 
 async def _plan_stream(session: "TaskSession", task_id: str, goal: str):
-    """阶段一：计划生成流（plan + status_change(pending_review) + done）"""
+    """阶段一：计划生成流（plan + [usage] + status_change(pending_review) + done）"""
     sse = _sse_formatter(session, task_id)
     if not goal:
         yield sse("error", {"code": "EMPTY_GOAL", "message": "任务描述为空"})
         yield sse("done", {})
         return
-    steps = await _generate_plan(goal)
+    steps, plan_usage = await _generate_plan(goal)
     session.plan = steps
     session.goal = goal
     yield sse("plan", {"plan_id": f"plan-{task_id}", "steps": steps})
+    # 计划阶段的真实 token 用量（Rust 侧按 usage 事件记账；前端不消费该类型）
+    if plan_usage:
+        yield sse("usage", {"usage": plan_usage})
     yield sse("status_change", {"taskId": task_id, "status": "pending_review"})
     yield sse("done", {})
+
+
+def _normalize_history(raw) -> list:
+    """对话历史归一：仅保留带正文的 user/assistant 条目（上限 40 条）。
+
+    桌面端走两阶段协议时，历史随 plan 请求一起到达，approve 之后才真正执行；
+    没有这一步归一，非法条目会在预填充阶段被静默跳过，日志里看不出丢了什么。
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list = []
+    for item in raw[-40:]:
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        role = str(item.get("role") or "user")
+        out.append({"role": role if role in ("user", "assistant") else "user", "content": content})
+    return out
+
+
+def _effective_history(session: "TaskSession", history: list | None) -> list:
+    """执行流取历史的两阶段语义：approve 不再重复带历史（None → 用会话里的），
+    本轮确实没有历史时前端传空列表（[] → 保持为空，不把上一轮的会话历史翻出来）。"""
+    return session.history if history is None else history
 
 
 def _snapshot_files(base: Path) -> dict:
@@ -303,9 +517,13 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
     """阶段二：执行流（status_change(executing) → Agent 事件 → deliver/done）。
     支持 pause/resume 门控与 rollback_to 语义；model_binding 为对话内选中的模型档位；
     work_dir 为前端选择的工作目录（工具操作与产物落盘均限定其中）；
-    history 为此前轮次对话历史（保障连续对话上下文）。"""
+    history 为此前轮次对话历史（保障连续对话上下文）。
+    启用安全工作环境且未自选目录时，执行落在 environment/{taskId} 隔离目录。"""
     sse = _sse_formatter(session, task_id)
-    eff_work_dir = work_dir or WORK_DIR
+    # 两阶段协议下历史随 plan 请求到达并存在会话里，approve 的执行流不再重复带
+    history = _effective_history(session, history)
+    isolated = work_dir is None and session.secure_env
+    eff_work_dir = work_dir or (_task_work_dir(task_id) if isolated else WORK_DIR)
 
     for chunk in _replay_prefix(session, task_id, replay_from):
         yield chunk
@@ -316,8 +534,20 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
         return
 
     # 构建 Agent（模型配置错误在此暴露；模型档位随对话绑定；工具限定在工作目录；model_config 支持自定义模型真实调用）
+    # 队列先建：用量回调需要随模型调用即时产出 usage 事件（Rust 侧据此记账）
+    queue = RecordingQueue(session)
+
+    def _on_usage(prompt_tokens: int, completion_tokens: int, model_name: str) -> None:
+        _safe_put(queue, "usage", {
+            "usage": {
+                "promptTokens": prompt_tokens,
+                "completionTokens": completion_tokens,
+                "model": model_name,
+            },
+        })
+
     try:
-        agent = build_agent(model_binding, eff_work_dir, model_config)
+        agent = build_agent(model_binding, eff_work_dir, model_config, on_usage=_on_usage)
     except Exception as exc:
         yield sse("error", {"code": "ENGINE_CONFIG_ERROR", "message": str(exc)})
         yield sse("done", {})
@@ -325,7 +555,6 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
 
     yield sse("status_change", {"taskId": task_id, "status": "executing"})
 
-    queue = RecordingQueue(session)
     session.exec_queue = queue
     session.pause_event.set()
     session.rolled_back = None
@@ -390,6 +619,11 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
                 eff_work_dir, before, _snapshot_files(eff_work_dir),
                 exclude_dir=session.session_dir,
             )
+            if isolated:
+                # 隔离目录可被整体清理，产物先归档进会话目录再上报
+                artifacts = _preserve_artifacts_in_session(
+                    session.session_dir, eff_work_dir, artifacts
+                )
             _safe_put(queue, "deliver", {
                 "summary": "任务完成",
                 "artifacts": artifacts,
@@ -479,11 +713,14 @@ SYS_PROMPT = """你是“通天办公”AI 工作助手，运行在用户的本�
 """
 
 
-def build_model_and_formatter(model_override: str | None = None, model_config: dict | None = None):
+def build_model_and_formatter(model_override: str | None = None, model_config: dict | None = None,
+                              stream: bool = True, on_usage=None):
     """按 .env 配置构建模型与 formatter（支持 DashScope 与 OpenAI 兼容端点）；
     model_override 非空时覆盖模型名（对话内模型档位绑定）；
     model_config 为前端传入的自定义模型配置（models.json，含 baseUrl/apiKey/modelName），
-    存在 baseUrl 时走 OpenAI 兼容端点真实调用自定义模型"""
+    存在 baseUrl 时走 OpenAI 兼容端点真实调用自定义模型；
+    stream=False 用于「一次性取值」场景（计划生成按完整响应解析 JSON）；
+    on_usage(prompt_tokens, completion_tokens, model_name) 在每次真实模型调用后回调"""
     from agentscope.model import DashScopeChatModel, OpenAIChatModel
     from agentscope.formatter import DashScopeChatFormatter, OpenAIChatFormatter
 
@@ -500,10 +737,10 @@ def build_model_and_formatter(model_override: str | None = None, model_config: d
         model = OpenAIChatModel(
             model_name=model_name,
             api_key=api_key or "EMPTY",
-            stream=True,
+            stream=stream,
             client_kwargs={"base_url": custom_base},
         )
-        return model, OpenAIChatFormatter()
+        return _with_usage_tracking(model, on_usage), OpenAIChatFormatter()
 
     provider = os.environ.get("TT_PROVIDER", "dashscope").lower()
 
@@ -514,18 +751,100 @@ def build_model_and_formatter(model_override: str | None = None, model_config: d
             raise RuntimeError("未配置可用模型：请在「设置 → 模型与用量」中添加模型（或配置 TT_API_KEY 兜底）")
         # 联网搜索：调研类任务可获取实时网络信息（TT_ENABLE_SEARCH=false 可关闭）
         enable_search = os.environ.get("TT_ENABLE_SEARCH", "true").lower() != "false"
-        model = DashScopeChatModel(model_name=model_name, api_key=api_key, stream=True, enable_search=enable_search)
-        return model, DashScopeChatFormatter()
+        model = DashScopeChatModel(
+            model_name=model_name,
+            api_key=api_key,
+            stream=stream,
+            enable_search=enable_search,
+        )
+        return _with_usage_tracking(model, on_usage), DashScopeChatFormatter()
 
     # OpenAI 兼容协议（OpenAI / DeepSeek / Kimi / 本地 Ollama 等）
     base_url = os.environ.get("TT_BASE_URL", "")
     model = OpenAIChatModel(
         model_name=model_name,
         api_key=api_key or "EMPTY",
-        stream=True,
+        stream=stream,
         client_kwargs={"base_url": base_url} if base_url else {},
     )
-    return model, OpenAIChatFormatter()
+    return _with_usage_tracking(model, on_usage), OpenAIChatFormatter()
+
+
+try:
+    from agentscope.model import ChatModelBase
+except Exception:  # agentscope 缺失时降级为本地基类，仅影响用量采集包装
+    class ChatModelBase:  # type: ignore[no-redef]
+        """agentscope 缺失时的占位基类（model_name/stream 语义一致）"""
+
+        def __init__(self, model_name: str = "", stream: bool = True) -> None:
+            self.model_name = model_name
+            self.stream = stream
+
+
+class UsageTrackingModel(ChatModelBase):
+    """模型包装层：把每次真实调用的 token 用量记入台账并回调。
+
+    agentscope 的 ReActAgent 只依赖 `stream` 属性与 `__call__`（含 `stream` 的
+    运行时改写），故包装层透传这两者即可，不改动内核行为。
+
+    流式响应的 usage 仅在末尾 chunk 出现（DashScope 末 chunk / OpenAI
+    stream_options.include_usage），故按「最后一次非空 usage」计一次，
+    避免逐 chunk 重复累计。
+    """
+
+    def __init__(self, inner, on_usage=None):
+        self._inner = inner  # 必须先于 super().__init__：stream setter 需要它
+        super().__init__(model_name=inner.model_name, stream=inner.stream)
+        self._on_usage = on_usage
+
+    @property
+    def stream(self) -> bool:
+        return self._inner.stream
+
+    @stream.setter
+    def stream(self, value: bool) -> None:
+        self._inner.stream = value
+
+    def _record(self, usage) -> None:
+        if usage is None:
+            return
+        prompt, completion = usage
+        row = USAGE_LEDGER.add(self.model_name, prompt, completion)
+        if self._on_usage is not None:
+            try:
+                self._on_usage(prompt, completion, self.model_name)
+            except Exception as exc:  # 回调失败不影响模型调用链
+                print(f"[engine] usage 回调失败: {exc}", flush=True)
+        print(
+            f"[engine] usage model={self.model_name} +{prompt}/+{completion} "
+            f"累计={row['promptTokens'] + row['completionTokens']} calls={row['calls']}",
+            flush=True,
+        )
+
+    async def __call__(self, *args, **kwargs):
+        res = await self._inner(*args, **kwargs)
+        if inspect.isasyncgen(res):
+            return self._wrap_stream(res)
+        self._record(_usage_of(res))
+        return res
+
+    async def _wrap_stream(self, agen):
+        last = None
+        async for chunk in agen:
+            parsed = _usage_of(chunk)
+            if parsed is not None:
+                last = parsed
+            yield chunk
+        self._record(last)
+
+
+def _with_usage_tracking(model, on_usage):
+    """统一挂载用量采集（无 agentscope 基类可用时原样返回，保证不阻断）"""
+    try:
+        return UsageTrackingModel(model, on_usage)
+    except Exception as exc:
+        print(f"[engine] 用量采集包装跳过: {exc}", flush=True)
+        return model
 
 
 def build_toolkit(work_dir: Path):
@@ -622,11 +941,12 @@ def build_toolkit(work_dir: Path):
     return toolkit
 
 
-def build_agent(model_binding: str | None = None, work_dir: "Path | None" = None, model_config: dict | None = None):
+def build_agent(model_binding: str | None = None, work_dir: "Path | None" = None, model_config: dict | None = None,
+                on_usage=None):
     from agentscope.agent import ReActAgent
     from agentscope.memory import InMemoryMemory
 
-    model, formatter = build_model_and_formatter(model_binding, model_config)
+    model, formatter = build_model_and_formatter(model_binding, model_config, on_usage=on_usage)
     # 注入当前时间：模型涉及日期/“今天、本周”等概念及生成带日期文件名时以此为准
     weekdays = "一二三四五六日"
     now = time.localtime()
@@ -779,6 +1099,14 @@ async def chat(request: Request):
             session.work_dir = Path(work_dir_raw).expanduser()
         except Exception:
             session.work_dir = None
+    # 安全工作环境开关（Rust 从设置读取后随提交下发，approve 重跑沿用）
+    if payload.get("secureEnv") is not None:
+        session.secure_env = bool(payload.get("secureEnv"))
+    # 对话历史（保障连续对话）：桌面端两阶段协议下随 plan 请求到达，
+    # 存进会话后 approve 的执行流才能预填充；单阶段请求直接用本次传入的
+    history = _normalize_history(payload.get("history"))
+    if history:
+        session.history = history
 
     # 会话子目录：工作目录下按对话时间创建，存会话内容与产出物
     if session.session_dir is None and goal:
@@ -808,10 +1136,6 @@ async def chat(request: Request):
             media_type="text/event-stream",
             headers=sse_headers,
         )
-
-    # 对话历史（保障连续对话）：前端传入此前轮次的 user/assistant 消息列表
-    history_raw = payload.get("history") or []
-    history = history_raw if isinstance(history_raw, list) else []
 
     return StreamingResponse(
         _run_execution(session, task_id, goal, replay_from, model_binding, session.work_dir, history, model_config),
@@ -1073,13 +1397,181 @@ AWARENESS_DEFAULTS = {
 
 
 def _awareness_home() -> Path:
-    return Path.home() / ".tongtianwork" / "awareness" / "main"
+    """意识目录：`TONGTIANWORK_HOME` 覆盖（与 Rust `awareness::dir()` 同规则），
+    缺省 `~/.tongtianwork`，两条通道因此读写同一份文件"""
+    root = str(os.environ.get("TONGTIANWORK_HOME") or "").strip()
+    base = Path(root) if root else Path.home() / ".tongtianwork"
+    return base / "awareness" / "main"
+
+
+# 协作风格预设 id（与 Rust `awareness::STYLE_IDS`、contracts.ts 一致）
+AWARENESS_STYLES = ("efficient", "deliberate", "gentle", "assertive")
+AWARENESS_DEFAULT_STYLE = "efficient"
+# 意识画像落盘文件名（不在可编辑能力文件白名单内，只经 /api/awareness 接口读写）
+AWARENESS_PROFILE_FILE = "PROFILE.json"
+# 长期记忆条目的行分隔符（`- {id} · {source} · {createdAt} · {content}`，与 Rust 同格式）
+MEMORY_DELIM = " · "
+MEMORY_SOURCES = ("auto", "manual", "reflection")
+
+
+def _iso_utc(ms: int) -> str:
+    """epoch 毫秒 → `2026-09-21T00:00:00.000Z`（与 Rust `audit::iso8601_utc` 同格式）"""
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ms / 1000)) + ".%03dZ" % (ms % 1000)
+
+
+def _awareness_updated_at(p: Path) -> str:
+    try:
+        return _iso_utc(int(p.stat().st_mtime * 1000))
+    except Exception:
+        return "系统默认"
+
+
+def _profile_default() -> dict:
+    return {
+        "mode": True,
+        "autoMemory": True,
+        "style": AWARENESS_DEFAULT_STYLE,
+        "updatedAt": "",
+    }
+
+
+def _profile_load(home: Path) -> dict:
+    """读取 PROFILE.json；缺失/损坏回落默认值（与 Rust load_profile 同口径）"""
+    profile = _profile_default()
+    try:
+        raw = json.loads((home / AWARENESS_PROFILE_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        return profile
+    if not isinstance(raw, dict):
+        return profile
+    if "mode" in raw:
+        profile["mode"] = raw["mode"] is True or str(raw["mode"]).strip() == "true"
+    if "autoMemory" in raw:
+        profile["autoMemory"] = raw["autoMemory"] is True or str(raw["autoMemory"]).strip() == "true"
+    if raw.get("style") in AWARENESS_STYLES:
+        profile["style"] = raw["style"]
+    profile["updatedAt"] = str(raw.get("updatedAt") or "")
+    return profile
+
+
+def _profile_save(home: Path, profile: dict) -> None:
+    (home / AWARENESS_PROFILE_FILE).write_text(
+        json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _files_load(home: Path) -> dict:
+    """四个能力文件；缺失的按默认模板初始化落盘，已存在的绝不覆盖"""
+    files: dict = {}
+    for name in AWARENESS_FILE_NAMES:
+        p = home / name
+        if not p.exists():
+            try:
+                p.write_text(AWARENESS_DEFAULTS.get(name, ""), encoding="utf-8")
+            except Exception:
+                pass
+            files[name] = {
+                "content": AWARENESS_DEFAULTS.get(name, ""),
+                "updatedAt": "系统默认",
+            }
+            continue
+        try:
+            files[name] = {"content": p.read_text(encoding="utf-8"), "updatedAt": _awareness_updated_at(p)}
+        except Exception:
+            files[name] = {"content": "", "updatedAt": _awareness_updated_at(p)}
+    return files
+
+
+def _awareness_view(home: Path) -> dict:
+    profile = _profile_load(home)
+    return {
+        "ok": True,
+        "mode": profile["mode"],
+        "autoMemory": profile["autoMemory"],
+        "style": profile["style"],
+        "updatedAt": profile["updatedAt"],
+        "dir": str(home),
+        "files": _files_load(home),
+    }
+
+
+def _memory_line(entry: dict) -> str:
+    return "- {}{}{}{}{}{}{}".format(
+        entry["id"], MEMORY_DELIM, entry["source"], MEMORY_DELIM, entry["createdAt"], MEMORY_DELIM, entry["content"]
+    )
+
+
+def _parse_memory_line(line: str):
+    """解析结构化行；用户自己写的正文/默认占位段返回 None 并原样保留"""
+    body = line.strip()
+    if not body.startswith("- "):
+        return None
+    parts = body[2:].split(MEMORY_DELIM, 3)
+    if len(parts) != 4:
+        return None
+    mid, source, created_at, content = (p.strip() for p in parts)
+    if not mid or not content or source not in MEMORY_SOURCES:
+        return None
+    return {"id": mid, "content": content, "source": source, "createdAt": created_at}
+
+
+def _memories_load(home: Path) -> list:
+    """长期记忆条目（新→旧，与 Rust list_memories 同排序口径）"""
+    p = home / "MEMORY.md"
+    if not p.exists():
+        home.mkdir(parents=True, exist_ok=True)
+        p.write_text(AWARENESS_DEFAULTS.get("MEMORY.md", ""), encoding="utf-8")
+    rows = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        entry = _parse_memory_line(line)
+        if entry:
+            rows.append(entry)
+    rows.sort(key=lambda e: (e["createdAt"], e["id"]), reverse=True)
+    return rows
+
+
+def _memory_id(now_ms: int, existing) -> str:
+    base = "mem-%d" % now_ms
+    if base not in existing:
+        return base
+    n = 2
+    while f"{base}-{n}" in existing:
+        n += 1
+    return f"{base}-{n}"
 
 
 # ── 自定义模型配置文件：真实路径 ~/.tongtianwork/models.json ─────────
 
 def _models_config_path() -> Path:
     return Path.home() / ".tongtianwork" / "models.json"
+
+
+@app.get("/api/usage")
+async def usage_get(period: str = "monthly"):
+    """模型用量（真实 token 台账）：daily=今日 / monthly=本月 / total=全部。
+
+    仅供浏览器直连模式读取（无 Rust 后端时的联调通道）；
+    Tauri 模式的权威数据在 Rust model_usage 表（按 usage 事件持久化）。
+    台账为进程内累计，引擎重启清零。"""
+    p = period if period in ("daily", "monthly", "total") else "total"
+    return JSONResponse({"ok": True, "period": p, "rows": USAGE_LEDGER.aggregate(p)})
+
+
+@app.get("/api/usage/report")
+async def usage_report_get(period: str = "monthly"):
+    """用量报表（按日趋势 + 明细 + 汇总）：与 Rust `usage_report` 同一返回体。"""
+    p = period if period in ("daily", "monthly", "total") else "total"
+    models = USAGE_LEDGER.aggregate(p)
+    return JSONResponse(
+        {
+            "ok": True,
+            "period": p,
+            "generatedAtMs": int(time.time() * 1000),
+            "days": USAGE_LEDGER.days(p),
+            "models": models,
+            "totals": USAGE_LEDGER.totals(p, models),
+        }
+    )
 
 
 @app.get("/api/models/config")
@@ -1119,48 +1611,309 @@ async def models_config_set(request: Request):
     return JSONResponse({"ok": True, "path": str(p)})
 
 
-@app.get("/api/awareness/load")
-async def awareness_load():
-    """读取真实意识目录下的能力文件；四个能力文件（协作风格/工作手册/
-    用户画像/长期记忆）缺失时以默认模板初始化落盘，保证目录内真实存在"""
+@app.get("/api/awareness")
+async def awareness_get_view():
+    """意识视图（`awareness:get`）：画像 + 目录 + 四个能力文件真实内容
+    （缺失文件按默认模板初始化落盘，已存在的绝不覆盖）"""
     home = _awareness_home()
     try:
         home.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-    files: dict = {}
-    for name in AWARENESS_FILE_NAMES:
-        p = home / name
-        if not p.exists():
-            try:
-                p.write_text(AWARENESS_DEFAULTS.get(name, ""), encoding="utf-8")
-            except Exception:
-                continue
-        try:
-            files[name] = {
-                "content": p.read_text(encoding="utf-8"),
-                "updatedAt": time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(p.stat().st_mtime)),
-            }
-        except Exception:
-            continue
-    return JSONResponse({"ok": True, "path": str(home), "files": files})
+    except Exception as exc:
+        return JSONResponse(
+            {"ok": False, "code": "AWARENESS_DIR_FAILED", "message": f"意识目录不可访问：{exc}"},
+            status_code=500,
+        )
+    return JSONResponse(_awareness_view(home))
 
 
-@app.post("/api/awareness/save")
-async def awareness_save(request: Request):
-    """意识能力文件真实落盘到 ~/.tongtianwork/awareness/main（文件名白名单防穿越）"""
+@app.post("/api/awareness")
+async def awareness_update(request: Request):
+    """保存画像与能力文件（`awareness:update`）：先整体校验再落盘，避免半成品状态"""
     try:
         payload = await request.json()
     except Exception:
         return JSONResponse({"ok": False, "message": "无效 JSON"}, status_code=400)
-    name = Path(str(payload.get("fileName") or "")).name
-    if name not in AWARENESS_FILE_NAMES:
-        return JSONResponse({"ok": False, "message": f"未知意识文件: {name}"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse(
+            {"ok": False, "code": "AWARENESS_FILE_INVALID", "message": "意识补丁必须是对象"}, status_code=400
+        )
     home = _awareness_home()
-    home.mkdir(parents=True, exist_ok=True)
-    target = home / name
-    target.write_text(str(payload.get("content") or ""), encoding="utf-8")
-    return JSONResponse({"ok": True, "path": str(target)})
+    files = payload.get("files") or {}
+    if not isinstance(files, dict):
+        return JSONResponse(
+            {"ok": False, "code": "AWARENESS_FILE_INVALID", "message": "files 必须是文件名到正文的对象"},
+            status_code=400,
+        )
+    for name in files:
+        if Path(str(name)).name != str(name) or str(name) not in AWARENESS_FILE_NAMES:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "code": "AWARENESS_FILE_INVALID",
+                    "message": f"意识文件「{name}」不在可编辑清单内，仅支持 {' / '.join(AWARENESS_FILE_NAMES)}",
+                },
+                status_code=400,
+            )
+    style = payload.get("style")
+    if style is not None and str(style).strip() not in AWARENESS_STYLES:
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": "AWARENESS_STYLE_INVALID",
+                "message": f"协作风格「{style}」非法，仅支持 {' / '.join(AWARENESS_STYLES)}",
+            },
+            status_code=400,
+        )
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        profile = _profile_load(home)
+        if isinstance(payload.get("mode"), (bool, str)):
+            profile["mode"] = payload["mode"] is True or str(payload["mode"]).strip() == "true"
+        if isinstance(payload.get("autoMemory"), (bool, str)):
+            profile["autoMemory"] = (
+                payload["autoMemory"] is True or str(payload["autoMemory"]).strip() == "true"
+            )
+        if style is not None:
+            profile["style"] = str(style).strip()
+        for name, content in files.items():
+            (home / str(name)).write_text(str(content or ""), encoding="utf-8")
+        profile["updatedAt"] = _iso_utc(int(time.time() * 1000))
+        _profile_save(home, profile)
+    except Exception as exc:
+        return JSONResponse(
+            {"ok": False, "code": "AWARENESS_SAVE_FAILED", "message": f"意识内容保存失败：{exc}"},
+            status_code=500,
+        )
+    return JSONResponse(_awareness_view(home))
+
+
+@app.get("/api/awareness/memories")
+async def awareness_memories_get():
+    """长期记忆条目列表（`awareness:memories`），来自 MEMORY.md 的结构化行"""
+    try:
+        rows = _memories_load(_awareness_home())
+    except Exception as exc:
+        return JSONResponse(
+            {"ok": False, "code": "AWARENESS_LOAD_FAILED", "message": f"长期记忆读取失败：{exc}"},
+            status_code=500,
+        )
+    return JSONResponse({"ok": True, "entries": rows})
+
+
+@app.post("/api/awareness/memories")
+async def awareness_memory_add(request: Request):
+    """新增长期记忆条目（`awareness:memoryAdd`）：只追加行，MEMORY.md 里用户自己的正文原样保留"""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "message": "无效 JSON"}, status_code=400)
+    content = " ".join(str(payload.get("content") or "").split())
+    if not content:
+        return JSONResponse(
+            {"ok": False, "code": "AWARENESS_MEMORY_EMPTY", "message": "记忆条目内容不能为空"},
+            status_code=400,
+        )
+    source = str(payload.get("source") or "").strip()
+    if source not in MEMORY_SOURCES:
+        source = "manual"
+    home = _awareness_home()
+    try:
+        existing = [e["id"] for e in _memories_load(home)]
+        now_ms = int(time.time() * 1000)
+        entry = {
+            "id": _memory_id(now_ms, existing),
+            "content": content,
+            "source": source,
+            "createdAt": _iso_utc(now_ms),
+        }
+        p = home / "MEMORY.md"
+        raw = p.read_text(encoding="utf-8") if p.exists() else ""
+        body = raw.rstrip("\n")
+        merged = (body + "\n" if body else "") + _memory_line(entry) + "\n"
+        p.write_text(merged, encoding="utf-8")
+    except Exception as exc:
+        return JSONResponse(
+            {"ok": False, "code": "AWARENESS_SAVE_FAILED", "message": f"长期记忆写入失败：{exc}"},
+            status_code=500,
+        )
+    return JSONResponse({"ok": True, "entry": entry})
+
+
+@app.post("/api/awareness/memories/delete")
+async def awareness_memory_delete(request: Request):
+    """删除指定长期记忆条目（`awareness:memoryDelete`）：只删点名的那一行，未命中如实报错"""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "message": "无效 JSON"}, status_code=400)
+    target = str(payload.get("id") or "").strip()
+    home = _awareness_home()
+    p = home / "MEMORY.md"
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except Exception as exc:
+        return JSONResponse(
+            {"ok": False, "code": "AWARENESS_LOAD_FAILED", "message": f"长期记忆读取失败：{exc}"},
+            status_code=500,
+        )
+    kept = []
+    removed = False
+    for line in raw.splitlines():
+        entry = _parse_memory_line(line)
+        if entry and entry["id"] == target:
+            removed = True
+            continue
+        kept.append(line)
+    if not removed:
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": "AWARENESS_MEMORY_NOT_FOUND",
+                "message": f"记忆条目「{target}」已不存在，可能已被删除",
+            },
+            status_code=404,
+        )
+    try:
+        p.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    except Exception as exc:
+        return JSONResponse(
+            {"ok": False, "code": "AWARENESS_SAVE_FAILED", "message": f"长期记忆写入失败：{exc}"},
+            status_code=500,
+        )
+    return JSONResponse({"ok": True, "id": target})
+
+
+# ── 安全工作环境：隔离执行目录与磁盘用量 ─────────────────────────
+# 目录布局与 Rust `security::environment` 同源：{data_home}/workspaces/{ws}/environment
+# 引擎的 WORK_DIR 即某个工作空间目录，因此这里只统计它自己那一份。
+
+ENV_DIR_NAME = "environment"
+
+
+def env_root() -> Path:
+    return WORK_DIR / ENV_DIR_NAME
+
+
+def _task_work_dir(task_id: str) -> Path:
+    """安全工作环境开启且用户未自选工作目录时的任务隔离目录。
+
+    对话记录仍写在 {WORK_DIR}/sessions，工作产物按会话落盘，
+    二者都不受「清理工作环境文件」影响。"""
+    d = env_root() / task_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _dir_stat(root: Path) -> tuple[int, int]:
+    """递归统计目录内文件的字节数与个数。
+
+    符号链接一律不跟随（防环路，也防顺着链接统计到目录树之外）；
+    单个条目读不到就跳过，不中断整体统计。"""
+    total_bytes = 0
+    total_files = 0
+    stack = [root]
+    while stack:
+        cur = stack.pop()
+        try:
+            entries = list(os.scandir(cur))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir():
+                    stack.append(Path(entry.path))
+                else:
+                    total_bytes += entry.stat().st_size
+                    total_files += 1
+            except OSError:
+                continue
+    return total_bytes, total_files
+
+
+def _env_usage_view() -> dict:
+    root = env_root()
+    landed = root.is_dir()
+    size, files = _dir_stat(root) if landed else (0, 0)
+    return {
+        "supported": True,
+        "bytes": size,
+        "files": files,
+        "workspaceCount": 1 if landed else 0,
+        "workspaces": (
+            [{"workspaceId": WORK_DIR.name, "path": str(root), "bytes": size, "files": files}]
+            if landed
+            else []
+        ),
+        "rootPath": str(WORK_DIR),
+        "envDirName": ENV_DIR_NAME,
+    }
+
+
+@app.get("/api/sandbox/environment/usage")
+async def sandbox_environment_usage():
+    """工作环境文件用量（`sandbox:envUsage`）——磁盘实测，目录未落地即 0"""
+    try:
+        return JSONResponse(_env_usage_view())
+    except Exception as exc:
+        return JSONResponse(
+            {"ok": False, "code": "SANDBOX_ENV_USAGE_FAILED", "message": f"工作环境用量统计失败：{exc}"},
+            status_code=500,
+        )
+
+
+@app.post("/api/sandbox/environment/clear")
+async def sandbox_environment_clear():
+    """清理工作环境文件（`sandbox:envClear`）：只删 environment/ 内的内容，目录本身保留。
+
+    数据保护边界：对话记录（sessions/）、工作产物（files/）以及 environment/ 之外的任何
+    路径都不在删除范围内；符号链接条目一律不删。"""
+    root = env_root()
+    if not root.is_dir():
+        return JSONResponse({"freedBytes": 0, "freedFiles": 0, "cleared": [], "failed": []})
+    try:
+        entries = list(os.scandir(root))
+    except OSError as exc:
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": "SANDBOX_ENV_CLEAR_FAILED",
+                "message": f"无法读取工作环境目录：{exc}",
+            },
+            status_code=500,
+        )
+    before_size, before_files = _dir_stat(root)
+    failed: list = []
+    for entry in entries:
+        path = Path(entry.path)
+        try:
+            if path.is_symlink():
+                failed.append({
+                    "path": str(path),
+                    "error": "SANDBOX_ENV_CLEAR_SKIPPED_SYMLINK: 符号链接不删除",
+                })
+                continue
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except OSError as exc:
+            failed.append({"path": str(path), "error": f"SANDBOX_ENV_CLEAR_FAILED: {exc}"})
+    after_size, after_files = _dir_stat(root)
+    freed_size = max(before_size - after_size, 0)
+    freed_files = max(before_files - after_files, 0)
+    cleared = (
+        [{"workspaceId": WORK_DIR.name, "freedBytes": freed_size, "freedFiles": freed_files}]
+        if freed_size or freed_files
+        else []
+    )
+    return JSONResponse({
+        "freedBytes": freed_size,
+        "freedFiles": freed_files,
+        "cleared": cleared,
+        "failed": failed,
+    })
 
 
 @app.post("/api/files/open-folder")

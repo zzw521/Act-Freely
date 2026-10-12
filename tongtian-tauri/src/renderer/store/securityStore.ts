@@ -1,18 +1,56 @@
+/**
+ * 通天办公 - 安全与治理状态（PRD §4.7）
+ *
+ * 三通道统一走 `window.tongtianAPI.invoke`：
+ * - Tauri 容器 → Rust command（authority：分级/策略/审计均落 SQLite）
+ * - 浏览器直连引擎 → 前端本地实现（`lib/security-local.ts`）
+ * - 开发 Mock → 同上（Mock 开关规范：无后端也可自测）
+ *
+ * 出域控制/沙箱策略的边界校验在 Rust 侧完成，前端只做形状适配与展示。
+ */
+
 import { create } from 'zustand';
-import { SandboxPolicy, AuditLogEntry, DataSensitivity } from '../../shared/types';
+import { IPC_CHANNELS } from '../../shared/contracts';
+import type {
+  ComplianceDomainControl,
+  CompliancePatch,
+  ComplianceStatus,
+  ComplianceUpdateResp,
+} from '../../shared/contracts';
+import type { LocalScanResult } from '../../shared/sensitivity-rules';
+import type { AuditLogEntry, SandboxPolicy } from '../../shared/types';
+
+/** 出域控制配置（直接复用契约类型，避免与 Rust `policy::DomainControl` 双份字段漂移） */
+export type DomainControlConfig = ComplianceDomainControl;
+
+export interface AuditFilters {
+  /** 动作过滤（对齐 Rust AuditFilters.action，兼容旧 `type` 命名） */
+  type?: string;
+  severity?: string;
+  dateRange?: string;
+  limit?: number;
+}
+
+export interface AuditExportResult {
+  path: string;
+  count: number;
+  format: string;
+}
+
+interface DomainControlView {
+  config: DomainControlConfig;
+  persisted: boolean;
+}
 
 interface SecurityState {
   // 数据分级
-  lastScanResult: any | null;
-  sensitivityRules: Array<{ pattern: RegExp; level: DataSensitivity; description: string }>;
+  lastScanResult: LocalScanResult | null;
 
   // 出域控制
-  domainControlEnabled: boolean;
-  domainMode: 'whitelist' | 'blacklist';
-  allowedDomains: string[];
-  blockedDomains: string[];
-  forceLocalForConfidential: boolean;
-  hardDisableExternalAPI: boolean;
+  domainControl: DomainControlConfig | null;
+  /** 是否已落库过（false 表示当前展示的是语义默认值） */
+  domainControlPersisted: boolean;
+  domainControlLoading: boolean;
 
   // 审计日志
   auditLogs: AuditLogEntry[];
@@ -23,31 +61,49 @@ interface SecurityState {
   sandboxPolicy: SandboxPolicy | null;
   policyLoading: boolean;
 
+  // 合规聚合视图（与出域控制同一份权威，仅只读展示 + 硬开关写入）
+  compliance: ComplianceStatus | null;
+  complianceLoading: boolean;
+  complianceError: string | null;
+
   // Actions
-  scanData: (text: string) => Promise<any>;
-  updateDomainControl: (config: Partial<SecurityState>) => void;
-  loadAuditLogs: (filters?: { type?: string; severity?: string; dateRange?: string }) => Promise<void>;
-  exportAuditLogs: (format: 'csv' | 'json') => Promise<void>;
-  saveSandboxPolicy: (policy: SandboxPolicy) => Promise<void>;
-  loadSandboxPolicy: (workspaceId: string) => Promise<void>;
+  scanData: (text: string) => Promise<LocalScanResult>;
+  loadDomainControl: () => Promise<void>;
+  updateDomainControl: (config: DomainControlConfig) => Promise<DomainControlConfig>;
+  loadCompliance: () => Promise<void>;
+  updateCompliance: (patch: CompliancePatch) => Promise<ComplianceUpdateResp>;
+  loadAuditLogs: (filters?: AuditFilters) => Promise<void>;
+  exportAuditLogs: (format: 'csv' | 'json') => Promise<AuditExportResult>;
+  saveSandboxPolicy: (policy: SandboxPolicy) => Promise<SandboxPolicy>;
+  loadSandboxPolicy: (workspaceId: string) => Promise<SandboxPolicy | null>;
   reset: () => void;
 }
 
-export const useSecurityStore = create<SecurityState>((set, get) => ({
-  // 初始状态
-  lastScanResult: null,
-  sensitivityRules: [
-    { pattern: /身份证|护照|营业执照/, level: DataSensitivity.CONFIDENTIAL, description: '个人证件信息' },
-    { pattern: /合同|协议|薪资|报价/, level: DataSensitivity.CONFIDENTIAL, description: '商业机密文件' },
-    { pattern: /内部|机密|绝密/, level: DataSensitivity.INTERNAL, description: '内部敏感标记' },
-  ],
+function getAPI() {
+  const api = window.tongtianAPI;
+  if (!api) {
+    throw new Error('SECURITY_API_UNAVAILABLE: tongtianAPI 未注入，无法调用安全治理接口');
+  }
+  return api;
+}
 
-  domainControlEnabled: false,
-  domainMode: 'whitelist',
-  allowedDomains: ['localhost', '127.0.0.1'],
-  blockedDomains: [],
-  forceLocalForConfidential: true,
-  hardDisableExternalAPI: false,
+/** 审计过滤器 → Rust `AuditFilters`（`type` 归一为 `action`） */
+function toRustFilters(filters?: AuditFilters) {
+  if (!filters) return null;
+  return {
+    action: filters.type,
+    severity: filters.severity,
+    dateRange: filters.dateRange,
+    limit: filters.limit,
+  };
+}
+
+export const useSecurityStore = create<SecurityState>((set) => ({
+  lastScanResult: null,
+
+  domainControl: null,
+  domainControlPersisted: false,
+  domainControlLoading: false,
 
   auditLogs: [],
   logLoading: false,
@@ -56,88 +112,97 @@ export const useSecurityStore = create<SecurityState>((set, get) => ({
   sandboxPolicy: null,
   policyLoading: false,
 
-  // Actions
+  compliance: null,
+  complianceLoading: false,
+  complianceError: null,
+
+  /** 数据分级检测：Rust `security_scan_data`（权威）或本地同源规则表 */
   scanData: async (text: string) => {
+    const result = (await getAPI().invoke(IPC_CHANNELS.SECURITY_SCAN_DATA, text)) as LocalScanResult;
+    set({ lastScanResult: result });
+    return result;
+  },
+
+  loadDomainControl: async () => {
+    set({ domainControlLoading: true });
     try {
-      // TODO: 调用 IPC 接口进行数据分级检测
-      // const result = await window.electron.security.scanData({ text });
-      
-      // 临时实现：基于规则匹配
-      const rules = get().sensitivityRules;
-      let sensitivity: DataSensitivity = DataSensitivity.PUBLIC;
-      let confidence = 0.5;
-      const findings: any[] = [];
-
-      for (const rule of rules) {
-        if (rule.pattern.test(text)) {
-          if (rule.level === DataSensitivity.CONFIDENTIAL && sensitivity !== DataSensitivity.CONFIDENTIAL) {
-            sensitivity = DataSensitivity.CONFIDENTIAL;
-            confidence = 0.9;
-            findings.push({
-              type: 'sensitive',
-              pattern: rule.pattern.toString(),
-              severity: 'high',
-              description: rule.description,
-            });
-          } else if (rule.level === DataSensitivity.INTERNAL && sensitivity === DataSensitivity.PUBLIC) {
-            sensitivity = DataSensitivity.INTERNAL;
-            confidence = 0.75;
-          }
-        }
-      }
-
-      const result = {
-        sensitivity,
-        confidence,
-        findings,
-        summary:
-          sensitivity === DataSensitivity.CONFIDENTIAL
-            ? '检测到高度敏感信息，建议仅使用本地模型处理'
-            : sensitivity === DataSensitivity.INTERNAL
-            ? '检测到内部敏感内容，建议限制使用范围'
-            : '未检测到敏感信息，可正常使用',
-      };
-
-      set({ lastScanResult: result });
-      return result;
+      const view = (await getAPI().invoke(
+        IPC_CHANNELS.SECURITY_GET_DOMAIN_CONTROL,
+      )) as DomainControlView;
+      set({
+        domainControl: view?.config ?? null,
+        domainControlPersisted: Boolean(view?.persisted),
+        domainControlLoading: false,
+      });
     } catch (err) {
+      set({ domainControlLoading: false });
       throw err;
     }
   },
 
-  updateDomainControl: (config) => {
+  /** 保存出域控制：以后端归一化结果为准（域名小写去重等） */
+  updateDomainControl: async (config) => {
+    const view = (await getAPI().invoke(
+      IPC_CHANNELS.SECURITY_SET_DOMAIN_CONTROL,
+      config,
+    )) as DomainControlView;
+    const stored = view?.config ?? config;
+    set({ domainControl: stored, domainControlPersisted: true });
+    // 出域控制与合规视图共用同一份权威，保存后同步聚合视图，避免两处展示打架
+    await useSecurityStore.getState().loadCompliance();
+    return stored;
+  },
+
+  /**
+   * 读取合规聚合视图。
+   * 失败时记录 complianceError 而不抛出：安全页已有各自的错误提示通道，
+   * 这里必须让调用方看到失败，而不是静默回落到「一切正常」。
+   */
+  loadCompliance: async () => {
+    set({ complianceLoading: true });
+    try {
+      const status = (await getAPI().invoke(IPC_CHANNELS.COMPLIANCE_STATUS)) as ComplianceStatus;
+      set({
+        compliance: status ?? null,
+        complianceLoading: false,
+        complianceError: null,
+        // 出域控制摘要与合规视图同源：一并回写，避免两处展示打架
+        ...(status
+          ? {
+              domainControl: status.domainControl,
+              domainControlPersisted: Boolean(status.persisted),
+            }
+          : null),
+      });
+    } catch (err) {
+      set({ complianceLoading: false, complianceError: `加载合规状态失败: ${err}` });
+    }
+  },
+
+  /** 更新合规策略（硬开关等）：以后端回读的聚合状态为准，并把变更写回出域控制 */
+  updateCompliance: async (patch) => {
+    const resp = (await getAPI().invoke(
+      IPC_CHANNELS.COMPLIANCE_UPDATE,
+      patch,
+    )) as ComplianceUpdateResp;
+    const status = resp?.status ?? null;
     set({
-      ...config,
+      compliance: status,
+      complianceError: null,
+      domainControl: status?.domainControl ?? useSecurityStore.getState().domainControl,
+      domainControlPersisted: Boolean(status?.persisted),
     });
-    
-    // TODO: 调用 IPC 接口持久化配置
-    // window.electron.security.saveDomainControl(config);
-    console.log('[SecurityStore] 出域控制配置已更新:', config);
+    return resp;
   },
 
   loadAuditLogs: async (filters) => {
+    set({ logLoading: true, logError: null });
     try {
-      set({ logLoading: true, logError: null });
-      
-      // TODO: 调用 IPC 接口获取审计日志
-      // const logs = await window.electron.security.getAuditLogs({ filters });
-      
-      // 临时模拟数据
-      await new Promise(resolve => setTimeout(resolve, 500));
-      const logs: AuditLogEntry[] = [
-        {
-          id: '1',
-          timestamp: new Date(),
-          action: 'model_call',
-          severity: 'info',
-          user: 'admin',
-          resource: 'qwen-max',
-          details: '成功调用通义千问模型',
-          read: false,
-        },
-      ];
-
-      set({ auditLogs: logs, logLoading: false });
+      const logs = (await getAPI().invoke(
+        IPC_CHANNELS.AUDIT_QUERY,
+        toRustFilters(filters),
+      )) as AuditLogEntry[];
+      set({ auditLogs: logs ?? [], logLoading: false });
     } catch (err) {
       set({ logError: `加载日志失败: ${err}`, logLoading: false });
       throw err;
@@ -145,51 +210,41 @@ export const useSecurityStore = create<SecurityState>((set, get) => ({
   },
 
   exportAuditLogs: async (format) => {
-    try {
-      // TODO: 调用 IPC 接口导出日志
-      // await window.electron.security.exportAuditLogs({ format });
-      console.log(`[SecurityStore] 导出审计日志: ${format}`);
-    } catch (err) {
-      throw err;
-    }
+    const result = (await getAPI().invoke(
+      IPC_CHANNELS.AUDIT_EXPORT,
+      format,
+      toRustFilters(),
+    )) as AuditExportResult;
+    // 导出会写一条 file_write 审计，刷新列表保持一致
+    await useSecurityStore.getState().loadAuditLogs();
+    return result;
   },
 
   saveSandboxPolicy: async (policy) => {
+    set({ policyLoading: true });
     try {
-      set({ policyLoading: true });
-      
-      // TODO: 调用 IPC 接口保存策略
-      // await window.electron.security.saveSandboxPolicy({ policy });
-      
-      set({ sandboxPolicy: policy, policyLoading: false });
-      console.log('[SecurityStore] 沙箱策略已保存:', policy);
+      const stored = (await getAPI().invoke(
+        IPC_CHANNELS.SANDBOX_UPDATE_POLICY,
+        policy,
+      )) as SandboxPolicy;
+      set({ sandboxPolicy: stored ?? policy, policyLoading: false });
+      return stored ?? policy;
     } catch (err) {
       set({ policyLoading: false });
       throw err;
     }
   },
 
+  /** 读取沙箱策略：未配置返回 null（由表单展示默认值，不伪造已保存数据） */
   loadSandboxPolicy: async (workspaceId) => {
+    set({ policyLoading: true });
     try {
-      set({ policyLoading: true });
-      
-      // TODO: 调用 IPC 接口获取策略
-      // const policy = await window.electron.security.getSandboxPolicy({ workspaceId });
-      
-      // 临时默认策略
-      const policy: SandboxPolicy = {
+      const policy = (await getAPI().invoke(
+        IPC_CHANNELS.SANDBOX_GET_POLICY,
         workspaceId,
-        executionLevel: 'L1',
-        fileAllowlist: ['C:/Users/*/Documents/**'],
-        fileBlocklist: ['C:/Windows/**'],
-        toolAllowlist: [],
-        toolBlocklist: [],
-        maxCpuPercent: 50,
-        maxMemoryMB: 512,
-        maxDiskWriteMbps: 10,
-      };
-
-      set({ sandboxPolicy: policy, policyLoading: false });
+      )) as SandboxPolicy | null;
+      set({ sandboxPolicy: policy ?? null, policyLoading: false });
+      return policy ?? null;
     } catch (err) {
       set({ policyLoading: false });
       throw err;
@@ -199,17 +254,17 @@ export const useSecurityStore = create<SecurityState>((set, get) => ({
   reset: () => {
     set({
       lastScanResult: null,
-      domainControlEnabled: false,
-      domainMode: 'whitelist',
-      allowedDomains: ['localhost', '127.0.0.1'],
-      blockedDomains: [],
-      forceLocalForConfidential: true,
-      hardDisableExternalAPI: false,
+      domainControl: null,
+      domainControlPersisted: false,
+      domainControlLoading: false,
       auditLogs: [],
       logLoading: false,
       logError: null,
       sandboxPolicy: null,
       policyLoading: false,
+      compliance: null,
+      complianceLoading: false,
+      complianceError: null,
     });
   },
 }));

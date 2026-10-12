@@ -33,8 +33,9 @@ import CheckIcon from '@mui/icons-material/Check';
 import type { AttachmentMeta } from '../../../shared/types';
 import { isTauri } from '../../lib/tauri-api';
 import { chatAPI } from '../../lib/api';
-import { loadAllSkills, type SkillInfo } from '../../lib/skills';
+import { loadAllSkills, SKILL_SOURCE_META, type SkillInfo } from '../../lib/skills';
 import { useAppSettings, WORKBENCH_MODE_DEFS } from '../../lib/use-app-settings';
+import { useWorkbenchStore } from '../../store/workbenchStore';
 import { useNavigate } from 'react-router-dom';
 
 interface ChatInputProps {
@@ -87,7 +88,7 @@ function readFileAsBase64(file: File): Promise<string> {
 
 // 内置模型（对话模型选择；modelId 为提交时绑定给引擎的真实模型名）
 // 实测：qwen3.7-plus 名称不可用 → 基础用 qwen-plus；qwen3.7-flash 免费额度用尽 → 经济用 qwen-flash
-const BUILTIN_MODELS = [
+const BUILTIN_MODELS: ModelOption[] = [
   { id: 'auto', name: 'Auto Mode', desc: '自动选择最合适的模型', color: '#6366F1', modelId: '' },
   { id: 'qwen-max', name: 'Qwen3.8-Max', desc: '千问最强模型 · 1.1x', color: '#8B5CF6', modelId: 'qwen3.8-max' },
   { id: 'advanced', name: '高级', desc: '性能均衡，擅长复杂任务 · 1x', color: '#3B82F6', modelId: 'qwen3.7-max' },
@@ -123,8 +124,11 @@ const ChatInput: React.FC<ChatInputProps> = ({
 
   // ── 模型选择（替换原「添加到队列」占位） ──
   const [modelAnchor, setModelAnchor] = useState<null | HTMLElement>(null);
-  const [selectedModel, setSelectedModel] = useState<ModelOption>(BUILTIN_MODELS[0]);
-  
+  // 选项存在 workbenchStore 而非本组件 state：欢迎页 → 对话态切换会让 ChatInput 重挂，
+  // 实例内 state 的选择被无声重置回 Auto，后续轮次就不再按用户选的模型执行
+  const chatModelId = useWorkbenchStore((s) => s.chatModelId);
+  const setChatModelId = useWorkbenchStore((s) => s.setChatModelId);
+
     // 自定义模型（来自设置页已保存模型 tt-custom-models，选中后引擎真实调用其端点）
     const [customModels, setCustomModels] = useState<ModelOption[]>([]);
     useEffect(() => {
@@ -155,6 +159,10 @@ const ChatInput: React.FC<ChatInputProps> = ({
         // ignore
       }
     }, []);
+
+  // 清单异步加载（自定义模型来自 localStorage），所选 id 不在清单时按 Auto 展示
+  const selectedModel =
+    [...BUILTIN_MODELS, ...customModels].find((m) => m.id === chatModelId) ?? BUILTIN_MODELS[0];
 
   // ── 技能调用（魔棒按钮 + / 前缀，真实加载已安装+内置技能） ──
   const [skills, setSkills] = useState<SkillInfo[]>([]);
@@ -457,7 +465,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
         <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.75 }}>
           {referencedSkill && (() => {
             const active = Boolean(skillBlockAnchor); // 点击展开时才变色
-            const installed = referencedSkill.source === 'installed';
+            const meta = SKILL_SOURCE_META[referencedSkill.source];
             return (
               <Box
                 onClick={(e) => setSkillBlockAnchor(active ? null : e.currentTarget)}
@@ -471,12 +479,8 @@ const ChatInput: React.FC<ChatInputProps> = ({
                   borderRadius: '8px',
                   cursor: 'pointer',
                   flexShrink: 0,
-                  background: active
-                    ? installed ? '#E2D5FB' : '#C7EFDC'
-                    : installed ? '#F1EBFF' : '#E7F8EF',
-                  border: `1px solid ${active
-                    ? installed ? 'rgba(139, 92, 246, 0.55)' : 'rgba(16, 185, 129, 0.55)'
-                    : installed ? 'rgba(139, 92, 246, 0.28)' : 'rgba(16, 185, 129, 0.28)'}`,
+                  background: active ? meta.activeBg : meta.bg,
+                  border: `1px solid ${active ? meta.activeBorder : meta.border}`,
                   transition: 'background 0.15s ease, border-color 0.15s ease',
                 }}
               >
@@ -485,20 +489,22 @@ const ChatInput: React.FC<ChatInputProps> = ({
                     width: 14,
                     height: 14,
                     borderRadius: '4px',
-                    background: installed ? '#8B5CF6' : '#10B981',
+                    background: meta.solid,
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
                   }}
                 >
-                  <Typography sx={{ fontSize: '9px', fontWeight: 800, color: '#fff', lineHeight: 1 }}>T</Typography>
+                  <Typography sx={{ fontSize: '9px', fontWeight: 800, color: '#fff', lineHeight: 1 }}>
+                    {referencedSkill.source === 'suite' ? 'S' : 'T'}
+                  </Typography>
                 </Box>
                 <Typography
                   sx={{
                     fontSize: '12.5px',
                     fontWeight: 700,
                     whiteSpace: 'nowrap',
-                    color: installed ? '#6D28D9' : '#047857',
+                    color: meta.deep,
                   }}
                 >
                   {referencedSkill.name}
@@ -506,7 +512,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 <KeyboardArrowDownIcon
                   sx={{
                     fontSize: 14,
-                    color: installed ? '#8B5CF6' : '#10B981',
+                    color: meta.fg,
                     transform: active ? 'rotate(180deg)' : 'none',
                     transition: 'transform 0.2s ease',
                   }}
@@ -694,7 +700,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 width: 28,
                 height: 28,
                 borderRadius: '8px',
-                background: referencedSkill.source === 'installed' ? '#F1EBFF' : '#E7F8EF',
+                background: SKILL_SOURCE_META[referencedSkill.source].bg,
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
@@ -702,7 +708,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
               }}
             >
               <AutoAwesomeIcon
-                sx={{ fontSize: 15, color: referencedSkill.source === 'installed' ? '#8B5CF6' : '#10B981' }}
+                sx={{ fontSize: 15, color: SKILL_SOURCE_META[referencedSkill.source].solid }}
               />
             </Box>
             <Box sx={{ flexGrow: 1, minWidth: 0 }}>
@@ -710,7 +716,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 /{referencedSkill.name}
               </Typography>
               <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
-                {referencedSkill.source === 'installed' ? '已安装技能' : '内置技能'}
+                {SKILL_SOURCE_META[referencedSkill.source].blockLabel}
               </Typography>
             </Box>
           </Box>
@@ -812,14 +818,14 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 width: 26,
                 height: 26,
                 borderRadius: '8px',
-                background: s.source === 'installed' ? '#F1EBFF' : '#E7F8EF',
+                background: SKILL_SOURCE_META[s.source].bg,
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
                 flexShrink: 0,
               }}
             >
-              <AutoAwesomeIcon sx={{ fontSize: 14, color: s.source === 'installed' ? '#8B5CF6' : '#10B981' }} />
+              <AutoAwesomeIcon sx={{ fontSize: 14, color: SKILL_SOURCE_META[s.source].solid }} />
             </Box>
             <Box sx={{ flexGrow: 1, minWidth: 0 }}>
               <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#1F2937' }}>/{s.name}</Typography>
@@ -844,11 +850,11 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 py: 0.2,
                 borderRadius: '6px',
                 flexShrink: 0,
-                background: s.source === 'installed' ? '#F1EBFF' : '#E7F8EF',
+                background: SKILL_SOURCE_META[s.source].bg,
               }}
             >
-              <Typography sx={{ fontSize: '10px', fontWeight: 600, color: s.source === 'installed' ? '#8B5CF6' : '#059669' }}>
-                {s.source === 'installed' ? '已安装' : '内置'}
+              <Typography sx={{ fontSize: '10px', fontWeight: 600, color: SKILL_SOURCE_META[s.source].fg }}>
+                {SKILL_SOURCE_META[s.source].label}
               </Typography>
             </Box>
           </Box>
@@ -880,7 +886,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
           <Box
             key={m.id}
             onClick={() => {
-              setSelectedModel(m);
+              setChatModelId(m.id);
               setModelAnchor(null);
             }}
             sx={{
@@ -927,7 +933,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
               <Box
                 key={m.id}
                 onClick={() => {
-                  setSelectedModel(m);
+                  setChatModelId(m.id);
                   setModelAnchor(null);
                 }}
                 sx={{

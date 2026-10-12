@@ -31,6 +31,11 @@ futures-util = "0.3"
 rusqlite = { version = "0.31", features = ["bundled"] }
 keyring = "2"
 uuid = { version = "1", features = ["v4"] }
+# file:preview 正文提取（Office/PDF）：离线构建无 zip crate，DEFLATE 与 CRC 各自直用
+flate2 = "1.1"
+crc32fast = "1.5"
+# 专家套件包上传：zip 字节经 IPC 以 base64 透传（该版本已在依赖树内，离线可解析）
+base64 = "0.22"
 
 [profile.release]
 codegen-units = 1

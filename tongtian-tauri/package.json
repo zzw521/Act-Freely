@@ -2,6 +2,7 @@
   "name": "tongtian-tauri",
   "version": "0.1.0",
   "private": true,
+  "license": "Apache-2.0",
   "description": "通天办公 - Tauri 版（本地 AI 工作助手）",
   "type": "module",
   "scripts": {

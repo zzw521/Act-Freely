@@ -1,4 +1,4 @@
-//! settings_kv 读写（settings_get / settings_set 的数据层）
+//! settings_kv 读写（settings_get / settings_set_many 的数据层）
 
 use crate::store::Store;
 

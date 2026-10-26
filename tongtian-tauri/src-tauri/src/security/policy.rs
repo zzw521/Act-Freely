@@ -39,6 +39,9 @@ pub struct DomainControl {
 }
 
 /// 沙箱策略（与前端 `SandboxPolicy` 契约一致，附加 updatedAtMs）
+///
+/// `exec*` / `network*` 是执行授权：默认关闭，旧策略行没有这些键时按关闭处理，
+/// 不能因为反序列化失败就把整份策略判成损坏（那会掩盖已有白名单）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SandboxPolicy {
@@ -48,10 +51,52 @@ pub struct SandboxPolicy {
     pub file_blocklist: Vec<String>,
     pub tool_allowlist: Vec<String>,
     pub tool_blocklist: Vec<String>,
+    #[serde(default)]
+    pub exec_enabled: bool,
+    #[serde(default)]
+    pub exec_allowlist: Vec<String>,
+    #[serde(default)]
+    pub network_enabled: bool,
+    #[serde(default)]
+    pub network_allowlist: Vec<String>,
     pub max_cpu_percent: i64,
     pub max_memory_mb: i64,
     pub max_disk_write_mbps: i64,
     pub updated_at_ms: i64,
+}
+
+/// 命令白名单条目上限（超过就说明不是「受控」，而是变相放行）
+const MAX_EXEC_COMMANDS: usize = 64;
+/// 联网白名单条目上限
+const MAX_NETWORK_HOSTS: usize = 64;
+
+/// 命令名归一化：只接受裸命令名（禁止路径、空格与 shell 元字符）。
+/// 引擎用 `subprocess` 的 argv 方式执行，不经 shell；这里再拒绝路径，
+/// 避免把 `C:/Windows/System32/cmd.exe` 当成「命令名」混进白名单。
+fn normalize_command(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    if name.is_empty() || name.len() > 64 {
+        return None;
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+'))
+    {
+        return None;
+    }
+    Some(name.to_ascii_lowercase())
+}
+
+fn normalize_commands(list: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in list {
+        if let Some(name) = normalize_command(item) {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
 }
 
 /// 默认出域控制配置（未配置过时的语义默认：放行本地、不额外限制）
@@ -246,6 +291,27 @@ pub fn set_sandbox(store: &Store, policy: &SandboxPolicy) -> Result<SandboxPolic
             policy.max_disk_write_mbps
         ));
     }
+    if policy.exec_enabled && policy.exec_allowlist.len() > MAX_EXEC_COMMANDS {
+        return Err(format!(
+            "POLICY_INVALID_COMMAND: 命令白名单最多 {MAX_EXEC_COMMANDS} 项"
+        ));
+    }
+    let exec_allowlist = normalize_commands(&policy.exec_allowlist);
+    if policy.exec_allowlist.iter().any(|c| normalize_command(c).is_none()) {
+        return Err(
+            "POLICY_INVALID_COMMAND: 命令名只能包含字母、数字、下划线、连字符、点或加号，且不能带路径"
+                .into(),
+        );
+    }
+    if policy.network_enabled && policy.network_allowlist.len() > MAX_NETWORK_HOSTS {
+        return Err(format!(
+            "POLICY_INVALID_HOST: 联网白名单最多 {MAX_NETWORK_HOSTS} 项"
+        ));
+    }
+    let network_allowlist = normalize_domains(&policy.network_allowlist);
+    if policy.network_allowlist.iter().any(|h| normalize_domain(h).is_none()) {
+        return Err("POLICY_INVALID_HOST: 主机名不能为空或包含空格".into());
+    }
     let stored = SandboxPolicy {
         workspace_id: policy.workspace_id.trim().to_string(),
         execution_level: policy.execution_level.clone(),
@@ -253,6 +319,10 @@ pub fn set_sandbox(store: &Store, policy: &SandboxPolicy) -> Result<SandboxPolic
         file_blocklist: policy.file_blocklist.clone(),
         tool_allowlist: policy.tool_allowlist.clone(),
         tool_blocklist: policy.tool_blocklist.clone(),
+        exec_enabled: policy.exec_enabled,
+        exec_allowlist,
+        network_enabled: policy.network_enabled,
+        network_allowlist,
         max_cpu_percent: policy.max_cpu_percent,
         max_memory_mb: policy.max_memory_mb,
         max_disk_write_mbps: policy.max_disk_write_mbps,
@@ -261,6 +331,85 @@ pub fn set_sandbox(store: &Store, policy: &SandboxPolicy) -> Result<SandboxPolic
     let json = serde_json::to_string(&stored).map_err(|e| format!("POLICY_SAVE_FAILED: {e}"))?;
     put_json(store, &sandbox_key(&stored.workspace_id), &json)?;
     Ok(stored)
+}
+
+// ── 路径规则（沙箱文件白/黑名单） ──────────────────────────────
+
+/// 路径文本归一化：统一为 `/`、去掉尾部斜杠；Windows 下转小写（文件系统不区分大小写）。
+pub fn normalize_path_text(raw: &str) -> String {
+    let s = raw.trim().replace('\\', "/");
+    let trimmed = if !s.is_empty() && s.chars().all(|c| c == '/') {
+        "/"
+    } else {
+        s.trim_end_matches('/')
+    };
+    if cfg!(windows) {
+        trimmed.to_ascii_lowercase()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// 轻量 glob：`*` 不跨目录、`**` 跨目录、`?` 单个非分隔字符。
+fn glob_match(pattern: &str, text: &str) -> bool {
+    fn rec(p: &[u8], t: &[u8]) -> bool {
+        let Some(&head) = p.first() else {
+            return t.is_empty();
+        };
+        match head {
+            b'*' => {
+                let double = p.get(1) == Some(&b'*');
+                let rest = if double { &p[2..] } else { &p[1..] };
+                if rec(rest, t) {
+                    return true;
+                }
+                let mut i = 0;
+                while i < t.len() {
+                    if !double && t[i] == b'/' {
+                        break;
+                    }
+                    i += 1;
+                    if rec(rest, &t[i..]) {
+                        return true;
+                    }
+                }
+                false
+            }
+            b'?' => !t.is_empty() && t[0] != b'/' && rec(&p[1..], &t[1..]),
+            c => !t.is_empty() && t[0] == c && rec(&p[1..], &t[1..]),
+        }
+    }
+    rec(pattern.as_bytes(), text.as_bytes())
+}
+
+/// 单条规则是否命中路径。
+///
+/// - 无通配符：精确匹配，或作为目录前缀（`C:/Windows` 命中其下所有文件）
+/// - `dir/**`：命中该目录本身及其下所有内容
+/// - 其余按 glob 语义匹配（`*` 不跨目录）
+pub fn path_matches_rule(rule: &str, path: &str) -> bool {
+    let r = normalize_path_text(rule);
+    if r.is_empty() {
+        return false;
+    }
+    let p = normalize_path_text(path);
+    if let Some(base) = r.strip_suffix("/**") {
+        if p == base || p.starts_with(&format!("{base}/")) {
+            return true;
+        }
+    }
+    if r.contains('*') || r.contains('?') {
+        return glob_match(&r, &p);
+    }
+    p == r || p.starts_with(&format!("{r}/")) || (r == "/" && p.starts_with('/'))
+}
+
+/// 返回命中的第一条规则（用于审计说明），未命中返回 None
+pub fn path_blocked(rules: &[String], path: &str) -> Option<String> {
+    rules
+        .iter()
+        .find(|r| path_matches_rule(r, path))
+        .cloned()
 }
 
 #[cfg(test)]
@@ -286,6 +435,10 @@ mod tests {
             file_blocklist: vec!["C:/Windows/**".to_string()],
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
+            exec_enabled: false,
+            exec_allowlist: Vec::new(),
+            network_enabled: false,
+            network_allowlist: Vec::new(),
             max_cpu_percent: 50,
             max_memory_mb: 512,
             max_disk_write_mbps: 10,
@@ -407,6 +560,59 @@ mod tests {
     }
 
     #[test]
+    fn test_exec_and_network_grants_are_default_off_and_normalized() {
+        let (store, dir) = temp_store("sb-grants");
+        // 旧策略行没有执行授权键：按关闭处理，不能判成损坏
+        let mut legacy = serde_json::to_value(sample_sandbox("ws-a")).unwrap();
+        legacy.as_object_mut().unwrap().remove("execEnabled");
+        legacy.as_object_mut().unwrap().remove("execAllowlist");
+        legacy.as_object_mut().unwrap().remove("networkEnabled");
+        legacy.as_object_mut().unwrap().remove("networkAllowlist");
+        put_json(&store, &sandbox_key("ws-a"), &legacy.to_string()).unwrap();
+        let read = get_sandbox(&store, "ws-a").unwrap().unwrap();
+        assert!(!read.exec_enabled && !read.network_enabled);
+        assert!(read.exec_allowlist.is_empty());
+
+        let mut p = sample_sandbox("ws-b");
+        p.exec_enabled = true;
+        p.exec_allowlist = vec!["Python".into(), "python".into(), "git".into()];
+        p.network_enabled = true;
+        p.network_allowlist = vec!["https://API.Example.com/v1".into(), "example.org".into()];
+        let saved = set_sandbox(&store, &p).unwrap();
+        // 命令名小写去重；主机去协议/路径、小写去重
+        assert_eq!(saved.exec_allowlist, vec!["python", "git"]);
+        assert_eq!(saved.network_allowlist, vec!["api.example.com", "example.org"]);
+        let read = get_sandbox(&store, "ws-b").unwrap().unwrap();
+        assert!(read.exec_enabled && read.network_enabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_exec_and_network_grants_reject_paths_and_bad_hosts() {
+        let (store, dir) = temp_store("sb-grants-bad");
+        let mut p = sample_sandbox("ws");
+        p.exec_enabled = true;
+        p.exec_allowlist = vec!["C:/Windows/System32/cmd.exe".into()];
+        assert!(set_sandbox(&store, &p)
+            .unwrap_err()
+            .starts_with("POLICY_INVALID_COMMAND"));
+        p.exec_allowlist = vec!["powershell -Command".into()];
+        assert!(set_sandbox(&store, &p)
+            .unwrap_err()
+            .starts_with("POLICY_INVALID_COMMAND"));
+        p.exec_enabled = false;
+        p.exec_allowlist = Vec::new();
+        p.network_enabled = true;
+        p.network_allowlist = vec!["has space.com".into()];
+        assert!(set_sandbox(&store, &p)
+            .unwrap_err()
+            .starts_with("POLICY_INVALID_HOST"));
+        // 校验失败不落库
+        assert!(get_sandbox(&store, "ws").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_sandbox_upsert_overwrites_same_key() {
         let (store, dir) = temp_store("sb-upsert");
         set_sandbox(&store, &sample_sandbox("ws-a")).unwrap();
@@ -414,6 +620,15 @@ mod tests {
         p.execution_level = "L2".into();
         set_sandbox(&store, &p).unwrap();
         assert_eq!(get_sandbox(&store, "ws-a").unwrap().unwrap().execution_level, "L2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sandbox_corrupt_json_errors() {
+        let (store, dir) = temp_store("sb-corrupt");
+        put_json(&store, &sandbox_key("ws-a"), "not-json").unwrap();
+        let err = get_sandbox(&store, "ws-a").unwrap_err();
+        assert!(err.starts_with("POLICY_CORRUPT"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -439,6 +654,40 @@ mod tests {
         assert!(get_sandbox(&store, "ws").unwrap().is_none());
         assert!(get_sandbox(&store, "  ").unwrap_err().starts_with("POLICY_INVALID_WORKSPACE"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_path_rule_directory_prefix_and_glob() {
+        // 无通配符：目录前缀语义（不是字符串前缀，WindowsX 不能被 Windows 命中）
+        assert!(path_matches_rule("C:/Windows", "C:\\Windows\\System32\\drivers"));
+        assert!(path_matches_rule("C:/Windows/", "C:/Windows"));
+        assert!(!path_matches_rule("C:/Windows", "C:/WindowsX/file"));
+        // dir/** 命中目录本身与全部后代
+        assert!(path_matches_rule("D:/work/**", "D:/work"));
+        assert!(path_matches_rule("D:/work/**", "D:/work/a/b.txt"));
+        // 单星不跨目录，双星跨目录
+        assert!(!path_matches_rule("D:/work/*.txt", "D:/work/a/b.txt"));
+        assert!(path_matches_rule("D:/work/*.txt", "D:/work/a.txt"));
+        assert!(path_matches_rule("D:/work/**/secret.txt", "D:/work/a/b/secret.txt"));
+        assert!(path_matches_rule("D:/work/?.md", "D:/work/a.md"));
+        assert!(!path_matches_rule("D:/work/?.md", "D:/work/ab.md"));
+        // 空规则永不放宽
+        assert!(!path_matches_rule("  ", "D:/work/a.md"));
+        assert!(path_blocked(&[], "D:/work/a.md").is_none());
+        assert_eq!(
+            path_blocked(&["D:/work/**".into()], "D:/work/a.md").as_deref(),
+            Some("D:/work/**")
+        );
+    }
+
+    #[test]
+    fn test_normalize_path_text() {
+        let expected = if cfg!(windows) { "c:/users/x" } else { "C:/Users/x" };
+        assert_eq!(normalize_path_text("C:\\Users\\x\\"), expected);
+        assert_eq!(normalize_path_text("///"), "/");
+        assert_eq!(normalize_path_text("  "), "");
+        #[cfg(windows)]
+        assert!(path_matches_rule("C:/Windows/System32", "c:\\windows\\system32\\drivers"));
     }
 
     #[test]

@@ -20,6 +20,7 @@ import {
   Alert,
   Chip,
   Popover,
+  CircularProgress,
 } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import AttachFileIcon from '@mui/icons-material/AttachFile';
@@ -30,22 +31,37 @@ import MicIcon from '@mui/icons-material/Mic';
 import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
 import StopIcon from '@mui/icons-material/Stop';
 import CheckIcon from '@mui/icons-material/Check';
-import type { AttachmentMeta } from '../../../shared/types';
+import GroupsIcon from '@mui/icons-material/Groups';
+import type { AttachmentMeta, ModelConfig, WorkMode } from '../../../shared/types';
+import type { ExpertInfo } from '../../../shared/contracts';
 import { isTauri } from '../../lib/tauri-api';
-import { chatAPI } from '../../lib/api';
+import { chatAPI, expertsAPI } from '../../lib/api';
+import {
+  BUILTIN_CHAT_MODELS,
+  loadChatModels,
+  modelSourceLabel,
+  type BuiltinChatModel,
+} from '../../lib/chat-models';
 import { loadAllSkills, SKILL_SOURCE_META, type SkillInfo } from '../../lib/skills';
-import { useAppSettings, WORKBENCH_MODE_DEFS } from '../../lib/use-app-settings';
+import { useAppSettings } from '../../lib/use-app-settings';
+import { useWorkMode, MODE_PLACEHOLDERS } from '../../lib/use-work-mode';
+import { usePptxTemplates } from '../../lib/use-pptx-templates';
 import { useWorkbenchStore } from '../../store/workbenchStore';
+import { useI18n } from '../../i18n';
 import { useNavigate } from 'react-router-dom';
+import { errorTextOf } from '../../../shared/error-messages';
 
 interface ChatInputProps {
-  /** 发送消息回调（两阶段协议：附件暂存后随提交上送；modelBinding 为选中模型；
-   *  modelConfig 为自定义模型配置（models.json 条目，引擎真实调用其端点） */
+  /** 发送消息回调（两阶段协议：附件暂存后随提交上送；modelBinding 为内置档位；
+   *  modelId 为已保存模型 id，端点与密钥由持有数据源的后端解析；
+   *  expertId 为本轮负责人专家，专家绑定的模型优先于 modelBinding/modelId） */
   onSend: (
     text: string,
     attachments?: AttachmentMeta[],
     modelBinding?: string,
-    modelConfig?: { baseUrl: string; apiKey: string; modelName: string },
+    modelId?: string,
+    mode?: WorkMode,
+    expertId?: string,
   ) => void;
   /** 是否处于加载状态（思考/流式生成中） */
   loading?: boolean;
@@ -73,6 +89,17 @@ function extOf(name: string): string {
 
 // 模式选项来自设置页「工作台」分区（启用模式 + 默认模式，见 lib/use-app-settings）
 
+/**
+ * 空输入时的起步建议（设置页「提示词建议」的真实消费方）。
+ * 只回填输入框、不直接发送：用户仍可改词后再提交。
+ */
+const PROMPT_SUGGESTIONS: Record<WorkMode, string[]> = {
+  general: ['帮我总结这份文档的要点', '把这段内容整理成可执行的待办清单', '对比两个方案并给出选择建议'],
+  design: ['做一个产品落地页原型', '设计一个数据看板页面', '把这张截图还原成可交互 HTML'],
+  slides: ['把这份材料做成 8 页汇报幻灯片', '生成一份季度复盘 PPT', '做一份产品发布会演示稿'],
+  writing: ['把这篇文章改得更简洁', '写一份本周项目周报', '润色这段产品介绍'],
+};
+
 /** 读取本地文件内容为 base64（浏览器模式真实上传用） */
 function readFileAsBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -86,25 +113,17 @@ function readFileAsBase64(file: File): Promise<string> {
   });
 }
 
-// 内置模型（对话模型选择；modelId 为提交时绑定给引擎的真实模型名）
-// 实测：qwen3.7-plus 名称不可用 → 基础用 qwen-plus；qwen3.7-flash 免费额度用尽 → 经济用 qwen-flash
-const BUILTIN_MODELS: ModelOption[] = [
-  { id: 'auto', name: 'Auto Mode', desc: '自动选择最合适的模型', color: '#6366F1', modelId: '' },
-  { id: 'qwen-max', name: 'Qwen3.8-Max', desc: '千问最强模型 · 1.1x', color: '#8B5CF6', modelId: 'qwen3.8-max' },
-  { id: 'advanced', name: '高级', desc: '性能均衡，擅长复杂任务 · 1x', color: '#3B82F6', modelId: 'qwen3.7-max' },
-  { id: 'basic', name: '基础', desc: '高性价比，胜任日常任务 · 0.25x', color: '#10B981', modelId: 'qwen-plus' },
-  { id: 'economy', name: '经济', desc: '经济实惠，适合简单任务 · 0.1x', color: '#F59E0B', modelId: 'qwen-flash' },
-];
-
-/** 模型选项（内置 + 自定义；customConfig 存在时引擎真实调用该端点） */
-type ModelOption = {
-  id: string;
-  name: string;
-  desc: string;
-  color: string;
-  modelId: string;
-  customConfig?: { baseUrl: string; apiKey: string; modelName: string };
+// 内置模型（对话模型选择；binding 为提交时绑定给引擎的真实模型名）
+// 档位只描述能力定位，不标价格倍率：倍率会随百炼计费调整而变化，写死在界面上就是编数字
+/** 模型选项（内置档位 + 数据源中的已保存模型） */
+type ModelOption = BuiltinChatModel & {
+  /** 已保存模型 id（提交只传 id，密钥不出渲染层） */
+  savedId?: string;
+  /** 仅用于提交前的合规出域判定 */
+  baseUrl?: string;
 };
+
+const BUILTIN_MODELS: ModelOption[] = BUILTIN_CHAT_MODELS;
 
 const ChatInput: React.FC<ChatInputProps> = ({
   onSend,
@@ -115,12 +134,20 @@ const ChatInput: React.FC<ChatInputProps> = ({
   workDir,
   onSelectWorkDir,
 }) => {
+  const { t: tr } = useI18n();
   const [value, setValue] = useState(initialText ?? '');
   const [focused, setFocused] = useState(false);
-  const [mode, setMode] = useState('通用');
-  const [modeAnchor, setModeAnchor] = useState<null | HTMLElement>(null);
+  // 模式放 store：欢迎页与对话态各挂一个 ChatInput，首轮发送后组件重挂，
+  // 实例 state 里的选择会被无声重置回默认模式（与模型选择同一类陷阱）
+  const { activeMode, enabledDefs: enabledModeDefs, setWorkMode } = useWorkMode();
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const navigate = useNavigate();
+
+  // 幻灯片模板：只在幻灯片模式下加载台账，避免每次挂载都扫模板目录。
+  // 选择写回 app settings，桌面端由 Rust runtime 下发给引擎。
+  const pptx = usePptxTemplates({ active: activeMode === 'slides' });
+  const [pptxError, setPptxError] = useState('');
+  const [pptxSwitching, setPptxSwitching] = useState(false);
 
   // ── 模型选择（替换原「添加到队列」占位） ──
   const [modelAnchor, setModelAnchor] = useState<null | HTMLElement>(null);
@@ -129,40 +156,65 @@ const ChatInput: React.FC<ChatInputProps> = ({
   const chatModelId = useWorkbenchStore((s) => s.chatModelId);
   const setChatModelId = useWorkbenchStore((s) => s.setChatModelId);
 
-    // 自定义模型（来自设置页已保存模型 tt-custom-models，选中后引擎真实调用其端点）
-    const [customModels, setCustomModels] = useState<ModelOption[]>([]);
-    useEffect(() => {
-      try {
-        const raw = localStorage.getItem('tt-custom-models');
-        if (!raw) return;
-        const list = JSON.parse(raw) as Array<{
-          id: string;
-          name: string;
-          provider: string;
-          baseUrl?: string;
-          apiKey?: string;
-          modelName: string;
-        }>;
-        setCustomModels(
-          list.map((m) => ({
-            id: `custom-${m.id}`,
-            name: m.name,
-            desc: `${m.provider} · ${m.modelName}`,
-            color: '#0EA5E9',
-            modelId: m.modelName,
-            customConfig: m.baseUrl
-              ? { baseUrl: m.baseUrl, apiKey: m.apiKey ?? '', modelName: m.modelName }
-              : undefined,
-          })),
-        );
-      } catch {
-        // ignore
-      }
-    }, []);
+  // 已保存模型（桌面端 SQLite / 浏览器 models.json / Mock 台账，经同一个 API 读取）。
+  // 清单里没有明文密钥；选中后只把 id 交给后端解析端点与密钥。
+  const [savedModels, setSavedModels] = useState<ModelConfig[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    loadChatModels(true)
+      .then((list) => {
+        if (!cancelled) setSavedModels(list);
+      })
+      .catch(() => {
+        // 读取失败时保留内置档位；不拿空清单冒充「没有已保存模型」
+        if (!cancelled) setSavedModels([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
-  // 清单异步加载（自定义模型来自 localStorage），所选 id 不在清单时按 Auto 展示
+  const savedOptions: ModelOption[] = savedModels.map((m) => ({
+    id: `saved-${m.id}`,
+    name: m.name || m.modelName,
+    desc: [tr(modelSourceLabel(m.source)), m.modelName, m.isDefault ? tr('默认') : '']
+      .filter(Boolean)
+      .join(' · '),
+    color: '#0EA5E9',
+    savedId: m.id,
+    baseUrl: m.baseUrl?.trim() || undefined,
+  }));
+
+  // 清单异步加载，所选 id 不在清单时按 Auto 展示
   const selectedModel =
-    [...BUILTIN_MODELS, ...customModels].find((m) => m.id === chatModelId) ?? BUILTIN_MODELS[0];
+    [...BUILTIN_MODELS, ...savedOptions].find((m) => m.id === chatModelId) ?? BUILTIN_MODELS[0];
+
+  // ── 负责人专家（注册表在桌面端 Rust；浏览器/Mock 读不到时不显示选择器） ──
+  const [experts, setExperts] = useState<ExpertInfo[]>([]);
+  const [expertAnchor, setExpertAnchor] = useState<null | HTMLElement>(null);
+  // 与模型/模式同理放 store：欢迎页 → 对话态 ChatInput 重挂时选择不能丢
+  const chatExpertId = useWorkbenchStore((s) => s.chatExpertId);
+  const setChatExpertId = useWorkbenchStore((s) => s.setChatExpertId);
+  useEffect(() => {
+    let cancelled = false;
+    expertsAPI
+      .list()
+      .then((list) => {
+        if (cancelled) return;
+        setExperts(list);
+        // 选中的专家已被删除：清掉选择，避免下一轮提交必然 EXPERT_NOT_FOUND
+        const current = useWorkbenchStore.getState().chatExpertId;
+        if (current && !list.some((e) => e.id === current)) setChatExpertId('');
+      })
+      .catch(() => {
+        // 桌面通道不可用时不展示专家选择器；不伪造「没有专家」的结论
+        if (!cancelled) setExperts([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [setChatExpertId]);
+  const selectedExpert = experts.find((e) => e.id === chatExpertId) ?? null;
 
   // ── 技能调用（魔棒按钮 + / 前缀，真实加载已安装+内置技能） ──
   const [skills, setSkills] = useState<SkillInfo[]>([]);
@@ -198,25 +250,10 @@ const ChatInput: React.FC<ChatInputProps> = ({
     if (initialText) setValue(initialText);
   }, [initialText]);
 
-  // ── 工作台模式（与设置页口径一致） ──
+  // 提示词建议开关（缺省开启）与当前模式的建议清单
   const [appSettings] = useAppSettings();
-  const enabledModes = (appSettings.workbenchModes as string[] | undefined) ?? ['general', 'design', 'slides'];
-  const modeOptions: string[] = WORKBENCH_MODE_DEFS.filter((d) => enabledModes.includes(d.id)).map((d) => d.name);
-  // 默认模式兼容存 id（general）或存中文名（通用）两种历史格式
-  const rawDefault = (appSettings.workbenchDefaultMode as string) ?? 'general';
-  const defaultModeName =
-    WORKBENCH_MODE_DEFS.find((d) => d.id === rawDefault)?.name ??
-    WORKBENCH_MODE_DEFS.find((d) => d.name === rawDefault)?.name ??
-    '通用';
-  // 用户手动选择过模式后，不再被默认值覆盖
-  const modeTouched = useRef(false);
-  useEffect(() => {
-    if (!modeTouched.current) setMode(defaultModeName);
-  }, [defaultModeName]);
-  useEffect(() => {
-    if (!modeOptions.includes(mode)) setMode(defaultModeName);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [modeOptions.join(','), defaultModeName]);
+  const promptSuggestionEnabled = appSettings.promptSuggestion !== false;
+  const suggestions = PROMPT_SUGGESTIONS[activeMode] ?? PROMPT_SUGGESTIONS.general;
 
   // ── 附件状态（交互补设计 §3 附件模式；支持真实文件/文件夹读取与上传） ──
   interface PendingAttachment {
@@ -239,11 +276,11 @@ const ChatInput: React.FC<ChatInputProps> = ({
   /** 通用校验与追加 */
   const pushAttachments = useCallback((items: PendingAttachment[]) => {
     if (attachments.length >= ATTACH_MAX_COUNT) {
-      setAttachError(`单次最多 ${ATTACH_MAX_COUNT} 个附件`);
+      setAttachError(tr('单次最多 {count} 个附件', { count: ATTACH_MAX_COUNT }));
       return;
     }
     if (attachments.length + items.length > ATTACH_MAX_COUNT) {
-      setAttachError(`单次最多 ${ATTACH_MAX_COUNT} 个附件，已截断`);
+      setAttachError(tr('单次最多 {count} 个附件，已截断', { count: ATTACH_MAX_COUNT }));
     }
     setAttachments((prev) => [...prev, ...items].slice(0, ATTACH_MAX_COUNT));
   }, [attachments.length]);
@@ -263,14 +300,14 @@ const ChatInput: React.FC<ChatInputProps> = ({
         for (const p of paths as string[]) {
           const fileName = p.split(/[\\/]/).pop() ?? p;
           if (!ATTACH_EXTS.includes(extOf(fileName))) {
-            setAttachError(`不支持的格式：${fileName}（支持 ${ATTACH_EXTS.join('/')}）`);
+            setAttachError(tr('不支持的格式：{name}（支持 {exts}）', { name: fileName, exts: ATTACH_EXTS.join('/') }));
             continue;
           }
           next.push({ fileName, srcPath: p, kind: 'file' });
         }
         pushAttachments(next);
       } catch (e) {
-        setAttachError(`打开文件对话框失败：${e}`);
+        setAttachError(tr('打开文件对话框失败：{msg}', { msg: String(e) }));
       }
     } else {
       fileInputRef.current?.click();
@@ -286,10 +323,10 @@ const ChatInput: React.FC<ChatInputProps> = ({
         const picked = await open({ directory: true });
         if (typeof picked === 'string' && picked) {
           const dirName = picked.split(/[\\/]/).filter(Boolean).pop() ?? picked;
-          pushAttachments([{ fileName: `${dirName}（文件夹）`, srcPath: picked, kind: 'folder' }]);
+          pushAttachments([{ fileName: tr('{folder}（文件夹）', { folder: dirName }), srcPath: picked, kind: 'folder' }]);
         }
       } catch (e) {
-        setAttachError(`打开文件夹对话框失败：${e}`);
+        setAttachError(tr('打开文件夹对话框失败：{msg}', { msg: String(e) }));
       }
     } else {
       folderInputRef.current?.click();
@@ -302,7 +339,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
     const next: PendingAttachment[] = [];
     for (const f of Array.from(fileList)) {
       if (!ATTACH_EXTS.includes(extOf(f.name))) {
-        setAttachError(`不支持的格式：${f.name}（支持 ${ATTACH_EXTS.join('/')}）`);
+        setAttachError(tr('不支持的格式：{name}（支持 {exts}）', { name: f.name, exts: ATTACH_EXTS.join('/') }));
         continue;
       }
       next.push({ fileName: f.name, srcPath: `local://${f.name}`, file: f, kind: 'file' });
@@ -322,7 +359,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
       next.push({ fileName: rel, srcPath: `local://${rel}`, file: f, kind: 'file' });
     }
     if (next.length === 0) {
-      setAttachError(`「${folderName}」内没有可附加的文件（支持 ${ATTACH_EXTS.join('/')}）`);
+      setAttachError(tr('「{folder}」内没有可附加的文件（支持 {exts}）', { folder: folderName, exts: ATTACH_EXTS.join('/') }));
       return;
     }
     pushAttachments(next);
@@ -367,7 +404,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           updated.push({ ...att, error: msg });
-          setAttachError(`附件上传失败：${att.fileName}（${msg}）`);
+          setAttachError(tr('附件上传失败：{name}（{msg}）', { name: att.fileName, msg }));
         }
       }
       setAttachments(updated);
@@ -377,15 +414,17 @@ const ChatInput: React.FC<ChatInputProps> = ({
     onSend(
       referencedSkill ? `/${referencedSkill.name} ${trimmed}` : trimmed,
       metas.length > 0 ? metas : undefined,
-      selectedModel.modelId || undefined,
-      selectedModel.customConfig,
+      selectedModel.binding || undefined,
+      selectedModel.savedId || undefined,
+      activeMode,
+      chatExpertId || undefined,
     );
     setValue('');
     setAttachments([]);
     setAttachError(null);
     setReferencedSkill(null);
     setTimeout(() => inputRef.current?.focus(), 50);
-  }, [value, loading, staging, attachments, referencedSkill, selectedModel, onSend]);
+  }, [value, loading, staging, attachments, referencedSkill, selectedModel, onSend, activeMode, chatExpertId]);
 
   /** 选择工作目录：Tauri 走系统目录对话框；浏览器用 File System Access API */
   const handlePickWorkDir = useCallback(async () => {
@@ -421,9 +460,111 @@ const ChatInput: React.FC<ChatInputProps> = ({
   }, []);
 
   const canSend = value.trim().length > 0 && !loading;
+  // 只在「空输入、无附件、未引用技能、非生成中」时给建议，避免和用户已写内容抢空间
+  const showSuggestions =
+    promptSuggestionEnabled &&
+    !loading &&
+    value.trim() === '' &&
+    attachments.length === 0 &&
+    !referencedSkill;
+  // 通用模式沿用调用方文案（欢迎区/对话态各自口径）；其他模式按模式给出真实预期
+  const modePlaceholder = activeMode === 'general' ? placeholder : MODE_PLACEHOLDERS[activeMode];
+
+  const handlePptxSelect = async (id: string) => {
+    setPptxSwitching(true);
+    setPptxError('');
+    try {
+      await pptx.select(id);
+    } catch (e) {
+      setPptxError(errorTextOf(e, '切换幻灯片模板失败'));
+    } finally {
+      setPptxSwitching(false);
+    }
+  };
+  const pptxOptions = pptx.templates.filter((t) => t.available);
 
   return (
     <Box>
+    {/* 工作台模式胶囊组：设置页只启用一个模式时不出现，避免单选装饰 */}
+    {enabledModeDefs.length > 1 && (
+      <Box
+        role="group"
+        aria-label={tr('工作台模式')}
+        sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, mb: 1, px: 0.25 }}
+      >
+        {enabledModeDefs.map((d) => {
+          const selected = d.id === activeMode;
+          return (
+            <Tooltip key={d.id} title={tr(d.desc)}>
+              <Chip
+                data-mode={d.id}
+                label={tr(d.name)}
+                size="small"
+                onClick={() => setWorkMode(d.id as WorkMode)}
+                aria-pressed={selected}
+                sx={{
+                  height: 26,
+                  borderRadius: '999px',
+                  fontSize: '12px',
+                  fontWeight: selected ? 600 : 500,
+                  bgcolor: selected ? '#14B8A6' : 'transparent',
+                  color: selected ? '#fff' : 'var(--tt-text-3)',
+                  border: `1px solid ${selected ? '#14B8A6' : 'var(--tt-border)'}`,
+                  transition: 'all 0.15s ease',
+                  '&:hover': {
+                    bgcolor: selected ? '#0D9488' : 'rgba(20, 184, 166, 0.06)',
+                    borderColor: '#14B8A6',
+                  },
+                  '& .MuiChip-label': { px: 1.25 },
+                }}
+              />
+            </Tooltip>
+          );
+        })}
+      </Box>
+    )}
+    {/* 幻灯片模式模板选择：只列可用模板；导入通道在设置页，避免输入框里再堆一个假的导入按钮 */}
+    {activeMode === 'slides' && (
+      <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 0.75, mb: 1, px: 0.25 }}>
+        <Tooltip title={tr('幻灯片模式按所选模板生成 .pptx；可在「设置 → 工作台 → 幻灯片模板」导入本机模板')}>
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>{tr('模板')}</Typography>
+        </Tooltip>
+        <Box
+          component="select"
+          data-pptx-picker=""
+          value={pptx.selectedId}
+          disabled={pptx.loading || pptxSwitching || pptxOptions.length === 0}
+          onChange={(e: React.ChangeEvent<HTMLSelectElement>) => void handlePptxSelect(e.target.value)}
+          sx={{
+            appearance: 'auto',
+            px: 1,
+            py: 0.4,
+            pr: 0.75,
+            borderRadius: '8px',
+            border: '1px solid var(--tt-border)',
+            bgcolor: 'var(--tt-surface)',
+            fontSize: '12px',
+            color: 'var(--tt-text-2)',
+            cursor: 'pointer',
+            outline: 'none',
+            '&:hover': { borderColor: '#14B8A6' },
+            '&:disabled': { opacity: 0.55, cursor: 'not-allowed' },
+          }}
+        >
+          {pptxOptions.map((t) => (
+            <option key={t.id} value={t.id}>
+              {t.name}
+              {t.builtin ? '' : tr('（导入）')}
+            </option>
+          ))}
+        </Box>
+        {pptx.loading && <CircularProgress size={12} />}
+        {pptxError && <Typography sx={{ fontSize: '12px', color: '#EF4444' }}>{pptxError}</Typography>}
+        {!pptx.desktop && (
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>{tr('浏览器直连仅内置主题')}</Typography>
+        )}
+      </Box>
+    )}
     <Box
       sx={{
         bgcolor: 'var(--tt-surface)',
@@ -446,7 +587,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
               key={`${att.fileName}-${idx}`}
               size="small"
               icon={att.kind === 'folder' ? <FolderOutlinedIcon sx={{ fontSize: 14 }} /> : <AttachFileIcon sx={{ fontSize: 14 }} />}
-              label={att.error ? `${att.fileName}（失败）` : att.fileName}
+              label={att.error ? tr('{name}（失败）', { name: att.fileName }) : att.fileName}
               color={att.error ? 'error' : 'default'}
               onDelete={() => removeAttachment(idx)}
               sx={{ fontSize: '12px', maxWidth: 260 }}
@@ -538,7 +679,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
           onKeyDown={handleKeyDown}
           onFocus={() => setFocused(true)}
           onBlur={() => setFocused(false)}
-          placeholder={loading ? 'AI 正在处理中…' : placeholder}
+          placeholder={loading ? tr('AI 正在处理中…') : tr(modePlaceholder)}
           disabled={loading}
           multiline
           minRows={1}
@@ -549,6 +690,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
             disableUnderline: true,
             sx: {
               fontSize: '15px',
+              fontFamily: 'var(--tt-chat-font)',
               lineHeight: 1.6,
               px: 0.5,
               color: 'var(--tt-text-1)',
@@ -559,6 +701,34 @@ const ChatInput: React.FC<ChatInputProps> = ({
           />
         </Box>
       </Box>
+
+      {/* 提示词建议：设置页开关控制；点击只回填，不替用户发送 */}
+      {showSuggestions && (
+        <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 0.75, mt: 1.1 }}>
+          <AutoAwesomeIcon sx={{ fontSize: 14, color: '#14B8A6', flexShrink: 0 }} />
+          <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mr: 0.25 }}>{tr('试试这样问')}</Typography>
+          {suggestions.map((s) => (
+            <Chip
+              key={s}
+              label={tr(s)}
+              size="small"
+              onClick={() => {
+                setValue(tr(s));
+                setTimeout(() => inputRef.current?.focus(), 30);
+              }}
+              sx={{
+                height: 24,
+                fontSize: '12px',
+                color: 'var(--tt-text-3)',
+                bgcolor: 'transparent',
+                border: '1px solid var(--tt-border)',
+                borderRadius: '999px',
+                '&:hover': { color: '#0D9488', borderColor: '#5EEAD4', bgcolor: 'rgba(20, 184, 166, 0.06)' },
+              }}
+            />
+          ))}
+        </Box>
+      )}
 
       {/* 工具栏（等比缩小 + 窄屏自动换行，防止溢出卡片） */}
       <Box
@@ -571,9 +741,9 @@ const ChatInput: React.FC<ChatInputProps> = ({
           mt: 1.25,
         }}
       >
-        {/* 左侧：附加操作 + 模式选择 */}
+        {/* 左侧：附加操作 + 负责人专家 */}
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.25 }}>
-          <Tooltip title="添加内容（文件 / 文件夹 / 技能）">
+          <Tooltip title={tr('添加内容（文件 / 文件夹 / 技能）')}>
             <IconButton
               size="small"
               sx={{ color: 'var(--tt-text-3)', width: 28, height: 28 }}
@@ -583,32 +753,38 @@ const ChatInput: React.FC<ChatInputProps> = ({
             </IconButton>
           </Tooltip>
 
-          {/* 「通用」模式选择 */}
-          <Box
-            onClick={(e) => setModeAnchor(e.currentTarget)}
-            sx={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 0.25,
-              ml: 0.5,
-              px: 1,
-              py: 0.4,
-              borderRadius: '999px',
-              border: '1px solid var(--tt-border)',
-              cursor: 'pointer',
-              transition: 'all 0.15s ease',
-              '&:hover': { borderColor: '#14B8A6', background: 'rgba(20, 184, 166, 0.04)' },
-            }}
-          >
-            <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-2)', fontWeight: 500 }}>{mode}</Typography>
-            <KeyboardArrowDownIcon sx={{ fontSize: 15, color: 'var(--tt-text-4)' }} />
-          </Box>
+          {/* 负责人专家：只在实际有专家时出现；本轮提示词与模型按专家执行 */}
+          {experts.length > 0 && (
+            <Tooltip title={tr('选择负责人专家（本轮由该专家组织结论，可绑定模型）')}>
+              <Box
+                onClick={(e) => setExpertAnchor(e.currentTarget)}
+                sx={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 0.4,
+                  px: 1,
+                  py: 0.4,
+                  borderRadius: '999px',
+                  border: '1px solid var(--tt-border)',
+                  cursor: 'pointer',
+                  transition: 'all 0.15s ease',
+                  '&:hover': { borderColor: '#0EA5E9', background: 'rgba(14, 165, 233, 0.04)' },
+                }}
+              >
+                <GroupsIcon sx={{ fontSize: 14, color: selectedExpert ? '#0EA5E9' : 'var(--tt-text-4)' }} />
+                <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-2)', fontWeight: 500 }}>
+                  {selectedExpert?.name ?? tr('通用助手')}
+                </Typography>
+                <KeyboardArrowDownIcon sx={{ fontSize: 15, color: 'var(--tt-text-4)' }} />
+              </Box>
+            </Tooltip>
+          )}
         </Box>
 
         {/* 右侧：选择模型 + 麦克风 + 发送 */}
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexShrink: 0 }}>
           {/* 选择模型（原「添加到队列」占位已替换为模型选择能力） */}
-          <Tooltip title="选择模型">
+          <Tooltip title={tr('选择模型')}>
             <Box
               onClick={(e) => setModelAnchor(e.currentTarget)}
               sx={{
@@ -638,15 +814,22 @@ const ChatInput: React.FC<ChatInputProps> = ({
             </Box>
           </Tooltip>
 
-          {/* 语音输入 */}
-          <Tooltip title="语音输入">
-            <IconButton size="small" sx={{ color: 'var(--tt-text-3)', width: 30, height: 30 }}>
-              <MicIcon sx={{ fontSize: 18 }} />
-            </IconButton>
+          {/* 语音输入：录音与转录尚未提供，入口保持禁用而不是留一个点了没反应的按钮 */}
+          <Tooltip title={tr('语音输入（录音与转录）尚未提供')}>
+            <span>
+              <IconButton
+                size="small"
+                disabled
+                aria-label={tr('语音输入（录音与转录）尚未提供')}
+                sx={{ color: 'var(--tt-text-3)', width: 30, height: 30 }}
+              >
+                <MicIcon sx={{ fontSize: 18 }} />
+              </IconButton>
+            </span>
           </Tooltip>
 
           {/* 发送按钮 */}
-          <Tooltip title={canSend ? '发送 (Enter)' : loading ? '生成中…' : '请输入内容'}>
+          <Tooltip title={canSend ? tr('发送 (Enter)') : loading ? tr('生成中…') : tr('请输入内容')}>
             <span>
               <IconButton
                 onClick={handleSend}
@@ -743,7 +926,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 '&:hover': { borderColor: '#8B5CF6', color: '#8B5CF6' },
               }}
             >
-              <Typography sx={{ fontSize: '12px', fontWeight: 600, color: 'var(--tt-text-2)' }}>重新选择</Typography>
+              <Typography sx={{ fontSize: '12px', fontWeight: 600, color: 'var(--tt-text-2)' }}>{tr('重新选择')}</Typography>
             </Box>
             <Box
               onClick={() => {
@@ -761,7 +944,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 '&:hover': { background: 'rgba(239, 68, 68, 0.05)' },
               }}
             >
-              <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#EF4444' }}>取消引用</Typography>
+              <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#EF4444' }}>{tr('取消引用')}</Typography>
             </Box>
           </Box>
         </Popover>
@@ -790,11 +973,11 @@ const ChatInput: React.FC<ChatInputProps> = ({
         }}
       >
         <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-text-4)', px: 1.25, py: 0.5 }}>
-          选择技能（{filteredSkills.length}）
+          {tr('选择技能（{count}）', { count: filteredSkills.length })}
         </Typography>
         {filteredSkills.length === 0 && (
           <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-4)', px: 1.25, py: 1.5, textAlign: 'center' }}>
-            未找到匹配技能，可到扩展页安装
+            {tr('未找到匹配技能，可到扩展页安装')}
           </Typography>
         )}
         {filteredSkills.map((s) => (
@@ -880,7 +1063,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
         }}
       >
         <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-text-4)', px: 1.25, py: 0.5 }}>
-          内置模型
+          {tr('内置模型')}
         </Typography>
         {BUILTIN_MODELS.map((m) => (
           <Box
@@ -916,20 +1099,20 @@ const ChatInput: React.FC<ChatInputProps> = ({
               <Typography sx={{ fontSize: '12px', fontWeight: 700, color: m.color }}>{m.name[0]}</Typography>
             </Box>
             <Box sx={{ flexGrow: 1, minWidth: 0 }}>
-              <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#1F2937' }}>{m.name}</Typography>
-              <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)', mt: 0.15 }}>{m.desc}</Typography>
+              <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#1F2937' }}>{tr(m.name)}</Typography>
+              <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)', mt: 0.15 }}>{tr(m.desc)}</Typography>
             </Box>
             {selectedModel.id === m.id && <CheckIcon sx={{ fontSize: 16, color: '#8B5CF6' }} />}
           </Box>
         ))}
 
-        {/* 自定义模型（来自设置页 models.json，选中后引擎真实调用其端点） */}
-        {customModels.length > 0 && (
+        {/* 已保存模型（数据源由后端持有，选中后按其配置真实调用） */}
+        {savedOptions.length > 0 && (
           <>
             <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-text-4)', px: 1.25, py: 0.5, borderTop: '1px solid var(--tt-border-soft)', mt: 0.5 }}>
-              自定义模型
+              {tr('已保存模型')}
             </Typography>
-            {customModels.map((m) => (
+            {savedOptions.map((m) => (
               <Box
                 key={m.id}
                 onClick={() => {
@@ -1004,7 +1187,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
             >
               <AddIcon sx={{ fontSize: 15, color: 'var(--tt-text-3)' }} />
             </Box>
-            <Typography sx={{ fontSize: '13px', fontWeight: 500, color: 'var(--tt-text-2)' }}>添加模型</Typography>
+            <Typography sx={{ fontSize: '13px', fontWeight: 500, color: 'var(--tt-text-2)' }}>{tr('添加模型')}</Typography>
           </Box>
         </Box>
       </Menu>
@@ -1025,7 +1208,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
           }}
           sx={{ fontSize: '13px', gap: 1 }}
         >
-          <AttachFileIcon sx={{ fontSize: 16, color: 'var(--tt-text-3)' }} /> 添加文件
+          <AttachFileIcon sx={{ fontSize: 16, color: 'var(--tt-text-3)' }} /> {tr('添加文件')}
         </MenuItem>
         <MenuItem
           onClick={() => {
@@ -1034,7 +1217,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
           }}
           sx={{ fontSize: '13px', gap: 1 }}
         >
-          <FolderOutlinedIcon sx={{ fontSize: 16, color: 'var(--tt-text-3)' }} /> 添加文件夹
+          <FolderOutlinedIcon sx={{ fontSize: 16, color: 'var(--tt-text-3)' }} /> {tr('添加文件夹')}
         </MenuItem>
         <MenuItem
           onClick={() => {
@@ -1044,7 +1227,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
           }}
           sx={{ fontSize: '13px', gap: 1 }}
         >
-          <AutoAwesomeIcon sx={{ fontSize: 16, color: 'var(--tt-text-3)' }} /> 调用技能
+          <AutoAwesomeIcon sx={{ fontSize: 16, color: 'var(--tt-text-3)' }} /> {tr('调用技能')}
         </MenuItem>
       </Menu>
 
@@ -1072,27 +1255,59 @@ const ChatInput: React.FC<ChatInputProps> = ({
         }}
       />
 
-      {/* 模式选择菜单 */}
+      {/* 负责人专家菜单：空白 id 表示按通用助手执行；模型随专家绑定 */}
       <Menu
-        anchorEl={modeAnchor}
-        open={Boolean(modeAnchor)}
-        onClose={() => setModeAnchor(null)}
+        anchorEl={expertAnchor}
+        open={Boolean(expertAnchor)}
+        onClose={() => setExpertAnchor(null)}
         anchorOrigin={{ vertical: 'top', horizontal: 'left' }}
         transformOrigin={{ vertical: 'bottom', horizontal: 'left' }}
-        PaperProps={{ sx: { minWidth: 140, mt: -0.5 } }}
+        PaperProps={{ sx: { minWidth: 260, mt: -0.5 } }}
       >
-        {modeOptions.map((opt) => (
+        <MenuItem
+          selected={!chatExpertId}
+          onClick={() => {
+            setChatExpertId('');
+            setExpertAnchor(null);
+          }}
+          sx={{ fontSize: '13px', gap: 1 }}
+        >
+          <Box sx={{ width: 16, flexShrink: 0 }}>
+            {!chatExpertId && <CheckIcon sx={{ fontSize: 16, color: '#0EA5E9' }} />}
+          </Box>
+          <Box sx={{ minWidth: 0 }}>
+            <Typography sx={{ fontSize: '13px', fontWeight: 500 }}>{tr('通用助手')}</Typography>
+            <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
+              {tr('不指定专家，按当前模型与技能执行')}
+            </Typography>
+          </Box>
+        </MenuItem>
+        {experts.map((e) => (
           <MenuItem
-            key={opt}
-            selected={opt === mode}
+            key={e.id}
+            selected={e.id === chatExpertId}
+            disabled={Boolean(e.modelError)}
             onClick={() => {
-              modeTouched.current = true;
-              setMode(opt);
-              setModeAnchor(null);
+              setChatExpertId(e.id);
+              setExpertAnchor(null);
             }}
-            sx={{ fontSize: '13px' }}
+            sx={{ fontSize: '13px', gap: 1, alignItems: 'flex-start' }}
           >
-            {opt}
+            <Box sx={{ width: 16, flexShrink: 0, pt: 0.25 }}>
+              {e.id === chatExpertId && <CheckIcon sx={{ fontSize: 16, color: '#0EA5E9' }} />}
+            </Box>
+            <Box sx={{ minWidth: 0 }}>
+              <Typography sx={{ fontSize: '13px', fontWeight: 500 }}>{e.name}</Typography>
+              <Typography
+                sx={{
+                  fontSize: '11px',
+                  color: e.modelError ? '#DC2626' : 'var(--tt-text-4)',
+                  whiteSpace: 'normal',
+                }}
+              >
+                {e.modelError ? tr('绑定模型不可用：{msg}', { msg: e.modelError }) : e.modelName ? tr('模型：{name}', { name: e.modelName }) : tr('沿用当前模型')}
+              </Typography>
+            </Box>
           </MenuItem>
         ))}
       </Menu>
@@ -1100,7 +1315,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
 
           {/* 输入框下方：选择工作目录（真实目录） + 免责提示 */}
       <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mt: 0.75, px: 0.5 }}>
-        <Tooltip title={workDir || '选择会话内容与产出物的存放目录'} placement="top">
+        <Tooltip title={workDir || tr('选择会话内容与产出物的存放目录')} placement="top">
           <Box
             onClick={handlePickWorkDir}
             sx={{
@@ -1127,11 +1342,11 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 whiteSpace: 'nowrap',
               }}
             >
-              {workDir ? workDir.split(/[\\/]/).filter(Boolean).slice(-2).join('/') : '选择工作目录'}
+              {workDir ? workDir.split(/[\\/]/).filter(Boolean).slice(-2).join('/') : tr('选择工作目录')}
             </Typography>
           </Box>
         </Tooltip>
-        <Typography sx={{ fontSize: '12px', color: '#C0C4CA' }}>内容由 AI 生成，请注意核实</Typography>
+        <Typography sx={{ fontSize: '12px', color: '#C0C4CA' }}>{tr('内容由 AI 生成，请注意核实')}</Typography>
       </Box>
     </Box>
   );

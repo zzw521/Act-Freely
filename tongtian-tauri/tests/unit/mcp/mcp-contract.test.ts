@@ -24,6 +24,7 @@ function read(rel: string): string {
 const rustMcp = () => read('../../../src-tauri/src/mcp/mod.rs');
 const rustLib = () => read('../../../src-tauri/src/lib.rs');
 const rustMigrate = () => read('../../../src-tauri/src/store/migrate.rs');
+const rustOauth = () => read('../../../src-tauri/src/mcp/oauth.rs');
 const tauriApi = () => read('../../../src/renderer/lib/tauri-api.ts');
 const mockApi = () => read('../../../src/renderer/lib/mock-api.ts');
 const engineApi = () => read('../../../src/renderer/lib/engine-api.ts');
@@ -87,7 +88,7 @@ describe('Rust 侧契约：注册表结构与脱敏边界', () => {
     expect(src).not.toMatch(/DELETE FROM mcp_servers/i);
   });
 
-  it('六个 command 均已注册进 invoke_handler（前端 invoke 不会落到未注册通道）', () => {
+  it('八个 command 均已注册进 invoke_handler（前端 invoke 不会落到未注册通道）', () => {
     const lib = rustLib();
     for (const cmd of [
       'mcp_list_servers',
@@ -96,6 +97,8 @@ describe('Rust 侧契约：注册表结构与脱敏边界', () => {
       'mcp_connect',
       'mcp_disconnect',
       'mcp_list_tools',
+      'mcp_oauth_authorize',
+      'mcp_oauth_revoke',
     ]) {
       expect(lib).toContain(`mcp::${cmd}`);
     }
@@ -111,8 +114,67 @@ describe('Rust 侧契约：注册表结构与脱敏边界', () => {
   });
 });
 
+describe('远程 MCP OAuth：公共客户端 PKCE 与令牌边界', () => {
+  it('只做授权码 + S256 PKCE，不保存 client secret', () => {
+    const src = rustOauth();
+    expect(src).toContain('.append_pair("code_challenge_method", "S256")');
+    expect(src).toContain('code_challenge(&verifier)');
+    // 公共客户端形态：请求体里不得出现 client_secret
+    expect(src).not.toContain('client_secret');
+  });
+
+  it('授权端点只允许 HTTPS 或回环 HTTP，并拒绝 URL 内嵌凭据与非公网解析', () => {
+    const src = rustOauth();
+    expect(src).toContain('"https" => Ok(url)');
+    expect(src).toContain('"http" if host_is_loopback(&url) => Ok(url)');
+    expect(src).toContain('url.username()');
+    expect(src).toContain('ensure_resolved_public');
+    expect(src).toContain('ip_is_public');
+  });
+
+  it('回调校验 state，等待有上限，换 token 不跟随重定向且限制响应体积', () => {
+    const src = rustOauth();
+    expect(src).toContain('CALLBACK_TIMEOUT_SECS');
+    expect(src).toContain('MCP_OAUTH_STATE_MISMATCH');
+    expect(src).toContain('redirect(reqwest::redirect::Policy::none())');
+    expect(src).toContain('MAX_TOKEN_BYTES');
+  });
+
+  it('令牌只进系统凭据库：不落 SQLite、不进 ServerRow/IPC', () => {
+    const src = rustOauth();
+    expect(src).toContain('mcp-oauth:{server_id}');
+    expect(src).toContain('store.vault()');
+    const mcp = rustMcp();
+    const row = mcp.slice(mcp.indexOf('pub struct ServerRow'), mcp.indexOf('pub struct ToolRow'));
+    expect(row).toContain('pub auth: Option<oauth::OAuthConfig>');
+    expect(row).not.toMatch(/access_token|refresh_token/);
+  });
+
+  it('V10 增量迁移只新增 auth_json 列（不动存量表与数据）', () => {
+    const src = rustMigrate();
+    expect(src).toMatch(/ALTER TABLE mcp_servers ADD COLUMN auth_json TEXT NOT NULL DEFAULT '\{\}'/);
+    expect(src).not.toMatch(/DROP TABLE|DELETE FROM mcp_servers/i);
+    expect(src).not.toMatch(/UPDATE mcp_servers/i);
+  });
+
+  it('运行时只注入 Authorization 头；缺令牌或令牌过期时不下发', () => {
+    const src = rustMcp();
+    expect(src).toContain('oauth::bearer_header(&token)');
+    expect(src).toContain('oauth::runtime_authorized(store, &r.server_id, now)');
+    expect(src).toContain('MCP_OAUTH_REQUIRED');
+    expect(src).toContain('MCP_OAUTH_REJECTED');
+  });
+
+  it('审计只记录连接器名与授权主机，不含令牌或查询串', () => {
+    const src = rustMcp();
+    expect(src).toContain('ACTION_CONNECTOR_AUTH');
+    expect(src).toContain('oauth::endpoint_host(&cfg.authorization_url)');
+    expect(src).not.toMatch(/format!\([^)]*access_token/);
+  });
+});
+
 describe('渲染层三通道接线', () => {
-  it('tauri-api：6 个 mcp:* 通道映射到对应 Rust command', () => {
+  it('tauri-api：8 个 mcp:* 通道映射到对应 Rust command', () => {
     const src = tauriApi();
     expect(src).toContain("if (channel === 'mcp:listServers') return invoke('mcp_list_servers')");
     expect(src).toContain("if (channel === 'mcp:addServer') return invoke('mcp_add_server', { req: args[0] })");
@@ -121,6 +183,8 @@ describe('渲染层三通道接线', () => {
       ['mcp:connect', 'mcp_connect'],
       ['mcp:disconnect', 'mcp_disconnect'],
       ['mcp:listTools', 'mcp_list_tools'],
+      ['mcp:oauthAuthorize', 'mcp_oauth_authorize'],
+      ['mcp:oauthRevoke', 'mcp_oauth_revoke'],
     ]) {
       expect(src).toContain(`'${channel}': '${command}'`);
     }
@@ -145,6 +209,8 @@ describe('渲染层三通道接线', () => {
       'MCP_CONNECT',
       'MCP_DISCONNECT',
       'MCP_LIST_TOOLS',
+      'MCP_OAUTH_AUTHORIZE',
+      'MCP_OAUTH_REVOKE',
     ]) {
       expect(src).toContain(`IPC_CHANNELS.${key}`);
     }
@@ -157,6 +223,8 @@ describe('渲染层三通道接线', () => {
     expect(IPC_CHANNELS.MCP_CONNECT).toBe('mcp:connect');
     expect(IPC_CHANNELS.MCP_DISCONNECT).toBe('mcp:disconnect');
     expect(IPC_CHANNELS.MCP_LIST_TOOLS).toBe('mcp:listTools');
+    expect(IPC_CHANNELS.MCP_OAUTH_AUTHORIZE).toBe('mcp:oauthAuthorize');
+    expect(IPC_CHANNELS.MCP_OAUTH_REVOKE).toBe('mcp:oauthRevoke');
   });
 });
 
@@ -175,6 +243,8 @@ describe('扩展页连接器页签真实化', () => {
       'mcpAPI.connect(',
       'mcpAPI.disconnect(',
       'mcpAPI.remove(',
+      'mcpAPI.oauthAuthorize(',
+      'mcpAPI.oauthRevoke(',
     ]) {
       expect(src).toContain(call);
     }
@@ -186,8 +256,36 @@ describe('扩展页连接器页签真实化', () => {
 
   it('凭据只回显键名，并明确值留在本机', () => {
     const src = extensionsPage();
-    expect(src).toContain('s.envKeys.length');
+    // stdio 展示环境变量键名、远程展示请求头键名，另一侧不展示
+    expect(src).toContain("s.transport === 'stdio' ? s.envKeys : s.headerKeys");
     expect(src).toContain('值仅存本机，不回显');
+    // 默认行留空，避免把示例 API_KEY / Bearer token 当成真实配置登记
+    expect(src).toContain("useState<KvPair[]>([{ key: '', value: '' }])");
+    expect(src).not.toContain("key: 'API_KEY', value: ''");
+    expect(src).not.toContain("key: 'Authorization', value: 'Bearer your-token'");
+  });
+
+  it('OAuth 与显式 Authorization 头互斥：表单拦截并禁用提交', () => {
+    const src = extensionsPage();
+    expect(src).toContain('oauthHeaderConflict');
+    expect(src).toContain('它会覆盖 OAuth 自动附加的令牌');
+    expect(src).toContain('!oauthHeaderConflict');
+  });
+
+  it('OAuth：配置在弹窗登记、卡片显示授权状态、令牌只存系统凭据库', () => {
+    const src = extensionsPage();
+    for (const field of ['mcpAuthEnabled', 'mcpAuthUrl', 'mcpTokenUrl', 'mcpClientId', 'mcpScopes']) {
+      expect(src).toContain(field);
+    }
+    expect(src).toContain("s.authStatus === 'authorized'");
+    expect(src).toContain("s.authStatus === 'expired'");
+    expect(src).toContain('OAuth 未授权');
+    expect(src).toContain('令牌仅存系统凭据库');
+    // 浏览器通道不持有令牌：授权/撤销入口如实禁用并说明去桌面版
+    expect(src).toContain('!desktopChannel');
+    expect(src).toContain('浏览器通道无法保存 OAuth 令牌');
+    // 页面不得渲染任何令牌字段
+    expect(src).not.toMatch(/accessToken|refreshToken|access_token|refresh_token/);
   });
 
   it('移除连接器需二次确认（不做无提示的破坏性删除）', () => {
@@ -261,6 +359,26 @@ describe('浏览器通道端到端分发（mock-api → mcpAPI → 本地台账�
     const row = await api.mcpAPI.add({ name: '握手', command: 'node h.js' });
     await expect(api.mcpAPI.connect(row.serverId)).rejects.toThrow(/MCP_UNSUPPORTED/);
     expect(await api.mcpAPI.list()).toHaveLength(1);
+    await api.mcpAPI.remove(row.serverId);
+  });
+
+  it('OAuth 配置可登记；浏览器通道授权/撤销如实拒绝且不伪造令牌', async () => {
+    const row = await api.mcpAPI.add({
+      name: '远端 OAuth',
+      transport: 'streamable_http',
+      url: 'https://a.com/mcp',
+      auth: {
+        authorizationUrl: 'https://auth.example.com/authorize',
+        tokenUrl: 'https://auth.example.com/token',
+        clientId: 'tt-desktop',
+        scopes: ['openid'],
+      },
+    });
+    expect(row.authStatus).toBe('none');
+    expect(row.auth?.clientId).toBe('tt-desktop');
+    await expect(api.mcpAPI.oauthAuthorize(row.serverId)).rejects.toThrow(/MCP_OAUTH_UNSUPPORTED/);
+    await expect(api.mcpAPI.oauthRevoke(row.serverId)).rejects.toThrow(/MCP_OAUTH_UNSUPPORTED/);
+    expect(JSON.stringify(await api.mcpAPI.list())).not.toMatch(/accessToken|refreshToken/);
     await api.mcpAPI.remove(row.serverId);
   });
 

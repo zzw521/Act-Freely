@@ -21,10 +21,13 @@ import {
   Divider,
 } from '@mui/material';
 import {
+  Paid as PaidIcon,
+  Speed as SpeedIcon,
   Storage as StorageIcon,
   Timeline as TimelineIcon,
   Warning as WarningIcon,
 } from '@mui/icons-material';
+import type { UsageCost } from '../../../shared/contracts';
 
 // ── 类型定义 ──────────────────────────────────────────────────────
 
@@ -36,6 +39,12 @@ export interface ModelUsageStats {
   usagePercent: number;
   lastUsedAt?: Date;
   period: 'daily' | 'monthly' | 'total';
+  /** 平均端到端耗时；没有延迟样本（旧数据）时为 null */
+  avgLatencyMs?: number | null;
+  /** 按币种分开的成本；空表示未计价（不能当 0 元） */
+  costs?: UsageCost[];
+  pricedCalls?: number;
+  unpricedCalls?: number;
 }
 
 interface ModelStatsPanelProps {
@@ -44,6 +53,16 @@ interface ModelStatsPanelProps {
 }
 
 // ── 组件实现 ──────────────────────────────────────────────────────
+
+function formatCosts(costs: UsageCost[]): string {
+  return costs
+    .map((c) => {
+      const unit = c.micros / 1_000_000;
+      const text = unit < 0.01 ? unit.toFixed(6) : unit.toFixed(4);
+      return `${c.currency} ${text.replace(/0+$/, '').replace(/\.$/, '')}`;
+    })
+    .join(' / ');
+}
 
 const ModelStatsPanel: React.FC<ModelStatsPanelProps> = ({ stats, onSetLimit }) => {
   // 计算使用状态颜色
@@ -158,7 +177,47 @@ const ModelStatsPanel: React.FC<ModelStatsPanelProps> = ({ stats, onSetLimit }) 
               </Box>
             </Box>
           </Grid>
+
+          <Grid item xs={6}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <SpeedIcon fontSize="small" color="action" />
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block">
+                  平均耗时
+                </Typography>
+                <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                  {stats.avgLatencyMs === null || stats.avgLatencyMs === undefined
+                    ? '—'
+                    : `${stats.avgLatencyMs} ms`}
+                </Typography>
+              </Box>
+            </Box>
+          </Grid>
+
+          <Grid item xs={6}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <PaidIcon fontSize="small" color="action" />
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block">
+                  成本
+                </Typography>
+                <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                  {stats.costs?.length
+                    ? formatCosts(stats.costs)
+                    : stats.unpricedCalls
+                      ? '未计价'
+                      : '—'}
+                </Typography>
+              </Box>
+            </Box>
+          </Grid>
         </Grid>
+
+        {(stats.unpricedCalls ?? 0) > 0 && (
+          <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
+            其中 {stats.unpricedCalls} 次调用未配置单价，未计入成本
+          </Typography>
+        )}
 
         {/* 操作按钮 */}
         {onSetLimit && !stats.tokensLimit && (

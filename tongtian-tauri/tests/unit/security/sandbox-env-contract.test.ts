@@ -102,7 +102,8 @@ describe('Rust 工作环境磁盘事实', () => {
     expect(rustAgent()).toContain('pub secure_env: bool');
     // secureEnv 由 chat_request_body 装配，入参取自 p0.secure_env（随每次提交下发）
     expect(rustAgent()).toContain('"secureEnv": secure_env');
-    expect(rustAgent()).toContain('attachments, p0.secure_env, &overrides');
+    expect(rustAgent()).toContain('p0.secure_env,');
+    expect(rustAgent()).toContain('p0.privacy,');
   });
 });
 
@@ -188,11 +189,16 @@ describe('契约常量与前端通道', () => {
     expect(src.indexOf('sandbox:envUsage')).toBeLessThan(src.indexOf('handleLocalSecurityChannel(channel, args)'));
   });
 
-  it('Mock 分支有可运转的快照台账（浏览器直连演示态不空转）', () => {
+  it('Mock 分支如实报不支持（不再返回写死的 1.2 GB 快照）', () => {
     const src = securityLocal();
     expect(src).toContain("if (channel === 'sandbox:envUsage')");
     expect(src).toContain("if (channel === 'sandbox:envClear')");
     expect(src).toContain('function mockEnvUsage()');
+    // 编造的演示用量必须彻底消失
+    expect(src).not.toContain('1_288_490_188');
+    expect(src).not.toContain('files: 1240');
+    expect(src).toContain("supported: false");
+    expect(src).toContain('SANDBOX_ENV_UNSUPPORTED');
     expect(mockApi()).toContain("channel.startsWith('sandbox:')");
   });
 
@@ -258,19 +264,24 @@ describe('设置页 SandboxPanel 真实化', () => {
 
   it('没有文件时按钮禁用而非假装可点', () => {
     const src = settingsPage();
-    expect(src).toContain('usedBytes > 0 && !clearing');
+    expect(src).toContain('const canClear = Boolean(usage?.supported) && usedBytes > 0 && !clearing;');
     expect(src).toContain('暂无可清理文件');
+    // 通道不支持时按钮文案与可点性都如实
+    expect(src).toContain("'仅桌面版可用'");
+    expect(src).toContain('usage.note ?? ');
   });
 
   it('Workbench 提交与重新生成都把 secureEnv 随请求下发（引擎直连口径）', () => {
     const src = workbenchStore();
-    expect(src.match(/await getSettings\(\)\.catch\(\(\) => null\)\)\?\.secureEnv/g)?.length).toBe(2);
-    expect(src).toContain('secureEnv,');
-    expect(src).toContain('api.chat.submit({ goal, secureEnv, conversationId: conv.id, turnIndex: turnIdx })');
+    // 两条路径共用同一份 settings 快照：secureEnv 与 privacyMode 一起读取
+    expect(src.match(/const secureEnv = settings\?\.secureEnv;/g)?.length).toBe(2);
+    expect(src.match(/^\s+secureEnv,$/gm)?.length).toBe(2);
+    // 两条提交路径都带上当前工作空间：不同 workspace 有独立引擎实例
+    expect(src.match(/^\s+workspaceId: getActiveWorkspaceId\(\),$/gm)?.length).toBe(2);
   });
 });
 
-// ── 行为：Mock 快照真实分发 ──────────────────────────────────────
+// ── 行为：本地通道的能力边界如实反映 ────────────────────────────
 
 async function loadLocal() {
   vi.resetModules();
@@ -291,30 +302,30 @@ describe('本地 sandbox:env* 通道行为', () => {
     return res.value;
   }
 
-  it('用量快照带 workspaces 明细，且标注 mock 路径', () => {
+  it('用量如实报不支持：supported=false 且全为 0，并带可显示的原因', () => {
     const v = call('sandbox:envUsage');
-    expect(v.supported).toBe(true);
-    expect(v.bytes).toBeGreaterThan(0);
-    expect(v.files).toBeGreaterThan(0);
-    expect(v.workspaces.length).toBeGreaterThan(0);
-    expect(v.workspaces[0].path).toContain('(mock)');
+    expect(v.supported).toBe(false);
+    expect(v.bytes).toBe(0);
+    expect(v.files).toBe(0);
+    expect(v.workspaceCount).toBe(0);
+    expect(v.workspaces).toEqual([]);
+    expect(v.note, '不支持时必须给出原因，否则界面只能瞎猜').toContain('桌面版');
     expect(v.envDirName).toBe('environment');
   });
 
-  it('清理返回真实释放量并把快照归零（幂等：第二次为 0）', () => {
-    const before = call('sandbox:envUsage');
-    const r = call('sandbox:envClear');
-    expect(r.freedBytes).toBe(before.bytes);
-    expect(r.freedFiles).toBe(before.files);
-    expect(r.cleared.length).toBe(before.workspaces.length);
-    expect(r.failed).toEqual([]);
-    expect(call('sandbox:envClear').freedBytes).toBe(0);
-    expect(call('sandbox:envUsage').bytes).toBe(0);
+  it('清理抛 SANDBOX_ENV_UNSUPPORTED，不返回「释放了 N 字节」的假回执', () => {
+    expect(() => handle('sandbox:envClear', [])).toThrow(/SANDBOX_ENV_UNSUPPORTED/);
   });
 
-  it('清理写入 file_write 审计，可在审计页按动作筛出', () => {
-    call('sandbox:envClear');
-    const logs = call('audit:query', { action: 'file_write' }) as any[];
-    expect(logs[0].details).toContain('清理工作环境文件');
+  it('该错误码有登记与可读文案（裸码不丢给用户）', () => {
+    expect(Object.values(ErrorCode)).toContain(ErrorCode.SANDBOX_ENV_UNSUPPORTED);
+    const text = errorTextOf('SANDBOX_ENV_UNSUPPORTED: 浏览器预览环境无法清理工作环境文件');
+    expect(text).toContain('桌面版');
+    expect(text).toContain('浏览器预览环境');
+  });
+
+  it('审计台账不再有编造的历史样本（清理失败也不留下假的 file_write）', () => {
+    expect(() => handle('sandbox:envClear', [])).toThrow(/SANDBOX_ENV_UNSUPPORTED/);
+    expect(handle('audit:query', [{ type: 'file_write' }]).value).toEqual([]);
   });
 });

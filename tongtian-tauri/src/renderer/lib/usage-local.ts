@@ -15,6 +15,7 @@
 import type {
   ModelUsageRow,
   ModelUsageView,
+  UsageCost,
   UsageDayPoint,
   UsagePeriod,
   UsageReport,
@@ -45,9 +46,20 @@ export function utcMonthOf(ms: number): string {
 
 // ── 进程内台账（仅开发 Mock 模式使用） ────────────────────────
 
-interface LocalUsageRow extends ModelUsageRow {
+interface LocalUsageRow {
+  modelName: string;
+  displayName: string;
   /** UTC 日，累加分桶键 */
   day: string;
+  promptTokens: number;
+  completionTokens: number;
+  tokensUsed: number;
+  calls: number;
+  lastUsedAtMs: number;
+  latencyMsTotal: number;
+  latencySamples: number;
+  costs: UsageCost[];
+  pricedCalls: number;
 }
 
 const ledger = new Map<string, LocalUsageRow>();
@@ -56,12 +68,28 @@ function bucketKey(modelName: string, day: string): string {
   return `${modelName}\u0000${day}`;
 }
 
+function mergeCost(target: UsageCost[], source: UsageCost[] | undefined): UsageCost[] {
+  for (const cost of source ?? []) {
+    const hit = target.find((c) => c.currency === cost.currency);
+    if (hit) hit.micros += cost.micros;
+    else target.push({ ...cost });
+  }
+  return target.sort((a, b) => a.currency.localeCompare(b.currency));
+}
+
 /** 记一次模型调用（按「模型 × UTC 日」增量累加；模型名为空时忽略） */
 export function recordLocalUsage(
   modelName: string,
   promptTokens: number,
   completionTokens: number,
-  opts: { displayName?: string; atMs?: number } = {}
+  opts: {
+    displayName?: string;
+    atMs?: number;
+    latencyMs?: number;
+    costMicros?: number | null;
+    currency?: string;
+    priced?: boolean;
+  } = {}
 ): void {
   const name = modelName.trim();
   if (!name) return;
@@ -77,12 +105,25 @@ export function recordLocalUsage(
     tokensUsed: 0,
     calls: 0,
     lastUsedAtMs: 0,
+    latencyMsTotal: 0,
+    latencySamples: 0,
+    costs: [],
+    pricedCalls: 0,
   };
   row.promptTokens += Math.max(0, promptTokens);
   row.completionTokens += Math.max(0, completionTokens);
   row.tokensUsed = row.promptTokens + row.completionTokens;
   row.calls += 1;
   row.lastUsedAtMs = atMs;
+  if (opts.latencyMs !== undefined && opts.latencyMs !== null) {
+    row.latencyMsTotal += Math.max(0, opts.latencyMs);
+    row.latencySamples += 1;
+  }
+  if (opts.priced && typeof opts.costMicros === 'number' && opts.costMicros >= 0) {
+    const currency = (opts.currency || 'CNY').trim().toUpperCase() || 'CNY';
+    mergeCost(row.costs, [{ currency, micros: opts.costMicros }]);
+    row.pricedCalls += 1;
+  }
   if (opts.displayName) row.displayName = opts.displayName;
   ledger.set(key, row);
 }
@@ -91,7 +132,22 @@ export function recordLocalUsage(
 export function localUsageRows(period: UsagePeriod, nowMs = Date.now()): ModelUsageRow[] {
   const day = utcDayOf(nowMs);
   const month = utcMonthOf(nowMs);
-  const agg = new Map<string, ModelUsageRow>();
+  const agg = new Map<
+    string,
+    {
+      modelName: string;
+      displayName: string;
+      promptTokens: number;
+      completionTokens: number;
+      tokensUsed: number;
+      calls: number;
+      lastUsedAtMs: number;
+      latencyMsTotal: number;
+      latencySamples: number;
+      costs: UsageCost[];
+      pricedCalls: number;
+    }
+  >();
   for (const row of ledger.values()) {
     if (period === 'daily' && row.day !== day) continue;
     if (period === 'monthly' && !row.day.startsWith(month)) continue;
@@ -103,17 +159,38 @@ export function localUsageRows(period: UsagePeriod, nowMs = Date.now()): ModelUs
       tokensUsed: 0,
       calls: 0,
       lastUsedAtMs: 0,
+      latencyMsTotal: 0,
+      latencySamples: 0,
+      costs: [],
+      pricedCalls: 0,
     };
     cur.promptTokens += row.promptTokens;
     cur.completionTokens += row.completionTokens;
     cur.tokensUsed += row.tokensUsed;
     cur.calls += row.calls;
     cur.lastUsedAtMs = Math.max(cur.lastUsedAtMs, row.lastUsedAtMs);
+    cur.latencyMsTotal += row.latencyMsTotal;
+    cur.latencySamples += row.latencySamples;
+    mergeCost(cur.costs, row.costs);
+    cur.pricedCalls += row.pricedCalls;
     agg.set(row.modelName, cur);
   }
-  return [...agg.values()].sort(
-    (a, b) => b.tokensUsed - a.tokensUsed || a.modelName.localeCompare(b.modelName)
-  );
+  return [...agg.values()]
+    .map((r) => ({
+      modelName: r.modelName,
+      displayName: r.displayName,
+      promptTokens: r.promptTokens,
+      completionTokens: r.completionTokens,
+      tokensUsed: r.tokensUsed,
+      calls: r.calls,
+      lastUsedAtMs: r.lastUsedAtMs,
+      avgLatencyMs: r.latencySamples ? Math.round(r.latencyMsTotal / r.latencySamples) : null,
+      latencySamples: r.latencySamples,
+      costs: r.costs,
+      pricedCalls: r.pricedCalls,
+      unpricedCalls: Math.max(0, r.calls - r.pricedCalls),
+    }))
+    .sort((a, b) => b.tokensUsed - a.tokensUsed || a.modelName.localeCompare(b.modelName));
 }
 
 /** 本地台账视图（Mock 模式 `model:usage` 返回值） */
@@ -125,27 +202,39 @@ export function localUsageView(period: UsagePeriod, nowMs = Date.now()): ModelUs
 
 /**
  * 明细行 → 周期汇总（与 Rust `model::usage::totals_of` 逐字段一致）。
- * 台账没有延迟与单价字段，故汇总不含平均耗时/成本估算。
+ * 平均耗时按真实延迟样本数加权；成本按币种合并，未计价调用单独计数（不当 0 元）。
  */
 export function totalsOf(rows: ModelUsageRow[]): UsageTotals {
-  return rows.reduce<UsageTotals>(
-    (acc, r) => ({
-      promptTokens: acc.promptTokens + r.promptTokens,
-      completionTokens: acc.completionTokens + r.completionTokens,
-      tokensUsed: acc.tokensUsed + r.tokensUsed,
-      calls: acc.calls + r.calls,
-      activeModels: acc.activeModels + 1,
-      lastUsedAtMs: Math.max(acc.lastUsedAtMs, r.lastUsedAtMs),
-    }),
-    {
-      promptTokens: 0,
-      completionTokens: 0,
-      tokensUsed: 0,
-      calls: 0,
-      activeModels: 0,
-      lastUsedAtMs: 0,
-    }
-  );
+  const totals: UsageTotals = {
+    promptTokens: 0,
+    completionTokens: 0,
+    tokensUsed: 0,
+    calls: 0,
+    activeModels: 0,
+    lastUsedAtMs: 0,
+    avgLatencyMs: null,
+    latencySamples: 0,
+    costs: [],
+    pricedCalls: 0,
+    unpricedCalls: 0,
+  };
+  let weightedLatency = 0;
+  for (const r of rows) {
+    totals.promptTokens += r.promptTokens;
+    totals.completionTokens += r.completionTokens;
+    totals.tokensUsed += r.tokensUsed;
+    totals.calls += r.calls;
+    totals.activeModels += 1;
+    totals.lastUsedAtMs = Math.max(totals.lastUsedAtMs, r.lastUsedAtMs);
+    const samples = r.latencySamples ?? 0;
+    totals.latencySamples! += samples;
+    weightedLatency += (r.avgLatencyMs ?? 0) * samples;
+    mergeCost(totals.costs!, r.costs);
+    totals.pricedCalls! += r.pricedCalls ?? 0;
+    totals.unpricedCalls! += r.unpricedCalls ?? 0;
+  }
+  totals.avgLatencyMs = totals.latencySamples! > 0 ? Math.round(weightedLatency / totals.latencySamples!) : null;
+  return totals;
 }
 
 /** 由明细行组装总览（浏览器直连引擎时用：`/api/usage` 行 → `usage:stats` 返回体） */
@@ -157,18 +246,53 @@ export function statsFromRows(period: UsagePeriod, rows: ModelUsageRow[]): Usage
 export function localDayPoints(period: UsagePeriod, nowMs = Date.now()): UsageDayPoint[] {
   const day = utcDayOf(nowMs);
   const month = utcMonthOf(nowMs);
-  const buckets = new Map<string, UsageDayPoint & { names: Set<string> }>();
+  const buckets = new Map<
+    string,
+    {
+      day: string;
+      tokensUsed: number;
+      calls: number;
+      names: Set<string>;
+      latencyMsTotal: number;
+      latencySamples: number;
+      costs: UsageCost[];
+      pricedCalls: number;
+    }
+  >();
   for (const row of ledger.values()) {
     if (period === 'daily' && row.day !== day) continue;
     if (period === 'monthly' && !row.day.startsWith(month)) continue;
-    const cur = buckets.get(row.day) ?? { day: row.day, tokensUsed: 0, calls: 0, models: 0, names: new Set<string>() };
+    const cur = buckets.get(row.day) ?? {
+      day: row.day,
+      tokensUsed: 0,
+      calls: 0,
+      names: new Set<string>(),
+      latencyMsTotal: 0,
+      latencySamples: 0,
+      costs: [],
+      pricedCalls: 0,
+    };
     cur.tokensUsed += row.tokensUsed;
     cur.calls += row.calls;
     cur.names.add(row.modelName);
+    cur.latencyMsTotal += row.latencyMsTotal;
+    cur.latencySamples += row.latencySamples;
+    mergeCost(cur.costs, row.costs);
+    cur.pricedCalls += row.pricedCalls;
     buckets.set(row.day, cur);
   }
   return [...buckets.values()]
-    .map((p) => ({ day: p.day, tokensUsed: p.tokensUsed, calls: p.calls, models: p.names.size }))
+    .map((p) => ({
+      day: p.day,
+      tokensUsed: p.tokensUsed,
+      calls: p.calls,
+      models: p.names.size,
+      avgLatencyMs: p.latencySamples ? Math.round(p.latencyMsTotal / p.latencySamples) : null,
+      latencySamples: p.latencySamples,
+      costs: p.costs,
+      pricedCalls: p.pricedCalls,
+      unpricedCalls: Math.max(0, p.calls - p.pricedCalls),
+    }))
     .sort((a, b) => a.day.localeCompare(b.day));
 }
 
@@ -189,18 +313,46 @@ function fmtTime(ms: number): string {
   return ms ? new Date(ms).toISOString().replace('T', ' ').slice(0, 16) + ' UTC' : '—';
 }
 
+/** micros → 货币单位（去掉尾随 0；极小额保留 6 位，不把真实成本舍成 0） */
+function fmtMicros(micros: number): string {
+  const unit = micros / 1_000_000;
+  if (!Number.isFinite(unit) || unit <= 0) return '0';
+  const fixed = unit < 0.01 ? unit.toFixed(6) : unit.toFixed(4);
+  return fixed.replace(/0+$/, '').replace(/\.$/, '');
+}
+
+/** 成本按币种分列；没有计价记录时写「未计价」而不是 0 元 */
+export function fmtCosts(costs: UsageCost[] | undefined, pricedCalls = 0): string {
+  const list = costs ?? [];
+  if (list.length) return list.map((c) => `${c.currency} ${fmtMicros(c.micros)}`).join(' / ');
+  return pricedCalls > 0 ? '—' : '未计价';
+}
+
+/** 平均耗时展示：没有延迟样本时写「—」 */
+export function fmtLatency(ms: number | null | undefined, samples = 0): string {
+  if (!samples || ms === null || ms === undefined) return '—';
+  return `${fmtNum(ms)} ms`;
+}
+
 /**
  * 报表 → Markdown 文本（三通道共用的导出格式，数字全部来自台账）。
  * 空台账明确写「暂无用量记录」，不产出空表误导。
  */
 export function reportToMarkdown(report: UsageReport): string {
+  const t = report.totals;
+  const latency = fmtLatency(t.avgLatencyMs, t.latencySamples ?? 0);
+  const cost = fmtCosts(t.costs, t.pricedCalls ?? 0);
+  const unpriced = t.unpricedCalls ?? 0;
   const lines: string[] = [
     `# 通天办公 模型用量报表（${PERIOD_LABEL[report.period]}）`,
     '',
     `- 生成时间：${fmtTime(report.generatedAtMs)}`,
-    `- 汇总：Token ${fmtNum(report.totals.tokensUsed)}（输入 ${fmtNum(report.totals.promptTokens)} / 输出 ${fmtNum(report.totals.completionTokens)}）`,
-    `- 调用：${fmtNum(report.totals.calls)} 次 · 活跃模型 ${report.totals.activeModels} 个 · 最近使用 ${fmtTime(report.totals.lastUsedAtMs)}`,
-    '- 口径：台账未采集调用延迟与模型单价，故本报表不提供耗时与成本估算',
+    `- 汇总：Token ${fmtNum(t.tokensUsed)}（输入 ${fmtNum(t.promptTokens)} / 输出 ${fmtNum(t.completionTokens)}）`,
+    `- 调用：${fmtNum(t.calls)} 次 · 活跃模型 ${t.activeModels} 个 · 最近使用 ${fmtTime(t.lastUsedAtMs)}`,
+    `- 平均耗时：${latency}（按 ${fmtNum(t.latencySamples ?? 0)} 次真实耗时样本加权）`,
+    `- 成本：${cost}（已计价 ${fmtNum(t.pricedCalls ?? 0)} 次${unpriced > 0 ? `；未计价 ${fmtNum(unpriced)} 次未计入` : ''}）`,
+    '- 口径：Token 与耗时来自引擎上报的真实调用；成本 = Token × 调用时配置的单价；' +
+      '未配置单价的调用标为「未计价」而非 0 元，不同币种不合并',
   ];
   if (!report.models.length) {
     lines.push('', '暂无用量记录。');
@@ -210,23 +362,27 @@ export function reportToMarkdown(report: UsageReport): string {
     '',
     '## 按日趋势',
     '',
-    '| UTC 日 | Token | 调用 | 活跃模型 |',
-    '| --- | ---: | ---: | ---: |'
+    '| UTC 日 | Token | 调用 | 活跃模型 | 平均耗时 | 成本 |',
+    '| --- | ---: | ---: | ---: | ---: | --- |'
   );
   for (const d of report.days) {
-    lines.push(`| ${d.day} | ${fmtNum(d.tokensUsed)} | ${d.calls} | ${d.models} |`);
+    lines.push(
+      `| ${d.day} | ${fmtNum(d.tokensUsed)} | ${d.calls} | ${d.models} | ` +
+        `${fmtLatency(d.avgLatencyMs, d.latencySamples ?? 0)} | ${fmtCosts(d.costs, d.pricedCalls ?? 0)} |`
+    );
   }
   lines.push(
     '',
     '## 模型明细',
     '',
-    '| 模型 | 输入 Token | 输出 Token | 合计 | 调用 | 最近使用 |',
-    '| --- | ---: | ---: | ---: | ---: | --- |'
+    '| 模型 | 输入 Token | 输出 Token | 合计 | 调用 | 平均耗时 | 成本 | 最近使用 |',
+    '| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |'
   );
   for (const m of report.models) {
     lines.push(
       `| ${m.displayName || m.modelName} | ${fmtNum(m.promptTokens)} | ${fmtNum(m.completionTokens)} | ` +
-        `${fmtNum(m.tokensUsed)} | ${m.calls} | ${fmtTime(m.lastUsedAtMs)} |`
+        `${fmtNum(m.tokensUsed)} | ${m.calls} | ${fmtLatency(m.avgLatencyMs, m.latencySamples ?? 0)} | ` +
+        `${fmtCosts(m.costs, m.pricedCalls ?? 0)} | ${fmtTime(m.lastUsedAtMs)} |`
     );
   }
   return lines.join('\n');
@@ -239,14 +395,52 @@ export function resetLocalUsage(): void {
 
 // ── 共用映射（三通道统一） ───────────────────────────────────
 
+/** 渠道返回的耗时字段：缺失/非法一律 null，不伪造成 0 ms */
+function optMs(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
+}
+
+function toNonNegInt(value: unknown): number {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+/** 成本数组兜底解析：非法项丢弃，同币种合并并按币种排序 */
+function parseCosts(value: unknown): UsageCost[] {
+  if (!Array.isArray(value)) return [];
+  const out: UsageCost[] = [];
+  for (const item of value) {
+    const c = (item ?? {}) as Record<string, unknown>;
+    const currency = String(c.currency ?? '').trim().toUpperCase();
+    const micros = Number(c.micros);
+    if (!currency || !Number.isFinite(micros) || micros < 0) continue;
+    const hit = out.find((x) => x.currency === currency);
+    if (hit) hit.micros += micros;
+    else out.push({ currency, micros });
+  }
+  return out.sort((a, b) => a.currency.localeCompare(b.currency));
+}
+
 /** 趋势点兜底解析：引擎/HTTP 字段缺失按 0 计，不伪造数字 */
 function toDayPoint(d: unknown): UsageDayPoint {
   const p = (d ?? {}) as Record<string, unknown>;
+  const samples = toNonNegInt(p.latencySamples);
+  const calls = toNonNegInt(p.calls);
+  const priced = toNonNegInt(p.pricedCalls);
   return {
     day: String(p.day ?? ''),
-    tokensUsed: Number(p.tokensUsed ?? 0) || 0,
-    calls: Number(p.calls ?? 0) || 0,
-    models: Number(p.models ?? 0) || 0,
+    tokensUsed: toNonNegInt(p.tokensUsed),
+    calls,
+    models: toNonNegInt(p.models),
+    avgLatencyMs: samples > 0 ? optMs(p.avgLatencyMs) : null,
+    latencySamples: samples,
+    costs: parseCosts(p.costs),
+    pricedCalls: priced,
+    unpricedCalls: p.unpricedCalls === undefined
+      ? Math.max(0, calls - priced)
+      : toNonNegInt(p.unpricedCalls),
   };
 }
 
@@ -273,16 +467,25 @@ export function extractUsageRows(resp: unknown): ModelUsageRow[] {
     : ((resp as ModelUsageView | null)?.rows ?? []);
   return raw.map((r) => {
     const row = r as Partial<ModelUsageRow> & Record<string, unknown>;
-    const prompt = Number(row.promptTokens ?? 0) || 0;
-    const completion = Number(row.completionTokens ?? 0) || 0;
+    const prompt = toNonNegInt(row.promptTokens);
+    const completion = toNonNegInt(row.completionTokens);
+    const calls = toNonNegInt(row.calls);
+    const samples = toNonNegInt(row.latencySamples);
+    const priced = toNonNegInt(row.pricedCalls);
     return {
       modelName: String(row.modelName ?? ''),
       displayName: (row.displayName as string | undefined) ?? undefined,
       promptTokens: prompt,
       completionTokens: completion,
-      tokensUsed: Number(row.tokensUsed ?? prompt + completion) || 0,
-      calls: Number(row.calls ?? 0) || 0,
-      lastUsedAtMs: Number(row.lastUsedAtMs ?? 0) || 0,
+      tokensUsed: row.tokensUsed === undefined ? prompt + completion : toNonNegInt(row.tokensUsed),
+      calls,
+      lastUsedAtMs: toNonNegInt(row.lastUsedAtMs),
+      avgLatencyMs: samples > 0 ? optMs(row.avgLatencyMs) : null,
+      latencySamples: samples,
+      costs: parseCosts(row.costs),
+      pricedCalls: priced,
+      unpricedCalls:
+        row.unpricedCalls === undefined ? Math.max(0, calls - priced) : toNonNegInt(row.unpricedCalls),
     };
   });
 }
@@ -306,6 +509,10 @@ export function toUsageStats(
       usagePercent: limit ? Math.min((r.tokensUsed / limit) * 100, 100) : 0,
       lastUsedAt: r.lastUsedAtMs ? new Date(r.lastUsedAtMs) : undefined,
       period,
+      avgLatencyMs: r.avgLatencyMs ?? null,
+      costs: r.costs ?? [],
+      pricedCalls: r.pricedCalls ?? 0,
+      unpricedCalls: r.unpricedCalls ?? 0,
     };
   });
 }

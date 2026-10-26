@@ -38,7 +38,14 @@ import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
 import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
 import { useNavigate } from 'react-router-dom';
-import type { ScheduledTask, ScheduleFreq, ScheduleRunStatus, WorkspaceInfo } from '../../../shared/contracts';
+import { IPC_CHANNELS } from '../../../shared/contracts';
+import type {
+  ImChannelsSnapshot,
+  ScheduledTask,
+  ScheduleFreq,
+  ScheduleRunStatus,
+  WorkspaceInfo,
+} from '../../../shared/contracts';
 import { errorTextOf } from '../../../shared/error-messages';
 import { workspaceAPI } from '../../lib/api';
 import {
@@ -127,6 +134,7 @@ const ScheduleView: React.FC = () => {
   const toggle = useScheduleStore((s) => s.toggle);
   const remove = useScheduleStore((s) => s.remove);
   const runNow = useScheduleStore((s) => s.runNow);
+  const parseNatural = useScheduleStore((s) => s.parse);
   const loadKeepAwake = useScheduleStore((s) => s.loadKeepAwake);
   const setKeepAwake = useScheduleStore((s) => s.setKeepAwake);
 
@@ -140,6 +148,15 @@ const ScheduleView: React.FC = () => {
   const [taskDesc, setTaskDesc] = useState('');
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+
+  // 一句话创建 + 执行结果推送
+  const [nlText, setNlText] = useState('');
+  const [nlParsing, setNlParsing] = useState(false);
+  const [nlNote, setNlNote] = useState<string | null>(null);
+  const [notifyChannel, setNotifyChannel] = useState('');
+  const [notifyTarget, setNotifyTarget] = useState('');
+  const [imSnapshot, setImSnapshot] = useState<ImChannelsSnapshot | null>(null);
+  const [imError, setImError] = useState<string | null>(null);
 
   // 工作空间（PRD「选择工作空间」）：桌面端由 Rust 以磁盘目录为权威
   const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([]);
@@ -184,6 +201,35 @@ const ScheduleView: React.FC = () => {
   };
 
   const selectedWorkspace = workspaces.find((w) => w.id === workspaceId);
+  const channelSessions = (imSnapshot?.sessions ?? []).filter((s) => s.source === notifyChannel);
+  const selectedChannel = imSnapshot?.channels.find((c) => c.kind === notifyChannel);
+
+  // 打开弹窗时读 IM 真实通道/会话；引擎没跑就如实提示，不让推送配置看起来「可用」
+  useEffect(() => {
+    if (!dialogOpen) return;
+    let cancelled = false;
+    setImError(null);
+    const api = window.tongtianAPI;
+    if (!api) {
+      setImSnapshot(null);
+      setImError('IM 通道状态不可用（tongtianAPI 未注入）');
+      return;
+    }
+    api
+      .invoke(IPC_CHANNELS.IM_CHANNELS)
+      .then((resp) => {
+        if (!cancelled) setImSnapshot(resp as ImChannelsSnapshot);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setImSnapshot(null);
+          setImError(errorTextOf(err, 'IM 通道状态读取失败'));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [dialogOpen]);
 
   useEffect(() => {
     void useScheduleStore.getState().loadTasks();
@@ -203,6 +249,10 @@ const ScheduleView: React.FC = () => {
     setNewWorkspaceId('');
     setWorkspaceError(null);
     setFormError(null);
+    setNlText('');
+    setNlNote(null);
+    setNotifyChannel('');
+    setNotifyTarget('');
     setDialogOpen(true);
   };
 
@@ -219,7 +269,40 @@ const ScheduleView: React.FC = () => {
     setNewWorkspaceId('');
     setWorkspaceError(null);
     setFormError(null);
+    setNlText('');
+    setNlNote(null);
+    setNotifyChannel(t.notifyChannel ?? '');
+    setNotifyTarget(t.notifyTarget ?? '');
     setDialogOpen(true);
+  };
+
+  /** 一句话解析：只回填能确定的字段；解析不出时间就如实报错，不替用户猜 */
+  const handleParseNatural = async () => {
+    const text = nlText.trim();
+    if (!text || nlParsing) return;
+    setNlParsing(true);
+    setFormError(null);
+    try {
+      const parsed = await parseNatural(text);
+      setTaskName(parsed.name);
+      setFreq(parsed.freq);
+      setTime(parsed.timeOfDay);
+      if (parsed.weekday) setWeekday(parsed.weekday);
+      setTaskDesc((cur) => (cur.trim() ? cur : text));
+      setNlNote(
+        parsed.note ??
+          `已解析：${freqLabel(parsed.freq)}${
+            parsed.freq === 'weekly' && parsed.weekday
+              ? WEEKDAY_LABELS[parsed.weekday]
+              : ''
+          } ${parsed.timeOfDay}`,
+      );
+    } catch (err) {
+      setNlNote(null);
+      setFormError(errorTextOf(err, '一句话解析失败'));
+    } finally {
+      setNlParsing(false);
+    }
   };
 
   // 通过对话创建：跳转新任务对话窗口并预置提示词
@@ -241,6 +324,9 @@ const ScheduleView: React.FC = () => {
       timeOfDay: localToUtcTime(time),
       weekday: freq === 'weekly' ? weekday : null,
       workspaceId,
+      // 空串＝不推送；编辑时显式传空可关闭已有推送
+      notifyChannel: notifyChannel.trim().toLowerCase(),
+      notifyTarget: notifyTarget.trim(),
     };
     try {
       if (editingScheduleId) {
@@ -521,6 +607,20 @@ const ScheduleView: React.FC = () => {
                       </Typography>
                     </Box>
                   )}
+                  {t.notifyChannel && (
+                    <Box
+                      sx={{
+                        px: 0.75,
+                        py: 0.2,
+                        borderRadius: '6px',
+                        background: 'rgba(79, 70, 229, 0.08)',
+                      }}
+                    >
+                      <Typography sx={{ fontSize: '11.5px', color: '#4338CA' }}>
+                        结果推送：{t.notifyChannel}
+                      </Typography>
+                    </Box>
+                  )}
                 </Box>
                 <Typography
                   sx={{
@@ -725,6 +825,62 @@ const ScheduleView: React.FC = () => {
           </Typography>
         </DialogTitle>
         <DialogContent sx={{ pt: '12px !important' }}>
+          {/* 一句话创建（仅新建时展示；解析是本地规则，不调用模型） */}
+          {!editingScheduleId && (
+            <Box
+              sx={{
+                mb: 2,
+                p: 1.25,
+                borderRadius: '12px',
+                background: 'rgba(79, 70, 229, 0.05)',
+                border: '1px solid rgba(79, 70, 229, 0.15)',
+              }}
+            >
+              <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#4338CA', mb: 0.75 }}>
+                一句话创建
+              </Typography>
+              <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+                <TextField
+                  value={nlText}
+                  onChange={(e) => setNlText(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      void handleParseNatural();
+                    }
+                  }}
+                  fullWidth
+                  size="small"
+                  placeholder="例如：每周一上午 9 点生成周报"
+                  inputProps={{ 'aria-label': '一句话描述定时任务' }}
+                  sx={{ '& .MuiOutlinedInput-root': { fontSize: '13px', background: '#fff' } }}
+                />
+                <Button
+                  variant="contained"
+                  disabled={!nlText.trim() || nlParsing}
+                  onClick={() => void handleParseNatural()}
+                  sx={{
+                    flexShrink: 0,
+                    bgcolor: '#4F46E5',
+                    borderRadius: '9px',
+                    textTransform: 'none',
+                    fontSize: '12.5px',
+                    fontWeight: 600,
+                    px: 1.75,
+                    '&:hover': { bgcolor: '#4338CA' },
+                    '&.Mui-disabled': { bgcolor: '#E5E7EB', color: '#9CA3AF' },
+                  }}
+                >
+                  {nlParsing ? '解析中…' : '解析'}
+                </Button>
+              </Box>
+              <Typography sx={{ fontSize: '11.5px', color: nlNote ? '#4338CA' : '#6B7280', mt: 0.75 }}>
+                {nlNote ??
+                  '支持每小时 / 每天 / 每周X / 每月 1 号 + 上午、下午、晚上等时刻；只写时间时按每天处理'}
+              </Typography>
+            </Box>
+          )}
+
           {/* 任务名称 */}
           <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>任务名称</Typography>
           <TextField
@@ -868,6 +1024,88 @@ const ScheduleView: React.FC = () => {
             inputProps={{ 'aria-label': '任务描述' }}
             sx={{ mb: 1.5, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
           />
+
+          {/* 执行结果推送（可选）：通道/会话来自引擎真实状态 */}
+          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>
+            执行结果推送（可选）
+          </Typography>
+          <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', mb: 0.75 }}>
+            <Select
+              value={notifyChannel}
+              onChange={(e) => {
+                setNotifyChannel(e.target.value as string);
+                setNotifyTarget('');
+              }}
+              displayEmpty
+              size="small"
+              inputProps={{ 'aria-label': '推送通道' }}
+              sx={{ width: 150, fontSize: '13px', borderRadius: '10px' }}
+            >
+              <MenuItem value="" sx={{ fontSize: '13px' }}>不推送</MenuItem>
+              {(imSnapshot?.channels ?? [])
+                .filter((c) => c.supported)
+                .map((c) => (
+                  <MenuItem key={c.kind} value={c.kind} sx={{ fontSize: '13px' }}>
+                    {c.label}
+                    {c.configured ? '' : '（未绑定）'}
+                  </MenuItem>
+                ))}
+              {notifyChannel &&
+                !(imSnapshot?.channels ?? []).some(
+                  (c) => c.kind === notifyChannel && c.supported,
+                ) && (
+                  <MenuItem value={notifyChannel} sx={{ fontSize: '13px' }}>
+                    {notifyChannel}（状态未知）
+                  </MenuItem>
+                )}
+            </Select>
+            <TextField
+              value={notifyTarget}
+              onChange={(e) => setNotifyTarget(e.target.value)}
+              disabled={!notifyChannel}
+              fullWidth
+              size="small"
+              placeholder={
+                notifyChannel === 'slack' ? '频道 ID，如 C0123456' : '目标会话 ID'
+              }
+              inputProps={{ 'aria-label': '推送目标会话' }}
+              sx={{ '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
+            />
+          </Box>
+          {notifyChannel && channelSessions.length > 0 && (
+            <Select
+              value=""
+              onChange={(e) => setNotifyTarget(String(e.target.value))}
+              displayEmpty
+              size="small"
+              inputProps={{ 'aria-label': '从最近会话填充' }}
+              sx={{ mb: 0.75, width: '100%', fontSize: '13px', borderRadius: '10px' }}
+            >
+              <MenuItem value="" sx={{ fontSize: '13px' }}>从最近会话填充…</MenuItem>
+              {channelSessions.map((s) => (
+                <MenuItem key={s.id} value={s.conversationId} sx={{ fontSize: '13px' }}>
+                  {s.title || s.conversationId}
+                </MenuItem>
+              ))}
+            </Select>
+          )}
+          <Typography
+            sx={{
+              fontSize: '11.5px',
+              color: imError || (selectedChannel && !selectedChannel.configured) ? '#B45309' : '#9CA3AF',
+              mb: 2,
+            }}
+          >
+            {imError
+              ? `IM 通道状态读取失败（${imError}）。仍可保存推送配置，执行时由引擎判定；推送失败会写入执行记录`
+              : !notifyChannel
+                ? '不选通道则仅执行任务，不推送结果'
+                : selectedChannel && !selectedChannel.configured
+                  ? `${selectedChannel.label} 尚未在 IM 频道页绑定凭据，到点推送会失败并记录原因`
+                  : notifyChannel === 'slack'
+                    ? 'Slack 可直接填频道 ID；推送失败会写入执行记录，不影响任务本身'
+                    : '钉钉/企微/飞书只能回贴到已有会话：需要对方先发过消息，且回贴窗口未过期'}
+          </Typography>
 
           {formError && (
             <Alert severity="error" sx={{ mb: 1.5, fontSize: '12.5px' }}>{formError}</Alert>

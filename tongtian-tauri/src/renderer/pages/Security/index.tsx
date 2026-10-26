@@ -33,6 +33,7 @@ import AuditLog from '../../components/AuditLog';
 import SandboxPolicy from '../../components/SandboxPolicy';
 import CompliancePanel from '../../components/CompliancePanel';
 import { useSecurityStore, type DomainControlConfig } from '../../store/securityStore';
+import { useWorkspaceStore } from '../../store/workspaceStore';
 import { errorTextOf } from '../../../shared/error-messages';
 
 interface TabPanelProps {
@@ -75,17 +76,28 @@ const SecurityPage: React.FC = () => {
     loadSandboxPolicy,
   } = useSecurityStore();
 
-  const workspaceId = 'default-workspace';
+  // 沙箱策略按当前工作空间隔离：与任务提交、引擎端点使用同一个 workspace
+  const workspaceId = useWorkspaceStore((s) => s.activeId);
+  const refreshWorkspaces = useWorkspaceStore((s) => s.refresh);
 
-  // 首次进入加载出域控制/合规状态/审计日志/沙箱策略（真实后端或本地 Mock）
+  // 首次进入加载出域控制/合规状态/审计日志（真实后端或本地 Mock）
   useEffect(() => {
+    void refreshWorkspaces().catch((e) =>
+      setError(`加载工作空间失败: ${errorTextOf(e)}`),
+    );
     void Promise.all([
       loadDomainControl().catch((e) => setError(`加载出域控制失败: ${errorTextOf(e)}`)),
       loadCompliance(),
       loadAuditLogs().catch((e) => setError(`加载审计日志失败: ${errorTextOf(e)}`)),
-      loadSandboxPolicy(workspaceId).catch((e) => setError(`加载沙箱策略失败: ${errorTextOf(e)}`)),
     ]);
-  }, []);
+  }, [refreshWorkspaces, loadDomainControl, loadCompliance, loadAuditLogs]);
+
+  // 切换工作空间后重新读取该空间的沙箱策略
+  useEffect(() => {
+    void loadSandboxPolicy(workspaceId).catch((e) =>
+      setError(`加载沙箱策略失败: ${errorTextOf(e)}`),
+    );
+  }, [workspaceId, loadSandboxPolicy]);
 
   // 切换标签页（审计页每次进入都重新拉取，避免展示过期日志；合规概览同理）
   const handleTabChange = (event: React.SyntheticEvent, newValue: number) => {

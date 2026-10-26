@@ -98,6 +98,18 @@ export function handleLocalSuiteChannel(channel: string, args: unknown[]): Local
       const req = (args[0] ?? {}) as { suiteId?: string; id?: string };
       return { handled: true, value: uninstallLocalSuite(req.suiteId ?? req.id ?? '') };
     }
+    // 插件 SDK：预检与模板由桌面端 Rust 读取 ZIP/模板文件，浏览器通道不做半个实现
+    case 'plugin:validate':
+    case 'plugin:template':
+      void args;
+      return {
+        handled: true,
+        value: Promise.reject(
+          new Error(
+            'PLUGIN_UNSUPPORTED: 浏览器通道无法读取插件包目录与内置模板，请在桌面版通天办公使用插件 SDK',
+          ),
+        ),
+      };
     default:
       return { handled: false };
   }

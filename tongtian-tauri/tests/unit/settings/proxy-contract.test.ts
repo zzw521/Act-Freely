@@ -110,15 +110,16 @@ describe('Rust 代理配置层', () => {
 // ── 生效链路 ─────────────────────────────────────────────────────
 
 describe('代理设置真实生效链路', () => {
-  it('批量保存在落库前按「补丁叠加现值」整组校验', () => {
-    // 纯校验函数在 proxy.rs（可单测），调用点在 lib.rs 的两个写入口
+  it('批量保存在落库前按「补丁叠加现值」整组校验，单键写入口已删除', () => {
+    // 纯校验函数在 proxy.rs（可单测），调用点是唯一的批量写入口
     expect(rustProxy()).toContain(
       'pub fn spec_from_patch(store: &Store, patch: &serde_json::Map<String, serde_json::Value>) -> Result<(), String>',
     );
     const src = rustLib();
     expect(src).toContain('proxy::spec_from_patch(&p0.store, obj)?;');
-    // 单键写同样要预校验，否则改 mode 不填地址会先落库再报错
-    expect(src).toContain('proxy::spec_from_patch(&p0.store, &probe)?;');
+    // 设置页只走批量 patch；没有调用方的单键 settings_set 已删除，避免出现第二条未接线写入口
+    expect(src).not.toContain('proxy::spec_from_patch(&p0.store, &probe)?;');
+    expect(src).not.toContain('async fn settings_set(');
     expect(src.indexOf('proxy::spec_from_patch(&p0.store, obj)?;')).toBeLessThan(
       src.indexOf('store::settings::set(&p0.store, k, &store::settings::encode_value(v))?;'),
     );
@@ -143,7 +144,10 @@ describe('代理设置真实生效链路', () => {
 
   it('外网出网改用 proxy::client()（模型连通性 / 远端 MCP / 云端账号）', () => {
     expect(rustModel()).toContain('let client = crate::proxy::client();');
-    expect(rustMcp()).toContain('let client = crate::proxy::client();');
+    // MCP 同时服务远端与本机端点：远端走代理，回环必须直连（系统代理常不 bypass 回环）
+    expect(rustMcp()).toContain(
+      'let client = if is_loopback_url(&job.url) {\n        crate::proxy::loopback_client()\n    } else {\n        crate::proxy::client()\n    };',
+    );
     expect(rustAuth()).toContain('crate::proxy::client()');
     // 账号侧不应再有绕过代理配置的裸 client
     expect(rustAuth()).not.toContain('reqwest::Client::new()');

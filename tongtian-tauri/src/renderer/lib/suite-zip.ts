@@ -294,7 +294,9 @@ export async function parseSuitePackage(bytes: Uint8Array): Promise<ParsedSuiteP
   for (const e of files) {
     if (!isSafeRelative(e.name)) incompatible(`套件包内含不安全路径：${e.name}`);
   }
-  const skillFiles = files.filter((e) => e.name.split('/').pop() === 'SKILL.md').length;
+  const skillFiles = files.filter(
+    (e) => (e.name.split('/').pop() ?? '').toLowerCase() === 'skill.md',
+  ).length;
   const id = suiteIdOf(name!);
   const suite: InstalledSuite = {
     id,

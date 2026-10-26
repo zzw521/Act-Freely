@@ -53,6 +53,18 @@ describe('workspaceAPI · 列表（页面消费面）', () => {
   });
 });
 
+describe('workspaceAPI · 后端与数据根能力视图', () => {
+  it('返回当前后端、数据根来源与诚实降级', async () => {
+    const caps = await api.workspaceAPI.capabilities();
+    expect(caps.activeBackend).toBe('local');
+    expect(caps.dataRootSource).toBe('browser');
+    expect(caps.backends).toHaveLength(3);
+    expect(caps.backends.filter((b) => b.supported).map((b) => b.id)).toEqual(['local']);
+    expect(caps.customRoot.supported).toBe(false);
+    expect(caps.deleteSupported).toBe(false);
+  });
+});
+
 describe('workspaceAPI · 与定时任务链路对齐', () => {
   it('schedule:create 透传 workspaceId，任务归属所选工作空间', async () => {
     await api.workspaceAPI.create('weekly');

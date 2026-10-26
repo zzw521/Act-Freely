@@ -113,6 +113,18 @@ describe('工作空间：错误码契约与 Rust 源码一致', () => {
     expect(src).toContain('c.is_ascii_lowercase() || c.is_ascii_digit() || c == \'_\' || c == \'-\'');
     expect(src).toContain("id.contains('.') || id.contains('/') || id.contains('\\\\')");
   });
+
+  it('能力命令已注册，数据根来源与 TONGTIAN_HOME 同源', () => {
+    const lib = readFileSync(
+      fileURLToPath(new URL('../../../src-tauri/src/lib.rs', import.meta.url)),
+      'utf8',
+    );
+    expect(lib).toContain('workspace::workspace_capabilities');
+    expect(src).toContain('pub async fn workspace_capabilities');
+    expect(src).toContain('"TONGTIAN_HOME"');
+    expect(src).toContain('"customRoot"');
+    expect(src).toContain('"deleteSupported": false');
+  });
 });
 
 // ── 标识校验 ──────────────────────────────────────────────────
@@ -275,10 +287,44 @@ describe('handleLocalWorkspaceChannel：路由与兜底', () => {
     );
   });
 
+  it('workspace:capabilities 返回后端与数据根视图', async () => {
+    const m = await freshWithStorage();
+    const res = m.handleLocalWorkspaceChannel('workspace:capabilities', []);
+    expect(res.handled).toBe(true);
+    expect((res.value as { activeBackend: string }).activeBackend).toBe('local');
+  });
+
   it('未命中通道返回 handled=false，交由其他通道处理', async () => {
     const m = await freshWithStorage();
     expect(m.handleLocalWorkspaceChannel('schedule:list', [])).toEqual({ handled: false });
     expect(m.handleLocalWorkspaceChannel('workspace:delete', [])).toEqual({ handled: false });
+  });
+});
+
+// ── 后端抽象：只报真实可用的能力 ──────────────────────────────
+
+describe('localWorkspaceCapabilities：诚实后端视图', () => {
+  it('只有 local 可用，容器/SSH 明确未提供并给出原因', async () => {
+    const m = await freshWithStorage();
+    const caps = m.localWorkspaceCapabilities();
+    expect(caps.activeBackend).toBe('local');
+    expect(caps.backends.find((b) => b.id === 'local')?.supported).toBe(true);
+    for (const id of ['docker', 'ssh']) {
+      const b = caps.backends.find((row) => row.id === id);
+      expect(b?.supported).toBe(false);
+      expect((b?.reason ?? '').length).toBeGreaterThan(8);
+    }
+  });
+
+  it('浏览器数据根如实为 localStorage，自定义根与环境变量不可用', async () => {
+    const m = await freshWithStorage();
+    const caps = m.localWorkspaceCapabilities();
+    expect(caps.dataRootSource).toBe('browser');
+    expect(caps.dataRoot).toContain('localStorage');
+    expect(caps.customRoot.supported).toBe(false);
+    expect(caps.customRoot.reason).toContain('桌面版');
+    expect(caps.deleteSupported).toBe(false);
+    expect(caps.maxIdLen).toBe(64);
   });
 });
 

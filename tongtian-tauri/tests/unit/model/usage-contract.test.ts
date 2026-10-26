@@ -6,8 +6,8 @@
  * `avgLatencyMs` / `estimatedCost` 两个**没有任何数据来源**的字段
  * （台账只记 token 与调用次数，未采集延迟与单价）。
  * 本文件从源码与行为两侧锁定链路完整，并守住「不伪造指标」这条线：
- * - Rust：stats/report 与明细共用同一周期过滤，错误码有可读文案
- * - 契约：幽灵字段不得回归（latency/cost/price 一律不出现在用量模块）
+ * - Rust/引擎：延迟与成本有真实采集来源，未配置单价记为「未计价」而非 0 元
+ * - 契约：新增的延迟/成本字段在三通道与页面之间同名同义
  * - 三通道：Tauri command、引擎 HTTP、Mock 本地台账都有分支且口径一致
  * - 页面：用量页真正消费总览与报表，不再是无人调用的常量
  */
@@ -41,8 +41,7 @@ const usageLocal = () => read('../../../src/renderer/lib/usage-local.ts');
 const storeSrc = () => read('../../../src/renderer/stores/useModelUsageStore.ts');
 const panelSrc = () => read('../../../src/renderer/components/UsageOverviewPanel/index.tsx');
 const modelHub = () => read('../../../src/renderer/pages/ModelHub/index.tsx');
-const preloadAllow = () => read('../../../src/preload/index.ts');
-const preloadDts = () => read('../../../src/preload/index.d.ts');
+const preloadDts = () => read('../../../src/shared/tongtian-api.d.ts');
 const engineServer = () => read('../../../engine/server.py');
 
 /** snake_case 字段 → camelCase（Rust serde rename_all 的等价变换） */
@@ -97,13 +96,21 @@ describe('Rust 用量总览与报表', () => {
     expect((src.match(/WHERE u\.day = \?1/g) ?? []).length).toBe(1);
   });
 
-  it('用量模块不出现延迟/成本/单价等无来源指标', () => {
-    // 台账只有 token 与调用次数：模型连通性测试的 latencyMs 属于另一条链路，不在此列
-    const lower = rustUsage().toLowerCase();
-    for (const ghost of ['latency', 'cost', 'price', 'avg_ms']) {
-      expect(lower, `字段 ${ghost} 没有台账数据来源`).not.toContain(ghost);
-    }
-    expect(contracts()).not.toMatch(/avgLatencyMs|estimatedCost/);
+  it('延迟与成本有真实采集来源，未配置单价单独计数', () => {
+    const src = rustUsage();
+    expect(src).toContain('latency_ms_total');
+    expect(src).toContain('latency_samples');
+    expect(src).toContain('cost_micros');
+    expect(src).toContain('model_usage_cost');
+    expect(src).toContain('unpriced_calls');
+    // 引擎侧同样有单价换算与台账字段（浏览器直连不是另一套口径）
+    const py = engineServer();
+    expect(py).toContain('def cost_micros_of(');
+    expect(py).toContain('def _prices_of(');
+    expect(py).toContain('"costMicros"');
+    expect(py).toContain('"priced"');
+    expect(contracts()).toMatch(/avgLatencyMs\?/);
+    expect(contracts()).toMatch(/costs\?: UsageCost\[\]/);
     expect(sharedTypes()).not.toMatch(/interface UsageStats\b/);
   });
 
@@ -114,11 +121,25 @@ describe('Rust 用量总览与报表', () => {
     expect(camelStructs).toEqual(
       expect.arrayContaining(['UsageRow', 'UsageTotals', 'StatsView', 'DayPoint', 'ReportView'])
     );
+    expect(rustFields(src, 'UsageRow').map(toCamel).sort()).toEqual(
+      [
+        'avgLatencyMs', 'calls', 'completionTokens', 'costs', 'displayName', 'lastUsedAtMs',
+        'latencySamples', 'modelName', 'pricedCalls', 'promptTokens', 'tokensUsed', 'unpricedCalls',
+      ].sort()
+    );
     expect(rustFields(src, 'UsageTotals').map(toCamel).sort()).toEqual(
-      ['activeModels', 'calls', 'completionTokens', 'lastUsedAtMs', 'promptTokens', 'tokensUsed'].sort()
+      [
+        'activeModels', 'avgLatencyMs', 'calls', 'completionTokens', 'costs', 'lastUsedAtMs',
+        'latencySamples', 'pricedCalls', 'promptTokens', 'tokensUsed', 'unpricedCalls',
+      ].sort()
     );
     expect(rustFields(src, 'StatsView').map(toCamel).sort()).toEqual(['period', 'topModel', 'totals']);
-    expect(rustFields(src, 'DayPoint').map(toCamel).sort()).toEqual(['calls', 'day', 'models', 'tokensUsed']);
+    expect(rustFields(src, 'DayPoint').map(toCamel).sort()).toEqual(
+      [
+        'avgLatencyMs', 'calls', 'costs', 'day', 'latencySamples', 'models', 'pricedCalls',
+        'tokensUsed', 'unpricedCalls',
+      ].sort()
+    );
     expect(rustFields(src, 'ReportView').map(toCamel).sort()).toEqual(
       ['days', 'generatedAtMs', 'models', 'period', 'totals'].sort()
     );
@@ -207,9 +228,7 @@ describe('契约与三通道接入', () => {
     expect(src).toContain('localReportView(normalizePeriod(arg))');
   });
 
-  it('preload 白名单与类型声明同步（不留旧签名误导调用方）', () => {
-    expect(preloadAllow()).toContain('IPC_CHANNELS.USAGE_STATS');
-    expect(preloadAllow()).toContain('IPC_CHANNELS.USAGE_REPORT');
+  it('全局 API 类型声明与用量通道同步（不留旧签名误导调用方）', () => {
     const dts = preloadDts();
     expect(dts).toContain('usageStats(period?: UsagePeriod): Promise<UsageStats>');
     expect(dts).toContain('usageReport(period?: UsagePeriod): Promise<UsageReport>');
@@ -223,9 +242,15 @@ describe('契约与三通道接入', () => {
     expect(panel).toContain('loadOverview');
     expect(panel).toContain('loadReport');
     expect(panel).toContain('reportMarkdown');
-    // 口径注释随行：避免后人再往报表里补「成本」
-    expect(panel).toContain('未采集调用延迟与模型单价');
+    // 口径随行：延迟/成本来自真实台账，未计价不能被写成 0 元
+    expect(panel).toContain('成本 = Token × 调用时配置的单价');
+    expect(panel).toContain('未配置单价的调用标为「未计价」');
+    expect(panel).toContain('fmtLatency');
+    expect(panel).toContain('fmtCosts');
     expect(panel).toContain('生成报表');
+    const statsPanel = read('../../../src/renderer/components/ModelStatsPanel/index.tsx');
+    expect(statsPanel).toContain('平均耗时');
+    expect(statsPanel).toContain('未计入成本');
     expect(storeSrc()).toContain('api.usage.stats(period)');
     expect(storeSrc()).toContain('api.usage.report(period)');
   });
@@ -234,7 +259,7 @@ describe('契约与三通道接入', () => {
 // ── 本地实现：总览 / 趋势 / 报表口径 ──────────────────────────
 
 describe('usage-local：汇总、趋势与报表', () => {
-  it('空明细汇总为零值，不伪造活跃模型与最近使用时间', () => {
+  it('空明细汇总为零值，不伪造活跃模型、耗时与成本', () => {
     expect(usage.totalsOf([])).toEqual({
       promptTokens: 0,
       completionTokens: 0,
@@ -242,6 +267,11 @@ describe('usage-local：汇总、趋势与报表', () => {
       calls: 0,
       activeModels: 0,
       lastUsedAtMs: 0,
+      avgLatencyMs: null,
+      latencySamples: 0,
+      costs: [],
+      pricedCalls: 0,
+      unpricedCalls: 0,
     });
     expect(usage.statsFromRows('daily', [])).toEqual({
       period: 'daily',
@@ -262,10 +292,40 @@ describe('usage-local：汇总、趋势与报表', () => {
       calls: 5,
       activeModels: 2,
       lastUsedAtMs: 9,
+      avgLatencyMs: null,
+      latencySamples: 0,
+      costs: [],
+      pricedCalls: 0,
+      unpricedCalls: 5,
     });
     // topModel 用展示名，缺名回落模型名
     expect(usage.statsFromRows('total', rows).topModel).toBe('模型A');
     expect(usage.statsFromRows('total', rows.slice(1)).topModel).toBe('b');
+  });
+
+  it('汇总的耗时按样本加权、成本按币种合并，未计价单独计数', () => {
+    const rows = usage.extractUsageRows([
+      {
+        modelName: 'a', promptTokens: 10, completionTokens: 5, calls: 2,
+        avgLatencyMs: 100, latencySamples: 2,
+        costs: [{ currency: 'CNY', micros: 1000 }], pricedCalls: 2,
+      },
+      {
+        modelName: 'b', promptTokens: 1, completionTokens: 1, calls: 2,
+        avgLatencyMs: 400, latencySamples: 1,
+        costs: [{ currency: 'USD', micros: 500 }], pricedCalls: 1, unpricedCalls: 1,
+      },
+    ]);
+    const totals = usage.totalsOf(rows);
+    // (100×2 + 400×1) / 3 = 200ms
+    expect(totals.avgLatencyMs).toBe(200);
+    expect(totals.latencySamples).toBe(3);
+    expect(totals.costs).toEqual([
+      { currency: 'CNY', micros: 1000 },
+      { currency: 'USD', micros: 500 },
+    ]);
+    expect(totals.pricedCalls).toBe(3);
+    expect(totals.unpricedCalls).toBe(1);
   });
 
   it('本地趋势按 UTC 日升序分桶，当日模型数按去重统计', () => {
@@ -278,7 +338,17 @@ describe('usage-local：汇总、趋势与报表', () => {
     const all = usage.localDayPoints('total', now);
     expect(all.map((p) => p.day)).toEqual([...all.map((p) => p.day)].sort());
     expect(all.length).toBe(3);
-    expect(all[all.length - 1]).toEqual({ day: usage.utcDayOf(now), tokensUsed: 120, calls: 2, models: 2 });
+    expect(all[all.length - 1]).toEqual({
+      day: usage.utcDayOf(now),
+      tokensUsed: 120,
+      calls: 2,
+      models: 2,
+      avgLatencyMs: null,
+      latencySamples: 0,
+      costs: [],
+      pricedCalls: 0,
+      unpricedCalls: 2,
+    });
 
     const daily = usage.localDayPoints('daily', now);
     expect(daily.length).toBe(1);
@@ -288,6 +358,21 @@ describe('usage-local：汇总、趋势与报表', () => {
     const month = usage.utcMonthOf(now);
     expect(monthly.every((p) => p.day.startsWith(month))).toBe(true);
     expect(monthly.some((p) => p.day === usage.utcDayOf(now - 40 * DAY))).toBe(false);
+  });
+
+  it('本地趋势携带耗时与成本：延迟按样本加权，未计价按次记录', () => {
+    const now = Date.UTC(2026, 9, 8, 12);
+    usage.recordLocalUsage('qwen-plus', 100, 50, {
+      atMs: now, latencyMs: 200, costMicros: 1080, currency: 'CNY', priced: true,
+    });
+    usage.recordLocalUsage('qwen-plus', 10, 5, { atMs: now, latencyMs: 400 });
+
+    const [point] = usage.localDayPoints('daily', now);
+    expect(point.avgLatencyMs).toBe(300);
+    expect(point.latencySamples).toBe(2);
+    expect(point.costs).toEqual([{ currency: 'CNY', micros: 1080 }]);
+    expect(point.pricedCalls).toBe(1);
+    expect(point.unpricedCalls).toBe(1);
   });
 
   it('报表内部自洽：趋势合计 == 明细合计 == totals', () => {
@@ -313,7 +398,12 @@ describe('usage-local：汇总、趋势与报表', () => {
         period: 'monthly',
         generatedAtMs: 111,
         days: [{ day: '2026-10-01', tokensUsed: '30', calls: 2, models: 1 }, { day: 'bad' }],
-        models: [{ modelName: 'qwen-plus', promptTokens: 20, completionTokens: 10, calls: 2, lastUsedAtMs: 7 }],
+        models: [{
+          modelName: 'qwen-plus', promptTokens: 20, completionTokens: 10, calls: 2,
+          lastUsedAtMs: 7, avgLatencyMs: 150, latencySamples: 2,
+          costs: [{ currency: 'usd', micros: 50 }, { currency: 'CNY', micros: 1080 }],
+          pricedCalls: 1, unpricedCalls: 1,
+        }],
         totals: { tokensUsed: 999999 },
       },
       'monthly',
@@ -321,11 +411,24 @@ describe('usage-local：汇总、趋势与报表', () => {
     );
     expect(rep.generatedAtMs).toBe(111);
     expect(rep.days).toEqual([
-      { day: '2026-10-01', tokensUsed: 30, calls: 2, models: 1 },
-      { day: 'bad', tokensUsed: 0, calls: 0, models: 0 },
+      {
+        day: '2026-10-01', tokensUsed: 30, calls: 2, models: 1,
+        avgLatencyMs: null, latencySamples: 0, costs: [], pricedCalls: 0, unpricedCalls: 2,
+      },
+      {
+        day: 'bad', tokensUsed: 0, calls: 0, models: 0,
+        avgLatencyMs: null, latencySamples: 0, costs: [], pricedCalls: 0, unpricedCalls: 0,
+      },
     ]);
     // 引擎自带的 totals 不可信时按明细重算，保证三块口径一致
     expect(rep.totals).toEqual(usage.totalsOf(rep.models));
+    expect(rep.models[0].avgLatencyMs).toBe(150);
+    expect(rep.models[0].latencySamples).toBe(2);
+    expect(rep.models[0].costs).toEqual([
+      { currency: 'CNY', micros: 1080 },
+      { currency: 'USD', micros: 50 },
+    ]);
+    expect(rep.totals.unpricedCalls).toBe(1);
 
     const empty = usage.extractReport(null, 'daily', 333);
     expect(empty.days).toEqual([]);
@@ -334,17 +437,33 @@ describe('usage-local：汇总、趋势与报表', () => {
     expect(empty.totals.activeModels).toBe(0);
   });
 
-  it('报表文本口径完整：周期、汇总、按日趋势、模型明细，且不出现成本', () => {
+  it('报表文本口径完整：周期、汇总、按日趋势、模型明细，含耗时与成本', () => {
     const now = Date.UTC(2026, 9, 8, 12);
-    usage.recordLocalUsage('qwen-plus', 1000, 500, { displayName: '通义千问', atMs: now });
+    usage.recordLocalUsage('qwen-plus', 1000, 500, {
+      displayName: '通义千问', atMs: now,
+      latencyMs: 1200, costMicros: 1080, currency: 'CNY', priced: true,
+    });
     const md = usage.reportToMarkdown(usage.localReportView('monthly', now));
     expect(md).toContain('# 通天办公 模型用量报表（本月）');
     expect(md).toContain('## 按日趋势');
     expect(md).toContain('## 模型明细');
     expect(md).toContain('通义千问');
     expect(md).toContain('1,500');
-    expect(md).toContain('台账未采集调用延迟与模型单价');
+    expect(md).toContain('平均耗时：1,200 ms');
+    expect(md).toContain('成本：CNY 0.00108');
+    expect(md).toContain('| UTC 日 | Token | 调用 | 活跃模型 | 平均耗时 | 成本 |');
+    expect(md).toContain('未配置单价的调用标为「未计价」');
+    expect(md).not.toContain('未采集调用延迟');
     expect(md).not.toMatch(/[¥$]/);
+  });
+
+  it('未计价调用在报表里明确标注，不写成 0 元', () => {
+    const now = Date.UTC(2026, 9, 8, 12);
+    usage.recordLocalUsage('qwen-plus', 1000, 500, { displayName: '通义千问', atMs: now });
+    const md = usage.reportToMarkdown(usage.localReportView('monthly', now));
+    expect(md).toContain('成本：未计价');
+    expect(md).toContain('未计价 1 次未计入');
+    expect(md).toContain('| 通义千问 | 1,000 | 500 | 1,500 | 1 | — | 未计价 |');
   });
 
   it('空台账报表只写「暂无用量记录」，不产出空表误导', () => {

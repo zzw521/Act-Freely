@@ -82,6 +82,99 @@ describe('schedule-local：输入规范化与错误码', () => {
   });
 });
 
+// ── 一句话解析（与 Rust `parse_natural` 同用例同期望值） ─────────
+
+describe('parseNaturalSchedule：一句话 → 表单字段', () => {
+  it('每天 + 下午时刻 + 名称去噪', () => {
+    const p = sched.parseNaturalSchedule('每天上午9点汇总品牌舆情');
+    expect(p.freq).toBe('daily');
+    expect(p.timeOfDay).toBe('09:00');
+    expect(p.weekday).toBeNull();
+    expect(p.name).toBe('汇总品牌舆情');
+    expect(p.note).toBeNull();
+
+    const q = sched.parseNaturalSchedule('每天下午 3 点半提醒我提交日报');
+    expect(q.timeOfDay).toBe('15:30');
+    expect(q.name).toBe('提交日报');
+  });
+
+  it('每周星期与每月 1 号', () => {
+    const w = sched.parseNaturalSchedule('每周一上午 9:00 生成周报');
+    expect(w.freq).toBe('weekly');
+    expect(w.weekday).toBe(1);
+    expect(w.timeOfDay).toBe('09:00');
+    expect(w.name).toBe('生成周报');
+
+    const sun = sched.parseNaturalSchedule('每周日晚上8点备份数据');
+    expect(sun.weekday).toBe(7);
+    expect(sun.timeOfDay).toBe('20:00');
+    expect(sun.name).toBe('备份数据');
+
+    const m = sched.parseNaturalSchedule('每月1号凌晨2点清理缓存');
+    expect(m.freq).toBe('monthly');
+    expect(m.timeOfDay).toBe('02:00');
+    expect(m.name).toBe('清理缓存');
+  });
+
+  it('每小时只取分钟字段', () => {
+    const p = sched.parseNaturalSchedule('每小时的第30分钟检查服务');
+    expect(p.freq).toBe('hourly');
+    expect(p.timeOfDay).toBe('00:30');
+    expect(p.name).toBe('检查服务');
+
+    const q = sched.parseNaturalSchedule('每小时 15 分同步数据');
+    expect(q.timeOfDay).toBe('00:15');
+    expect(q.name).toBe('同步数据');
+  });
+
+  it('未写频率按每天处理并显式给出 note', () => {
+    const p = sched.parseNaturalSchedule('上午10点开晨会');
+    expect(p.freq).toBe('daily');
+    expect(p.timeOfDay).toBe('10:00');
+    expect(p.name).toBe('开晨会');
+    expect(p.note).toBe('未写频率，已按每天处理');
+  });
+
+  it('夜里/中午的边界换算', () => {
+    expect(sched.parseNaturalSchedule('每天晚上12点归档').timeOfDay).toBe('00:00');
+    expect(sched.parseNaturalSchedule('每天中午1点午会').timeOfDay).toBe('13:00');
+    expect(sched.parseNaturalSchedule('每天中午12点午餐').timeOfDay).toBe('12:00');
+    expect(() => sched.parseNaturalSchedule('每天24:00 不允许')).toThrow(/SCHEDULE_PARSE_TIME/);
+  });
+
+  it('不支持的间隔/日期与缺失时刻如实拒绝（不猜一个值）', () => {
+    expect(() => sched.parseNaturalSchedule('每2小时同步一次')).toThrow(/SCHEDULE_UNSUPPORTED_FREQ/);
+    expect(() => sched.parseNaturalSchedule('每隔30分钟检查')).toThrow(/SCHEDULE_UNSUPPORTED_FREQ/);
+    expect(() => sched.parseNaturalSchedule('每月15号发工资')).toThrow(/SCHEDULE_UNSUPPORTED_DAY/);
+    expect(() => sched.parseNaturalSchedule('每天汇总舆情')).toThrow(/SCHEDULE_PARSE_NO_TIME/);
+    expect(() => sched.parseNaturalSchedule('   ')).toThrow(/SCHEDULE_PARSE_EMPTY/);
+  });
+});
+
+// ── 执行结果推送配置 ──────────────────────────────────────────
+
+describe('normalizeNotify：通道与目标成对校验', () => {
+  it('均空即关闭推送；合法值去空白并小写通道', () => {
+    expect(sched.normalizeNotify(undefined, undefined)).toEqual({
+      notifyChannel: '',
+      notifyTarget: '',
+    });
+    expect(sched.normalizeNotify(' Slack ', ' C123 ')).toEqual({
+      notifyChannel: 'slack',
+      notifyTarget: 'C123',
+    });
+  });
+
+  it('只填一侧或通道非法即拒 SCHEDULE_INVALID_NOTIFY', () => {
+    expect(() => sched.normalizeNotify('', 'C123')).toThrow(/SCHEDULE_INVALID_NOTIFY/);
+    expect(() => sched.normalizeNotify('slack', '')).toThrow(/SCHEDULE_INVALID_NOTIFY/);
+    expect(() => sched.normalizeNotify('sl/ack', 'C1')).toThrow(/SCHEDULE_INVALID_NOTIFY/);
+    expect(() => sched.normalizeNotify('slack', 'x'.repeat(129))).toThrow(
+      /SCHEDULE_INVALID_NOTIFY/,
+    );
+  });
+});
+
 // ── 下次执行时间（与 Rust 测试同基准同期望值） ─────────────────
 
 describe('nextRunAtMs：与 Rust 同口径的调度算法', () => {
@@ -317,6 +410,77 @@ describe('schedule-local：台账 CRUD/排序/执行回写', () => {
     expect(() => sched.updateLocalSchedule({ scheduleId: '  ' }, BASE)).toThrow(/SCHEDULE_INVALID_ID/);
     expect(() => sched.updateLocalSchedule({ scheduleId: 'sched-missing' }, BASE)).toThrow(/SCHEDULE_NOT_FOUND/);
   });
+
+  // ── 执行结果推送（与 Rust create/update 同口径） ───────────────
+
+  it('创建时落推送配置，未配置时两字段为空串', () => {
+    const bare = sched.createLocalSchedule(req('无推送'), BASE);
+    expect(bare.notifyChannel).toBe('');
+    expect(bare.notifyTarget).toBe('');
+
+    const pushed = sched.createLocalSchedule(
+      {
+        name: '带推送',
+        description: '',
+        freq: 'daily',
+        timeOfDay: '08:00',
+        notifyChannel: ' Slack ',
+        notifyTarget: ' C123 ',
+      },
+      BASE,
+    );
+    expect(pushed.notifyChannel).toBe('slack');
+    expect(pushed.notifyTarget).toBe('C123');
+    expect(sched.localSchedules().find((t) => t.scheduleId === pushed.scheduleId)?.notifyTarget).toBe('C123');
+  });
+
+  it('编辑只改目标时沿用通道；切通道不继承旧目标；通道置空连目标一起关闭', () => {
+    const t = sched.createLocalSchedule(
+      {
+        name: '带推送',
+        description: '',
+        freq: 'daily',
+        timeOfDay: '08:00',
+        notifyChannel: 'slack',
+        notifyTarget: 'C123',
+      },
+      BASE,
+    );
+
+    const targetOnly = sched.updateLocalSchedule(
+      { scheduleId: t.scheduleId, notifyTarget: 'C999' },
+      BASE,
+    );
+    expect(targetOnly.notifyChannel).toBe('slack');
+    expect(targetOnly.notifyTarget).toBe('C999');
+
+    expect(() =>
+      sched.updateLocalSchedule({ scheduleId: t.scheduleId, notifyChannel: 'dingtalk' }, BASE),
+    ).toThrow(/SCHEDULE_INVALID_NOTIFY/);
+
+    const cleared = sched.updateLocalSchedule(
+      { scheduleId: t.scheduleId, notifyChannel: '', notifyTarget: '' },
+      BASE,
+    );
+    expect(cleared.notifyChannel).toBe('');
+    expect(cleared.notifyTarget).toBe('');
+  });
+
+  it('创建时推送配置不完整即拒，且不落台账', () => {
+    expect(() =>
+      sched.createLocalSchedule(
+        {
+          name: '半配置',
+          description: '',
+          freq: 'daily',
+          timeOfDay: '08:00',
+          notifyChannel: 'slack',
+        },
+        BASE,
+      ),
+    ).toThrow(/SCHEDULE_INVALID_NOTIFY/);
+    expect(sched.localSchedules()).toHaveLength(0);
+  });
   it('删除任务并连同其执行记录', () => {
     const t = sched.createLocalSchedule(req('每日舆情'), BASE);
     sched.recordLocalRun(t.scheduleId, 'succeeded', 'ok', BASE + HOUR);
@@ -516,6 +680,18 @@ describe('useScheduleStore：真实通道（不再是 toast 假创建）', () =>
     expect(useScheduleStore.getState().runs).toHaveLength(1);
     expect(useScheduleStore.getState().runs[0].scheduleId).toBe(id);
     expect(useScheduleStore.getState().tasks[0].lastStatus).toBe('succeeded');
+  });
+
+  it('parse 经通道返回解析结果，非法描述抛裸错误码（页面用 errorTextOf 归一）', async () => {
+    const parsed = await useScheduleStore.getState().parse('每周一上午9点生成周报');
+    expect(parsed.freq).toBe('weekly');
+    expect(parsed.weekday).toBe(1);
+    expect(parsed.timeOfDay).toBe('09:00');
+    expect(parsed.name).toBe('生成周报');
+
+    await expect(useScheduleStore.getState().parse('每2小时同步')).rejects.toThrow(
+      /SCHEDULE_UNSUPPORTED_FREQ/,
+    );
   });
 
   it('保持唤醒：只读回实际状态，浏览器通道如实标记未生效', async () => {

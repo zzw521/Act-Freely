@@ -1,0 +1,16 @@
+# 构建上下文只需要前端源码与引擎依赖清单；凭据与会话数据一律不进镜像
+.env
+.env.*
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+sessions/
+.devtmp/
+.tools/
+vendor/
+**/__pycache__/
+**/*.pyc
+tests/
+*.log
+.git/

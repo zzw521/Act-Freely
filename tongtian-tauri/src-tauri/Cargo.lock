@@ -4755,16 +4755,20 @@ dependencies = [
  "flate2",
  "futures-util",
  "keyring",
+ "regex",
  "reqwest 0.12.28",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
  "tokio",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

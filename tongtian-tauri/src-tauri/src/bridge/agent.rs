@@ -135,6 +135,66 @@ fn emit_status(app: &AppHandle, workspace_id: &str, status: InstanceStatus) {
 
 // ── 启动 workspace ───────────────────────────────────────────
 
+/// 当前任一在跑的引擎实例端口（向引擎要实测数据用；没有实例时返回 None，
+/// 调用方据此回落到声明值，而不是启一个实例只为读个清单）
+pub async fn any_running_port(bridge: &BridgeState) -> Option<u16> {
+    let b = bridge.lock().await;
+    b.instances.values().find_map(|i| {
+        matches!(
+            i.status,
+            InstanceStatus::Ready | InstanceStatus::Busy | InstanceStatus::Starting
+        )
+        .then_some(i.port)
+    })
+}
+
+/// 指定 workspace 的引擎 HTTP 端点（`workspace_id=None` 时取任一在跑实例）。
+///
+/// 只回报已启动的实例：预览文件、打开配置目录这类只读动作不该顺手拉起引擎。
+/// 前端据此替换写死的 `127.0.0.1:18000` —— 第二个 workspace 的实例可能在 18001。
+pub async fn endpoint_of(
+    bridge: &BridgeState,
+    workspace_id: Option<&str>,
+) -> Result<Value, String> {
+    let b = bridge.lock().await;
+    let running = |i: &Instance| {
+        matches!(
+            i.status,
+            InstanceStatus::Ready | InstanceStatus::Busy | InstanceStatus::Starting
+        )
+    };
+    let (id, inst) = match workspace_id {
+        Some(id) => {
+            let inst = b.instances.get(id).ok_or_else(|| {
+                format!("ENGINE_NOT_RUNNING: 工作空间「{id}」的引擎尚未启动")
+            })?;
+            if !running(inst) {
+                return Err(format!(
+                    "ENGINE_NOT_RUNNING: 工作空间「{id}」的引擎状态为 {:?}，无法连接",
+                    inst.status
+                ));
+            }
+            (id, inst)
+        }
+        None => b
+            .instances
+            .iter()
+            .find(|(_, i)| running(i))
+            .map(|(id, i)| (id.as_str(), i))
+            .ok_or_else(|| "ENGINE_NOT_RUNNING: 当前没有运行中的引擎实例".to_string())?,
+    };
+    Ok(endpoint_view(id, inst))
+}
+
+fn endpoint_view(workspace_id: &str, inst: &Instance) -> Value {
+    json!({
+        "workspaceId": workspace_id,
+        "baseUrl": format!("http://127.0.0.1:{}", inst.port),
+        "port": inst.port,
+        "status": inst.status,
+    })
+}
+
 /// 启动指定 workspace 的 Agent 实例，返回分配端口
 pub async fn start_workspace(
     app: &AppHandle,
@@ -213,6 +273,9 @@ pub async fn start_workspace(
         // Windows 下子进程 stdout 默认走 ANSI 代码页（GBK）：中文日志会让 pump_logs 的
         // UTF-8 解码失败而停止转发，含 ✓/emoji 的日志更会让引擎自身编码报错。
         .env("PYTHONIOENCODING", "utf-8")
+        // 终端 AI+ 的进程级令牌：只注入引擎，浏览器直连/手工启动的引擎没有它。
+        // 是否放行终端请求由桌面端设置另行决定（配置 ≠ 授权）。
+        .env("TT_TERMINAL_TOKEN", crate::terminal::engine_token())
         .envs(proxy_spec.env_vars())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -384,48 +447,6 @@ async fn watch_loop(app: &AppHandle, bridge: &BridgeState, workspace_id: &str, p
     }
 }
 
-// ── 停止 workspace ───────────────────────────────────────────
-
-pub async fn stop_workspace(bridge: &BridgeState, app: &AppHandle, workspace_id: &str) -> Result<(), String> {
-    let removed = {
-        let mut b = bridge.lock().await;
-        b.used_ports.retain(|_| true); // keep ports of others
-        let inst = b.instances.remove(workspace_id);
-        if let Some(ref i) = inst {
-            b.used_ports.remove(&i.port);
-        }
-        inst
-    };
-
-    match removed {
-        Some(inst) => {
-            kill_pid(inst.pid);
-            emit_status(app, workspace_id, InstanceStatus::Stopped);
-            log(&format!("workspace {workspace_id} stopped"));
-            Ok(())
-        }
-        None => Err(format!("未找到 workspace 实例: {workspace_id}")),
-    }
-}
-
-fn kill_pid(pid: u32) {
-    if pid == 0 {
-        return;
-    }
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .output();
-    }
-}
-
 // ── 发送消息（SSE 流式） ─────────────────────────────────────
 
 /// 三层架构演进 P0 上下文：事件持久化 + 配额计量 + 任务注册表 + 存储
@@ -439,6 +460,9 @@ pub struct P0Context {
     pub store: Option<Arc<crate::store::Store>>,
     /// 安全工作环境开关（设置项 secureEnv，引擎据此把任务隔离进 environment/ 目录）
     pub secure_env: bool,
+    /// 隐私模式（设置项 privacyMode）：开启后本轮不写会话正文、不写可回放事件，
+    /// 用量与配额仍照常计量（不含内容），安全审计仍保留（只记违规事实）。
+    pub privacy: bool,
 }
 
 /// 对话内选择的覆盖项：模型档位、自定义模型、工作目录、上下文历史。
@@ -446,14 +470,20 @@ pub struct P0Context {
 /// 避免把「本轮没选」误当成「清空引擎会话上已有的设置」）。
 #[derive(Debug, Clone, Default)]
 pub struct SubmitOverrides {
+    /// 工作台模式（general/design/slides/writing）：引擎据此改系统提示与可用工具
+    pub mode: Option<String>,
     /// 模型档位（高级/基础/经济 → 具体模型名；Auto 时前端不下发）
     pub model_binding: Option<String>,
     /// 自定义模型配置（models.json 条目：baseUrl / apiKey / modelName）
     pub model_config: Option<Value>,
+    /// 本轮负责人专家（注册表 id）：引擎据此追加角色提示词并改用专家绑定的模型
+    pub expert_id: Option<String>,
     /// 自选工作目录（经 Rust 侧存在性校验后的绝对路径）
     pub work_dir: Option<String>,
     /// 此前轮次的 user/assistant 历史（保障连续对话上下文）
     pub history: Vec<Value>,
+    /// 执行面输入（意识 + 启用技能）；缺省时由 `runtime::build` 装配
+    pub runtime: Option<Value>,
 }
 
 impl SubmitOverrides {
@@ -462,17 +492,26 @@ impl SubmitOverrides {
         let Some(map) = body.as_object_mut() else {
             return;
         };
+        if let Some(mode) = &self.mode {
+            map.insert("mode".into(), json!(mode));
+        }
         if let Some(mb) = &self.model_binding {
             map.insert("modelBinding".into(), json!(mb));
         }
         if let Some(mc) = &self.model_config {
             map.insert("modelConfig".into(), mc.clone());
         }
+        if let Some(eid) = &self.expert_id {
+            map.insert("expertId".into(), json!(eid));
+        }
         if let Some(wd) = &self.work_dir {
             map.insert("workDir".into(), json!(wd));
         }
         if !self.history.is_empty() {
             map.insert("history".into(), json!(self.history));
+        }
+        if let Some(rt) = &self.runtime {
+            map.insert("runtime".into(), rt.clone());
         }
     }
 }
@@ -483,6 +522,7 @@ fn chat_request_body(
     goal: &str,
     attachments: Vec<Value>,
     secure_env: bool,
+    privacy: bool,
     overrides: &SubmitOverrides,
 ) -> Value {
     let mut body = json!({
@@ -491,6 +531,8 @@ fn chat_request_body(
         "stage": "plan",
         "attachments": attachments,
         "secureEnv": secure_env,
+        // 引擎据此跳过会话目录、conversation.md 与自动记忆（不落盘本轮内容）
+        "privacyMode": privacy,
     });
     overrides.apply_to(&mut body);
     body
@@ -529,6 +571,23 @@ pub async fn send_message_with_attachments(
     overrides: SubmitOverrides,
     p0: P0Context,
 ) -> Result<(), String> {
+    // 执行面输入装配：意识 + 启用技能（含 SKILL.md 正文）与附件正文抽取。
+    // 读盘和 Office 解析放 blocking 线程，别在 async 运行时里卡住其它任务。
+    // 所有提交路径（对话、定时任务）都经过这里，「装了技能但运行时不消费」
+    // 不会随调用方增多而复发。
+    let bundle = {
+        let store = p0.store.clone();
+        let raw = attachments.clone();
+        let ws = workspace_id.to_string();
+        tokio::task::spawn_blocking(move || super::runtime::build(store.as_deref(), &ws, &raw))
+            .await
+            .map_err(|e| format!("RUNTIME_BUNDLE_PANIC: 执行面输入装配线程异常：{e}"))?
+    };
+    let mut overrides = overrides;
+    if overrides.runtime.is_none() {
+        overrides.runtime = Some(bundle.runtime);
+    }
+
     // 取出端口并置 busy
     let port = {
         let mut b = bridge.lock().await;
@@ -544,7 +603,7 @@ pub async fn send_message_with_attachments(
     };
     emit_status(app, workspace_id, InstanceStatus::Busy);
 
-    let result = stream_chat(app, task_id, goal, port, attachments, overrides, p0).await;
+    let result = stream_chat(app, task_id, goal, port, bundle.attachments, overrides, p0).await;
 
     // 恢复 ready
     {
@@ -703,8 +762,20 @@ async fn forward_events(
     }
 }
 
-/// 从事件 `usage` 字段解析 (prompt, completion, model)；兼容 snake_case
-fn usage_of(ev: &super::sse::AgentEvent) -> Option<(u64, u64, Option<String>)> {
+/// 一次真实模型调用的用量样本（引擎 usage 事件解析结果）
+#[derive(Debug, Clone, PartialEq)]
+struct UsageSample {
+    prompt: u64,
+    completion: u64,
+    model: Option<String>,
+    latency_ms: Option<i64>,
+    cost_micros: Option<i64>,
+    currency: Option<String>,
+    priced: bool,
+}
+
+/// 从事件 `usage` 字段解析用量；兼容 snake_case，延迟/成本缺失时保持 None
+fn usage_of(ev: &super::sse::AgentEvent) -> Option<UsageSample> {
     let u = ev.data.get("usage")?;
     let field = |camel: &str, snake: &str| -> u64 {
         u.get(camel)
@@ -712,16 +783,33 @@ fn usage_of(ev: &super::sse::AgentEvent) -> Option<(u64, u64, Option<String>)> {
             .and_then(|v| v.as_u64())
             .unwrap_or(0)
     };
-    let model = u
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .filter(|m| !m.trim().is_empty());
-    Some((
-        field("promptTokens", "prompt_tokens"),
-        field("completionTokens", "completion_tokens"),
+    let number = |camel: &str, snake: &str| -> Option<i64> {
+        u.get(camel)
+            .or_else(|| u.get(snake))
+            .and_then(|v| v.as_i64())
+    };
+    let text = |camel: &str, snake: &str| -> Option<String> {
+        u.get(camel)
+            .or_else(|| u.get(snake))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let model = text("model", "model");
+    let cost_micros = number("costMicros", "cost_micros").filter(|v| *v >= 0);
+    let priced = u
+        .get("priced")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(cost_micros.is_some());
+    Some(UsageSample {
+        prompt: field("promptTokens", "prompt_tokens"),
+        completion: field("completionTokens", "completion_tokens"),
         model,
-    ))
+        latency_ms: number("latencyMs", "latency_ms").filter(|v| *v >= 0),
+        cost_micros,
+        currency: text("costCurrency", "cost_currency"),
+        priced,
+    })
 }
 
 /// 从 deliver 事件 data 提取（回复正文, 摘要, 交付物清单）
@@ -765,13 +853,92 @@ async fn persist_and_meter(
     p0: &P0Context,
     tx: &tokio::sync::mpsc::Sender<Value>,
 ) {
-    if let Some(store) = &p0.events {
-        store.append(task_id, &ev.kind, ev.seq, ev.data.clone());
+    // 隐私模式：事件流本身也带正文/步骤细节，不落可回放存储。
+    // 实时转发不受影响（本轮界面照常显示），刷新后不会从库里恢复出来。
+    if !p0.privacy {
+        if let Some(store) = &p0.events {
+            store.append(task_id, &ev.kind, ev.seq, ev.data.clone());
+        }
     }
     let usage = usage_of(ev);
 
-    // 会话正文落库：事件流只留 24h，交付正文要跨重启可恢复
-    if ev.kind == "deliver" {
+    // 引擎侧沙箱拒绝（工具白/黑名单、文件边界、策略损坏 fail-closed）→ 审计留痕
+    if ev.kind == "sandbox_denied" {
+        if let Some(store) = &p0.store {
+            let field = |key: &str| ev.data.get(key).and_then(|v| v.as_str()).unwrap_or("");
+            crate::security::audit::record_quiet(
+                store,
+                crate::security::audit::ACTION_SANDBOX_VIOLATION,
+                crate::security::audit::SEV_WARNING,
+                field("tool"),
+                &format!(
+                    "{}（来源：{}，规则：{}，工作区：{}）",
+                    field("reason"),
+                    field("source"),
+                    field("rule"),
+                    field("workspaceId"),
+                ),
+            );
+        }
+    }
+
+    // 模型故障转移：主模型失败切到备用模型属于影响本轮真实口径的事件，审计留痕。
+    // 用户可见的切换原因由引擎的 step 事件承担，这里只记录事实。
+    if ev.kind == "route_switch" {
+        if let Some(store) = &p0.store {
+            let field = |key: &str| ev.data.get(key).and_then(|v| v.as_str()).unwrap_or("");
+            crate::security::audit::record_quiet(
+                store,
+                crate::security::audit::ACTION_ROUTE_SWITCH,
+                crate::security::audit::SEV_WARNING,
+                field("from"),
+                &format!("切换到 {}：{}", field("to"), field("reason")),
+            );
+        }
+    }
+
+    // 受控命令执行 / 联网获取 / 浏览器操作：每次调用都留痕，拒绝与失败升级为 warning。
+    // 引擎只报事实字段；动作码与严重度由 Rust 归一，避免前端可伪造审计动作。
+    if ev.kind == "tool_audit" {
+        if let Some(store) = &p0.store {
+            let field = |key: &str| ev.data.get(key).and_then(|v| v.as_str()).unwrap_or("");
+            let tool = field("tool");
+            // 新引擎显式带 action（exec / network / browser）；旧引擎没有该字段，
+            // 按工具名兜底，保持既有 exec/network 行为不变。
+            let action = match field("action") {
+                "exec" => crate::security::audit::ACTION_EXEC_RUN,
+                "network" => crate::security::audit::ACTION_NETWORK_FETCH,
+                "browser" => crate::security::audit::ACTION_BROWSER_ACTION,
+                _ if tool == "run_command" => crate::security::audit::ACTION_EXEC_RUN,
+                _ if tool == "fetch_url" => crate::security::audit::ACTION_NETWORK_FETCH,
+                _ if tool.starts_with("browser_") => crate::security::audit::ACTION_BROWSER_ACTION,
+                _ => crate::security::audit::ACTION_NETWORK_FETCH,
+            };
+            let outcome = field("outcome");
+            let severity = if matches!(outcome, "ok" | "") {
+                crate::security::audit::SEV_INFO
+            } else {
+                crate::security::audit::SEV_WARNING
+            };
+            crate::security::audit::record_quiet(
+                store,
+                action,
+                severity,
+                field("target"),
+                &format!(
+                    "结果：{}；{}；工具：{}；工作区：{}",
+                    if outcome.is_empty() { "unknown" } else { outcome },
+                    field("detail"),
+                    tool,
+                    field("workspaceId"),
+                ),
+            );
+        }
+    }
+
+    // 会话正文落库：事件流只留 24h，交付正文要跨重启可恢复。
+    // 隐私模式下不写正文（刷新后本轮对话不会从库里恢复）。
+    if ev.kind == "deliver" && !p0.privacy {
         if let Some(store) = &p0.store {
             let (final_text, summary, artifacts) = deliver_parts(ev);
             if let Err(e) = crate::store::messages::record_assistant_reply(
@@ -788,13 +955,24 @@ async fn persist_and_meter(
     }
 
     // 模型用量台账（model_usage 表，按「模型 × UTC 日」增量累加）
-    if let (Some(store), Some((prompt, completion, Some(model)))) = (&p0.store, usage.as_ref()) {
-        crate::model::usage::record_quiet(store, model, *prompt, *completion);
+    if let (Some(store), Some(sample)) = (&p0.store, usage.as_ref()) {
+        if let Some(model) = sample.model.as_deref() {
+            crate::model::usage::record_sample_quiet(
+                store,
+                model,
+                sample.prompt,
+                sample.completion,
+                sample.latency_ms,
+                sample.cost_micros,
+                sample.currency.as_deref(),
+                sample.priced,
+            );
+        }
     }
 
     if let Some(gate) = &p0.quota {
         // 从 usage 字段累计 token（promptTokens + completionTokens）
-        let tokens = usage.map(|(p, c, _)| p + c).unwrap_or(0);
+        let tokens = usage.map(|u| u.prompt + u.completion).unwrap_or(0);
         if tokens > 0 {
             if let crate::task::quota::TierTransition::Entered(snap) = gate.add_usage(tokens) {
                 // 档位跃迁产出 quota_warning 事件（去抖：同档不重复）
@@ -855,7 +1033,14 @@ async fn stream_chat(
 ) -> Result<(), String> {
     // 两阶段协议（核心闭环补齐）：提交时仅生成计划待审阅（stage=plan），
     // approve 后经 review_task 进入执行流
-    let body = chat_request_body(task_id, goal, attachments, p0.secure_env, &overrides);
+    let body = chat_request_body(
+        task_id,
+        goal,
+        attachments,
+        p0.secure_env,
+        p0.privacy,
+        &overrides,
+    );
     stream_post(app, task_id, port, "/api/chat", body, p0).await
 }
 
@@ -869,6 +1054,21 @@ pub async fn review_task(
     patch: Value,
     p0: P0Context,
 ) -> Result<(), String> {
+    review_task_with(app, bridge, workspace_id, task_id, action, patch, p0, None).await
+}
+
+/// 带恢复上下文的审阅请求：resume 时重新下发 modelConfig 与 runtime
+/// （检查点文件不保存密钥，引擎重启后只能由 Rust 侧重新解析并装配）。
+pub async fn review_task_with(
+    app: &AppHandle,
+    bridge: &BridgeState,
+    workspace_id: &str,
+    task_id: &str,
+    action: &str,
+    patch: Value,
+    p0: P0Context,
+    extra_body: Option<Value>,
+) -> Result<(), String> {
     let port = {
         let b = bridge.lock().await;
         b.instances
@@ -876,8 +1076,44 @@ pub async fn review_task(
             .map(|i| i.port)
             .ok_or_else(|| format!("workspace 未启动: {workspace_id}"))?
     };
-    let body = json!({ "task_id": task_id, "action": action, "patch": patch });
+    let mut body = json!({ "task_id": task_id, "action": action, "patch": patch });
+    if let Some(extra) = extra_body {
+        if let (Some(dst), Some(src)) = (body.as_object_mut(), extra.as_object()) {
+            for (key, value) in src {
+                dst.insert(key.clone(), value.clone());
+            }
+        }
+    }
     stream_post(app, task_id, port, "/api/chat/review", body, p0).await
+}
+
+/// 批量查询检查点状态（刷新页面后重建「从检查点继续」入口）。
+/// 引擎未运行时明确报错，由渲染层自行降级为「无入口」，不编造可续跑状态。
+pub async fn query_checkpoints(
+    bridge: &BridgeState,
+    workspace_id: Option<&str>,
+    task_ids: Vec<String>,
+) -> Result<Value, String> {
+    let port = {
+        let b = bridge.lock().await;
+        match workspace_id.filter(|s| !s.is_empty()) {
+            Some(ws) => b.instances.get(ws).map(|i| i.port),
+            None => b.instances.values().next().map(|i| i.port),
+        }
+        .ok_or_else(|| "ENGINE_NOT_RUNNING: 引擎未启动，无法查询检查点".to_string())?
+    };
+    let resp = http_client()
+        .post(format!("http://127.0.0.1:{port}/api/chat/checkpoint/query"))
+        .json(&json!({ "task_ids": task_ids }))
+        .send()
+        .await
+        .map_err(|e| format!("BRIDGE_COMM_FAILED: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("BRIDGE_CHAT_HTTP_{}", resp.status().as_u16()));
+    }
+    resp.json::<Value>()
+        .await
+        .map_err(|e| format!("BRIDGE_CHAT_PARSE: {e}"))
 }
 
 /// 任务控制转发（pause/resume/rollback_to，引擎返回 JSON）
@@ -933,7 +1169,32 @@ async fn stream_post(
         .map_err(|e| format!("BRIDGE_COMM_FAILED: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("BRIDGE_CHAT_HTTP_{}", resp.status().as_u16()));
+        // 非 2xx 也要把引擎给出的 code/message 带到界面：检查点不可用、引擎重启导致
+        // 会话丢失时，只说 HTTP 409/404 用户无法判断发生了什么。
+        let status = resp.status().as_u16();
+        let raw = resp.text().await.unwrap_or_default();
+        let parsed: Option<Value> = serde_json::from_str(&raw).ok();
+        let field = |key: &str| -> String {
+            parsed
+                .as_ref()
+                .and_then(|v| v.get(key))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let code = field("code");
+        let message = field("message");
+        let detail = match (code.is_empty(), message.is_empty()) {
+            (false, false) => format!("{code}: {message}"),
+            (false, true) => code,
+            (true, false) => message,
+            (true, true) => raw.trim().chars().take(200).collect(),
+        };
+        return Err(if detail.is_empty() {
+            format!("BRIDGE_CHAT_HTTP_{status}")
+        } else {
+            format!("BRIDGE_CHAT_HTTP_{status}: {detail}")
+        });
     }
 
     let mut stream = resp.bytes_stream();
@@ -1010,6 +1271,7 @@ mod p0_tests {
             registry: Some(Arc::clone(&registry)),
             store: None,
             secure_env: false,
+            privacy: false,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(16);
 
@@ -1054,6 +1316,49 @@ mod p0_tests {
         assert_eq!(gate.check_submit(), Err("QUOTA_EXCEEDED"));
     }
 
+    /// P1-5：同一时刻两个 workspace 的实例各占一个端口，端点必须按 workspace 返回
+    #[tokio::test]
+    async fn test_endpoint_of_maps_each_workspace_to_its_own_port() {
+        let mut bridge = AgentBridge {
+            python: None,
+            instances: HashMap::new(),
+            used_ports: HashSet::new(),
+            http: crate::proxy::loopback_client(),
+        };
+        let inst = |port: u16, status: InstanceStatus| Instance {
+            port,
+            pid: port as u32,
+            status,
+            health_fail_count: 0,
+            proxy_fingerprint: String::new(),
+        };
+        bridge
+            .instances
+            .insert("default".into(), inst(18000, InstanceStatus::Ready));
+        bridge
+            .instances
+            .insert("second".into(), inst(18001, InstanceStatus::Busy));
+        bridge.instances.insert(
+            "stopped".into(),
+            inst(18002, InstanceStatus::Stopped),
+        );
+        let state: BridgeState = Arc::new(Mutex::new(bridge));
+
+        let second = endpoint_of(&state, Some("second")).await.unwrap();
+        assert_eq!(second["workspaceId"], "second");
+        assert_eq!(second["port"], 18001);
+        assert_eq!(second["baseUrl"], "http://127.0.0.1:18001");
+
+        let default = endpoint_of(&state, Some("default")).await.unwrap();
+        assert_eq!(default["port"], 18000);
+
+        // 没启动 / 已停止的 workspace 不返回可用端点，前端据此显示 ENGINE_NOT_RUNNING
+        for ws in ["missing", "stopped"] {
+            let err = endpoint_of(&state, Some(ws)).await.unwrap_err();
+            assert!(err.starts_with("ENGINE_NOT_RUNNING"), "实际: {err}");
+        }
+    }
+
     /// 计划 D3/F2：事件持久化在 persist_and_meter 中生效
     #[tokio::test]
     async fn test_persist_and_meter_event_store() {
@@ -1065,6 +1370,7 @@ mod p0_tests {
             registry: None,
             store: None,
             secure_env: false,
+            privacy: false,
         };
         let (tx, _rx) = tokio::sync::mpsc::channel::<Value>(16);
         let ev = super::super::sse::AgentEvent {
@@ -1076,6 +1382,39 @@ mod p0_tests {
         let replay = store.replay("t-store", 0);
         assert_eq!(replay.len(), 1);
         assert_eq!(replay[0].seq, Some(7));
+    }
+
+    /// 隐私模式：事件与交付正文都不落盘（实时事件仍可转发，刷新后无从恢复）
+    #[tokio::test]
+    async fn test_privacy_skips_event_store_and_conversation_body() {
+        let dir = std::env::temp_dir().join(format!(
+            "tt-agent-privacy-test-{}",
+            crate::bridge::event_store::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let events = Arc::new(super::super::event_store::EventStore::new(dir.join("events")));
+        let store = Arc::new(crate::store::Store::open(dir.join("t.db")).unwrap());
+        let p0 = P0Context {
+            events: Some(Arc::clone(&events)),
+            store: Some(Arc::clone(&store)),
+            privacy: true,
+            ..P0Context::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Value>(16);
+        let ev = super::super::sse::AgentEvent {
+            kind: "deliver".into(),
+            data: json!({ "final_text": "这段正文不能落盘", "summary": "完成", "artifacts": [] }),
+            seq: Some(1),
+        };
+        persist_and_meter(&ev, "t-priv", &p0, &tx).await;
+
+        assert!(
+            events.replay("t-priv", 0).is_empty(),
+            "隐私模式不应写入可回放事件"
+        );
+        let convs = crate::store::messages::list_conversations(&store, None).unwrap();
+        assert!(convs.is_empty(), "隐私模式不应写入会话正文：{convs:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 模型用量台账：usage 事件带 model 时按模型落库；缺 model 不记账（不归到空模型）
@@ -1093,6 +1432,7 @@ mod p0_tests {
             registry: None,
             store: Some(Arc::clone(&store)),
             secure_env: false,
+            privacy: false,
         };
         let (tx, _rx) = tokio::sync::mpsc::channel::<Value>(16);
 
@@ -1152,6 +1492,297 @@ pub async fn bridge_status(bridge: &BridgeState) -> Value {
 mod tests {
     use super::*;
 
+    fn instance(port: u16, status: InstanceStatus) -> Instance {
+        Instance {
+            port,
+            pid: 42,
+            status,
+            health_fail_count: 0,
+            proxy_fingerprint: String::new(),
+        }
+    }
+
+    #[test]
+    fn endpoint_view_uses_the_instance_port_not_a_fixed_one() {
+        let view = endpoint_view("team-a", &instance(18001, InstanceStatus::Ready));
+        assert_eq!(view["workspaceId"], "team-a");
+        assert_eq!(view["baseUrl"], "http://127.0.0.1:18001");
+        assert_eq!(view["port"], 18001);
+        assert_eq!(view["status"], "ready");
+    }
+
+    #[tokio::test]
+    async fn sandbox_denied_event_is_written_to_audit_log() {
+        let dir = std::env::temp_dir().join(format!(
+            "tt-audit-sandbox-{}",
+            crate::bridge::event_store::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(crate::store::Store::open(dir.join("t.db")).unwrap());
+        let p0 = P0Context {
+            events: None,
+            quota: None,
+            registry: None,
+            store: Some(store.clone()),
+            secure_env: false,
+            privacy: false,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let ev = super::super::sse::AgentEvent {
+            kind: "sandbox_denied".into(),
+            data: json!({
+                "workspaceId": "ws-a",
+                "tool": "write_text_file",
+                "reason": "工具不在沙箱工具白名单内",
+                "source": "tool_allowlist",
+                "rule": "",
+            }),
+            seq: Some(1),
+        };
+        persist_and_meter(&ev, "task-1", &p0, &tx).await;
+
+        let entries = crate::security::audit::query(&store, &Default::default()).unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(
+            entries[0].action,
+            crate::security::audit::ACTION_SANDBOX_VIOLATION
+        );
+        assert_eq!(entries[0].severity, crate::security::audit::SEV_WARNING);
+        assert_eq!(entries[0].resource.as_deref(), Some("write_text_file"));
+        let details = entries[0].details.as_deref().unwrap_or("");
+        assert!(details.contains("tool_allowlist"), "{details}");
+        assert!(details.contains("ws-a"), "{details}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn tool_audit_event_maps_to_exec_network_and_browser_actions() {
+        let dir = std::env::temp_dir().join(format!(
+            "tt-audit-tool-{}",
+            crate::bridge::event_store::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(crate::store::Store::open(dir.join("t.db")).unwrap());
+        let p0 = P0Context {
+            events: None,
+            quota: None,
+            registry: None,
+            store: Some(store.clone()),
+            secure_env: false,
+            privacy: false,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        for (tool, action, target, outcome) in [
+            ("run_command", "exec", "python -V", "ok"),
+            ("fetch_url", "network", "https://example.com", "denied"),
+            ("browser_click", "browser", "https://example.com/path", "ok"),
+            ("browser_type", "browser", "https://example.com/path", "denied"),
+        ] {
+            let ev = super::super::sse::AgentEvent {
+                kind: "tool_audit".into(),
+                data: json!({
+                    "workspaceId": "ws-a",
+                    "tool": tool,
+                    "action": action,
+                    "target": target,
+                    "outcome": outcome,
+                    "detail": "detail",
+                }),
+                seq: Some(1),
+            };
+            persist_and_meter(&ev, "task-1", &p0, &tx).await;
+        }
+
+        let entries = crate::security::audit::query(&store, &Default::default()).unwrap();
+        assert_eq!(entries.len(), 4, "{entries:?}");
+        assert!(entries
+            .iter()
+            .any(|e| e.action == crate::security::audit::ACTION_EXEC_RUN
+                && e.severity == crate::security::audit::SEV_INFO));
+        assert!(entries
+            .iter()
+            .any(|e| e.action == crate::security::audit::ACTION_NETWORK_FETCH
+                && e.severity == crate::security::audit::SEV_WARNING));
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.action == crate::security::audit::ACTION_BROWSER_ACTION)
+                .count(),
+            2,
+            "{entries:?}"
+        );
+        assert!(entries
+            .iter()
+            .any(|e| e.action == crate::security::audit::ACTION_BROWSER_ACTION
+                && e.severity == crate::security::audit::SEV_WARNING));
+        assert!(entries
+            .iter()
+            .all(|e| e.resource.as_deref().is_some_and(|r| !r.is_empty())));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn usage_event_parses_latency_cost_and_priced_flag() {
+        let event = super::super::sse::AgentEvent {
+            kind: "usage".into(),
+            data: json!({
+                "usage": {
+                    "promptTokens": 600,
+                    "completionTokens": 300,
+                    "model": " qwen-plus ",
+                    "latencyMs": 1200,
+                    "costMicros": 1080,
+                    "costCurrency": "cny",
+                    "priced": true
+                }
+            }),
+            seq: Some(1),
+        };
+        let sample = usage_of(&event).expect("usage 事件必须解析出样本");
+        assert_eq!(sample.prompt, 600);
+        assert_eq!(sample.completion, 300);
+        assert_eq!(sample.model.as_deref(), Some("qwen-plus"));
+        assert_eq!(sample.latency_ms, Some(1200));
+        assert_eq!(sample.cost_micros, Some(1080));
+        assert_eq!(sample.currency.as_deref(), Some("cny"));
+        assert!(sample.priced);
+
+        // 旧引擎 snake_case 字段同样识别；负延迟/负成本按缺失处理
+        let legacy = super::super::sse::AgentEvent {
+            kind: "usage".into(),
+            data: json!({
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "model": "qwen-max",
+                    "latency_ms": -1,
+                    "cost_micros": -2
+                }
+            }),
+            seq: None,
+        };
+        let legacy_sample = usage_of(&legacy).expect("兼容字段必须解析");
+        assert_eq!((legacy_sample.prompt, legacy_sample.completion), (10, 5));
+        assert_eq!(legacy_sample.latency_ms, None);
+        assert_eq!(legacy_sample.cost_micros, None);
+        // 没有成本也没有 priced 字段 → 未计价，不能默认成免费
+        assert!(!legacy_sample.priced);
+
+        // 引擎显式说「未计价」时，即使带了成本数字也不按已计价入账
+        let explicit_unpriced = super::super::sse::AgentEvent {
+            kind: "usage".into(),
+            data: json!({
+                "usage": { "promptTokens": 1, "model": "m", "costMicros": 10, "priced": false }
+            }),
+            seq: None,
+        };
+        assert!(!usage_of(&explicit_unpriced).unwrap().priced);
+        assert!(usage_of(&super::super::sse::AgentEvent {
+            kind: "usage".into(),
+            data: json!({}),
+            seq: None,
+        })
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn usage_event_updates_latency_and_cost_ledger() {
+        let dir = std::env::temp_dir().join(format!(
+            "tt-usage-event-{}",
+            crate::bridge::event_store::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(crate::store::Store::open(dir.join("t.db")).unwrap());
+        let p0 = P0Context {
+            events: None,
+            quota: None,
+            registry: None,
+            store: Some(store.clone()),
+            secure_env: false,
+            privacy: false,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        // 两次调用：一次按 CNY 计价，一次未配置单价；延迟都参与加权
+        for usage in [
+            json!({
+                "promptTokens": 600, "completionTokens": 300, "model": "qwen-plus",
+                "latencyMs": 1200, "costMicros": 1080, "costCurrency": "cny", "priced": true
+            }),
+            json!({
+                "promptTokens": 10, "completionTokens": 5, "model": "qwen-plus",
+                "latencyMs": 200
+            }),
+        ] {
+            let ev = super::super::sse::AgentEvent {
+                kind: "usage".into(),
+                data: json!({ "usage": usage }),
+                seq: Some(1),
+            };
+            persist_and_meter(&ev, "task-1", &p0, &tx).await;
+        }
+
+        let rows = crate::model::usage::query(&store, "total").unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].calls, 2);
+        assert_eq!(rows[0].latency_samples, 2);
+        assert_eq!(rows[0].avg_latency_ms, Some(700));
+        assert_eq!(rows[0].priced_calls, 1);
+        assert_eq!(rows[0].unpriced_calls, 1);
+        assert_eq!(
+            rows[0].costs,
+            vec![crate::model::usage::UsageCost { currency: "CNY".into(), micros: 1080 }]
+        );
+
+        let stats = crate::model::usage::stats(&store, "total").unwrap();
+        assert_eq!(stats.totals.avg_latency_ms, Some(700));
+        assert_eq!(stats.totals.priced_calls, 1);
+        assert_eq!(stats.totals.unpriced_calls, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn route_switch_event_is_written_to_audit_log() {
+        let dir = std::env::temp_dir().join(format!(
+            "tt-audit-route-{}",
+            crate::bridge::event_store::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(crate::store::Store::open(dir.join("t.db")).unwrap());
+        let p0 = P0Context {
+            events: None,
+            quota: None,
+            registry: None,
+            store: Some(store.clone()),
+            secure_env: false,
+            privacy: false,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let ev = super::super::sse::AgentEvent {
+            kind: "route_switch".into(),
+            data: json!({
+                "from": "qwen-plus",
+                "to": "qwen-max",
+                "reason": "主模型 500"
+            }),
+            seq: Some(1),
+        };
+        persist_and_meter(&ev, "task-1", &p0, &tx).await;
+
+        let entries = crate::security::audit::query(&store, &Default::default()).unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].action, crate::security::audit::ACTION_ROUTE_SWITCH);
+        assert_eq!(entries[0].severity, crate::security::audit::SEV_WARNING);
+        assert_eq!(entries[0].resource.as_deref(), Some("qwen-plus"));
+        let details = entries[0].details.as_deref().unwrap_or("");
+        assert!(details.contains("qwen-max"), "{details}");
+        assert!(details.contains("主模型 500"), "{details}");
+
+        // 切换事件不是用量样本：台账仍然为空
+        assert!(crate::model::usage::query(&store, "total").unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn overrides(
         model_binding: Option<&str>,
         model_config: Option<Value>,
@@ -1163,11 +1794,19 @@ mod tests {
             model_config,
             work_dir: work_dir.map(str::to_string),
             history,
+            ..SubmitOverrides::default()
         }
     }
 
     fn body(overrides: &SubmitOverrides) -> Value {
-        chat_request_body("task-1", "写周报", vec![json!({ "fileName": "a.md" })], false, overrides)
+        chat_request_body(
+            "task-1",
+            "写周报",
+            vec![json!({ "fileName": "a.md" })],
+            false,
+            false,
+            overrides,
+        )
     }
 
     #[test]
@@ -1177,6 +1816,7 @@ mod tests {
         assert_eq!(b["task_id"], "task-1");
         assert_eq!(b["stage"], "plan");
         assert_eq!(b["secureEnv"], json!(false));
+        assert_eq!(b["privacyMode"], json!(false));
         assert_eq!(b["attachments"].as_array().unwrap().len(), 1);
     }
 
@@ -1196,6 +1836,16 @@ mod tests {
     }
 
     #[test]
+    fn lead_expert_reaches_engine_and_absent_means_unset() {
+        let mut o = SubmitOverrides::default();
+        o.expert_id = Some("expert-1".into());
+        let b = body(&o);
+        assert_eq!(b["expertId"], "expert-1");
+        // 本轮没选负责人时不能下发空串，否则引擎会把它当成「专家不存在」
+        assert!(body(&SubmitOverrides::default()).get("expertId").is_none());
+    }
+
+    #[test]
     fn engine_reads_the_camel_case_keys() {
         // 引擎按 camelCase 读取（engine/server.py: payload.get("modelBinding") 等），
         // 键名写成 snake_case 会被静默忽略，等同没有透传
@@ -1206,7 +1856,7 @@ mod tests {
             vec![json!({ "role": "assistant", "content": "hi" })],
         ));
         let map = b.as_object().unwrap();
-        for key in ["modelBinding", "modelConfig", "workDir", "history", "secureEnv"] {
+        for key in ["modelBinding", "modelConfig", "workDir", "history", "secureEnv", "privacyMode"] {
             assert!(map.contains_key(key), "请求体缺少引擎读取的键 {key}：{map:?}");
         }
         for legacy in ["model_binding", "model_config", "work_dir"] {
@@ -1227,8 +1877,14 @@ mod tests {
 
     #[test]
     fn secure_env_flag_follows_settings() {
-        let b = chat_request_body("task-2", "g", vec![], true, &SubmitOverrides::default());
+        let b = chat_request_body("task-2", "g", vec![], true, false, &SubmitOverrides::default());
         assert_eq!(b["secureEnv"], json!(true));
         assert_eq!(b["attachments"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn privacy_flag_follows_settings() {
+        let b = chat_request_body("task-3", "g", vec![], false, true, &SubmitOverrides::default());
+        assert_eq!(b["privacyMode"], json!(true), "隐私模式必须随请求下发，引擎才会跳过落盘");
     }
 }

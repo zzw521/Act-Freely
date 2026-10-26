@@ -270,11 +270,13 @@ impl EventStore {
     }
 }
 
-/// 周期 TTL 清理循环（应用启动时 spawn 一次，每 10min 扫描）
-pub fn spawn_ttl_cleanup_loop(
-    store: std::sync::Arc<EventStore>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+/// 周期 TTL 清理循环（应用启动时 spawn 一次，每 10min 扫描）。
+///
+/// 必须挂在 `tauri::async_runtime` 上：setup 回调跑在主线程，那里没有 tokio reactor，
+/// 裸 `tokio::spawn` 会让打包后的应用一启动就 panic
+/// （「there is no reactor running…」，安装版实测）。启动循环的其余几条都走 async_runtime。
+pub fn spawn_ttl_cleanup_loop(store: std::sync::Arc<EventStore>) {
+    tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
         interval.tick().await; // 首个 tick 立即返回，跳过
         loop {
@@ -284,7 +286,7 @@ pub fn spawn_ttl_cleanup_loop(
                 eprintln!("[event_store] ttl cleanup removed {n} files");
             }
         }
-    })
+    });
 }
 
 #[cfg(test)]

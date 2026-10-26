@@ -57,36 +57,49 @@ describe('alignment-api · Hooks（页面消费面）', () => {
   it('试运行在浏览器通道如实抛错，不返回假 exitCode 0', async () => {
     await expect(a.testHook('Stop', 'echo hi')).rejects.toThrow(/HOOK_TEST_UNSUPPORTED/);
   });
-});
 
-// ── 连接器页 ─────────────────────────────────────────────────
-
-describe('alignment-api · 连接器授权（页面消费面）', () => {
-  it('初始无授权记录；授权→撤销→再授权的狀態流转可被页面读取', async () => {
-    expect(await a.listConnectors()).toEqual([]);
-
-    await a.authorizeConnector('github', 'market', 'https://mcp/github');
-    const after = await a.listConnectors();
-    expect(after).toHaveLength(1);
-    expect(after[0]).toMatchObject({
-      connectorId: 'github',
-      category: 'market',
-      installed: true,
-      authStatus: 'authorized',
-      serverRef: 'https://mcp/github',
-    });
-
-    await a.revokeConnector('github');
-    const revoked = await a.listConnectors();
-    expect(revoked).toHaveLength(1);
-    expect(revoked[0]).toMatchObject({ installed: false, authStatus: 'none' });
-
-    await a.authorizeConnector('github', 'market');
-    expect((await a.listConnectors())[0].serverRef).toBe('https://mcp/github');
+  it('执行面概览初始为空态，并如实标注「当前通道不会执行」', async () => {
+    const s = await a.getHooksStatus();
+    expect(s).toMatchObject({ configured: 0, mountedEvents: [], ungranted: [], grants: [] });
+    expect(s.firedEvents).toHaveLength(10);
+    expect(s.unfiredEvents).toHaveLength(2);
+    expect(s.gateError).toContain('不会执行');
   });
 
-  it('撤销未授权连接器如实报错（页面提示而非静默成功）', async () => {
-    await expect(a.revokeConnector('nope')).rejects.toThrow(/CONNECTOR_NOT_FOUND/);
+  it('配置 → 未放行 → 放行 → 撤销：页面读到的状态逐跳变化', async () => {
+    await a.setHooks({ hooks: { PreToolUse: [{ hooks: [{ command: 'echo guard' }] }] } });
+    expect((await a.getHooksStatus()).ungranted).toEqual(['echo guard']);
+
+    await a.grantHook('PreToolUse', 'echo guard');
+    const granted = await a.getHooksStatus();
+    expect(granted.ungranted).toEqual([]);
+    expect(granted.grants).toHaveLength(1);
+    expect(granted.grants[0]).toMatchObject({ command: 'echo guard', event: 'PreToolUse', runCount: 0 });
+
+    await a.revokeHook('echo guard');
+    const revoked = await a.getHooksStatus();
+    expect(revoked.grants).toEqual([]);
+    // 撤权 ≠ 删配置：配置必须原样还在
+    expect((await a.getHooks()).hooks.PreToolUse).toBeDefined();
+  });
+
+  it('无触发点事件被概览点名，页面才不会宣称「配了就会跑」', async () => {
+    await a.setHooks({ hooks: { Notification: [{ hooks: [{ command: 'echo s' }] }] } });
+    const s = await a.getHooksStatus();
+    expect(s.mountedEvents).toEqual(['Notification']);
+    expect(s.mountedUnfired).toEqual(['Notification']);
+  });
+
+  it('保存时已从配置删除的命令，其放行一并作废并回报', async () => {
+    await a.setHooks({ hooks: { Stop: [{ hooks: [{ command: 'echo a' }] }] } });
+    await a.grantHook('Stop', 'echo a');
+    const res = await a.setHooks({ hooks: {} });
+    expect(res).toMatchObject({ ok: true, events: 0, revoked: ['echo a'] });
+    expect((await a.getHooksStatus()).grants).toEqual([]);
+  });
+
+  it('放行非法事件名如实抛错（避免留下永远用不上的授权记录）', async () => {
+    await expect(a.grantHook('Typo' as never, 'echo x')).rejects.toThrow(/HOOK_INVALID_EVENT/);
   });
 });
 

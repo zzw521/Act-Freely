@@ -191,7 +191,7 @@ impl LeaseManager {
             .cloned()
     }
 
-    /// 全部租约视图（lease_info command）
+    /// 全部活跃租约视图（供内部诊断与测试使用）
     pub fn list(&self) -> Vec<LeaseRecord> {
         self.leases
             .lock()

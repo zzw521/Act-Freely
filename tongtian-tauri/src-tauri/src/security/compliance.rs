@@ -233,6 +233,7 @@ mod tests {
             is_default: false,
             agent_binding: String::new(),
             force_local,
+            ..Default::default()
         }
     }
 

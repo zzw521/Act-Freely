@@ -233,6 +233,36 @@ pub fn mock_agent_command(python_path: &str, port: u16, work_dir: &PathBuf) -> R
     ])
 }
 
+/// ACP 服务端启动命令（stdio JSON-RPC，供外部 IDE/终端接入）：
+/// python <项目根>/engine/acp_server.py [--engine-url <url>]
+pub fn acp_server_command(python_path: &str, engine_url: Option<&str>) -> Result<Vec<String>, String> {
+    let script = locate_project_script("engine/acp_server.py")?;
+    let mut cmd = vec![
+        python_path.to_string(),
+        script.to_string_lossy().to_string(),
+    ];
+    if let Some(url) = engine_url.filter(|u| !u.trim().is_empty()) {
+        cmd.push("--engine-url".to_string());
+        cmd.push(url.to_string());
+    }
+    Ok(cmd)
+}
+
+/// 给设置页展示的命令行：只做可读拼接，不经过 shell。
+pub fn join_command(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|p| {
+            if p.contains(' ') {
+                format!("\"{p}\"")
+            } else {
+                p.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// AgentScope 引擎启动命令（默认引擎）：
 /// python <项目根>/engine/server.py --port <port> --work-dir <dir>
 pub fn agentscope_engine_command(python_path: &str, port: u16, work_dir: &PathBuf) -> Result<Vec<String>, String> {

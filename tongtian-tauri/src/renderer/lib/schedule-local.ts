@@ -15,6 +15,7 @@ import type {
   KeepAwakeStatus,
   ScheduleCreateReq,
   ScheduleFreq,
+  ScheduleParseResult,
   ScheduleRun,
   ScheduleRunStatus,
   ScheduledTask,
@@ -86,6 +87,177 @@ export function normalizeName(v: string): string {
 
 function pad(n: number): string {
   return String(n).padStart(2, '0');
+}
+
+/** 推送配置归一（与 Rust `normalize_notify` 同口径） */
+export function normalizeNotify(
+  channel: string | undefined,
+  target: string | undefined,
+): { notifyChannel: string; notifyTarget: string } {
+  const ch = (channel ?? '').trim().toLowerCase();
+  const tg = (target ?? '').trim();
+  if (!ch && !tg) return { notifyChannel: '', notifyTarget: '' };
+  if (!ch) throw new Error('SCHEDULE_INVALID_NOTIFY: 已填写推送目标，但未选择推送通道');
+  if (!tg) throw new Error('SCHEDULE_INVALID_NOTIFY: 已选择推送通道，但未填写目标会话');
+  if (ch.length > 32 || !/^[a-z0-9_-]+$/.test(ch)) {
+    throw new Error(`SCHEDULE_INVALID_NOTIFY: 推送通道不合法（${ch}）`);
+  }
+  if ([...tg].length > 128) {
+    throw new Error('SCHEDULE_INVALID_NOTIFY: 推送目标过长（上限 128 字）');
+  }
+  return { notifyChannel: ch, notifyTarget: tg };
+}
+
+const CN_DIGITS: Record<string, number> = {
+  零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
+};
+
+function cnNumber(v: string): number | null {
+  const t = v.trim();
+  if (/^\d+$/.test(t)) return Number(t);
+  const ten = t.indexOf('十');
+  if (ten >= 0) {
+    const hi = ten === 0 ? 1 : CN_DIGITS[t.slice(0, ten)];
+    const lo = ten === t.length - 1 ? 0 : CN_DIGITS[t.slice(ten + 1)];
+    if (hi === undefined || lo === undefined) return null;
+    return hi * 10 + lo;
+  }
+  return t.length === 1 ? CN_DIGITS[t] ?? null : null;
+}
+
+function applyPeriod(h: number, period?: string): number | null {
+  let hour = h;
+  if (period && h <= 12) {
+    if (period === '凌晨' || period === '清晨' || period === '早晨' || period === '早上' || period === '上午') {
+      hour = h === 12 ? 0 : h;
+    } else if (period === '中午') {
+      hour = h < 11 ? h + 12 : h;
+    } else if (period === '下午' || period === '傍晚') {
+      hour = h < 12 ? h + 12 : h;
+    } else if (['晚上', '夜里', '夜间', '晚间'].includes(period)) {
+      hour = h === 12 ? 0 : h < 12 ? h + 12 : h;
+    }
+  }
+  return hour >= 0 && hour <= 23 ? hour : null;
+}
+
+function findTime(
+  raw: string,
+  freq: ScheduleFreq,
+): { hour: number; minute: number; token: string } | null {
+  const period = /(凌晨|清晨|早晨|早上|上午|中午|下午|傍晚|晚上|夜里|夜间|晚间)/.exec(raw)?.[1];
+  const colon = /(\d{1,2})\s*[:：]\s*(\d{1,2})/.exec(raw);
+  if (colon) {
+    const h = Number(colon[1]);
+    const hour = h > 12 ? h : applyPeriod(h, period);
+    if (hour === null) return null;
+    return { hour, minute: Number(colon[2]), token: colon[0] };
+  }
+  const point = /([0-9]{1,2}|[零一二三四五六七八九十两]{1,3})\s*[点时](?:\s*(半)|([0-9]{1,2})\s*分?)?/.exec(raw);
+  if (point) {
+    const h = cnNumber(point[1]);
+    if (h === null) return null;
+    const minute = point[2] ? 30 : point[3] ? Number(point[3]) : 0;
+    const hour = h > 12 ? h : applyPeriod(h, period);
+    if (hour === null) return null;
+    return { hour, minute, token: point[0] };
+  }
+  if (freq === 'hourly') {
+    const m = /([0-9]{1,2})\s*分(?:钟)?/.exec(raw);
+    if (m) return { hour: 0, minute: Number(m[1]), token: m[0] };
+  }
+  return null;
+}
+
+function cleanScheduleName(raw: string, tokens: string[]): string {
+  let s = raw;
+  for (const t of tokens) {
+    if (t) s = s.replace(t, '');
+  }
+  const leading = ['请帮我', '麻烦', '帮我', '请', '定时', '提醒我', '提醒', '我要', '我想', '需要', '的第', '第', '的'];
+  const trailing = ['提醒我', '提醒', '执行', '任务'];
+  for (let guard = 0; guard < 8; guard += 1) {
+    const before = s;
+    s = s.trim();
+    for (const f of leading) if (s.startsWith(f)) s = s.slice(f.length).trimStart();
+    for (const f of trailing) if (s.endsWith(f)) s = s.slice(0, -f.length).trimEnd();
+    if (s === before) break;
+  }
+  const trimmed = s.replace(/^[\s，,。；;：:！!？?、\-—]+|[\s，,。；;：:！!？?、\-—]+$/g, '');
+  return trimmed ? [...trimmed].slice(0, 60).join('') : '定时任务';
+}
+
+/** 一句话解析（与 Rust `parse_natural` 同口径；浏览器/Mock 通道使用） */
+export function parseNaturalSchedule(text: string): ScheduleParseResult {
+  const raw = (text ?? '').trim();
+  if (!raw) {
+    throw new Error('SCHEDULE_PARSE_EMPTY: 请用一句话描述执行时间，例如「每周一上午 9 点生成周报」');
+  }
+  if (
+    /(?:每|每隔)\s*[0-9一二三四五六七八九十两]+\s*(?:个)?\s*(?:小时|钟头)/.test(raw) ||
+    /(?:每|每隔)\s*[0-9一二三四五六七八九十两]+\s*(?:分钟|分)/.test(raw)
+  ) {
+    throw new Error('SCHEDULE_UNSUPPORTED_FREQ: 暂不支持按「每 N 小时 / 每 N 分钟」间隔调度，请改用每小时、每天、每周或每月');
+  }
+
+  const tokens: string[] = [];
+  let freq: ScheduleFreq | null = null;
+  let weekday: number | null = null;
+
+  const weekly = /每(?:周|星期|礼拜)\s*([一二三四五六日天七1-7])/.exec(raw);
+  const monthlyDay = /每月\s*([0-9]{1,2}|[一二三四五六七八九十]{1,3})\s*[号日]/.exec(raw);
+  if (weekly) {
+    const map: Record<string, number> = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 日: 7, 天: 7, 七: 7, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7 };
+    weekday = map[weekly[1]] ?? null;
+    if (weekday === null) throw new Error(`SCHEDULE_PARSE_FAILED: 无法识别星期（${raw}）`);
+    freq = 'weekly';
+    tokens.push(weekly[0]);
+  } else if (monthlyDay) {
+    const day = cnNumber(monthlyDay[1]);
+    if (day !== 1) {
+      throw new Error(`SCHEDULE_UNSUPPORTED_DAY: 当前调度只支持每月 1 日（收到 ${String(day ?? monthlyDay[1])} 号），请改用每周或每天`);
+    }
+    freq = 'monthly';
+    tokens.push(monthlyDay[0]);
+  } else if (/每(?:个)?小时/.test(raw)) {
+    freq = 'hourly';
+    tokens.push(/每(?:个)?小时/.exec(raw)![0]);
+  } else if (/每月/.test(raw)) {
+    freq = 'monthly';
+    tokens.push('每月');
+  } else if (/每(?:天|日)|天天/.test(raw)) {
+    freq = 'daily';
+    tokens.push(/每(?:天|日)|天天/.exec(raw)![0]);
+  }
+
+  let note: string | null = null;
+  if (!freq) {
+    note = '未写频率，已按每天处理';
+    freq = 'daily';
+  }
+
+  const hit = findTime(raw, freq);
+  if (!hit) {
+    throw new Error(
+      freq === 'hourly'
+        ? 'SCHEDULE_PARSE_NO_TIME: 没识别到分钟，请补充「每小时的第 30 分」这类时间'
+        : 'SCHEDULE_PARSE_NO_TIME: 没识别到执行时刻，请补充「上午 9 点」这类时间',
+    );
+  }
+  if (hit.hour > 23 || hit.minute > 59) {
+    throw new Error(`SCHEDULE_PARSE_TIME: 无法识别有效时刻（${hit.hour}:${hit.minute}）`);
+  }
+  tokens.push(hit.token);
+  const period = /(凌晨|清晨|早晨|早上|上午|中午|下午|傍晚|晚上|夜里|夜间|晚间)/.exec(raw)?.[1];
+  if (period && !hit.token.includes(period)) tokens.push(period);
+
+  return {
+    freq,
+    timeOfDay: `${pad(hit.hour)}:${pad(hit.minute)}`,
+    weekday,
+    name: cleanScheduleName(raw, tokens),
+    note,
+  };
 }
 
 // ── 下次执行时间（与 Rust next_run_at_ms 同构，UTC 口径） ──────
@@ -258,6 +430,7 @@ export function createLocalSchedule(req: ScheduleCreateReq, nowMs: number = Date
   const freq = normalizeFreq(req.freq);
   const timeOfDay = normalizeTime(req.timeOfDay);
   const weekday = normalizeWeekday(freq, req.weekday);
+  const notify = normalizeNotify(req.notifyChannel, req.notifyTarget);
   seq += 1;
   const task: ScheduledTask = {
     scheduleId: `sched-${nowMs}-${seq}`,
@@ -274,6 +447,7 @@ export function createLocalSchedule(req: ScheduleCreateReq, nowMs: number = Date
     lastRunAtMs: null,
     lastStatus: null,
     lastTaskId: null,
+    ...notify,
   };
   ledger = [...ledger, task];
   persist();
@@ -304,6 +478,27 @@ export function updateLocalSchedule(
     req.workspaceId !== undefined
       ? (req.workspaceId.trim() || 'default')
       : cur.workspaceId || 'default';
+  // 与 Rust 同口径：通道传空串＝关闭推送；切通道不继承旧目标
+  let notify = {
+    notifyChannel: cur.notifyChannel ?? '',
+    notifyTarget: cur.notifyTarget ?? '',
+  };
+  if (req.notifyChannel !== undefined || req.notifyTarget !== undefined) {
+    const ch = (req.notifyChannel !== undefined ? req.notifyChannel : cur.notifyChannel ?? '')
+      .trim()
+      .toLowerCase();
+    if (!ch) {
+      notify = { notifyChannel: '', notifyTarget: '' };
+    } else {
+      const tg =
+        req.notifyTarget !== undefined
+          ? req.notifyTarget.trim()
+          : ch === (cur.notifyChannel ?? '')
+            ? cur.notifyTarget ?? ''
+            : '';
+      notify = normalizeNotify(ch, tg);
+    }
+  }
 
   const next: ScheduledTask = {
     ...cur,
@@ -313,6 +508,7 @@ export function updateLocalSchedule(
     timeOfDay,
     weekday,
     workspaceId,
+    ...notify,
     updatedAtMs: nowMs,
     // 禁用任务编辑后仍不排期，避免「改完自己跑起来」
     nextRunAtMs: cur.enabled ? nextRunAtMs(freq, timeOfDay, weekday, nowMs) : null,
@@ -425,6 +621,9 @@ export function handleLocalScheduleChannel(
 ): LocalScheduleResult {
   if (channel === 'schedule:list') {
     return { handled: true, value: localSchedules() };
+  }
+  if (channel === 'schedule:parse') {
+    return { handled: true, value: parseNaturalSchedule(String(args[0] ?? '')) };
   }
   if (channel === 'schedule:create') {
     return { handled: true, value: createLocalSchedule(args[0] as ScheduleCreateReq) };

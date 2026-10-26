@@ -8,7 +8,6 @@
 // 2. 本地 local-first 退化：queued 入队即出队（<100ms）、retry_pending 走本地退避，
 //    转移表保持单一版本，云端接入时零改动切换
 // 3. 非法转移显式拒绝（抛 IllegalTransitionError），不静默吞掉
-// 4. 不动 src/main/agent/state-machine.ts（Electron 遗留，未被 Tauri 构建引用）
 
 import { TaskStatus } from './types';
 import type { WaitReason } from './types';

@@ -38,6 +38,18 @@ pub fn launch_command() -> String {
         .unwrap_or_default()
 }
 
+/// 按后台常驻设置生成启动命令：开启时追加 `--hidden`，登录后直接驻留托盘。
+pub fn launch_command_for(background: bool) -> String {
+    crate::background::command_for(&launch_command(), background)
+}
+
+/// 去掉 `--hidden` 后的可执行文件路径，用于区分「指向别的程序」与「只是参数没更新」。
+fn command_target(command: &str) -> &str {
+    command
+        .strip_suffix(&format!(" {}", crate::background::HIDDEN_ARG))
+        .unwrap_or(command)
+}
+
 /// 组装 reg 命令参数（不执行；单测覆盖，避免测试触碰真实注册表）
 pub fn reg_args(action: Action, exe: &str) -> Vec<String> {
     let key = RUN_KEY.to_string();
@@ -131,8 +143,9 @@ pub fn registered() -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// 写入/删除启动项，并回读校验（回读不一致即报错，不留下「显示已开但其实没写」）
-pub fn apply(enabled: bool) -> Result<(), String> {
+/// 写入/删除启动项，并回读校验（回读不一致即报错，不留下「显示已开但其实没写」）。
+/// `background=true` 时登记的命令带 `--hidden`，登录后静默驻留托盘。
+pub fn apply(enabled: bool, background: bool) -> Result<(), String> {
     if !cfg!(windows) {
         // 关闭在语义上等价于「系统里本来就没有本应用的启动项」，可以如实落库；
         // 开启则必须报不支持，不能让开关亮着却没有启动项
@@ -145,8 +158,9 @@ pub fn apply(enabled: bool) -> Result<(), String> {
     if exe.is_empty() {
         return Err("AUTOSTART_FAILED: 无法定位当前程序路径，启动项未写入".into());
     }
+    let expected = crate::background::command_for(&exe, background);
     let action = if enabled { Action::Add } else { Action::Delete };
-    let out = run_reg(&reg_args(action, &exe))?;
+    let out = run_reg(&reg_args(action, &expected))?;
     if !out.status.success() {
         let code = out.status.code();
         // 关闭时「启动项本来就不在」不是失败（reg 对缺失值给 1）：交给下面的回读确认事实
@@ -165,7 +179,10 @@ pub fn apply(enabled: bool) -> Result<(), String> {
     }
     let now = registered()?;
     match (enabled, now) {
-        (true, Some(path)) if path == exe => Ok(()),
+        (true, Some(path)) if path == expected => Ok(()),
+        (true, Some(path)) if command_target(&path) == exe => Err(format!(
+            "AUTOSTART_FAILED: 启动项参数未更新（仍为 {path}），请关闭后重新开启"
+        )),
         (true, Some(path)) => Err(format!(
             "AUTOSTART_FAILED: 启动项已存在但指向其他程序（{path}），请在系统设置中手动调整"
         )),
@@ -178,16 +195,16 @@ pub fn apply(enabled: bool) -> Result<(), String> {
 }
 
 /// 当前状态（requested 为设置里的意愿，enabled 为注册表事实）
-pub fn status() -> Result<Value, String> {
+pub fn status(background: bool) -> Result<Value, String> {
     let registered_path = registered()?;
-    let exe = launch_command();
+    let expected = launch_command_for(background);
     Ok(json!({
         "supported": cfg!(windows),
         "enabled": registered_path.is_some(),
         "command": registered_path,
-        "currentCommand": exe,
-        // 开发态构建路径变动时，启动项会指向旧路径：如实告知而不是当作正常
-        "stale": registered_path.as_deref().map_or(false, |p| !exe.is_empty() && p != exe),
+        "currentCommand": expected,
+        // 开发态构建路径变动 / 后台常驻开关变化时，启动项与期望命令不一致：如实告知而不是当作正常
+        "stale": registered_path.as_deref().map_or(false, |p| !expected.is_empty() && p != expected),
         "valueName": VALUE_NAME,
         "runKey": RUN_KEY,
     }))
@@ -295,8 +312,28 @@ mod tests {
             assert!(!launch_command().is_empty(), "测试进程应能取到自身路径");
             return;
         }
-        let e = apply(true).unwrap_err();
+        let e = apply(true, false).unwrap_err();
         assert!(e.starts_with("AUTOSTART_UNSUPPORTED"), "{e}");
+    }
+
+    #[test]
+    fn command_target_strips_only_hidden_argument() {
+        assert_eq!(command_target("C:\\Apps\\tt.exe --hidden"), "C:\\Apps\\tt.exe");
+        assert_eq!(command_target("C:\\Apps\\tt.exe"), "C:\\Apps\\tt.exe");
+        // 其他参数不属于我们写的启动命令，不能被误认成本程序
+        assert_eq!(command_target("C:\\Apps\\tt.exe --other"), "C:\\Apps\\tt.exe --other");
+    }
+
+    #[test]
+    fn status_current_command_follows_background_setting() {
+        // 后台常驻开启后，界面展示的期望命令必须带 --hidden，否则 stale 永远判不出来
+        let plain = status(false).unwrap();
+        let resident = status(true).unwrap();
+        assert_eq!(plain["currentCommand"], launch_command());
+        assert!(resident["currentCommand"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with(crate::background::HIDDEN_ARG));
     }
 
     #[cfg(windows)]

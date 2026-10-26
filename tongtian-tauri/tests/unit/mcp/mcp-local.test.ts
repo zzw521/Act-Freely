@@ -334,8 +334,122 @@ describe('JSON 配置导入解析', () => {
   });
 });
 
+describe('OAuth 配置（仅 Streamable HTTP，浏览器不持有令牌）', () => {
+  const auth = {
+    authorizationUrl: 'https://auth.example.com/oauth/authorize',
+    tokenUrl: 'https://auth.example.com/oauth/token',
+    clientId: 'tt-desktop',
+    scopes: ['openid', 'profile', 'openid'],
+  };
+
+  it('规范化保留非敏感参数、去重 scopes', async () => {
+    const m = await freshWithStorage();
+    expect(m.normalizeOAuthConfig(auth)).toEqual({
+      authorizationUrl: auth.authorizationUrl,
+      tokenUrl: auth.tokenUrl,
+      clientId: 'tt-desktop',
+      scopes: ['openid', 'profile'],
+    });
+    expect(m.normalizeOAuthConfig(undefined)).toBeUndefined();
+  });
+
+  it('授权端点只允许 HTTPS；本机回环允许 HTTP；拒绝内嵌凭据与非法协议', async () => {
+    const m = await freshWithStorage();
+    expect(
+      m.normalizeOAuthConfig({ ...auth, authorizationUrl: 'http://localhost:9000/authorize' })
+        ?.authorizationUrl,
+    ).toBe('http://localhost:9000/authorize');
+    expectCode(
+      () => m.normalizeOAuthConfig({ ...auth, authorizationUrl: 'http://auth.example.com/a' }),
+      'MCP_OAUTH_INVALID_CONFIG',
+    );
+    expectCode(
+      () => m.normalizeOAuthConfig({ ...auth, tokenUrl: 'ftp://auth.example.com/token' }),
+      'MCP_OAUTH_INVALID_CONFIG',
+    );
+    expectCode(
+      () => m.normalizeOAuthConfig({ ...auth, tokenUrl: 'https://u:p@auth.example.com/token' }),
+      'MCP_OAUTH_INVALID_CONFIG',
+    );
+    expectCode(
+      () => m.normalizeOAuthConfig({ ...auth, clientId: 'bad id' }),
+      'MCP_OAUTH_INVALID_CONFIG',
+    );
+  });
+
+  it('OAuth 只支持 Streamable HTTP（stdio / SSE 登记直接拒绝）', async () => {
+    const m = await freshWithStorage();
+    expectCode(
+      () => m.addLocalServer({ name: 'stdio-oauth', command: 'node a.js', auth }, BASE),
+      'MCP_OAUTH_INVALID_CONFIG',
+    );
+    expectCode(
+      () =>
+        m.addLocalServer(
+          { name: 'sse-oauth', transport: 'sse', url: 'https://a.com/sse', auth },
+          BASE,
+        ),
+      'MCP_OAUTH_INVALID_CONFIG',
+    );
+    expect(m.listLocalServers()).toEqual([]);
+  });
+
+  it('启用 OAuth 时拒绝显式 Authorization 头（会覆盖自动附加的令牌）', async () => {
+    const m = await freshWithStorage();
+    expectCode(
+      () =>
+        m.addLocalServer(
+          {
+            name: '重复授权头',
+            transport: 'streamable_http',
+            url: 'https://a.com/mcp',
+            headers: { authorization: 'Bearer stale' },
+            auth,
+          },
+          BASE,
+        ),
+      'MCP_OAUTH_INVALID_CONFIG',
+    );
+    expect(m.listLocalServers()).toEqual([]);
+  });
+
+  it('登记远程连接器保存授权参数，但状态是未授权且没有令牌字段', async () => {
+    const m = await freshWithStorage();
+    const row = m.addLocalServer(
+      { name: '远端数据', transport: 'streamable_http', url: 'https://a.com/mcp', auth },
+      BASE,
+    );
+    expect(row.auth).toEqual({ ...auth, scopes: ['openid', 'profile'] });
+    expect(row.authStatus).toBe('none');
+    const wire = JSON.stringify(row);
+    expect(wire).not.toMatch(/accessToken|refreshToken|access_token|refresh_token/);
+    // 重载后仍只有配置，状态保持未授权（浏览器没有系统凭据库）
+    const reloaded = await freshModule();
+    expect(reloaded.listLocalServers()[0].auth?.clientId).toBe('tt-desktop');
+    expect(reloaded.listLocalServers()[0].authStatus).toBe('none');
+  });
+
+  it('浏览器通道的授权 / 撤销如实拒绝为 MCP_OAUTH_UNSUPPORTED', async () => {
+    const m = await freshWithStorage();
+    const row = m.addLocalServer(
+      { name: '远端数据', transport: 'streamable_http', url: 'https://a.com/mcp', auth },
+      BASE,
+    );
+    expectCode(
+      () => m.handleLocalMcpChannel('mcp:oauthAuthorize', [{ serverId: row.serverId }]),
+      'MCP_OAUTH_UNSUPPORTED',
+    );
+    expectCode(
+      () => m.handleLocalMcpChannel('mcp:oauthRevoke', [{ serverId: row.serverId }]),
+      'MCP_OAUTH_UNSUPPORTED',
+    );
+    // 未授权状态不会因为点击而被伪装成已授权
+    expect(m.listLocalServers()[0].authStatus).toBe('none');
+  });
+});
+
 describe('通道分发器路由', () => {
-  it('六个 mcp:* 通道均由本地权威接管，其他通道交回上层', async () => {
+  it('八个 mcp:* 通道均由本地权威接管，其他通道交回上层', async () => {
     const m = await freshWithStorage();
     const add = m.handleLocalMcpChannel('mcp:addServer', [
       { name: 'routed', command: 'node r.js' },

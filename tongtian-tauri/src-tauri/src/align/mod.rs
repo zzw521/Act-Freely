@@ -2,7 +2,6 @@
 //!
 //! command：
 //! - hooks_get / hooks_set / hooks_test:            Hook 配置读写 + 真实试运行（拉起进程、stdin 喂事件 JSON、按秒超时）
-//! - connector_list / authorize / revoke:           连接器授权状态持久化（installed + authStatus 落库）
 //! - task_archive / list / unarchive / delete / clear: 任务归档标记（取消归档与清空均不动任务本体，除点名的彻底删除）
 //! - computer_use_get_policy / computer_use_set_policy: 电脑操控策略（与设置页共用 settings_kv 同一键，避免双写源）
 //!
@@ -10,7 +9,6 @@
 //! 使 Tauri 包里这些页面不再拿到空响应而静默失效。
 
 pub mod archive;
-pub mod connector;
 pub mod hooks;
 
 use std::sync::Arc;
@@ -44,6 +42,8 @@ pub async fn hooks_set(
 ) -> Result<Value, String> {
     hooks::validate_config(&config)?;
     hooks::set(&p0.store, &config, now_ms_u64() as i64)?;
+    // 配置里没这条命令了，它的放行也就作废——留着会让「删掉再原样加回来」绕过重新放行
+    let revoked = hooks::prune_grants(&p0.store, &config)?;
     let events = hooks::count_events(&config);
     audit::record_quiet(
         &p0.store,
@@ -52,7 +52,20 @@ pub async fn hooks_set(
         "hooks",
         &format!("Hook 配置保存：{events} 个事件挂载"),
     );
-    Ok(json!({ "ok": true, "events": events }))
+    if !revoked.is_empty() {
+        audit::record_quiet(
+            &p0.store,
+            audit::ACTION_CONFIG_CHANGE,
+            audit::SEV_WARNING,
+            "hooks",
+            &format!(
+                "Hook 配置保存后作废 {} 条放行：{}",
+                revoked.len(),
+                revoked.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join("；")
+            ),
+        );
+    }
+    Ok(json!({ "ok": true, "events": events, "revoked": revoked }))
 }
 
 /// Hook 试运行：真实执行命令并回传 exitCode/stdout/stderr/超时标记
@@ -90,56 +103,49 @@ pub async fn hooks_test(
     Ok(run.to_value())
 }
 
-// ── 连接器授权 ──────────────────────────────────────────────
-
-/// 连接器授权状态列表（无记录时为空数组，不伪造已授权项）
+/// 放行一条 Hook 命令：真实任务里只有放行过的命令才会被网关拉起执行
 #[tauri::command]
-pub async fn connector_list(p0: State<'_, Arc<P0Services>>) -> Result<Value, String> {
-    let rows = connector::list(&p0.store)?;
-    Ok(serde_json::to_value(rows).unwrap_or_else(|_| Value::Array(vec![])))
-}
-
-/// 授权（安装）连接器
-#[tauri::command]
-pub async fn connector_authorize(
+pub async fn hooks_grant(
     p0: State<'_, Arc<P0Services>>,
-    connector_id: String,
-    category: Option<String>,
-    server_ref: Option<String>,
+    command: String,
+    event: String,
 ) -> Result<Value, String> {
-    let view = connector::authorize(
-        &p0.store,
-        &connector_id,
-        category.as_deref(),
-        server_ref.as_deref(),
-        now_ms_u64() as i64,
-    )?;
-    audit::record_quiet(
-        &p0.store,
-        audit::ACTION_CONFIG_CHANGE,
-        audit::SEV_INFO,
-        &view.connector_id,
-        &connector::audit_summary(&view),
-    );
-    Ok(connector::ok_value(&view))
-}
-
-/// 撤销连接器授权（无授权记录时明确报错，不静默成功）
-#[tauri::command]
-pub async fn connector_revoke(
-    p0: State<'_, Arc<P0Services>>,
-    connector_id: String,
-) -> Result<Value, String> {
-    let id = connector_id.trim().to_string();
-    connector::revoke(&p0.store, &connector_id, now_ms_u64() as i64)?;
+    hooks::ensure_event(&event)?;
+    hooks::ensure_command(&command)?;
+    hooks::grant(&p0.store, &command, &event, now_ms_u64() as i64)?;
     audit::record_quiet(
         &p0.store,
         audit::ACTION_CONFIG_CHANGE,
         audit::SEV_WARNING,
-        &id,
-        &connector::revoke_summary(&id),
+        "hooks",
+        &format!("Hook 命令已放行，真实任务里会由本机拉起：{event} · `{}`", command.trim()),
     );
-    Ok(json!({ "ok": true, "connectorId": id }))
+    Ok(json!({ "ok": true, "granted": true }))
+}
+
+/// 撤销放行：只删授权记录，配置保留（撤权 ≠ 删除用户的脚本配置）
+#[tauri::command]
+pub async fn hooks_revoke(p0: State<'_, Arc<P0Services>>, command: String) -> Result<Value, String> {
+    hooks::revoke(&p0.store, &command)?;
+    audit::record_quiet(
+        &p0.store,
+        audit::ACTION_CONFIG_CHANGE,
+        audit::SEV_WARNING,
+        "hooks",
+        &format!("Hook 命令已撤销放行，真实任务里不再执行：`{}`", command.trim()),
+    );
+    Ok(json!({ "ok": true, "granted": false }))
+}
+
+/// 放行台账 + 执行面概览（页面据此显示「已放行/待放行」与哪些事件没有触发点）
+#[tauri::command]
+pub async fn hooks_status(p0: State<'_, Arc<P0Services>>) -> Result<Value, String> {
+    let mut summary = hooks::runtime_summary(&p0.store)?;
+    let grants = hooks::list_grants(&p0.store)?;
+    if let Some(map) = summary.as_object_mut() {
+        map.insert("grants".into(), Value::Array(grants));
+    }
+    Ok(summary)
 }
 
 // ── 任务归档 ────────────────────────────────────────────────

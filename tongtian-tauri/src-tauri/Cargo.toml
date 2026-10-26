@@ -3,6 +3,7 @@ name = "tongtian-tauri"
 version = "0.1.0"
 description = "通天办公 - Tauri 版（本地 AI 工作助手）"
 authors = ["TongTian Office Team"]
+license = "Apache-2.0"
 edition = "2021"
 
 [lib]
@@ -36,6 +37,22 @@ flate2 = "1.1"
 crc32fast = "1.5"
 # 专家套件包上传：zip 字节经 IPC 以 base64 透传（该版本已在依赖树内，离线可解析）
 base64 = "0.22"
+# Hook matcher（`Bash|Write`、`mcp__.*`）：regex 1.13.1 已在依赖树内，离线可解析
+regex = "1.13"
+# 在线市场下载完整性校验：sha2 0.10 已在依赖树内（tauri-codegen 传递依赖），离线可解析
+sha2 = "0.10"
+# 市场发布者签名验签：ring 0.17 已在依赖树内（tauri 传递依赖），只用 Ed25519 公钥验签
+ring = "0.17"
+
+# 电脑操控执行器（Windows）：GDI 截屏 + SendInput 键鼠注入 + 原生确认框
+# 0.59.0 已在依赖树内（Tauri 传递依赖），离线可解析；仅 Windows 目标编译
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 codegen-units = 1

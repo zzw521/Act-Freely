@@ -11,8 +11,6 @@ import {
 } from '../../../src/shared/contracts';
 import type {
   ChatEvent as ChatEventContracts,
-  LeaseInfo,
-  LeaseTakeoverResp,
   QuotaSnapshot,
   TaskSummary,
 } from '../../../src/shared/contracts';
@@ -64,13 +62,15 @@ describe('契约快照：ErrorCode 云端必需码', () => {
 });
 
 describe('契约快照：IPC_CHANNELS 新增通道', () => {
-  it('包含取消/任务状态/配额/租约/重放通道', () => {
+  it('只保留界面真实消费的取消/重放通道', () => {
     expect(IPC_CHANNELS.CHAT_CANCEL).toBe('chat:cancel');
-    expect(IPC_CHANNELS.TASK_STATE).toBe('task:state');
-    expect(IPC_CHANNELS.QUOTA_STATUS).toBe('quota:status');
-    expect(IPC_CHANNELS.LEASE_INFO).toBe('lease:info');
-    expect(IPC_CHANNELS.LEASE_TAKEOVER).toBe('lease:takeover');
     expect(IPC_CHANNELS.EVENT_REPLAY).toBe('event:replay');
+    // 没有 UI 消费方的查询通道已删除，防止死命令回流
+    const removed = IPC_CHANNELS as unknown as Record<string, string | undefined>;
+    expect(removed.TASK_STATE).toBeUndefined();
+    expect(removed.QUOTA_STATUS).toBeUndefined();
+    expect(removed.LEASE_INFO).toBeUndefined();
+    expect(removed.LEASE_TAKEOVER).toBeUndefined();
   });
 
   it('通道名无重复', () => {
@@ -110,24 +110,7 @@ describe('契约快照：ChatEvent 新增事件与 seq 兼容字段', () => {
   });
 });
 
-describe('契约快照：Lease / Quota / TaskMeta 类型', () => {
-  it('LeaseInfo 字段齐备（对齐 ADJ-R2-4）', () => {
-    const lease: LeaseInfo = {
-      taskId: 't1',
-      leaseId: 'lease-1',
-      holder: 'local-device',
-      heartbeatAt: new Date().toISOString(),
-      leaseUntil: new Date().toISOString(),
-      idle: false,
-    };
-    expect(lease.holder).toBe('local-device');
-  });
-
-  it('LeaseTakeoverResp 禁止抢占语义（需确认）', () => {
-    const resp: LeaseTakeoverResp = { needConfirmation: true, currentHolder: 'web' };
-    expect(resp.needConfirmation).toBe(true);
-  });
-
+describe('契约快照：Quota / TaskMeta 类型', () => {
   it('QuotaSnapshot 四档与动作链枚举收敛', () => {
     const snap: QuotaSnapshot = {
       usedTokens: 85,

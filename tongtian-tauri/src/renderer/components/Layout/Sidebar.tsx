@@ -9,7 +9,7 @@
  * - hover/active 均有明确反馈，微动效过渡
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   Box,
   Drawer,
@@ -25,9 +25,12 @@ import {
   DialogContentText,
   DialogActions,
   Button,
+  TextField,
+  InputAdornment,
   useTheme,
   useMediaQuery,
 } from '@mui/material';
+import SearchIcon from '@mui/icons-material/Search';
 import AddIcon from '@mui/icons-material/Add';
 import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
 import KeyboardArrowUpIcon from '@mui/icons-material/KeyboardArrowUp';
@@ -47,13 +50,15 @@ import ChevronLeftIcon from '@mui/icons-material/ChevronLeft';
 import ArchiveIcon from '@mui/icons-material/Archive';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useWorkbenchStore } from '../../store/workbenchStore';
-import { useImChannelStore, IM_CHANNEL_META } from '../../stores/imChannelStore';
+import { useImChannelStore, imChannelMeta } from '../../stores/imChannelStore';
 import { useAuthStore } from '../../stores/useAuthStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { useAppSettings } from '../../lib/use-app-settings';
+import { systemAPI } from '../../lib/api';
 import { useShallow } from 'zustand/react/shallow';
 import { errorTextOf } from '../../../shared/error-messages';
 import { navPalette, type NavPaletteKey } from '../../theme/tokens';
+import { useI18n } from '../../i18n';
 
 // ── 导航项定义 ──────────────────────────────────────────────────────
 
@@ -69,15 +74,18 @@ interface NavItem {
 }
 
 // 能力管理子项（专家套件/技能/连接器，定时任务与 IM 频道独立展示）
+// 浏览器 AI+、终端 AI+、电脑操控、远程桌面属于执行能力配置，统一收进「设置 → 执行能力」；
+// 专家团队作为「专家套件」的一个页签展示，不再单独占导航位。
 const extensionItems: NavItem[] = [
   { id: 'expert-suites', label: '专家套件', path: '/expert-suites', icon: ConstructionIcon, color: 'amber' },
+  { id: 'knowledge', label: '知识库', path: '/knowledge', icon: MenuBookIcon, color: 'blue' },
   { id: 'skills', label: '技能', path: '/extensions?tab=skills', icon: BoltIcon, color: 'purple' },
   { id: 'connector', label: '连接器', path: '/extensions?tab=connectors', icon: LinkIcon, color: 'cyan' },
 ];
 
 // 用户菜单项（带配色）
 const userMenuItems = [
-  { id: 'team', label: '企业/团队', icon: BusinessIcon, color: 'blue' as NavPaletteKey },
+  { id: 'team', label: '项目协作', icon: BusinessIcon, color: 'blue' as NavPaletteKey, path: '/collaboration' },
   { id: 'prefs', label: '偏好设置', icon: TuneIcon, color: 'teal' as NavPaletteKey, path: '/settings' },
   { id: 'settings', label: '设置', icon: SettingsIcon, color: 'slate' as NavPaletteKey, path: '/settings' },
   { id: 'guide', label: '新人指南', icon: MenuBookIcon, color: 'green' as NavPaletteKey },
@@ -98,6 +106,8 @@ interface SidebarProps {
 }
 
 const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) => {
+  // t 在本文件里被会话列表项占用（map((t) => ...)），翻译函数用 tr 避免遮蔽
+  const { t: tr } = useI18n();
   const theme = useTheme();
   const navigate = useNavigate();
   const location = useLocation();
@@ -110,6 +120,18 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
   const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false);
   /** 任务/频道并排页签：软件端发起 → 任务；IM 发起 → 频道 */
   const [activeTab, setActiveTab] = useState<'tasks' | 'channels'>('tasks');
+  /** 应用版本号：向 Rust system_info 要（浏览器通道用构建期注入值），不在前端写死 */
+  const [appVersion, setAppVersion] = useState('');
+  useEffect(() => {
+    void (async () => {
+      try {
+        const info = await systemAPI.info();
+        if (typeof info.version === 'string') setAppVersion(info.version);
+      } catch {
+        // 读不到就不显示版本号，不回落一个写死的字符串
+      }
+    })();
+  }, []);
 
   // 账号登录态（网页验证登录 · Loopback 方案）
   const { loggedIn, profile, busy: authBusy, init: authInit, login: authLogin, logout: authLogout } = useAuthStore(
@@ -128,14 +150,14 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
     void authInit();
   }, [authInit]);
 
-  /** 登录：Mock 直登；真实模式拉起浏览器网页登录 + loopback 回调 */
+  /** 登录：默认拉起浏览器完成综合服务端验证 + loopback 回调；TT_AUTH_MOCK=true 时模拟直登 */
   const handleLogin = async () => {
     const ok = await authLogin();
     if (ok) {
       const nick = useAuthStore.getState().profile?.nickname ?? '';
-      showNotification(`登录成功${nick ? `：${nick}` : ''}`, 'success');
+      showNotification(nick ? tr('登录成功：{nick}', { nick }) : tr('登录成功'), 'success');
     } else {
-      showNotification(useAuthStore.getState().error ?? '登录失败，请重试', 'error');
+      showNotification(useAuthStore.getState().error ?? tr('登录失败，请重试'), 'error');
     }
   };
 
@@ -143,7 +165,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
   const handleLogoutConfirm = async () => {
     setLogoutConfirmOpen(false);
     const ok = await authLogout();
-    showNotification(ok ? '已退出登录' : '退出失败，请重试', ok ? 'success' : 'error');
+    showNotification(ok ? tr('已退出登录') : tr('退出失败，请重试'), ok ? 'success' : 'error');
   };
 
   // 多会话列表（侧边栏任务区：点击切换会话，支持多会话并行）
@@ -160,24 +182,55 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
   const handleArchive = async (id: string, title: string) => {
     try {
       await archiveConversation(id);
-      showNotification(`已归档：${title || '未命名任务'}，可在「已归档」恢复`, 'success');
+      showNotification(tr('已归档：{title}，可在「已归档」恢复', { title: title || tr('未命名任务') }), 'success');
     } catch (err) {
-      showNotification(errorTextOf(err, '归档失败'), 'error');
+      showNotification(errorTextOf(err, tr('归档失败')), 'error');
     }
   };
 
   // IM 频道会话列表（频道页签数据源）
-  const { channelSessions, loadSessions } = useImChannelStore(
-    useShallow((s) => ({ channelSessions: s.channelSessions, loadSessions: s.loadSessions })),
+  const { channelSessions, channels, loadSessions } = useImChannelStore(
+    useShallow((s) => ({
+      channelSessions: s.channelSessions,
+      channels: s.channels,
+      loadSessions: s.loadSessions,
+    })),
   );
 
   // 头像色（个人资料设置真实生效）
   const [appSettings] = useAppSettings();
   const avatarColor = (appSettings.avatarColor as string) ?? '';
 
+  // 对话列表筛选（实验开关）：标题搜索 + 创建时间范围，只影响侧栏展示
+  const experiments = (appSettings.experiments as Record<string, boolean> | undefined) ?? {};
+  const filterEnabled = Boolean(experiments.filter);
+  const [taskQuery, setTaskQuery] = useState('');
+  const [taskRange, setTaskRange] = useState<'all' | '7d' | '30d'>('all');
+  const visibleConversations = useMemo(() => {
+    if (!filterEnabled) return conversations;
+    const q = taskQuery.trim().toLowerCase();
+    const since =
+      taskRange === 'all' ? 0 : Date.now() - (taskRange === '7d' ? 7 : 30) * 24 * 60 * 60 * 1000;
+    return conversations.filter((c) => {
+      if (since > 0 && c.createdAt < since) return false;
+      if (q && !(c.title || '新任务').toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [conversations, filterEnabled, taskQuery, taskRange]);
+
+  // 长连接由引擎进程持有，引擎不会往界面推事件，所以「频道」页签的数据只能按固定间隔问。
+  // 这里常驻，因此由它统一负责刷新：过渡态（connecting/reconnecting）等状态落定，
+  // 已连接时等新的入站消息——不盯后者的话，用户从 IM 会话里 @完机器人，
+  // 界面上的会话列表会一直停在空状态，看起来像「频道没接通」。
+  const imNeedsPolling = channels.some((c) =>
+    ['connected', 'connecting', 'reconnecting'].includes(c.state),
+  );
   useEffect(() => {
-    loadSessions();
-  }, [loadSessions]);
+    void loadSessions();
+    if (!imNeedsPolling) return undefined;
+    const timer = window.setInterval(() => void loadSessions(), 4000);
+    return () => window.clearInterval(timer);
+  }, [imNeedsPolling, loadSessions]);
 
   // 路由变化时关闭个人中心菜单，避免跳转后弹窗锚点失效残留
   useEffect(() => {
@@ -270,7 +323,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
               transition: 'color 0.15s ease',
             }}
           >
-            {item.label}
+            {tr(item.label)}
           </Typography>
         )}
       </Box>
@@ -279,13 +332,17 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
     // 占位能力：禁用态 + tooltip（占位清单规范）
     if (item.disabled) {
       return (
-        <Tooltip key={item.id} title={`${item.label} · 即将上线`} placement="right">
+        <Tooltip
+          key={item.id}
+          title={tr('{label} · 即将上线', { label: tr(item.label) })}
+          placement="right"
+        >
           {button}
         </Tooltip>
       );
     }
     return isCollapsed ? (
-      <Tooltip key={item.id} title={item.label} placement="right">
+      <Tooltip key={item.id} title={tr(item.label)} placement="right">
         {button}
       </Tooltip>
     ) : (
@@ -363,9 +420,8 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                 WebkitTextFillColor: 'transparent',
               }}
             >
-              通天办公
+              {tr('通天办公')}
             </Typography>
-            {/* BETA 徽标：彩色胶囊 */}
             <Box
               sx={{
                 px: 0.75,
@@ -436,13 +492,13 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
               </Box>
               {!isCollapsed && (
                 <Typography sx={{ fontSize: '13.5px', fontWeight: 700, color: '#fff', letterSpacing: '0.02em' }}>
-                  新任务
+                  {tr('新任务')}
                 </Typography>
               )}
             </Box>
           );
           return isCollapsed ? (
-            <Tooltip title="新任务" placement="right">
+            <Tooltip title={tr('新任务')} placement="right">
               {cta}
             </Tooltip>
           ) : (
@@ -467,7 +523,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
             }}
           >
             <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', flexGrow: 1 }}>
-              能力管理
+              {tr('能力管理')}
             </Typography>
             <KeyboardArrowDownIcon
               sx={{
@@ -498,8 +554,8 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
           <Box sx={{ display: 'flex', gap: 0.5, px: 0.5, pt: 1.25, pb: 0.25 }}>
             {(
               [
-                { key: 'tasks', label: '任务', color: '#4F46E5' },
-                { key: 'channels', label: '频道', color: '#06B6D4' },
+                { key: 'tasks', label: tr('任务'), color: '#4F46E5' },
+                { key: 'channels', label: tr('频道'), color: '#06B6D4' },
               ] as const
             ).map((tab) => {
               const active = activeTab === tab.key;
@@ -547,11 +603,67 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
           </Box>
         )}
 
+        {/* 对话筛选（实验开关）：标题搜索 + 创建时间范围 */}
+        {!isCollapsed && activeTab === 'tasks' && filterEnabled && (
+          <Box sx={{ px: 0.5, pt: 0.75, pb: 0.25 }}>
+            <TextField
+              value={taskQuery}
+              onChange={(e) => setTaskQuery(e.target.value)}
+              placeholder={tr('搜索任务标题')}
+              size="small"
+              fullWidth
+              InputProps={{
+                startAdornment: (
+                  <InputAdornment position="start">
+                    <SearchIcon sx={{ fontSize: 15, color: 'var(--tt-text-4)' }} />
+                  </InputAdornment>
+                ),
+              }}
+              sx={{
+                '& .MuiInputBase-root': {
+                  fontSize: '12.5px',
+                  height: 30,
+                  borderRadius: '8px',
+                  bgcolor: 'var(--tt-surface)',
+                },
+                '& fieldset': { borderColor: 'var(--tt-border-soft)' },
+              }}
+            />
+            <Box sx={{ display: 'flex', gap: 0.5, mt: 0.5 }}>
+              {(
+                [
+                  { key: 'all', label: tr('全部') },
+                  { key: '7d', label: tr('近 7 天') },
+                  { key: '30d', label: tr('近 30 天') },
+                ] as const
+              ).map((r) => (
+                <Box
+                  key={r.key}
+                  onClick={() => setTaskRange(r.key)}
+                  sx={{
+                    px: 0.75,
+                    py: 0.25,
+                    borderRadius: '6px',
+                    cursor: 'pointer',
+                    fontSize: '11.5px',
+                    color: taskRange === r.key ? '#4338CA' : 'var(--tt-text-4)',
+                    bgcolor: taskRange === r.key ? 'rgba(79, 70, 229, 0.10)' : 'transparent',
+                    fontWeight: taskRange === r.key ? 600 : 400,
+                    transition: 'background 0.15s ease, color 0.15s ease',
+                  }}
+                >
+                  {r.label}
+                </Box>
+              ))}
+            </Box>
+          </Box>
+        )}
+
         {/* 任务页签：会话列表（多会话并行，点击切换） */}
         {!isCollapsed &&
           activeTab === 'tasks' &&
-          (conversations.length > 0 ? (
-            conversations.slice(0, 20).map((t) => (
+          (visibleConversations.length > 0 ? (
+            visibleConversations.slice(0, 20).map((t) => (
               <Box
                 key={t.id}
                 onClick={() => {
@@ -595,10 +707,10 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                     transition: 'color 0.15s ease',
                   }}
                 >
-                  {t.title || '新任务'}
+                  {t.title || tr('新任务')}
                 </Typography>
                 {/* hover 显现归档入口（写入 task:archive 通道） */}
-                <Tooltip title="归档" placement="left">
+                <Tooltip title={tr('归档')} placement="left">
                   <IconButton
                     className="conv-archive-btn"
                     size="small"
@@ -621,7 +733,9 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
             ))
           ) : (
             <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', px: 1, py: 1 }}>
-              暂无任务，点击上方「新任务」开始
+              {filterEnabled && (taskQuery.trim() !== '' || taskRange !== 'all')
+                ? tr('没有符合筛选条件的任务')
+                : tr('暂无任务，点击上方「新任务」开始')}
             </Typography>
           ))}
 
@@ -630,7 +744,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
           activeTab === 'channels' &&
           (channelSessions.length > 0 ? (
             channelSessions.slice(0, 20).map((s) => {
-              const meta = IM_CHANNEL_META[s.source];
+              const meta = imChannelMeta(s.source, channels.find((c) => c.kind === s.source)?.label);
               return (
                 <Box
                   key={s.id}
@@ -686,7 +800,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
             })
           ) : (
             <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', px: 1, py: 1 }}>
-              暂无 IM 会话，在「IM 频道」开通渠道后即可接收
+              {tr('暂无 IM 会话，在「IM 频道」开通渠道后即可接收')}
             </Typography>
           ))}
       </Box>
@@ -736,7 +850,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
             }}
           >
             <Typography sx={{ color: '#fff', fontSize: '14px', fontWeight: 700 }}>
-              {loggedIn ? profile?.nickname?.charAt(0) || '客' : '客'}
+              {loggedIn ? profile?.nickname?.charAt(0) || tr('客') : tr('客')}
             </Typography>
           </Box>
 
@@ -744,7 +858,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
             <>
               <Box sx={{ flexGrow: 1, minWidth: 0 }}>
                 <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)', lineHeight: 1.35 }}>
-                  {loggedIn ? profile?.nickname ?? '未命名用户' : '未登录'}
+                  {loggedIn ? profile?.nickname ?? tr('未命名用户') : tr('未登录')}
                 </Typography>
                 {/* 套餐彩色胶囊（登录态动态展示；未登录提示点击登录） */}
                 <Box
@@ -758,7 +872,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                   }}
                 >
                   <Typography component="span" sx={{ fontSize: '10px', fontWeight: 600, color: loggedIn ? '#059669' : '#4F46E5', lineHeight: 1.7 }}>
-                    {loggedIn ? profile?.plan ?? '个人免费版' : authBusy ? '登录中…' : '点击登录网页验证'}
+                    {loggedIn ? profile?.plan ?? tr('个人免费版') : authBusy ? tr('登录中…') : tr('点击登录网页验证')}
                   </Typography>
                 </Box>
               </Box>
@@ -787,33 +901,21 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
           },
         }}
       >
-        {/* 版本信息 + 升级 */}
+        {/* 版本信息：这里原来是一个渐变高亮的「升级」胶囊，但没有任何 onClick，
+            应用内也不存在购买/升级页面 —— 纯装饰的诱导按钮，已换成真实版本号
+            （桌面通道由 Rust system_info 报 CARGO_PKG_VERSION）。 */}
         <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', px: 1.5, py: 1 }}>
           <Box>
             <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)' }}>
-              {loggedIn ? profile?.nickname ?? '未命名用户' : '未登录'}
+              {loggedIn ? profile?.nickname ?? tr('未命名用户') : tr('未登录')}
             </Typography>
             <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
-              {loggedIn ? profile?.plan ?? '个人版' : '完成网页验证即可登录'}
+              {loggedIn ? profile?.plan ?? tr('个人版') : tr('完成网页验证即可登录')}
             </Typography>
           </Box>
-          <Box
-            sx={{
-              px: 1.75,
-              py: 0.5,
-              borderRadius: '999px',
-              background: 'linear-gradient(120deg, #6366F1 0%, #8B5CF6 100%)',
-              boxShadow: '0 2px 8px rgba(99, 102, 241, 0.3)',
-              cursor: 'pointer',
-              transition: 'transform 0.15s ease, box-shadow 0.15s ease',
-              '&:hover': {
-                transform: 'translateY(-1px)',
-                boxShadow: '0 4px 12px rgba(99, 102, 241, 0.38)',
-              },
-            }}
-          >
-            <Typography sx={{ fontSize: '12px', fontWeight: 700, color: '#fff' }}>升级</Typography>
-          </Box>
+          <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
+            {appVersion ? `v${appVersion}` : tr('版本读取中…')}
+          </Typography>
         </Box>
 
         <Divider sx={{ my: 0.75, borderColor: 'var(--tt-border-soft)' }} />
@@ -880,7 +982,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                   flexGrow: 1,
                 }}
               >
-                {item.label}
+                {tr(item.label)}
               </Typography>
             </Box>
           );
@@ -893,15 +995,15 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
         onClose={() => setLogoutConfirmOpen(false)}
         PaperProps={{ sx: { borderRadius: '14px', minWidth: 320 } }}
       >
-        <DialogTitle sx={{ fontSize: '15px', fontWeight: 700 }}>退出登录</DialogTitle>
+        <DialogTitle sx={{ fontSize: '15px', fontWeight: 700 }}>{tr('退出登录')}</DialogTitle>
         <DialogContent>
           <DialogContentText sx={{ fontSize: '13px', color: 'var(--tt-text-2)' }}>
-            确定要在此设备退出登录吗？退出后本地任务与会话数据仍会保留，可随时重新登录。
+            {tr('确定要在此设备退出登录吗？退出后本地任务与会话数据仍会保留，可随时重新登录。')}
           </DialogContentText>
         </DialogContent>
         <DialogActions sx={{ px: 3, pb: 2 }}>
           <Button onClick={() => setLogoutConfirmOpen(false)} sx={{ color: 'var(--tt-text-3)', fontSize: '13px' }}>
-            取消
+            {tr('取消')}
           </Button>
           <Button
             onClick={() => void handleLogoutConfirm()}
@@ -909,7 +1011,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
             variant="contained"
             sx={{ fontSize: '13px', bgcolor: '#EF4444', '&:hover': { bgcolor: '#DC2626' } }}
           >
-            退出登录
+            {tr('退出登录')}
           </Button>
         </DialogActions>
       </Dialog>

@@ -187,6 +187,54 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX IF NOT EXISTS idx_chat_feedback_conv ON chat_feedback (conv_id, turn_index);
     "#,
+    // ── V9：Hook 执行面放行台账（hook_grants） ──
+    // 增量变更：仅新增表，hook_configs（V5）与其存量配置不动。
+    // 配置里写了命令 ≠ 允许在真实任务里拉起进程：每条命令首次执行前需在 Hooks 页明确放行，
+    // 放行按命令原文（去首尾空白）记录，撤销放行只删这一条授权、不删配置。
+    r#"
+    CREATE TABLE IF NOT EXISTS hook_grants (
+        command       TEXT PRIMARY KEY,                       -- 与 hook_configs 里同一条命令原文一致
+        event         TEXT NOT NULL,                          -- 放行时所属事件（仅用于界面回显）
+        granted_at_ms INTEGER NOT NULL,
+        run_count     INTEGER NOT NULL DEFAULT 0,             -- 真实任务里实际执行过多少次
+        last_run_at_ms INTEGER
+    );
+    "#,
+    // ── V10：远程 MCP 连接器 OAuth 配置（令牌仍只存系统凭据库） ──
+    // 增量变更：仅给 mcp_servers 追加一列，V1~V9 表与存量行不受影响。
+    // auth_json 只存授权地址 / token 地址 / client_id / scopes，不存令牌或 client secret。
+    r#"
+    ALTER TABLE mcp_servers ADD COLUMN auth_json TEXT NOT NULL DEFAULT '{}';
+    "#,
+    // ── V11：定时任务执行完成推送 IM（只加列，存量任务默认不推送） ──
+    // 增量变更：notify_channel 为空的存量任务行为完全不变；推送目标只存会话标识，
+    // 凭据仍只在引擎侧配置与系统凭据库中。
+    r#"
+    ALTER TABLE scheduled_tasks ADD COLUMN notify_channel TEXT NOT NULL DEFAULT '';
+    ALTER TABLE scheduled_tasks ADD COLUMN notify_target TEXT NOT NULL DEFAULT '';
+    "#,
+    // ── V12：模型计费单价、故障转移链、调用延迟与成本台账（P1 成本/延迟 + 路由） ──
+    // 增量变更：model_configs/model_usage 只加列，存量行保持原值（单价 NULL=未配置，
+    // 延迟 0 样本=旧数据无耗时事实）；成本单独建表，按币种分桶，避免混币种相加。
+    r#"
+    ALTER TABLE model_configs ADD COLUMN price_input_per_m REAL;             -- 每 100 万输入 token 单价；NULL=未配置
+    ALTER TABLE model_configs ADD COLUMN price_output_per_m REAL;            -- 每 100 万输出 token 单价；NULL=未配置
+    ALTER TABLE model_configs ADD COLUMN price_currency TEXT NOT NULL DEFAULT 'CNY';
+    ALTER TABLE model_configs ADD COLUMN fallback_ids TEXT NOT NULL DEFAULT '[]'; -- 有序模型 id 数组（JSON）
+
+    ALTER TABLE model_usage ADD COLUMN latency_ms_total INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE model_usage ADD COLUMN latency_samples INTEGER NOT NULL DEFAULT 0;
+
+    CREATE TABLE IF NOT EXISTS model_usage_cost (
+        model_name   TEXT NOT NULL,
+        day          TEXT NOT NULL,                    -- UTC yyyy-mm-dd
+        currency     TEXT NOT NULL,                    -- CNY / USD …（按调用时配置的币种）
+        cost_micros  INTEGER NOT NULL DEFAULT 0,       -- 1 货币单位 = 1,000,000 micros
+        priced_calls INTEGER NOT NULL DEFAULT 0,       -- 计入成本的调用次数（与未计价调用分开）
+        PRIMARY KEY (model_name, day, currency)
+    );
+    CREATE INDEX IF NOT EXISTS idx_model_usage_cost_day ON model_usage_cost (day);
+    "#,
 ];
 
 /// 执行所有尚未应用的迁移
@@ -239,12 +287,12 @@ mod tests {
                  ('model_configs','tasks','settings_kv','schema_version','audit_logs',\
                  'security_policies','model_usage','scheduled_tasks','schedule_runs',\
                  'hook_configs','connector_states','archived_tasks','mcp_servers','chat_messages',\
-                 'chat_feedback')",
+                 'chat_feedback','hook_grants','model_usage_cost')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 15);
+        assert_eq!(count, 17);
     }
 
     /// 增量升级：老库（仅 V1）升级到 V2 后，存量数据必须完好（开发规范：禁止覆盖存量数据）
@@ -536,6 +584,79 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM chat_feedback", [], |r| r.get(0))
             .unwrap();
         assert_eq!(feedback, 0, "新表 chat_feedback 初始应为空（不伪造评价）");
+        let max_v: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(max_v, MIGRATIONS.len() as i64);
+    }
+
+    /// 增量升级：V11 老库升级到 V12 后，存量模型/用量数据必须完好，计价字段为「未配置」而非 0
+    #[test]
+    fn test_v12_upgrade_preserves_existing_rows() {
+        let conn = mem_conn();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        // 模拟只跑过 V1~V11 的历史库
+        for sql in MIGRATIONS.iter().take(11) {
+            conn.execute_batch(sql).unwrap();
+        }
+        let versions: Vec<String> = (1..=11).map(|v| format!("({v}, datetime('now'))")).collect();
+        conn.execute_batch(&format!(
+            "INSERT INTO schema_version (version, applied_at) VALUES {};",
+            versions.join(", ")
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO model_configs (id, name, source, model_name, created_at, updated_at) \
+             VALUES ('m-v11', 'V11 存量模型', 'openai_compat', 'qwen-plus', '2026-05-01', '2026-05-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO model_usage (model_name, day, prompt_tokens, completion_tokens, calls, last_used_at_ms) \
+             VALUES ('qwen-plus', '2026-05-02', 88, 99, 7, 2000)",
+            [],
+        )
+        .unwrap();
+
+        run(&conn).unwrap();
+
+        let (name, price_in, price_out, currency, fallbacks): (
+            String,
+            Option<f64>,
+            Option<f64>,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT name, price_input_per_m, price_output_per_m, price_currency, fallback_ids \
+                 FROM model_configs WHERE id='m-v11'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "V11 存量模型", "存量模型不得被清理");
+        assert!(price_in.is_none() && price_out.is_none(), "存量模型单价必须是「未配置」，不能伪造成 0");
+        assert_eq!(currency, "CNY");
+        assert_eq!(fallbacks, "[]", "存量模型默认无故障转移链");
+
+        let (tokens, latency_total, latency_samples): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT prompt_tokens, latency_ms_total, latency_samples FROM model_usage \
+                 WHERE model_name='qwen-plus' AND day='2026-05-02'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(tokens, 88, "存量用量台账不得被清理");
+        assert_eq!((latency_total, latency_samples), (0, 0), "旧数据没有耗时样本，不能补零平均");
+
+        let costs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM model_usage_cost", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(costs, 0, "新表 model_usage_cost 初始应为空（不伪造历史成本）");
         let max_v: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();

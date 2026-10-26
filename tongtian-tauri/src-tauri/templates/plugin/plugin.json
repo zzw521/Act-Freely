@@ -1,0 +1,14 @@
+{
+  "name": "{{name}}",
+  "version": "0.1.0",
+  "description": "一句话说明这个套件解决什么工作",
+  "author": "",
+  "category": "",
+  "commands": [
+    {
+      "name": "hello",
+      "description": "示例指令：在对话框输入 /hello 取用",
+      "file": "commands/hello.md"
+    }
+  ]
+}

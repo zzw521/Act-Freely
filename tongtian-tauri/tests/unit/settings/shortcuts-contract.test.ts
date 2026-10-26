@@ -305,7 +305,7 @@ describe('dispatchShortcut', () => {
 });
 
 describe('已注册能力清单', () => {
-  it('与处理函数表一致，且都是清单里的 in-app 能力', async () => {
+  it('默认注册清单与处理函数表一致（QuickPick 按设置开关注册）', async () => {
     const { registeredShortcutIds } = await import('../../../src/renderer/lib/use-app-shortcuts');
     const ids = registeredShortcutIds();
     const inAppIds = IN_APP.map((a) => a.id);
@@ -314,7 +314,14 @@ describe('已注册能力清单', () => {
     // 搜索/查找已落地为真实能力，必须出现在注册表里
     expect(ids).toContain('searchAllTasks');
     expect(ids).toContain('searchInTask');
-    // 清单里所有 in-app 能力都真的有处理函数，不设按了没反应的装饰项
+    // QuickPick 未启用时不注册，避免空占一个组合键
+    expect(ids).not.toContain('quickPick');
+  });
+
+  it('启用后清单与能力表完全一致，不留按了没反应的装饰项', async () => {
+    const { registeredShortcutIds } = await import('../../../src/renderer/lib/use-app-shortcuts');
+    const ids = registeredShortcutIds({ quickPickEnabled: true, quickPickMode: '组合键' });
+    const inAppIds = IN_APP.map((a) => a.id);
     expect([...ids].sort()).toEqual([...inAppIds].sort());
   });
 });
@@ -390,7 +397,7 @@ describe('源码接线', () => {
     expect(page).not.toContain("['发送消息', 'Enter 或 Ctrl + Enter']");
     expect(page).toContain('SHORTCUT_ACTIONS.filter((a) => a.group === group)');
     expect(page).toContain('effectiveCombos(overrides)');
-    expect(page).toContain('registeredShortcutIds()');
+    expect(page).toContain('registeredShortcutIds({ quickPickEnabled:');
   });
 
   it('录制入口有 onClick，Esc 取消、撞车当场拒绝', () => {
@@ -404,15 +411,18 @@ describe('源码接线', () => {
 
   it('未注册能力如实展示状态，不自称可录制', () => {
     const page = settingsPage();
-    expect(page).toContain("return { text: '未注册（能力尚未提供）', recordable: false };");
-    expect(page).toContain("return { text: '输入框处理', recordable: false };");
+    expect(page).toContain("return { text: '未注册（能力尚未提供）', recordable: false, active: false };");
+    expect(page).toContain("return { text: '输入框处理', recordable: false, active: true };");
+    // QuickPick 关闭时显示未启用，但仍允许改键（开启后生效）
+    expect(page).toContain("return { text: '未启用', recordable: true, active: false };");
     expect(page).toContain('sub={a.note}');
   });
 
-  it('三处「点击录制」装饰入口已收口为只读的全局触发展示', () => {
+  it('两处「点击录制」装饰入口已收口为只读的全局触发展示', () => {
     const page = settingsPage();
     expect(page).not.toContain('（点击录制）');
-    expect([...page.matchAll(/<GlobalTriggerRow/g)].length).toBe(3);
+    // 语音与应用快照各一处；QuickPick 已是真实可注册能力，不再走只读展示
+    expect([...page.matchAll(/<GlobalTriggerRow/g)].length).toBe(2);
     expect(page).toContain('const GlobalTriggerRow: React.FC<{ label: string; combo: string; sub?: string }>');
   });
 

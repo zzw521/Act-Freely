@@ -1,6 +1,10 @@
 #!/bin/bash
 # 准备随包 Python 运行时（发布方案 B：embeddable 解释器 + pip --target 锁定依赖）
 #
+# 注意：体积/清理统计不要用 MSYS 的 du —— 在 Windows 上对上万文件的 lark_oapi 目录
+# 逐文件 stat 能卡住十几分钟（实测 [6/6] 前的 du -sm 卡了 7 分钟以上），改用随包
+# 解释器原生 os.walk。
+#
 # 产物：vendor/python/  —— 打包时由 tauri.conf.json 的 bundle.resources
 #       以 "../vendor/python" → "python" 随包分发，Rust 侧 bridge::python_env::bundled_python() 优先使用它。
 #       （resources 的相对路径以 tauri.conf.json 所在目录即 src-tauri/ 为基准，故必须放在项目根）
@@ -81,13 +85,119 @@ echo "  ✓ 写入 $(basename "$PTH")"
 # 重新解包再剔除，而只看标记文件则会在锁文件变更时误判 pip 可用、让 [3/6] 直接失败。
 MARKER="$SITE/.tongtian-engine-lock"
 LOCK_HASH=$(sha256sum "$LOCK" | cut -d' ' -f1)
+DRIFT_LIST="$DL/lock-drift.txt"
+
+# 标记文件只证明「按这把锁装过一次」，不证明「装对了」。pip 的 --target 安装看到同名
+# dist-info 就认为需求已满足，于是 site-packages 里可以同时留着 websockets 16.0 的代码和
+# 15.0.1 的元数据（实测踩过：lark-oapi 把锁里的 websockets 降到 15.0.1，磁盘上的 16.0 文件
+# 却没被覆盖，`import websockets` 拿到的是 16.0，而随包锁写着 15.0.1）。
+# 所以「跳过安装」之前必须按锁逐条核对磁盘：每个包只允许一份 dist-info，且版本等于锁定值。
+# PYTHONIOENCODING 必给：Windows 控制台默认 GBK，而这里的判定结果带 ⚠/✓，
+# 编码一崩 python 就以非零退出，bash 只会看到「不一致」却不知道为什么不一致。
+check_lock_on_disk() {
+  : > "$DRIFT_LIST"
+  PYTHONIOENCODING=utf-8 TT_LOCK="$LOCK" TT_SITE="$SITE" TT_DRIFT="$DRIFT_LIST" "$VENDOR/python.exe" - <<'PY'
+import os, pathlib, re
+
+lock = pathlib.Path(os.environ["TT_LOCK"])
+site = pathlib.Path(os.environ["TT_SITE"])
+drift = pathlib.Path(os.environ.get("TT_DRIFT", "")) if os.environ.get("TT_DRIFT") else None
+
+def norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+want = {}
+for raw in lock.read_text(encoding="utf-8").splitlines():
+    line = raw.split("#")[0].strip()
+    if not line or line.startswith("-") or "==" not in line:
+        continue
+    name, version = line.split("==", 1)
+    want[norm(name)] = version.strip()
+
+have: dict[str, list[str]] = {}
+for info in site.glob("*.dist-info"):
+    parts = info.name[: -len(".dist-info")].rsplit("-", 1)
+    if len(parts) != 2:
+        continue
+    have.setdefault(norm(parts[0]), []).append(parts[1])
+
+bad = []
+for name, version in sorted(want.items()):
+    got = sorted(have.get(name, []))
+    if got != [version]:
+        bad.append(f"{name}:{'/'.join(got) or '缺失'}!={version}")
+
+if bad:
+    print("  ⚠ 磁盘与锁不一致：" + "；".join(bad[:6]) + ("…" if len(bad) > 6 else ""))
+    if drift is not None:
+        drift.write_text("\n".join(n for n in (b.split(":")[0] for b in bad)), encoding="utf-8")
+    raise SystemExit(1)
+print(f"  ✓ 磁盘与锁逐条一致（{len(want)} 个包）")
+PY
+}
+
+# 只删「磁盘版本与锁不一致」的那几个包：按它们自己的 RECORD 删文件，任何越出 site-packages
+# 的路径一律拒绝，剩下的交给 pip 重装。
+purge_drifted() {
+  [ -s "$DRIFT_LIST" ] || return 0
+  PYTHONIOENCODING=utf-8 TT_DRIFT="$DRIFT_LIST" TT_SITE="$SITE" "$VENDOR/python.exe" - <<'PY'
+import csv, os, pathlib, re, shutil
+
+def norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+site = pathlib.Path(os.environ["TT_SITE"]).resolve()
+targets = {norm(line.strip()) for line in pathlib.Path(os.environ["TT_DRIFT"]).read_text(encoding="utf-8").splitlines() if line.strip()}
+removed = 0
+for info in list(site.glob("*.dist-info")):
+    stem = info.name[: -len(".dist-info")]
+    if "-" not in stem:
+        continue
+    head, _ = stem.rsplit("-", 1)
+    if norm(head) not in targets:
+        continue
+    record = info / "RECORD"
+    if record.exists():
+        for row in csv.reader(record.read_text(encoding="utf-8", errors="replace").splitlines()):
+            if not row:
+                continue
+            rel = row[0].replace("\\", "/")
+            if not rel or rel.startswith("../") or rel.startswith("/") or ".." in rel.split("/"):
+                continue
+            victim = site / rel
+            if victim.is_file():
+                victim.unlink(missing_ok=True)
+            elif victim.is_dir():
+                shutil.rmtree(victim, ignore_errors=True)
+    shutil.rmtree(info, ignore_errors=True)
+    removed += 1
+
+# RECORD 只删文件，目录会留下来（连 dist-info 都被删掉时连包名都无从得知）；
+# 而 pip --target 看到同名目录存在就整包跳过（"Target directory ... already exists"），
+# 所以把整个 site-packages 下的空壳目录清掉——空目录不承载任何模块，删除是安全的。
+for root, _dirs, _files in os.walk(site, topdown=False):
+    if pathlib.Path(root) == site:
+        continue
+    try:
+        os.rmdir(root)
+    except OSError:
+        pass
+print(f"  已按 RECORD 撤掉 {removed} 份与锁不一致的旧安装记录")
+PY
+}
+
 NEED_INSTALL=1
 if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$LOCK_HASH" ]; then
-  NEED_INSTALL=0
+  if check_lock_on_disk; then
+    NEED_INSTALL=0
+  else
+    echo "  → 标记说装过了，磁盘却不是锁写的那份：撤掉旧记录后重装"
+    purge_drifted
+  fi
 fi
 
 if [ "$NEED_INSTALL" = "0" ]; then
-  echo "[2/6] 依赖已与锁文件一致，无需引导 pip"
+  echo "[2/6] 依赖已与锁文件一致（逐条核对过磁盘），无需引导 pip"
 elif [ -d "$SITE/pip" ]; then
   echo "[2/6] pip 已在 site-packages 中，跳过引导"
 else
@@ -109,7 +219,9 @@ if [ "$NEED_INSTALL" = "0" ]; then
   echo "[3/6] 依赖与 requirements.lock.txt 一致，跳过安装"
 else
   echo "[3/6] 安装 engine/requirements.lock.txt（$(grep -vc '^#' "$LOCK") 个包）..."
-  "$VENDOR/python.exe" -m pip install --no-cache-dir --disable-pip-version-check \
+  # 锁文件是完整传递闭包，不需要 pip 再解析依赖：不加 --no-deps 时，哪怕只缺一个包，
+  # pip 也会为解析把 101 个 wheel 全部重新下载（实测 10 分钟仍未下载完）。
+  "$VENDOR/python.exe" -m pip install --no-cache-dir --disable-pip-version-check --no-deps \
     --target "$SITE" -r "$LOCK" -i "$PIP_INDEX" --trusted-host "$(echo "$PIP_INDEX" | sed -E 's#https?://([^/]+).*#\1#')"
   echo "$LOCK_HASH" > "$MARKER"
 fi
@@ -156,16 +268,38 @@ echo "[4/6] 剔除随包运行时用不到的内容，并补齐 pywin32 DLL..."
 prune_dead_weight
 patch_portable_pywin32
 echo "[5/6] 冒烟测试（真实引擎导入路径）..."
-PYTHONIOENCODING=utf-8 "$VENDOR/python.exe" - <<'PY'
-import importlib, sys
+( cd "$ROOT/engine" && PYTHONIOENCODING=utf-8 "$VENDOR/python.exe" - ) <<'PY'
+import importlib, sys, time
+# 冒烟测试在 engine/ 目录里跑，通道模块才 import 得起来（Windows 解释器读不懂 POSIX 路径，
+# 所以只能用 cwd + 相对路径，不能把 $ROOT 拼进源码字符串）
+sys.path.insert(0, ".")
 # win32api 必须排在 pywintypes 之前：这个“冷启动”顺序正是修复前 DLL load failed 的场景，
 # 谁把它挪到 pywintypes 后面，这一步就会连同顺序隐雷一起失效。
 for mod in ("ssl", "sqlite3", "win32api", "win32job", "win32file", "pywintypes",
-            "uvicorn", "fastapi", "multipart", "agentscope", "dashscope", "openai"):
+            "uvicorn", "fastapi", "multipart", "agentscope", "dashscope", "openai",
+            "dingtalk_stream", "aibot"):
     importlib.import_module(mod)
 import mcp.client.streamable_http as sh
 assert hasattr(sh, "streamablehttp_client"), "mcp 版本与 agentscope 不兼容"
-print(f"  ✓ 导入通过（{sys.version.split()[0]}，{len(sys.path)} 条搜索路径）")
+# 钉钉与企业微信通道的协议都来自随包的官方 SDK：缺任一个依赖，通道会如实退回「尚未接入」，
+# 界面就成了「看得到输入框但永远连不上」——打包前先把这个可能性排除掉
+import slack_channel, dingtalk_channel, wecom_channel
+# 飞书的 lark-oapi 是整包发布（20MB/上万文件，根 __init__ 把全部 API 模块都拉进来说话），
+# 引擎启动不陪它等，只有绑定/启动连接那一次才加载。所以这里分成两段量：先证明注册飞书通道
+# 这件事在启动侧几乎是免费的，再证明随包运行时真的加载得动它——两段缺一都算随包件不合格。
+boot_at = time.perf_counter()
+import feishu_channel
+boot_cost = time.perf_counter() - boot_at
+assert "lark_oapi" not in sys.modules, "引擎启动阶段就把官方飞书 SDK 拉进来了（「绑定时才加载」的契约破了）"
+assert feishu_channel.SDK_PRESENT is True, "随包运行时缺 lark_oapi，连 find_spec 都没探到"
+lark_at = time.perf_counter()
+importlib.import_module("lark_oapi")
+lark_cost = time.perf_counter() - lark_at
+missing = [c.kind for c in (dingtalk_channel.DingTalkStreamChannel, wecom_channel.WeComAibotChannel,
+                            feishu_channel.FeishuChannel) if not c.supported]
+assert not missing, f"随包运行时缺 IM 协议依赖，通道退回未接入：{missing}"
+print(f"  ✓ 导入通过（{sys.version.split()[0]}，{len(sys.path)} 条搜索路径，IM 通道协议齐全）")
+print(f"    飞书：启动侧注册 {boot_cost:.2f}s 且不加载 SDK；整包 import {lark_cost:.1f}s（绑定/启动连接时才付这一次）")
 PY
 "$VENDOR/python.exe" -m uvicorn --version >/dev/null && echo "  ✓ uvicorn 可执行"
 
@@ -195,7 +329,18 @@ fi
 echo "  ✓ 引擎启动正常：$HEALTH"
 
 # ── [6/6] 结果 ──────────────────────────────────────────────
-SIZE=$(du -sm "$VENDOR" | cut -f1)
+SIZE=$("$VENDOR/python.exe" - "$VENDOR" <<'PY'
+import os, sys
+total = 0
+for root, _dirs, files in os.walk(sys.argv[1]):
+    for name in files:
+        try:
+            total += os.path.getsize(os.path.join(root, name))
+        except OSError:
+            pass
+print(total // 1048576)
+PY
+)
 echo "[6/6] 完成：vendor/python 共 ${SIZE} MB（未压缩）"
 echo "-----------------------------------------"
 echo "  解释器:   $VENDOR/python.exe"

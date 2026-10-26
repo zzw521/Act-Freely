@@ -108,7 +108,7 @@ describe('任务栏清单区交互', () => {
 
   it('技能与连接器逐项展示真实名称与状态，禁用/需重装如实标注', () => {
     const src = monitor();
-    expect(src).toContain('{s.readable ? s.name : `${s.name}（需重装）`}');
+    expect(src).toContain("s.readable ? s.name : tr('{name}（需重装）', { name: s.name })");
     expect(src).toContain("s.enabled ? '#E6F7F4' : '#F3F4F6'");
     expect(src).toContain("s.status === 'connected'");
     expect(src).toContain("'已连接'");

@@ -192,16 +192,26 @@ describe('useSecurityStore：沙箱策略', () => {
 // ── 审计日志：查询与导出 ──────────────────────────────────────
 
 describe('useSecurityStore：审计日志', () => {
-  it('查询返回种子日志且按动作过滤有效', async () => {
-    await useSecurityStore.getState().loadAuditLogs();
-    expect(useSecurityStore.getState().auditLogs.length).toBeGreaterThan(0);
-    expect(useSecurityStore.getState().logError).toBeNull();
+  it('台账里不得出现本次会话之外的历史（原来的编造样本已删）', async () => {
+    const startedAt = Date.now() - 1000;
+    await useSecurityStore.getState().scanData('内部文件：采购合同');
+    const logs = (await win.tongtianAPI!.invoke('audit:query')) as Array<{
+      timestamp: string;
+      action: string;
+      details: string;
+    }>;
+    expect(logs.length).toBeGreaterThan(0);
+    expect(logs.every((l) => Date.parse(l.timestamp) >= startedAt)).toBe(true);
+    expect(logs.some((l) => l.details.includes('842ms') || l.details === '网页验证登录成功')).toBe(false);
+  });
 
-    const filtered = (await win.tongtianAPI!.invoke('audit:query', { type: 'sandbox_violation' })) as Array<{
+  it('按动作过滤只返回该类条目（过滤的是真实条目）', async () => {
+    await useSecurityStore.getState().scanData('一段普通文本');
+    const checks = (await win.tongtianAPI!.invoke('audit:query', { type: 'data_check' })) as Array<{
       action: string;
     }>;
-    expect(filtered.length).toBeGreaterThan(0);
-    expect(filtered.every((l) => l.action === 'sandbox_violation')).toBe(true);
+    expect(checks.length).toBeGreaterThan(0);
+    expect(checks.every((l) => l.action === 'data_check')).toBe(true);
   });
 
   it('分级检测会留审计痕迹（配置变更动作）', async () => {
@@ -212,6 +222,7 @@ describe('useSecurityStore：审计日志', () => {
   });
 
   it('导出返回落盘路径与条数，并追加一条 file_write 审计', async () => {
+    await useSecurityStore.getState().scanData('导出前的真实条目');
     const result = await useSecurityStore.getState().exportAuditLogs('csv');
     expect(result.format).toBe('csv');
     expect(result.path.endsWith('.csv')).toBe(true);
@@ -220,9 +231,12 @@ describe('useSecurityStore：审计日志', () => {
     expect(writes.length).toBeGreaterThan(0);
   });
 
-  it('新增审计条目 id 与种子条目不冲突（React key 唯一）', async () => {
+  it('每条审计 id 唯一（React key 不冲突）', async () => {
+    await useSecurityStore.getState().scanData('第一条');
+    await useSecurityStore.getState().scanData('第二条');
     const logs = (await win.tongtianAPI!.invoke('audit:query')) as Array<{ id: string }>;
     const ids = logs.map((l) => l.id);
+    expect(ids.length).toBeGreaterThan(1);
     expect(new Set(ids).size).toBe(ids.length);
   });
 

@@ -2,8 +2,8 @@
  * 通天办公 - 账号登录态状态管理（网页验证登录 · Loopback 方案）
  *
  * 数据源：Rust auth command（auth_status/auth_login/auth_logout）。
- * Mock 开关语义与后端一致：TT_AUTH_MOCK 开启时登录为模拟用户直登，
- * 关闭时拉起浏览器网页登录并经 loopback 回调完成闭环。
+ * 默认连接综合服务端做真实账号验证：拉起浏览器网页登录并等 loopback 回调。
+ * 仅当显式 TT_AUTH_MOCK=true 时为模拟用户直登（离线开发）。
  *
  * localStorage 兜底：引擎直连/IPC 异常时 status 返回空（已知陷阱），
  * 以本地缓存还原登录态显示，避免刷新丢失。

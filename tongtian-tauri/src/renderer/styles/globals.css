@@ -17,6 +17,13 @@
   --tt-text-4: #9ca3af;
   --tt-shadow-card: 0 1px 3px rgba(15, 23, 42, 0.06);
   --tt-sidebar-bg: linear-gradient(180deg, #fbfcff 0%, #f6f8fe 55%, #f4f7fd 100%);
+  /* 对话区表面：暗色/皮肤下不能再用写死的白，否则浅字压白底看不清 */
+  --tt-chat-assistant-bg: #ffffff;
+  --tt-chat-process-bg: #fbfcfd;
+  --tt-chat-code-bg: #f8fafc;
+  /* 对话正文与输入框字体（设置页「对话字体」） */
+  --tt-chat-font: 'PingFang SC', 'Microsoft YaHei', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    Roboto, 'Helvetica Neue', Arial, sans-serif;
 }
 
 html[data-theme='dark'] {
@@ -32,6 +39,154 @@ html[data-theme='dark'] {
   --tt-text-4: #64748b;
   --tt-shadow-card: 0 1px 3px rgba(0, 0, 0, 0.35);
   --tt-sidebar-bg: linear-gradient(180deg, #16213a 0%, #131c31 55%, #101828 100%);
+  --tt-chat-assistant-bg: #1e293b;
+  --tt-chat-process-bg: #1a2537;
+  --tt-chat-code-bg: #162033;
+}
+
+/* ── 对话字体：仅正文与输入框，不改变应用其余字体 ── */
+html[data-chat-font='serif'] {
+  --tt-chat-font: 'Songti SC', 'Noto Serif SC', 'Source Han Serif SC', STSong, SimSun, Georgia,
+    'Times New Roman', serif;
+}
+
+/* ── 界面风格：默认（上面即是）/ 玻璃 / 经典 / 羊皮纸 ─────────────────
+   皮肤只覆盖语义变量与少量全局表面，组件无需逐个感知（设置页偏好即时生效）。 */
+html[data-ui-style='glass'] {
+  --tt-bg: #eef4f8;
+  --tt-surface: rgba(255, 255, 255, 0.62);
+  --tt-surface-2: rgba(248, 250, 252, 0.55);
+  --tt-surface-3: rgba(241, 245, 249, 0.62);
+  --tt-border: rgba(148, 163, 184, 0.28);
+  --tt-border-soft: rgba(148, 163, 184, 0.18);
+  --tt-shadow-card: 0 10px 30px rgba(15, 23, 42, 0.1);
+  --tt-sidebar-bg: linear-gradient(
+    180deg,
+    rgba(240, 253, 250, 0.82) 0%,
+    rgba(238, 242, 255, 0.78) 55%,
+    rgba(253, 242, 248, 0.8) 100%
+  );
+  --tt-chat-assistant-bg: rgba(255, 255, 255, 0.68);
+  --tt-chat-process-bg: rgba(248, 250, 252, 0.66);
+  --tt-chat-code-bg: rgba(241, 245, 249, 0.72);
+}
+
+html[data-theme='dark'][data-ui-style='glass'] {
+  --tt-bg: #0b1220;
+  --tt-surface: rgba(30, 41, 59, 0.62);
+  --tt-surface-2: rgba(36, 50, 74, 0.58);
+  --tt-surface-3: rgba(43, 58, 85, 0.62);
+  --tt-border: rgba(148, 163, 184, 0.26);
+  --tt-border-soft: rgba(148, 163, 184, 0.16);
+  --tt-shadow-card: 0 12px 34px rgba(0, 0, 0, 0.34);
+  --tt-sidebar-bg: linear-gradient(
+    180deg,
+    rgba(22, 33, 58, 0.8) 0%,
+    rgba(19, 28, 49, 0.76) 55%,
+    rgba(26, 16, 36, 0.8) 100%
+  );
+  --tt-chat-assistant-bg: rgba(30, 41, 59, 0.68);
+  --tt-chat-process-bg: rgba(26, 37, 55, 0.7);
+  --tt-chat-code-bg: rgba(15, 23, 42, 0.72);
+}
+
+html[data-ui-style='classic'] {
+  --tt-bg: #f0f0f0;
+  --tt-surface: #ffffff;
+  --tt-surface-2: #f7f7f7;
+  --tt-surface-3: #ebebeb;
+  --tt-border: #9ca3af;
+  --tt-border-soft: #d1d5db;
+  --tt-text-1: #111827;
+  --tt-text-2: #1f2937;
+  --tt-text-3: #4b5563;
+  --tt-text-4: #6b7280;
+  --tt-shadow-card: none;
+  --tt-sidebar-bg: #e8e8e8;
+  --tt-chat-assistant-bg: #ffffff;
+  --tt-chat-process-bg: #f7f7f7;
+  --tt-chat-code-bg: #f0f0f0;
+}
+
+html[data-theme='dark'][data-ui-style='classic'] {
+  --tt-bg: #111827;
+  --tt-surface: #1f2937;
+  --tt-surface-2: #273244;
+  --tt-surface-3: #303c50;
+  --tt-border: #4b5563;
+  --tt-border-soft: #374151;
+  --tt-sidebar-bg: #182132;
+  --tt-chat-assistant-bg: #1f2937;
+  --tt-chat-process-bg: #182132;
+  --tt-chat-code-bg: #111827;
+}
+
+html[data-ui-style='parchment'] {
+  --tt-bg: #f3e8d2;
+  --tt-surface: #fbf3e3;
+  --tt-surface-2: #f5ebd8;
+  --tt-surface-3: #efe2c8;
+  --tt-border: #d8c3a0;
+  --tt-border-soft: #e6d6ba;
+  --tt-text-1: #3b2f23;
+  --tt-text-2: #52432f;
+  --tt-text-3: #7a6650;
+  --tt-text-4: #9b866d;
+  --tt-shadow-card: 0 2px 8px rgba(90, 66, 38, 0.12);
+  --tt-sidebar-bg: linear-gradient(180deg, #f7eeda 0%, #efe0c4 100%);
+  --tt-chat-assistant-bg: #fdf7ea;
+  --tt-chat-process-bg: #f8efdd;
+  --tt-chat-code-bg: #f2e6cf;
+}
+
+html[data-theme='dark'][data-ui-style='parchment'] {
+  --tt-bg: #241d16;
+  --tt-surface: #31281e;
+  --tt-surface-2: #3a2f24;
+  --tt-surface-3: #44372a;
+  --tt-border: #5b4a36;
+  --tt-border-soft: #4a3b2b;
+  --tt-text-1: #f3e7d3;
+  --tt-text-2: #ddcbb0;
+  --tt-text-3: #bfa98b;
+  --tt-text-4: #9a866c;
+  --tt-shadow-card: 0 2px 10px rgba(0, 0, 0, 0.4);
+  --tt-sidebar-bg: linear-gradient(180deg, #2b2219 0%, #221b14 100%);
+  --tt-chat-assistant-bg: #352b20;
+  --tt-chat-process-bg: #2c241b;
+  --tt-chat-code-bg: #241d16;
+}
+
+/* 皮肤级的全局表面处理：只动外壳，不重排组件 */
+html[data-ui-style='glass'] .MuiDrawer-paper,
+html[data-ui-style='glass'] .MuiDialog-paper,
+html[data-ui-style='glass'] .MuiMenu-paper,
+html[data-ui-style='glass'] .MuiPopover-paper {
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+}
+
+html[data-ui-style='classic'] .MuiPaper-root,
+html[data-ui-style='classic'] .MuiButton-root,
+html[data-ui-style='classic'] .MuiOutlinedInput-root,
+html[data-ui-style='classic'] .MuiChip-root {
+  border-radius: 4px !important;
+}
+
+html[data-ui-style='parchment'] .MuiPaper-root {
+  background-image: radial-gradient(circle at 15% 0%, rgba(255, 250, 240, 0.55), transparent 60%);
+}
+
+html[data-ui-style='parchment'] .MuiDialogTitle-root,
+html[data-ui-style='parchment'] .MuiTypography-h1,
+html[data-ui-style='parchment'] .MuiTypography-h2,
+html[data-ui-style='parchment'] .MuiTypography-h3 {
+  font-family: 'Songti SC', 'Noto Serif SC', STSong, SimSun, Georgia, serif;
+}
+
+/* 风格切换时不做大面积动画，避免整页闪烁 */
+html[data-ui-style] body {
+  background-attachment: fixed;
 }
 
 @layer base {
@@ -118,6 +273,7 @@ html[data-theme='dark'] {
     font-size: 14px;
     line-height: 1.7;
     word-break: break-word;
+    font-family: var(--tt-chat-font);
   }
 
   .markdown-body > *:first-child {
@@ -183,7 +339,7 @@ html[data-theme='dark'] {
     border-left: 3px solid #22c55e;
     border-radius: 0 8px 8px 0;
     background: rgba(34, 197, 94, 0.06);
-    color: #475569;
+    color: var(--tt-text-3);
   }
 
   .markdown-body table {
@@ -196,12 +352,12 @@ html[data-theme='dark'] {
   .markdown-body th,
   .markdown-body td {
     padding: 8px 12px;
-    border: 1px solid #e2e8f0;
+    border: 1px solid var(--tt-border);
     text-align: left;
   }
 
   .markdown-body th {
-    background: #f8fafc;
+    background: var(--tt-surface-2);
     font-weight: 600;
   }
 
@@ -217,6 +373,6 @@ html[data-theme='dark'] {
   .markdown-body hr {
     margin: 1em 0;
     border: none;
-    border-top: 1px solid #e2e8f0;
+    border-top: 1px solid var(--tt-border);
   }
 }

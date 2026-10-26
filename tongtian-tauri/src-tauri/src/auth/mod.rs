@@ -6,7 +6,8 @@
 //!                loopback 回调收码 → state 校验 → code 换 token → 持久化
 //! - auth_logout: 尽力远端吊销 → 清理 keyring/profile（本地任务/会话保留）
 //!
-//! Mock 开关（开发规范）：TT_AUTH_MOCK 缺省开启；联调设 false。
+//! 默认连接综合服务端（tontian-server，127.0.0.1:8000）做真实账号验证；
+//! 离线开发可设 TT_AUTH_MOCK=true 走模拟登录。
 
 pub mod service;
 
@@ -37,7 +38,7 @@ fn end_login() {
     *LOGIN_BUSY.lock().unwrap_or_else(|e| e.into_inner()) = false;
 }
 
-/// 登录态查询：`{loggedIn, profile, mock}`
+/// 登录态查询：`{loggedIn, profile, mock, serverUrl}`
 #[tauri::command]
 pub async fn auth_status(p0: State<'_, Arc<P0Services>>) -> Result<Value, String> {
     let profile = service::load_profile(&p0.store);
@@ -45,7 +46,15 @@ pub async fn auth_status(p0: State<'_, Arc<P0Services>>) -> Result<Value, String
         "loggedIn": profile.is_some(),
         "profile": profile,
         "mock": service::mock_enabled(),
+        "serverUrl": service::auth_server_url(&p0.store),
     }))
+}
+
+/// 账号服务连通性探测：不抛错，失败原因放在 `error` 供设置页如实展示
+#[tauri::command]
+pub async fn auth_server_probe(p0: State<'_, Arc<P0Services>>) -> Result<Value, String> {
+    let base = service::auth_server_url(&p0.store);
+    Ok(service::probe_server_view(&base).await)
 }
 
 /// 登录：Mock 模式模拟用户直登；真实模式走网页验证 + loopback 回调闭环
@@ -106,15 +115,18 @@ pub async fn auth_login(
     result
 }
 
-/// 真实网页登录闭环：loopback 监听 → 拉起浏览器 → 等回调 → 校验 → 换 token
+/// 真实网页登录闭环：探活综合服务端 → loopback 监听 → 拉起浏览器 → 等回调 → 校验 → 换 token
 async fn real_login(app: &AppHandle, p0: &Arc<P0Services>) -> Result<Value, String> {
+    // 先确认服务可用，避免把浏览器打开在一个连不上的地址上空等 120 秒
+    let base = service::auth_server_url(&p0.store);
+    service::ensure_server_ready(&base).await?;
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| format!("CALLBACK_BIND_FAILED: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
 
     let state = service::gen_state();
-    let base = service::auth_server_url();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
     let login_url = format!(
         "{base}/auth/login?state={state}&redirect_uri={}",
@@ -165,7 +177,7 @@ pub async fn auth_logout(
     // 尽力而为的远端 session 吊销（Mock token 与服务不可达均不阻断）
     if let Some(refresh) = p0.store.vault().get_secret(service::REFRESH_ACCOUNT) {
         if !refresh.starts_with("mock-") {
-            service::revoke_remote(&service::auth_server_url(), &refresh).await;
+            service::revoke_remote(&service::auth_server_url(&p0.store), &refresh).await;
         }
     }
 

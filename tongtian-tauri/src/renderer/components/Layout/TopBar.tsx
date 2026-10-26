@@ -37,6 +37,8 @@ const routeTitles: Record<string, string> = {
   '/': '工作台',
   '/model-hub': '模型中心',
   '/security': '安全合规',
+  '/expert-suites': '专家套件',
+  '/knowledge': '知识库',
   '/skill-market': '技能市场',
   '/workspace': '工作区',
   '/files': '文件管理',

@@ -13,15 +13,33 @@ import type {
   AwarenessPatch,
   AwarenessProfile,
   AwarenessView,
+  AcpConfigState,
+  AcpServerStatus,
+  BrowserUseCapabilities,
+  BrowserUsePolicy,
+  BrowserUseSession,
+  ComputerUseCapabilities,
+  ComputerUseCapture,
   ComputerUsePolicy,
-  ConnectorState,
   HookConfigStore,
   HookEventName,
   HookResult,
+  HooksStatus,
+  ImChannelsSnapshot,
+  ImPreferences,
   MemoryEntry,
   ProxyStatus,
+  RemoteDesktopCapabilities,
+  RemoteDesktopFrame,
+  RemoteDesktopSession,
+  RemoteDesktopStartResp,
+  RemoteDesktopStopResp,
   SystemCapability,
   SystemPermissionStatus,
+  TerminalAiResult,
+  TerminalCapabilities,
+  TerminalReadResult,
+  TerminalSessionInfo,
 } from '../../shared/contracts';
 import { handleLocalAlignmentChannel } from './alignment-local';
 import { handleLocalAwarenessChannel } from './awareness-local';
@@ -90,8 +108,8 @@ const DEFAULT_SETTINGS: Partial<AppSettingsData> = {
   previewMode: '应用内预览',
   promptSuggestion: true,
   expandToolCalls: false,
-  imShowToolProcess: false,
   autoStart: false,
+  runInBackground: false,
   keepAwake: true,
   desktopNotify: true,
   badgeUnread: true,
@@ -104,9 +122,16 @@ const DEFAULT_SETTINGS: Partial<AppSettingsData> = {
   snapshotEnabled: false,
   quickPickEnabled: false,
   computerUsePolicy: 'ask_every_time',
+  browserUsePolicy: 'ask_every_time',
+  piiOutboundMode: 'off',
+  toolApprovalMode: 'off',
+  agentMaxIters: 8,
+  agentAutoCompress: true,
+  agentLazyMcpTools: true,
   secureEnv: false,
   workbenchModes: ['general', 'design', 'slides'],
   workbenchDefaultMode: 'general',
+  pptxTemplateId: 'business-blue',
   shortcuts: {},
   experiments: {},
 };
@@ -244,13 +269,25 @@ export async function getHooks(): Promise<HookConfigStore> {
   return local<HookConfigStore>(IPC_CHANNELS.HOOKS_GET, []);
 }
 
-export async function setHooks(config: HookConfigStore): Promise<void> {
+/**
+ * 保存 Hook 配置。返回里带 `revoked`：配置里已删除的命令，其放行同时作废，
+ * 页面必须把这件事说出来，否则用户会以为「删了再加回来」还要再点一次放行。
+ */
+export async function setHooks(
+  config: HookConfigStore,
+): Promise<{ ok: boolean; events: number; revoked: string[] }> {
   const api = getAPI();
   if (api) {
-    await api.invoke(IPC_CHANNELS.HOOKS_SET, config);
-    return;
+    return (await api.invoke(IPC_CHANNELS.HOOKS_SET, config)) as {
+      ok: boolean;
+      events: number;
+      revoked: string[];
+    };
   }
-  local(IPC_CHANNELS.HOOKS_SET, [config]);
+  return local<{ ok: boolean; events: number; revoked: string[] }>(
+    IPC_CHANNELS.HOOKS_SET,
+    [config],
+  );
 }
 
 /**
@@ -263,6 +300,38 @@ export async function testHook(event: HookEventName, command: string): Promise<H
     return (await api.invoke(IPC_CHANNELS.HOOKS_TEST, { event, command })) as HookResult;
   }
   return local<HookResult>(IPC_CHANNELS.HOOKS_TEST, [{ event, command }]);
+}
+
+/**
+ * `hooks:status`：执行面事实（配了几条 / 哪些事件真有触发点 / 哪些还没放行）。
+ * 网关地址与 token 不下发到这里——渲染层只拿决策需要的部分。
+ */
+export async function getHooksStatus(): Promise<HooksStatus> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.HOOKS_STATUS)) as HooksStatus;
+  }
+  return local<HooksStatus>(IPC_CHANNELS.HOOKS_STATUS, []);
+}
+
+/** 放行一条 Hook 命令：只有放行过的命令才会在真实任务里由本机拉起 */
+export async function grantHook(event: HookEventName, command: string): Promise<void> {
+  const api = getAPI();
+  if (api) {
+    await api.invoke(IPC_CHANNELS.HOOKS_GRANT, { event, command });
+    return;
+  }
+  local(IPC_CHANNELS.HOOKS_GRANT, [{ event, command }]);
+}
+
+/** 撤销放行：只删授权记录，配置原样保留 */
+export async function revokeHook(command: string): Promise<void> {
+  const api = getAPI();
+  if (api) {
+    await api.invoke(IPC_CHANNELS.HOOKS_REVOKE, { command });
+    return;
+  }
+  local(IPC_CHANNELS.HOOKS_REVOKE, [{ command }]);
 }
 
 // ── Awareness（画像 + 四个能力文件 + 长期记忆条目） ────────────
@@ -322,38 +391,6 @@ export async function deleteMemory(id: string): Promise<{ ok: boolean; id: strin
     return (await api.invoke(IPC_CHANNELS.AWARENESS_MEMORY_DELETE, { id })) as { ok: boolean; id: string };
   }
   return localAwareness<{ ok: boolean; id: string }>(IPC_CHANNELS.AWARENESS_MEMORY_DELETE, [{ id }]);
-}
-
-// ── Connectors ──────────────────────────────────────────────
-
-export async function listConnectors(): Promise<ConnectorState[]> {
-  const api = getAPI();
-  if (api) {
-    return (await api.invoke(IPC_CHANNELS.CONNECTOR_LIST)) as ConnectorState[];
-  }
-  return local<ConnectorState[]>(IPC_CHANNELS.CONNECTOR_LIST, []);
-}
-
-export async function authorizeConnector(
-  connectorId: string,
-  category: 'builtin' | 'market',
-  serverRef?: string,
-): Promise<void> {
-  const api = getAPI();
-  if (api) {
-    await api.invoke(IPC_CHANNELS.CONNECTOR_AUTHORIZE, { connectorId, category, serverRef });
-    return;
-  }
-  local(IPC_CHANNELS.CONNECTOR_AUTHORIZE, [{ connectorId, category, serverRef }]);
-}
-
-export async function revokeConnector(connectorId: string): Promise<void> {
-  const api = getAPI();
-  if (api) {
-    await api.invoke(IPC_CHANNELS.CONNECTOR_REVOKE, { connectorId });
-    return;
-  }
-  local(IPC_CHANNELS.CONNECTOR_REVOKE, [{ connectorId }]);
 }
 
 // ── Archive ─────────────────────────────────────────────────
@@ -442,4 +479,347 @@ export async function setComputerUsePolicy(policy: ComputerUsePolicy): Promise<v
     return;
   }
   local(IPC_CHANNELS.COMPUTER_USE_SET_POLICY, [{ policy }]);
+}
+
+/**
+ * 执行器真实能力视图：平台、档位、网关与不可用原因都以 Rust/本地权威实现为准。
+ * 页面用它决定截屏自检是否可点，不能拿设置里保存的档位当「现在能用」。
+ */
+export async function getComputerUseCapabilities(): Promise<ComputerUseCapabilities> {
+  const api = getAPI();
+  if (api) {
+    const r = (await api.invoke(IPC_CHANNELS.COMPUTER_USE_CAPABILITIES)) as
+      | ComputerUseCapabilities
+      | null;
+    if (r && typeof r === 'object' && !Array.isArray(r)) return r;
+    throw new Error('COMPUTER_USE_UNSUPPORTED: 桌面通道没有返回电脑操控能力视图');
+  }
+  return local<ComputerUseCapabilities>(IPC_CHANNELS.COMPUTER_USE_CAPABILITIES, []);
+}
+
+/**
+ * 用户主动触发的截屏自检。
+ * 桌面端由 Rust 按当前档位确认后执行（每次询问会弹系统确认框），
+ * 图片只回传到当前页面内存用于预览，不落盘；浏览器/Mock 如实抛 COMPUTER_USE_UNSUPPORTED。
+ */
+export async function captureComputerUseScreen(): Promise<ComputerUseCapture> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.COMPUTER_USE_CAPTURE)) as ComputerUseCapture;
+  }
+  return local<ComputerUseCapture>(IPC_CHANNELS.COMPUTER_USE_CAPTURE, []);
+}
+
+// ── Remote Desktop（本机实时画面；只看不控） ────────────────
+
+export async function getRemoteDesktopCapabilities(): Promise<RemoteDesktopCapabilities> {
+  const api = getAPI();
+  if (api) {
+    const r = (await api.invoke(IPC_CHANNELS.REMOTE_DESKTOP_CAPABILITIES)) as
+      | RemoteDesktopCapabilities
+      | null;
+    if (r && typeof r === 'object' && !Array.isArray(r)) return r;
+    throw new Error('REMOTE_UNSUPPORTED: 桌面通道没有返回远程桌面能力视图');
+  }
+  return local<RemoteDesktopCapabilities>(IPC_CHANNELS.REMOTE_DESKTOP_CAPABILITIES, []);
+}
+
+export async function getRemoteDesktopStatus(): Promise<RemoteDesktopSession> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.REMOTE_DESKTOP_STATUS)) as RemoteDesktopSession;
+  }
+  return local<RemoteDesktopSession>(IPC_CHANNELS.REMOTE_DESKTOP_STATUS, []);
+}
+
+/** 开启会话：Rust 按电脑操控档位确认后签发 10 分钟会话（只看不控） */
+export async function startRemoteDesktop(): Promise<RemoteDesktopStartResp> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.REMOTE_DESKTOP_START)) as RemoteDesktopStartResp;
+  }
+  return local<RemoteDesktopStartResp>(IPC_CHANNELS.REMOTE_DESKTOP_START, []);
+}
+
+/** 取一帧：间隔不足返回 throttled（不重复截屏）；到期抛 REMOTE_SESSION_EXPIRED */
+export async function fetchRemoteDesktopFrame(): Promise<RemoteDesktopFrame> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.REMOTE_DESKTOP_FRAME)) as RemoteDesktopFrame;
+  }
+  return local<RemoteDesktopFrame>(IPC_CHANNELS.REMOTE_DESKTOP_FRAME, []);
+}
+
+export async function stopRemoteDesktop(): Promise<RemoteDesktopStopResp> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.REMOTE_DESKTOP_STOP)) as RemoteDesktopStopResp;
+  }
+  return local<RemoteDesktopStopResp>(IPC_CHANNELS.REMOTE_DESKTOP_STOP, []);
+}
+
+// ── Browser Use ─────────────────────────────────────────────
+
+export async function getBrowserUsePolicy(): Promise<BrowserUsePolicy> {
+  const api = getAPI();
+  if (api) {
+    const res = (await api.invoke(IPC_CHANNELS.BROWSER_USE_GET_POLICY)) as {
+      policy: BrowserUsePolicy;
+    };
+    return res.policy;
+  }
+  return local<{ policy: BrowserUsePolicy }>(IPC_CHANNELS.BROWSER_USE_GET_POLICY, []).policy;
+}
+
+export async function setBrowserUsePolicy(policy: BrowserUsePolicy): Promise<void> {
+  const api = getAPI();
+  if (api) {
+    await api.invoke(IPC_CHANNELS.BROWSER_USE_SET_POLICY, { policy });
+    return;
+  }
+  local(IPC_CHANNELS.BROWSER_USE_SET_POLICY, [{ policy }]);
+}
+
+/**
+ * 受控浏览器真实能力视图：浏览器、档位、网关与会话状态以 Rust/本地权威实现为准。
+ * 「保存了档位」不等于「现在能用」，页面必须看这份视图。
+ */
+export async function getBrowserUseCapabilities(): Promise<BrowserUseCapabilities> {
+  const api = getAPI();
+  if (api) {
+    const r = (await api.invoke(IPC_CHANNELS.BROWSER_USE_CAPABILITIES)) as
+      | BrowserUseCapabilities
+      | null;
+    if (r && typeof r === 'object' && !Array.isArray(r)) return r;
+    throw new Error('BROWSER_USE_SESSION_FAILED: 桌面通道没有返回浏览器能力视图');
+  }
+  return local<BrowserUseCapabilities>(IPC_CHANNELS.BROWSER_USE_CAPABILITIES, []);
+}
+
+/** 启动受控浏览器（用户主动；档位为禁用时 Rust 拒绝） */
+export async function startBrowserUseSession(): Promise<BrowserUseSession> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.BROWSER_USE_START)) as BrowserUseSession;
+  }
+  return local<BrowserUseSession>(IPC_CHANNELS.BROWSER_USE_START, []);
+}
+
+/** 结束本应用启动的受控浏览器；不会动用户日常浏览器 */
+export async function stopBrowserUseSession(): Promise<BrowserUseSession> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.BROWSER_USE_STOP)) as BrowserUseSession;
+  }
+  return local<BrowserUseSession>(IPC_CHANNELS.BROWSER_USE_STOP, []);
+}
+
+// ── 终端 AI+ 与 ACP ─────────────────────────────────────────
+
+/**
+ * 终端真实能力视图：开关、shell、管道限制与 ACP 配置。
+ * 「设置里保存了开关」不等于「现在能用」——浏览器/Mock 通道没有本机进程，
+ * 这里会返回 enabled=false 与可读原因，页面据此禁用入口。
+ */
+export async function getTerminalCapabilities(): Promise<TerminalCapabilities> {
+  const api = getAPI();
+  if (api) {
+    const r = (await api.invoke(IPC_CHANNELS.TERMINAL_CAPABILITIES)) as
+      | TerminalCapabilities
+      | null;
+    if (r && typeof r === 'object' && !Array.isArray(r)) return r;
+    throw new Error('TERMINAL_STATE_FAILED: 桌面通道没有返回终端能力视图');
+  }
+  return local<TerminalCapabilities>(IPC_CHANNELS.TERMINAL_CAPABILITIES, []);
+}
+
+/** 显式开启/关闭终端 AI+（高风险动作，Rust 侧写审计） */
+export async function setTerminalEnabled(enabled: boolean): Promise<void> {
+  const api = getAPI();
+  if (api) {
+    await api.invoke(IPC_CHANNELS.TERMINAL_SET_POLICY, { enabled });
+    return;
+  }
+  local(IPC_CHANNELS.TERMINAL_SET_POLICY, [{ enabled }]);
+}
+
+/** 在真实 shell 中开会话；cwd 必须是已存在目录 */
+export async function openTerminal(
+  cwd: string,
+  workspaceId?: string,
+): Promise<TerminalSessionInfo> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.TERMINAL_OPEN, {
+      cwd,
+      workspaceId: workspaceId ?? null,
+    })) as TerminalSessionInfo;
+  }
+  return local<TerminalSessionInfo>(IPC_CHANNELS.TERMINAL_OPEN, [{ cwd, workspaceId }]);
+}
+
+/**
+ * 写入 shell。source 只用于审计口径：manual=用户键入/粘贴，ai=执行 AI 建议。
+ * 两条路径都必须由用户在界面上主动触发，AI 自身没有写入能力。
+ */
+export async function writeTerminal(
+  sessionId: string,
+  data: string,
+  source: 'manual' | 'ai' = 'manual',
+): Promise<void> {
+  const api = getAPI();
+  if (api) {
+    await api.invoke(IPC_CHANNELS.TERMINAL_INPUT, { sessionId, data, source });
+    return;
+  }
+  local(IPC_CHANNELS.TERMINAL_INPUT, [{ sessionId, data, source }]);
+}
+
+/** 增量读取：传入上次的 offset，只拿新输出 */
+export async function readTerminal(
+  sessionId: string,
+  offset: number,
+): Promise<TerminalReadResult> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.TERMINAL_READ, {
+      sessionId,
+      offset,
+    })) as TerminalReadResult;
+  }
+  return local<TerminalReadResult>(IPC_CHANNELS.TERMINAL_READ, [{ sessionId, offset }]);
+}
+
+export async function closeTerminal(sessionId: string): Promise<void> {
+  const api = getAPI();
+  if (api) {
+    await api.invoke(IPC_CHANNELS.TERMINAL_CLOSE, { sessionId });
+    return;
+  }
+  local(IPC_CHANNELS.TERMINAL_CLOSE, [{ sessionId }]);
+}
+
+/** 根据最近输出让模型给命令建议；永不执行，执行只由用户逐条确认 */
+export async function suggestTerminalCommand(
+  sessionId: string,
+  question: string,
+  modelId?: string,
+): Promise<TerminalAiResult> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.TERMINAL_AI, {
+      sessionId,
+      question,
+      modelId: modelId ?? null,
+    })) as TerminalAiResult;
+  }
+  return local<TerminalAiResult>(IPC_CHANNELS.TERMINAL_AI, [{ sessionId, question, modelId }]);
+}
+
+/** ACP 客户端配置（外部编码 Agent 的启动命令与审批策略） */
+export async function getAcpConfig(): Promise<AcpConfigState> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.ACP_GET_CONFIG)) as AcpConfigState;
+  }
+  return local<AcpConfigState>(IPC_CHANNELS.ACP_GET_CONFIG, []);
+}
+
+export async function setAcpConfig(input: {
+  enabled: boolean;
+  command: string;
+  permission: string;
+  timeoutSeconds: number;
+}): Promise<void> {
+  const api = getAPI();
+  if (api) {
+    await api.invoke(IPC_CHANNELS.ACP_SET_CONFIG, input);
+    return;
+  }
+  local(IPC_CHANNELS.ACP_SET_CONFIG, [input]);
+}
+
+/** ACP 服务端启动命令：让外部 IDE/终端把本应用当编码 Agent 用 */
+export async function getAcpStatus(): Promise<AcpServerStatus> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.ACP_STATUS)) as AcpServerStatus;
+  }
+  return local<AcpServerStatus>(IPC_CHANNELS.ACP_STATUS, []);
+}
+
+// ── IM 频道 ─────────────────────────────────────────────────
+//
+// 频道清单、连接状态、会话台账一律以引擎为准：桌面端由 Rust 代理 `/api/im/*`，
+// 浏览器引擎直连问同一个接口。渲染层不缓存第二份状态，也不在前端维护
+// 「支持哪些 IM」的清单——那会让界面宣称的能力超过引擎真实能力。
+
+/** `im:channels`：通道清单 + 每个通道的真实状态 + IM 发起的会话台账 */
+export async function getImChannels(): Promise<ImChannelsSnapshot> {
+  const api = getAPI();
+  if (!api) {
+    throw new Error('IM_ENGINE_UNAVAILABLE: 当前运行通道没有引擎进程，无法持有 IM 长连接');
+  }
+  const res = (await api.invoke(IPC_CHANNELS.IM_CHANNELS)) as Partial<ImChannelsSnapshot> | null;
+  return { channels: res?.channels ?? [], sessions: res?.sessions ?? [] };
+}
+
+/** `im:configure`：登记凭据（引擎先真实校验，通过后自动起连接）；失败不落盘 */
+export async function configureImChannel(
+  kind: string,
+  credentials: Record<string, string>,
+): Promise<Record<string, string>> {
+  const api = getAPI();
+  if (!api) {
+    throw new Error('IM_ENGINE_UNAVAILABLE: 当前运行通道没有引擎进程，无法绑定 IM 频道');
+  }
+  const res = (await api.invoke(IPC_CHANNELS.IM_CONFIGURE, { kind, credentials })) as {
+    account?: Record<string, string>;
+  } | null;
+  return res?.account ?? {};
+}
+
+/** `im:start` / `im:stop` / `im:forget`：连接开关与解绑，返回引擎给出的新状态 */
+async function imAction(
+  channel: string,
+  kind: string,
+): Promise<string> {
+  const api = getAPI();
+  if (!api) {
+    throw new Error('IM_ENGINE_UNAVAILABLE: 当前运行通道没有引擎进程，无法控制 IM 长连接');
+  }
+  const res = (await api.invoke(channel, { kind })) as { state?: string } | null;
+  return res?.state ?? '';
+}
+
+export const startImChannel = (kind: string) => imAction(IPC_CHANNELS.IM_START, kind);
+export const stopImChannel = (kind: string) => imAction(IPC_CHANNELS.IM_STOP, kind);
+/** 解绑只删该通道凭据登记，IM 会话历史保留（存量数据不删） */
+export const forgetImChannel = (kind: string) => imAction(IPC_CHANNELS.IM_FORGET, kind);
+
+/**
+ * `im:preferencesGet`：IM 偏好的当前值由引擎给出（回贴正文是引擎拼的），
+ * 这里不缓存也不落 localStorage —— 否则设置页显示的会是「界面以为的开关」而不是生效中的开关。
+ */
+export async function getImPreferences(): Promise<ImPreferences> {
+  const api = getAPI();
+  if (!api) {
+    throw new Error('IM_ENGINE_UNAVAILABLE: 当前运行通道没有引擎进程，IM 回贴偏好无从生效');
+  }
+  const res = (await api.invoke(IPC_CHANNELS.IM_PREFERENCES_GET)) as {
+    preferences?: Partial<ImPreferences>;
+  } | null;
+  return { showToolProcess: Boolean(res?.preferences?.showToolProcess) };
+}
+
+/** `im:preferencesSet`：写成功后返回引擎落盘的值（写失败原样抛出，开关不提前拨过去） */
+export async function setImPreferences(patch: Partial<ImPreferences>): Promise<ImPreferences> {
+  const api = getAPI();
+  if (!api) {
+    throw new Error('IM_ENGINE_UNAVAILABLE: 当前运行通道没有引擎进程，IM 回贴偏好无法保存');
+  }
+  const res = (await api.invoke(IPC_CHANNELS.IM_PREFERENCES_SET, { preferences: patch })) as {
+    preferences?: Partial<ImPreferences>;
+  } | null;
+  return { showToolProcess: Boolean(res?.preferences?.showToolProcess) };
 }

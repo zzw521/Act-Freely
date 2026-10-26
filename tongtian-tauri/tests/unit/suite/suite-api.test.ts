@@ -254,8 +254,10 @@ describe('套件页与输入框接线契约', () => {
     expect(page).not.toContain('安装能力即将上线');
     expect(page).not.toContain('本地安装流程即将上线');
     expect(page).not.toContain('「让通天办公帮我创建」能力即将上线');
-    // 广场安装如实拒绝：没有远端包来源就引导上传
-    expect(page).toContain('暂无远端套件包来源');
+    // 广场示例条目没有下载地址时如实说明，并引导配置市场源或上传
+    expect(page).toContain('本地示例条目，没有下载地址');
+    expect(page).toContain("import MarketBrowser from '../../components/MarketBrowser'");
+    expect(page).toContain('await marketAPI.installSuite(s.id)');
   });
 
   it('套件页不再自造安装标志位，安装状态来自注册表匹配', () => {

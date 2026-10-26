@@ -15,6 +15,9 @@ use super::status;
 pub struct TaskRecord {
     pub task_id: String,
     pub workspace_id: String,
+    /// 提交时选中的已保存模型 id（断点续跑时据此重新解析端点与密钥）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
     /// 14 态状态字面值（见 task::status）
     pub status: String,
     /// executing 子态 / 等待成因（rate_limited/circuit_break/quota_wait/...）
@@ -71,6 +74,7 @@ impl TaskRegistry {
         let record = TaskRecord {
             task_id: task_id.to_string(),
             workspace_id: workspace_id.to_string(),
+            model_id: None,
             status: status::QUEUED.to_string(),
             wait_reason: None,
             retry_count: 0,
@@ -95,6 +99,14 @@ impl TaskRegistry {
             .unwrap_or_else(|e| e.into_inner())
             .get(task_id)
             .cloned()
+    }
+
+    /// 记住提交时选中的模型 id：引擎重启后 resume 需要重新解析端点与密钥
+    pub fn set_model_id(&self, task_id: &str, model_id: Option<&str>) {
+        let mut map = self.tasks.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = map.get_mut(task_id) {
+            r.model_id = model_id.map(str::to_string);
+        }
     }
 
     /// 状态更新（revision 单调递增；调用方负责转移合法性校验，

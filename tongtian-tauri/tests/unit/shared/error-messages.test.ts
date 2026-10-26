@@ -35,6 +35,18 @@ describe('错误码文案：9 个云端必需码全覆盖', () => {
   });
 });
 
+describe('错误码文案：系统默认应用打开产物', () => {
+  it('打开失败与通道不支持都有用户文案，不把裸码丢给用户', () => {
+    for (const code of [ErrorCode.OPEN_FAILED, ErrorCode.OPEN_EXTERNAL_UNSUPPORTED]) {
+      const msg = errorMessageOf(code);
+      expect(msg).toBeTruthy();
+      expect(msg).not.toBe(code);
+      expect(msg).not.toContain('发生错误（');
+    }
+    expect(errorTextOf('OPEN_EXTERNAL_UNSUPPORTED')).toContain('桌面版');
+  });
+});
+
 describe('错误码文案：降级展示（防白屏）', () => {
   it('未知错误码返回含原始码的降级文案', () => {
     const msg = errorMessageOf('SOME_UNKNOWN_CODE');
@@ -98,7 +110,8 @@ function rustCodesMatching(pattern: RegExp, keep: (c: string) => boolean = () =>
 }
 
 describe('错误码文案：安全与治理码全覆盖（Rust security 模块抛出的码不得裸奔）', () => {
-  const emitted = rustCodesMatching(/(?:POLICY|AUDIT)_[A-Z][A-Z_]*/g);
+  // 只收字符串字面量中的码，避免把 POLICY_KEY 之类的常量名当成错误码
+  const emitted = rustCodesMatching(/(?<=")(?:POLICY|AUDIT)_[A-Z][A-Z_]*/g);
 
   it('Rust security 源码扫描命中错误码（防止路径配置失效导致空集合假通过）', () => {
     expect(emitted.length).toBeGreaterThan(0);

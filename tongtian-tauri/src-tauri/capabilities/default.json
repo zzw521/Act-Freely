@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "默认权限集：核心 API + opener/dialog 插件",
-  "windows": ["main"],
+  "description": "默认权限集：核心 API + opener/dialog 插件；task-* 为独立任务窗口",
+  "windows": ["main", "task-*"],
   "permissions": ["core:default", "opener:default", "dialog:default"]
 }

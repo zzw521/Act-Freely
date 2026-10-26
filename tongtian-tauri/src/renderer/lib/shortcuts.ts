@@ -32,6 +32,7 @@ export const SHORTCUT_ACTIONS: readonly ShortcutAction[] = [
   { id: 'toggleSidebar', label: '切换侧边栏', group: '通用', defaultCombo: 'Ctrl+\\', scope: 'in-app' },
   { id: 'toggleTaskMonitor', label: '切换任务监控', group: '通用', defaultCombo: 'Ctrl+/', scope: 'in-app' },
   { id: 'cycleTask', label: '快速切换任务', group: '任务', defaultCombo: 'Ctrl+Tab', scope: 'in-app' },
+  { id: 'quickPick', label: '快速任务窗', group: '任务', defaultCombo: 'Alt+Space', scope: 'in-app' },
   { id: 'newTask', label: '创建新任务', group: '任务', defaultCombo: 'Ctrl+N', scope: 'in-app' },
   { id: 'searchAllTasks', label: '搜索全部任务', group: '任务', defaultCombo: 'Ctrl+G', scope: 'in-app' },
   { id: 'searchInTask', label: '在当前任务中搜索', group: '任务', defaultCombo: 'Ctrl+F', scope: 'in-app' },

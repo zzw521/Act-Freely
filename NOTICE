@@ -1,0 +1,23 @@
+通天办公 (Tongtian Office)
+Copyright 2026 TongTian Office Team
+
+This product includes software developed by the QwenPaw project
+(https://github.com/agentscope-ai/QwenPaw), licensed under the
+Apache License, Version 2.0.
+
+The following source directory contains code derived from QwenPaw and
+has been modified for use in Tongtian Office:
+
+  tongtian-tauri/src/agent/
+
+This product uses AgentScope 1.0.20
+(https://github.com/agentscope-ai/agentscope), licensed under the
+Apache License, Version 2.0.
+
+The packaged desktop distribution bundles third-party Python packages
+under vendor/python/ in the source tree (bundled as python/ in the
+desktop distribution). Each package retains its own license in the
+corresponding .dist-info/ directory.
+
+Other third-party dependencies remain under their respective licenses;
+see package-lock.json and src-tauri/Cargo.lock for the dependency sets.

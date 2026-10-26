@@ -251,7 +251,8 @@ describe('UI 消费与假状态清理', () => {
   it('Workbench 提交与重新生成前都过合规闸门', () => {
     const src = workbenchStore();
     expect(src.match(/await api\.compliance\.check\(/g)?.length).toBe(2);
-    expect(src).toContain('await api.compliance.check(goal, modelConfig?.baseUrl);');
+    // 端点按所选模型 id 从权威清单解析（渲染层不再持有模型配置对象）
+    expect(src).toContain('await api.compliance.check(goal, await modelBaseUrl(modelId));');
   });
 });
 

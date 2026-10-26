@@ -30,11 +30,12 @@ import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
 import ContentPasteIcon from '@mui/icons-material/ContentPaste';
 import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import type { InstalledSkill, McpAddReq, McpServer, SkillRootInfo } from '../../../shared/contracts';
+import type { BuiltinTool, BuiltinToolList, InstalledSkill, McpAddReq, McpServer, SkillRootInfo } from '../../../shared/contracts';
 import { errorTextOf } from '../../../shared/error-messages';
-import { mcpAPI, skillAPI } from '../../lib/api';
+import { mcpAPI, skillAPI, systemAPI } from '../../lib/api';
 import { parseMcpJsonConfig, TRANSPORT_LABEL_TEXT } from '../../lib/mcp-local';
 import { isTauri } from '../../lib/tauri-api';
+import MarketBrowser from '../../components/MarketBrowser';
 
 // ── 对话创建技能的预置提示词（create-skill 流程，落盘目录与 skill:list 扫描目录同源） ──
 
@@ -77,15 +78,15 @@ const JSON_IMPORT_PLACEHOLDER = `// You can use either format:
 
 type TabKey = 'skills' | 'connectors';
 
-// ── 内置工具（随应用内置） ──────────────────────────────
-
-const BUILTIN_TOOLS = [
-  { id: 'file-ops', name: '文件管理', desc: '查看、整理、转换本地文件（Markdown 转 Word、Excel 转 CSV 等）', icon: FolderOutlinedIcon },
-  { id: 'doc-ops', name: '文档处理', desc: '读取、编写、生成各类文档', icon: DescriptionOutlinedIcon },
-  { id: 'shell', name: '命令执行', desc: '在本地运行 Shell / CMD / PowerShell 命令', icon: TerminalIcon },
-  { id: 'sys-query', name: '系统查询', desc: '查看系统信息、目录内容、环境状态等', icon: SearchIcon },
-  { id: 'data-ops', name: '数据分析', desc: '汇总数据、生成图表与统计摘要', icon: InsightsIcon },
-];
+// ── 内置工具（清单来自引擎注册表 / 同源声明值，见 shared/builtin-tools.ts）──
+// 这里只保留图标映射：原先写死的五张卡片里有三张对应的能力在引擎里根本没有注册，
+// 属于假宣传，已删除（清单见 shared/builtin-tools.ts 与契约测试）。
+const TOOL_ICONS: Record<string, typeof FolderOutlinedIcon> = {
+  view_text_file: SearchIcon,
+  write_text_file: DescriptionOutlinedIcon,
+  insert_text_file: InsightsIcon,
+};
+const fallbackToolIcon = FolderOutlinedIcon;
 
 // ── 连接器市场目录（仅作浏览入口：点「登记」打开手动配置弹窗，真实登记走 mcp_add_server） ──
 
@@ -100,12 +101,15 @@ const CONNECTORS = [
 
 const ExtensionsPage: React.FC = () => {
   const navigate = useNavigate();
+  // 浏览器直连通道没有系统凭据库，无法持有 OAuth 令牌（授权按钮如实禁用）
+  const desktopChannel = isTauri();
   const [searchParams, setSearchParams] = useSearchParams();
   const tab = (searchParams.get('tab') as TabKey) || 'connectors';
   const [skills, setSkills] = useState<InstalledSkill[]>([]);
   const [skillsLoaded, setSkillsLoaded] = useState(false);
   const [skillsError, setSkillsError] = useState<string | null>(null);
   const [skillRoot, setSkillRoot] = useState<SkillRootInfo | null>(null);
+  const [marketOpen, setMarketOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   // MCP 连接器登记台账（mcp:listServers 的真实结果：桌面端读 SQLite，浏览器通道读本地台账）
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
@@ -142,6 +146,26 @@ const ExtensionsPage: React.FC = () => {
       .then(setSkillRoot)
       .catch(() => setSkillRoot(null));
   }, [refreshSkills]);
+
+  /**
+   * 内置工具清单：向通道要真实注册表（桌面端引擎在跑时是实测值，
+   * 引擎直连读 GET /api/tools，演示态给与引擎同源的声明清单）。
+   * 读失败就显示失败原因，不再退回一组写死的卡片。
+   */
+  const [builtin, setBuiltin] = useState<BuiltinToolList | null>(null);
+  const [builtinError, setBuiltinError] = useState<string | null>(null);
+  useEffect(() => {
+    void (async () => {
+      try {
+        setBuiltin(await systemAPI.builtinTools());
+        setBuiltinError(null);
+      } catch (e) {
+        setBuiltin(null);
+        setBuiltinError(errorTextOf(e, '内置工具清单读取失败'));
+      }
+    })();
+  }, []);
+  const builtinCount = builtin?.count ?? 0;
 
   const refreshMcp = React.useCallback(async () => {
     try {
@@ -216,7 +240,12 @@ const ExtensionsPage: React.FC = () => {
       setSkillUploadOpen(false);
       setSkillSourcePath(null);
       await refreshSkills();
-      setToast(`技能「${s.name}」安装完成`);
+      const warned = s.scan?.level === 'warn' ? s.scan.findings.length : 0;
+      setToast(
+        warned > 0
+          ? `技能「${s.name}」安装完成，安全扫描有 ${warned} 项提醒，请在技能列表查看`
+          : `技能「${s.name}」安装完成`,
+      );
     } catch (e) {
       setToast(errorTextOf(e, '技能安装失败'));
     } finally {
@@ -262,9 +291,16 @@ const ExtensionsPage: React.FC = () => {
   const [mcpName, setMcpName] = useState('my-mcp-server');
   const [mcpCommand, setMcpCommand] = useState('npx -y @modelcontextprotocol/server-filesystem');
   const [mcpUrl, setMcpUrl] = useState('http://localhost:8080/sse');
-  const [envVars, setEnvVars] = useState<KvPair[]>([{ key: 'API_KEY', value: '' }]);
-  const [headers, setHeaders] = useState<KvPair[]>([{ key: 'Authorization', value: 'Bearer your-token' }]);
+  // 默认留空行：占位符只做提示，避免把示例密钥当成真实配置登记
+  const [envVars, setEnvVars] = useState<KvPair[]>([{ key: '', value: '' }]);
+  const [headers, setHeaders] = useState<KvPair[]>([{ key: '', value: '' }]);
   const [mcpTimeout, setMcpTimeout] = useState('60');
+  // OAuth（仅 Streamable HTTP）：公共客户端 + PKCE，令牌由 Rust 存系统凭据库
+  const [mcpAuthEnabled, setMcpAuthEnabled] = useState(false);
+  const [mcpAuthUrl, setMcpAuthUrl] = useState('');
+  const [mcpTokenUrl, setMcpTokenUrl] = useState('');
+  const [mcpClientId, setMcpClientId] = useState('');
+  const [mcpScopes, setMcpScopes] = useState('');
   const [jsonOpen, setJsonOpen] = useState(false);
   const [jsonText, setJsonText] = useState('');
   const [mcpSaving, setMcpSaving] = useState(false);
@@ -276,9 +312,22 @@ const ExtensionsPage: React.FC = () => {
     setMcpOpen(true);
   };
 
-  // 手动配置必填校验：名称 + （STDIO 命令 / 远程地址）
+  // 手动配置必填校验：名称 + （STDIO 命令 / 远程地址）+（启用 OAuth 时三项授权参数）
+  const oauthDraft = mcpType === 'STREAMABLE_HTTP' && mcpAuthEnabled;
+  // 显式 Authorization 会覆盖 OAuth 自动附加的令牌，登记前拦下
+  const oauthHeaderConflict =
+    !!oauthDraft &&
+    headers.some((h) => h.key.trim().toLowerCase() === 'authorization' && h.value.trim().length > 0);
+  const oauthDraftValid =
+    !oauthDraft ||
+    (mcpAuthUrl.trim().length > 0 &&
+      mcpTokenUrl.trim().length > 0 &&
+      mcpClientId.trim().length > 0 &&
+      !oauthHeaderConflict);
   const mcpValid =
-    mcpName.trim().length > 0 && (mcpType === 'STDIO' ? mcpCommand.trim().length > 0 : mcpUrl.trim().length > 0);
+    mcpName.trim().length > 0 &&
+    (mcpType === 'STDIO' ? mcpCommand.trim().length > 0 : mcpUrl.trim().length > 0) &&
+    oauthDraftValid;
 
   /** 环境变量/请求头键值对 → 映射（空键名丢弃；值只交给后端，不回显） */
   const kvPairsToMap = (pairs: KvPair[]): Record<string, string> => {
@@ -295,9 +344,23 @@ const ExtensionsPage: React.FC = () => {
     transport: mcpType === 'STDIO' ? 'stdio' : mcpType === 'SSE' ? 'sse' : 'streamable_http',
     command: mcpCommand.trim(),
     url: mcpUrl.trim(),
-    env: kvPairsToMap(envVars),
-    headers: kvPairsToMap(headers),
+    // stdio 用环境变量、远程用请求头；另一侧不会被消费，不写入免得卡片显示假凭据项
+    env: mcpType === 'STDIO' ? kvPairsToMap(envVars) : {},
+    headers: mcpType === 'STDIO' ? {} : kvPairsToMap(headers),
     timeoutSecs: Number(mcpTimeout) || undefined,
+    ...(oauthDraft
+      ? {
+          auth: {
+            authorizationUrl: mcpAuthUrl.trim(),
+            tokenUrl: mcpTokenUrl.trim(),
+            clientId: mcpClientId.trim(),
+            scopes: mcpScopes
+              .split(/[\s,;]+/)
+              .map((s) => s.trim())
+              .filter(Boolean),
+          },
+        }
+      : {}),
   });
 
   // 提交手动配置：登记落 mcp_servers（重名/校验失败由后端拒绝并显示原因）
@@ -382,6 +445,35 @@ const ExtensionsPage: React.FC = () => {
     }
   };
 
+  /** OAuth 授权：打开系统浏览器走公共客户端 + PKCE，令牌由 Rust 存系统凭据库 */
+  const handleAuthorizeMcp = async (s: McpServer) => {
+    setMcpBusyId(s.serverId);
+    try {
+      const row = await mcpAPI.oauthAuthorize(s.serverId);
+      setMcpServers((prev) => prev.map((item) => (item.serverId === row.serverId ? row : item)));
+      setToast(`连接器「${row.name}」已授权，点击「连接」完成握手`);
+    } catch (e) {
+      setToast(errorTextOf(e, 'OAuth 授权未完成'));
+      await refreshMcp();
+    } finally {
+      setMcpBusyId(null);
+    }
+  };
+
+  /** 撤销授权：清除系统凭据库里的令牌并断开连接，配置本身保留 */
+  const handleRevokeMcp = async (s: McpServer) => {
+    setMcpBusyId(s.serverId);
+    try {
+      const row = await mcpAPI.oauthRevoke(s.serverId);
+      setMcpServers((prev) => prev.map((item) => (item.serverId === row.serverId ? row : item)));
+      setToast(`连接器「${row.name}」的授权已撤销，本地令牌已清除`);
+    } catch (e) {
+      setToast(errorTextOf(e, '撤销授权失败'));
+    } finally {
+      setMcpBusyId(null);
+    }
+  };
+
   /** 确认移除：只删这一条登记（不影响任务与审计存量数据） */
   const handleConfirmRemoveMcp = async () => {
     const target = serverToRemove;
@@ -420,13 +512,34 @@ const ExtensionsPage: React.FC = () => {
         }}
       >
         <Tab value="skills" label={`技能 (${skills.length})`} />
-        <Tab value="connectors" label={`连接器 (${BUILTIN_TOOLS.length + installedCount})`} />
+        <Tab value="connectors" label={`连接器 (${builtinCount + installedCount})`} />
       </Tabs>
 
       {/* ── 技能 ── */}
       {tab === 'skills' && (
         <Box>
-          <Box sx={{ display: 'flex', justifyContent: 'flex-end', mb: 2 }}>
+          <Alert severity="info" sx={{ mb: 2, fontSize: '12.5px' }}>
+            技能从本机运行目录扫描；可上传本地技能、通过对话创建，或在配置索引源后从在线市场安装。
+            市场下载会校验 SHA-256，来源与版本记入审计日志。
+          </Alert>
+          <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1, mb: 2 }}>
+            <Button
+              variant="outlined"
+              startIcon={<PublicIcon />}
+              onClick={() => setMarketOpen(true)}
+              sx={{
+                borderRadius: '10px',
+                textTransform: 'none',
+                fontSize: '13px',
+                fontWeight: 600,
+                px: 2,
+                borderColor: '#E5E7EB',
+                color: '#374151',
+                '&:hover': { borderColor: '#4F46E5', color: '#4F46E5', bgcolor: 'rgba(79, 70, 229, 0.04)' },
+              }}
+            >
+              在线市场
+            </Button>
             {/* 「+ 添加」：对话创建 / 上传技能 */}
             <Button
               variant="contained"
@@ -731,6 +844,37 @@ const ExtensionsPage: React.FC = () => {
                           </Tooltip>
                         </Box>
                       )}
+                      {s.scan && s.scan.level !== 'clean' && (
+                        <Tooltip
+                          title={
+                            <Box sx={{ whiteSpace: 'pre-line', fontSize: '12px', lineHeight: 1.6 }}>
+                              {s.scan.summary}
+                              {s.scan.findings.length > 0
+                                ? '\n' + s.scan.findings.map((f) => `· ${f.message}`).join('\n')
+                                : ''}
+                            </Box>
+                          }
+                        >
+                          <Box
+                            sx={{
+                              px: 1,
+                              py: 0.2,
+                              borderRadius: '6px',
+                              background: s.scan.level === 'block' ? '#FEE2E2' : '#FEF3C7',
+                            }}
+                          >
+                            <Typography
+                              sx={{
+                                fontSize: '11px',
+                                fontWeight: 600,
+                                color: s.scan.level === 'block' ? '#B91C1C' : '#B45309',
+                              }}
+                            >
+                              {s.scan.level === 'block' ? '安全风险' : `提醒 ${s.scan.findings.length}`}
+                            </Typography>
+                          </Box>
+                        </Tooltip>
+                      )}
                     </Box>
                     <Typography sx={{ fontSize: '12px', color: '#6B7280', mt: 0.25 }}>
                       {s.description ?? '（SKILL.md 未填写描述）'}
@@ -752,11 +896,17 @@ const ExtensionsPage: React.FC = () => {
                     </Tooltip>
                   </Box>
                   <Tooltip title={s.enabled ? '禁用后对话中不可调用，技能文件保持不动' : '启用后可在对话中调用'}>
-                    <Switch
-                      checked={s.enabled}
-                      disabled={!isTauri() || skillBusyId === s.id}
-                      onChange={(_, checked) => void handleToggleSkill(s, checked)}
-                    />
+                    <span>
+                      <Switch
+                        checked={s.enabled}
+                        disabled={
+                          !isTauri() ||
+                          skillBusyId === s.id ||
+                          (s.scan?.level === 'block' && !s.enabled)
+                        }
+                        onChange={(_, checked) => void handleToggleSkill(s, checked)}
+                      />
+                    </span>
                   </Tooltip>
                   <Tooltip title={isTauri() ? '卸载（移入回收目录）' : '浏览器通道不支持卸载'}>
                     <span>
@@ -773,6 +923,17 @@ const ExtensionsPage: React.FC = () => {
               ))}
             </Box>
           )}
+
+          {/* 在线技能市场：索引可配置，安装走 Rust 下载校验后落盘 */}
+          <MarketBrowser
+            open={marketOpen}
+            kind="skill"
+            onClose={() => setMarketOpen(false)}
+            onInstalled={() => {
+              void refreshSkills();
+              setToast('技能已从在线市场安装到运行目录');
+            }}
+          />
         </Box>
       )}
 
@@ -1014,6 +1175,78 @@ const ExtensionsPage: React.FC = () => {
                   >
                     + 添加 Header
                   </Typography>
+
+                  {/* OAuth（仅 Streamable HTTP）：公共客户端 + PKCE，令牌不进配置文件 */}
+                  {mcpType === 'STREAMABLE_HTTP' && (
+                    <Box sx={{ mb: 2, p: 1.5, border: '1px solid #EEF0F2', borderRadius: '12px', background: '#FAFBFC' }}>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                        <Switch
+                          size="small"
+                          checked={mcpAuthEnabled}
+                          onChange={(e) => setMcpAuthEnabled(e.target.checked)}
+                        />
+                        <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#374151' }}>
+                          启用 OAuth 授权
+                        </Typography>
+                      </Box>
+                      <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF', lineHeight: 1.6 }}>
+                        公共客户端 + PKCE，无需 client_secret。授权与刷新令牌由桌面端保存在系统凭据库，不写入配置文件，也不会回显。
+                      </Typography>
+                      {oauthHeaderConflict && (
+                        <Typography sx={{ fontSize: '11.5px', color: '#DC2626', lineHeight: 1.6, mt: 0.5 }}>
+                          请移除上方 Authorization 请求头：它会覆盖 OAuth 自动附加的令牌。
+                        </Typography>
+                      )}
+                      {mcpAuthEnabled && (
+                        <Box sx={{ mt: 1.5 }}>
+                          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>
+                            授权地址 <Box component="span" sx={{ color: '#EF4444' }}>*</Box>
+                          </Typography>
+                          <TextField
+                            value={mcpAuthUrl}
+                            onChange={(e) => setMcpAuthUrl(e.target.value)}
+                            fullWidth
+                            size="small"
+                            placeholder="https://auth.example.com/oauth/authorize"
+                            sx={{ mb: 1.5, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
+                          />
+                          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>
+                            Token 地址 <Box component="span" sx={{ color: '#EF4444' }}>*</Box>
+                          </Typography>
+                          <TextField
+                            value={mcpTokenUrl}
+                            onChange={(e) => setMcpTokenUrl(e.target.value)}
+                            fullWidth
+                            size="small"
+                            placeholder="https://auth.example.com/oauth/token"
+                            sx={{ mb: 1.5, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
+                          />
+                          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>
+                            client_id <Box component="span" sx={{ color: '#EF4444' }}>*</Box>
+                          </Typography>
+                          <TextField
+                            value={mcpClientId}
+                            onChange={(e) => setMcpClientId(e.target.value)}
+                            fullWidth
+                            size="small"
+                            placeholder="tongtian-desktop"
+                            sx={{ mb: 1.5, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
+                          />
+                          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>Scopes（可选）</Typography>
+                          <TextField
+                            value={mcpScopes}
+                            onChange={(e) => setMcpScopes(e.target.value)}
+                            fullWidth
+                            size="small"
+                            placeholder="openid profile，空格或逗号分隔"
+                            helperText="授权与 Token 地址需为 HTTPS；本机服务（localhost / 127.0.0.1）允许 HTTP。"
+                            FormHelperTextProps={{ sx: { fontSize: '11.5px', color: '#9CA3AF', mx: 0 } }}
+                            sx={{ '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
+                          />
+                        </Box>
+                      )}
+                    </Box>
+                  )}
                 </>
               )}
 
@@ -1108,7 +1341,7 @@ const ExtensionsPage: React.FC = () => {
           {/* 内置工具 / 市场 / 已安装 */}
           <Box sx={{ display: 'flex', gap: 2.5, mt: 1.5, mb: 2.5, borderBottom: '1px solid #F3F4F6' }}>
             {([
-              ['builtin', `内置工具 ${BUILTIN_TOOLS.length}`],
+              ['builtin', `内置工具 ${builtinCount}`],
               ['market', '市场'],
               ['installed', `已安装 ${installedCount}`],
             ] as const).map(([key, label]) => (
@@ -1134,11 +1367,22 @@ const ExtensionsPage: React.FC = () => {
             ))}
           </Box>
 
-          {/* 内置工具：随应用内置，不可卸载 */}
+          {/* 内置工具：清单来自引擎注册表（或同源声明值），不可卸载 */}
           {connectorTab === 'builtin' && (
-            <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 2 }}>
-              {BUILTIN_TOOLS.map((t) => {
-                const Icon = t.icon;
+            builtinError ? (
+              <Typography sx={{ fontSize: '12.5px', color: '#B91C1C', mb: 1.5 }}>{builtinError}</Typography>
+            ) : !builtin ? (
+              <Typography sx={{ fontSize: '12.5px', color: '#9CA3AF', mb: 1.5 }}>正在读取内置工具清单…</Typography>
+            ) : (
+              <>
+                <Typography sx={{ fontSize: '12px', color: '#9CA3AF', mb: 1.5 }}>
+                  {builtin.note ?? (builtin.source === 'engine'
+                    ? '清单读自运行中引擎的工具注册表'
+                    : '按与引擎同源的声明清单显示')}
+                </Typography>
+                <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 2 }}>
+              {builtin.tools.map((t: BuiltinTool) => {
+                const Icon = TOOL_ICONS[t.id] ?? fallbackToolIcon;
                 return (
                   <Box
                     key={t.id}
@@ -1169,7 +1413,9 @@ const ExtensionsPage: React.FC = () => {
                   </Box>
                 );
               })}
-            </Box>
+                </Box>
+              </>
+            )
           )}
 
           {/* 市场目录：点开即打开手动配置弹窗并预填名称（市场自动安装未接入，不伪造「已安装」） */}
@@ -1269,13 +1515,93 @@ const ExtensionsPage: React.FC = () => {
                       未连接（配置已保存，握手后才会显示工具清单）
                     </Typography>
                   )}
-                  {(s.envKeys.length > 0 || s.headerKeys.length > 0) && (
+                  {/* stdio 消耗环境变量、远程消耗请求头，另一侧不展示避免造成假凭据项 */}
+                  {(s.transport === 'stdio' ? s.envKeys : s.headerKeys).length > 0 && (
                     <Typography sx={{ fontSize: '11px', color: '#9CA3AF' }}>
-                      凭据项：{[...s.envKeys, ...s.headerKeys].join('、')}（值仅存本机，不回显）
+                      凭据项：{(s.transport === 'stdio' ? s.envKeys : s.headerKeys).join('、')}（值仅存本机，不回显）
                     </Typography>
                   )}
-                  <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1, mt: 0.5 }}>
-                    {s.status === 'connected' ? (
+                  {s.auth && (
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexWrap: 'wrap' }}>
+                      <Box
+                        sx={{
+                          px: 1,
+                          py: 0.25,
+                          borderRadius: '6px',
+                          background:
+                            s.authStatus === 'authorized' ? '#ECFDF5' : s.authStatus === 'expired' ? '#FFFBEB' : '#F3F4F6',
+                        }}
+                      >
+                        <Typography
+                          sx={{
+                            fontSize: '11px',
+                            fontWeight: 600,
+                            color:
+                              s.authStatus === 'authorized' ? '#0D9488' : s.authStatus === 'expired' ? '#B45309' : '#6B7280',
+                          }}
+                        >
+                          {s.authStatus === 'authorized'
+                            ? 'OAuth 已授权'
+                            : s.authStatus === 'expired'
+                              ? 'OAuth 令牌已过期'
+                              : 'OAuth 未授权'}
+                        </Typography>
+                      </Box>
+                      <Typography sx={{ fontSize: '11px', color: '#9CA3AF' }}>
+                        {s.authStatus === 'none'
+                          ? '连接前需在系统浏览器完成授权'
+                          : s.authStatus === 'expired'
+                            ? '连接时将尝试自动刷新，失败需重新授权'
+                            : '令牌仅存系统凭据库'}
+                      </Typography>
+                    </Box>
+                  )}
+                  {s.auth && !desktopChannel && (
+                    <Typography sx={{ fontSize: '11px', color: '#B45309', lineHeight: 1.6 }}>
+                      浏览器通道无法保存 OAuth 令牌，授权与连接请在桌面版通天办公中完成。
+                    </Typography>
+                  )}
+                  <Box sx={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 1, mt: 0.5, flexWrap: 'wrap' }}>
+                    {s.auth && s.authStatus !== 'none' && (
+                      <Button
+                        size="small"
+                        variant="text"
+                        disabled={mcpBusyId === s.serverId || !desktopChannel}
+                        onClick={() => void handleRevokeMcp(s)}
+                        sx={{ borderRadius: '8px', textTransform: 'none', fontSize: '11.5px', minWidth: 0, color: '#9CA3AF' }}
+                      >
+                        撤销授权
+                      </Button>
+                    )}
+                    {s.auth && s.authStatus === 'expired' && s.status !== 'connected' && (
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        disabled={mcpBusyId === s.serverId || !desktopChannel}
+                        onClick={() => void handleAuthorizeMcp(s)}
+                        sx={{ borderRadius: '8px', textTransform: 'none', fontSize: '12px' }}
+                      >
+                        重新授权
+                      </Button>
+                    )}
+                    {s.auth && s.authStatus === 'none' ? (
+                      <Button
+                        size="small"
+                        variant="contained"
+                        disabled={mcpBusyId === s.serverId || !desktopChannel}
+                        onClick={() => void handleAuthorizeMcp(s)}
+                        sx={{
+                          bgcolor: '#111827',
+                          borderRadius: '8px',
+                          textTransform: 'none',
+                          fontSize: '12px',
+                          px: 2,
+                          '&:hover': { bgcolor: '#1F2937' },
+                        }}
+                      >
+                        {mcpBusyId === s.serverId ? '等待浏览器授权…' : '授权'}
+                      </Button>
+                    ) : s.status === 'connected' ? (
                       <Button
                         size="small"
                         variant="outlined"
@@ -1327,6 +1653,7 @@ const ExtensionsPage: React.FC = () => {
             <DialogContent>
               <Typography sx={{ fontSize: '13px', color: '#6B7280', lineHeight: 1.7 }}>
                 将移除「{serverToRemove?.name}」的连接配置{serverToRemove?.status === 'connected' ? '（当前处于已连接状态）' : ''}。
+                {serverToRemove?.auth ? '该连接器保存在系统凭据库中的 OAuth 令牌也会一并清除。' : ''}
                 历史任务与审计记录不受影响，之后可用相同配置重新登记。
               </Typography>
             </DialogContent>

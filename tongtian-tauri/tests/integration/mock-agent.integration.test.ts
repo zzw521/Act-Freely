@@ -10,7 +10,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -90,6 +90,22 @@ describe.skipIf(!hasPython)('Mock Agent SSE 集成（黄金 fixture）', () => {
   afterAll(() => {
     proc?.kill();
     rmSync(WORK_DIR, { recursive: true, force: true });
+  });
+
+  it('中文目标不会因父进程代码页崩掉请求线程（脚本自带 UTF-8 stdout 兜底）', async () => {
+    const src = readFileSync(MOCK_AGENT, 'utf8');
+    expect(src).toContain('reconfigure(encoding="utf-8"');
+    expect(src).toContain('_force_utf8_stdio()');
+    // 未预期异常必须回 500，而不是让连接无声关闭（客户端只会看到 other side closed）
+    expect(src).toContain('self._send_json(500,');
+    // 真实回归：中文目标 + stage=plan 必须拿到完整计划流
+    const resp = await fetch(`${BASE}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: '写一份周报，含本周三件事', task_id: `integ-cjk-${Date.now()}`, stage: 'plan' }),
+    });
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain('event: plan');
   });
 
   it('突发 500 事件：seq 单调递增且含 id 行（吞吐与丢失=0）', async () => {

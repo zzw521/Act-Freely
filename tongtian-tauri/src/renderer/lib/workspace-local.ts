@@ -9,7 +9,7 @@
  * - 运行态如实为 stopped：浏览器通道没有 Agent 子进程可查
  */
 
-import type { WorkspaceInfo } from '../../shared/contracts';
+import type { WorkspaceCapabilities, WorkspaceInfo } from '../../shared/contracts';
 
 export const DEFAULT_WORKSPACE = 'default';
 const MAX_ID_LEN = 64;
@@ -121,6 +121,51 @@ export function createLocalWorkspace(
   return toView(row);
 }
 
+/**
+ * 能力视图：浏览器通道没有本机文件系统，台账落在 localStorage；
+ * 容器/SSH 与桌面端同口径「未提供」，不把不可用的后端伪装成可切换。
+ */
+export function localWorkspaceCapabilities(): WorkspaceCapabilities {
+  return {
+    activeBackend: 'local',
+    backends: [
+      {
+        id: 'local',
+        label: '浏览器本地台账',
+        supported: true,
+        isolation: '工作空间标识与任务归属记在 localStorage；文件与引擎实例不在浏览器侧',
+        reason: '',
+      },
+      {
+        id: 'docker',
+        label: '容器工作区',
+        supported: false,
+        isolation: '需要本机 Docker 守护进程、镜像与卷编排',
+        reason: '当前版本没有容器编排与镜像管理，无法提供容器隔离',
+      },
+      {
+        id: 'ssh',
+        label: 'SSH 远程工作区',
+        supported: false,
+        isolation: '需要主机配对、凭据托管与远程执行代理',
+        reason: '当前版本没有远程主机配对与远程执行代理；跨机器协作请使用「项目协作」',
+      },
+    ],
+    dataRoot: 'localStorage（tt:workspaces）',
+    dataRootExists: true,
+    dataRootSource: 'browser',
+    dataRootVariable: '',
+    customRoot: {
+      supported: false,
+      variable: 'TONGTIAN_HOME',
+      requiresRestart: false,
+      reason: '浏览器通道没有本机目录，无法通过 TONGTIAN_HOME 指定数据根；请在桌面版使用',
+    },
+    deleteSupported: false,
+    maxIdLen: MAX_ID_LEN,
+  };
+}
+
 /** 测试用：复位本地台账 */
 export function resetLocalWorkspaces(): void {
   ledger = [];
@@ -150,6 +195,8 @@ export function handleLocalWorkspaceChannel(
         handled: true,
         value: createLocalWorkspace(payload.workspaceId ?? payload.id),
       };
+    case 'workspace:capabilities':
+      return { handled: true, value: localWorkspaceCapabilities() };
     default:
       return { handled: false };
   }

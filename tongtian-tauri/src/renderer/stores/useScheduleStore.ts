@@ -15,6 +15,7 @@ import { IPC_CHANNELS } from '../../shared/contracts';
 import type {
   KeepAwakeStatus,
   ScheduleCreateReq,
+  ScheduleParseResult,
   ScheduleRun,
   ScheduledTask,
   ScheduleUpdateReq,
@@ -33,6 +34,8 @@ interface ScheduleState {
 
   loadTasks: () => Promise<void>;
   loadRuns: (scheduleId?: string) => Promise<void>;
+  /** 一句话解析（本地规则；失败时抛带错误码的异常） */
+  parse: (text: string) => Promise<ScheduleParseResult>;
   create: (req: ScheduleCreateReq) => Promise<ScheduledTask>;
   update: (req: ScheduleUpdateReq) => Promise<ScheduledTask>;
   toggle: (scheduleId: string, enabled: boolean) => Promise<void>;
@@ -77,6 +80,14 @@ export const useScheduleStore = create<ScheduleState>((set) => ({
     } catch (err) {
       set({ runs: [], runsLoading: false, error: `执行记录加载失败：${errorTextOf(err)}` });
     }
+  },
+
+  parse: async (text) => {
+    const result = (await getAPI().invoke(
+      IPC_CHANNELS.SCHEDULE_PARSE,
+      text,
+    )) as ScheduleParseResult;
+    return result;
   },
 
   create: async (req) => {

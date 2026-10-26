@@ -12,9 +12,11 @@
  */
 
 import type { ChatEvent, ChatSubmitReq } from '../../shared/types';
+import { appVersion } from '../../shared/app-version';
+import { declaredBuiltinToolList } from '../../shared/builtin-tools';
 import { isTauri, tauriAPI, createProxiedAPI } from './tauri-api';
 import { engineAPI, ENGINE_DIRECT_URL } from './engine-api';
-import type { LeaseInfo, LeaseTakeoverResp, QuotaSnapshot } from '../../shared/contracts';
+import type { QuotaSnapshot } from '../../shared/contracts';
 import { handleLocalSecurityChannel } from './security-local';
 import { handleLocalScheduleChannel } from './schedule-local';
 import { handleLocalAlignmentChannel } from './alignment-local';
@@ -23,7 +25,9 @@ import { handleLocalConversationChannel } from './conversation-local';
 import { handleLocalWorkspaceChannel } from './workspace-local';
 import { handleLocalSkillChannel } from './skill-local';
 import { handleLocalSuiteChannel } from './suite-local';
+import { handleLocalMarketChannel } from './market-local';
 import { handleLocalMcpChannel } from './mcp-local';
+import { handleLocalCollabChannel } from './collab-local';
 import { assertProxyPatchAcceptable, localProxyStatus } from './proxy-local';
 import { localAutostart } from './system-local';
 import { handleLocalPermissionChannel } from './permissions-local';
@@ -101,29 +105,56 @@ function mockActiveModel(): { modelName: string; displayName: string } {
 }
 
 /** 对话内选择的模型 → 用量归属对象。
- * 优先级与引擎 build_model_and_formatter 一致：档位绑定 > 自定义模型名 > 默认模型；
- * 档位未在清单里（如内置的 qwen-flash）时按所选名称归属，而不是回落默认——
- * 否则 Mock 态的用量统计会与用户在输入框选中的模型不符。 */
+ * 优先级与引擎一致：档位绑定 > 已保存模型 id > 旧式 modelConfig > 默认模型。
+ * id 找不到时如实报错，不拿清单首项冒充用户选择。 */
 function resolveMockModel(
   modelBinding?: string,
-  modelConfig?: { modelName?: string },
+  modelId?: string,
+  legacyModelConfig?: { modelName?: string },
 ): { modelName: string; displayName: string } {
-  const selected = (modelBinding ?? '').trim() || (modelConfig?.modelName ?? '').trim();
-  if (selected) {
-    const hit = mockModels.find((m) => m.modelName === selected || m.id === selected);
-    return { modelName: selected, displayName: hit?.name ?? selected };
+  const binding = (modelBinding ?? '').trim();
+  if (binding) {
+    const hit = mockModels.find((m) => m.modelName === binding || m.id === binding);
+    return { modelName: binding, displayName: hit?.name ?? binding };
+  }
+  const selectedId = (modelId ?? '').trim();
+  if (selectedId) {
+    const hit = mockModels.find((m) => m.id === selectedId);
+    if (!hit) throw new Error(`MODEL_NOT_FOUND: 未找到模型 ${selectedId}`);
+    return { modelName: hit.modelName || selectedId, displayName: hit.name || hit.modelName };
+  }
+  const legacyName = (legacyModelConfig?.modelName ?? '').trim();
+  if (legacyName) {
+    const hit = mockModels.find((m) => m.modelName === legacyName);
+    return { modelName: legacyName, displayName: hit?.name ?? legacyName };
   }
   return mockActiveModel();
 }
 
-/** Mock 用量记账：写入本地台账（Mock 通道权威数据源，供 model:usage 查询） */
+/** Mock 用量记账：写入本地台账（Mock 通道权威数据源，供 model:usage 查询）。
+ * 耗时与成本只用于开发预览演示口径；真实环境由引擎上报，价格来自模型配置。 */
 function recordMockUsage(
   promptTokens: number,
   completionTokens: number,
   model?: { modelName: string; displayName: string },
 ): void {
   const { modelName, displayName } = model ?? mockActiveModel();
-  recordLocalUsage(modelName, promptTokens, completionTokens, { displayName });
+  const hit = mockModels.find((m) => m.modelName === modelName);
+  const inputPrice = hit?.priceInputPerM;
+  const outputPrice = hit?.priceOutputPerM;
+  const priced =
+    typeof inputPrice === 'number' && typeof outputPrice === 'number';
+  const costMicros = priced
+    ? Math.max(0, Math.round(promptTokens * inputPrice + completionTokens * outputPrice))
+    : null;
+  const latencyMs = 300 + Math.round((promptTokens + completionTokens) * 0.4);
+  recordLocalUsage(modelName, promptTokens, completionTokens, {
+    displayName,
+    latencyMs,
+    costMicros,
+    currency: hit?.priceCurrency || 'CNY',
+    priced,
+  });
 }
 
 function defaultSteps(title: string) {
@@ -186,7 +217,21 @@ function scheduleExecutionFlow(task: MockTaskState) {
       type: 'deliver',
       summary: '任务完成',
       // 助手回复正文：界面气泡取 final_text（与引擎/Rust deliver 同字段），Mock 同样给真正文
-      final_text: `已按目标「${task.title}」完成分析与处理，交付文件见下方附件。`,
+      // `[test:html]` 是演示/验收标记：给一段 html 代码块，用于验证「生成式 UI」开关的沙箱渲染
+      final_text: task.title.includes('[test:html]')
+        ? [
+            '下面是一个可交互的示例组件：',
+            '',
+            '```html',
+            '<!doctype html>',
+            '<html><body style="font-family:system-ui;padding:16px">',
+            '<h3>生成式 UI 沙箱示例</h3>',
+            '<button id="b">点我 +1</button> <span id="n">0</span>',
+            '<script>let n=0;document.getElementById("b").onclick=()=>{n++;document.getElementById("n").textContent=n;}</script>',
+            '</body></html>',
+            '```',
+          ].join('\n')
+        : `已按目标「${task.title}」完成分析与处理，交付文件见下方附件。`,
       // 产出物落在会话子目录（工作目录/对话时间）
       artifacts: ['成果报告.md', '数据摘要.xlsx'].map((f) => `${task.sessionDir}/${f}`),
     }))],
@@ -219,9 +264,23 @@ interface MockModel {
   agentBinding: string;
   forceLocal: boolean;
   hasApiKey: boolean;
+  priceInputPerM?: number | null;
+  priceOutputPerM?: number | null;
+  priceCurrency?: string;
+  fallbackIds?: string[];
   createdAt: string;
   updatedAt: string;
 }
+
+/** 写入请求：单价走嵌套 prices（与 Rust/引擎契约一致），空值表示清空/未配置 */
+type MockModelWrite = Partial<Omit<MockModel, 'priceInputPerM' | 'priceOutputPerM' | 'priceCurrency'>> & {
+  apiKey?: string;
+  prices?: {
+    inputPerM?: number | null;
+    outputPerM?: number | null;
+    currency?: string;
+  } | null;
+};
 
 let mockModels: MockModel[] = [
   {
@@ -236,6 +295,10 @@ let mockModels: MockModel[] = [
     agentBinding: '',
     forceLocal: false,
     hasApiKey: true,
+    priceInputPerM: 0.8,
+    priceOutputPerM: 2,
+    priceCurrency: 'CNY',
+    fallbackIds: ['mock-model-2'],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   },
@@ -251,10 +314,24 @@ let mockModels: MockModel[] = [
     agentBinding: '',
     forceLocal: true,
     hasApiKey: false,
+    priceInputPerM: 0,
+    priceOutputPerM: 0,
+    priceCurrency: 'CNY',
+    fallbackIds: [],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   },
 ];
+
+/** `api.model.remove/setDefault` 传的是 { id }，旧 Mock 曾把整个对象当 id 比较 */
+function argModelId(arg: unknown): string {
+  if (typeof arg === 'string') return arg.trim();
+  if (arg && typeof arg === 'object') {
+    const id = (arg as { id?: unknown }).id;
+    if (typeof id === 'string') return id.trim();
+  }
+  return '';
+}
 
 function handleModelChannel(channel: string, arg: unknown): unknown {
   const now = new Date().toISOString();
@@ -275,7 +352,11 @@ function handleModelChannel(channel: string, arg: unknown): unknown {
     return localReportView(normalizePeriod(arg));
   }
   if (channel === 'model:create') {
-    const req = (arg ?? {}) as Partial<MockModel> & { apiKey?: string };
+    const req = (arg ?? {}) as MockModelWrite;
+    const fallbackIds = (req.fallbackIds ?? []).slice(0, 3);
+    if (fallbackIds.some((id) => !mockModels.some((m) => m.id === id))) {
+      throw new Error('MODEL_FALLBACK_NOT_FOUND: 未找到转移目标');
+    }
     const model: MockModel = {
       id: `mock-model-${Date.now()}`,
       name: req.name ?? '未命名模型',
@@ -288,6 +369,10 @@ function handleModelChannel(channel: string, arg: unknown): unknown {
       agentBinding: req.agentBinding ?? '',
       forceLocal: req.forceLocal ?? false,
       hasApiKey: Boolean(req.apiKey),
+      priceInputPerM: req.prices?.inputPerM ?? null,
+      priceOutputPerM: req.prices?.outputPerM ?? null,
+      priceCurrency: (req.prices?.currency || 'CNY').toUpperCase(),
+      fallbackIds,
       createdAt: now,
       updatedAt: now,
     };
@@ -296,14 +381,45 @@ function handleModelChannel(channel: string, arg: unknown): unknown {
     return model;
   }
   if (channel === 'model:update') {
-    const req = (arg ?? {}) as Partial<MockModel> & { apiKey?: string };
+    const req = (arg ?? {}) as MockModelWrite;
+    if (!req.id) throw new Error('MODEL_INVALID: 缺少模型 id');
+    if (!mockModels.some((m) => m.id === req.id)) {
+      throw new Error(`MODEL_NOT_FOUND: 未找到模型 ${req.id}`);
+    }
+    if (req.fallbackIds) {
+      if (req.fallbackIds.length > 3) {
+        throw new Error('MODEL_FALLBACK_LIMIT: 故障转移链最多 3 个模型');
+      }
+      if (req.fallbackIds.includes(req.id)) {
+        throw new Error('MODEL_FALLBACK_SELF: 故障转移链不能指向自身');
+      }
+      if (new Set(req.fallbackIds).size !== req.fallbackIds.length) {
+        throw new Error('MODEL_FALLBACK_DUPLICATE: 故障转移链重复');
+      }
+      if (req.fallbackIds.some((id) => !mockModels.some((m) => m.id === id))) {
+        throw new Error('MODEL_FALLBACK_NOT_FOUND: 未找到转移目标');
+      }
+    }
+    // 密钥字段不得随 patch 落进清单（Mock 也不保留明文，只留 hasApiKey）
+    const { apiKey: keyInput, prices, ...patch } = req;
+    // 默认模型最多一个
+    if (patch.isDefault === true) {
+      mockModels = mockModels.map((m) => ({ ...m, isDefault: false }));
+    }
     mockModels = mockModels.map((m) =>
       m.id === req.id
         ? {
             ...m,
-            ...req,
+            ...patch,
+            ...(prices !== undefined
+              ? {
+                  priceInputPerM: prices?.inputPerM ?? null,
+                  priceOutputPerM: prices?.outputPerM ?? null,
+                  priceCurrency: (prices?.currency || m.priceCurrency || 'CNY').toUpperCase(),
+                }
+              : {}),
             apiKeyEncrypted: '',
-            hasApiKey: req.apiKey !== undefined ? Boolean(req.apiKey) : m.hasApiKey,
+            hasApiKey: keyInput !== undefined ? Boolean(keyInput) : m.hasApiKey,
             updatedAt: now,
           }
         : m,
@@ -311,7 +427,18 @@ function handleModelChannel(channel: string, arg: unknown): unknown {
     return mockModels.find((m) => m.id === req.id) ?? null;
   }
   if (channel === 'model:delete') {
-    mockModels = mockModels.filter((m) => m.id !== arg);
+    const id = argModelId(arg);
+    if (!id) throw new Error('MODEL_INVALID: 缺少模型 id');
+    if (!mockModels.some((m) => m.id === id)) {
+      throw new Error(`MODEL_NOT_FOUND: 未找到模型 ${id}`);
+    }
+    mockModels = mockModels
+      .filter((m) => m.id !== id)
+      .map((m) =>
+        m.fallbackIds?.includes(id)
+          ? { ...m, fallbackIds: m.fallbackIds.filter((v) => v !== id) }
+          : m,
+      );
     return { ok: true };
   }
   if (channel === 'model:test') {
@@ -323,11 +450,31 @@ function handleModelChannel(channel: string, arg: unknown): unknown {
       model: model?.modelName ?? req.modelName ?? 'mock',
     };
   }
-  if (channel === 'model:setDefault') {
-    mockModels = mockModels.map((m) => ({ ...m, isDefault: m.id === arg }));
-    return { ok: true };
+  // 本机 Ollama 探测是真实外部依赖：Mock 通道不假装探测过，如实说明
+  if (channel === 'model:detectLocal') {
+    return {
+      supported: false,
+      available: false,
+      endpoint: 'http://127.0.0.1:11434',
+      openaiBaseUrl: 'http://127.0.0.1:11434/v1',
+      latencyMs: 0,
+      models: [],
+      error:
+        'LOCAL_MODEL_UNSUPPORTED: Mock 通道不探测本机 Ollama；桌面版会真实请求 /api/tags',
+    };
   }
-  return [];
+  if (channel === 'model:setDefault') {
+    const id = argModelId(arg);
+    if (!id) throw new Error('MODEL_INVALID: 缺少模型 id');
+    if (!mockModels.some((m) => m.id === id)) {
+      throw new Error(`MODEL_NOT_FOUND: 未找到模型 ${id}`);
+    }
+    mockModels = mockModels.map((m) => ({ ...m, isDefault: m.id === id }));
+    return { ok: true, defaultId: id };
+  }
+  throw new Error(
+    `IPC_CHANNEL_UNHANDLED: Mock 通道未实现 ${channel}（已阻止静默返回空结果）`,
+  );
 }
 
 // ── 文件/附件/设置 Mock ──────────────────────────────────
@@ -395,6 +542,16 @@ function handleAuthChannel(channel: string): unknown {
     mockAuthProfile = null;
     return { ok: true, wasLoggedIn };
   }
+  if (channel === 'auth:serverProbe') {
+    // 浏览器 Mock 没有 Rust 侧网络能力，如实返回不可达而不是编一个假连接
+    return {
+      baseUrl: 'http://127.0.0.1:8000',
+      reachable: false,
+      service: null,
+      version: null,
+      error: 'AUTH_SERVER_UNREACHABLE: 浏览器 Mock 模式不连接账号服务，请在桌面版验证真实登录',
+    };
+  }
   return null;
 }
 
@@ -414,6 +571,9 @@ const MIME_BY_EXT: Record<string, string> = {
 };
 
 function handleFileChannel(channel: string, args: unknown[]): unknown {
+  if (channel === 'file:openExternal') {
+    throw new Error('OPEN_EXTERNAL_UNSUPPORTED');
+  }
   if (channel === 'file:browse') {
     return [
       { name: 'attachments', path: '/mock/workspaces/default/files/attachments', isDirectory: true, size: 0, modifiedAt: String(Date.now()) },
@@ -446,13 +606,22 @@ function handleFileChannel(channel: string, args: unknown[]): unknown {
       };
     });
   }
-  return [];
+  throw new Error(
+    `IPC_CHANNEL_UNHANDLED: Mock 通道未实现 ${channel}（已阻止静默返回空结果）`,
+  );
 }
 
 /** 常用 channel 的 Mock 返回值 */
 const channelMocks: Record<string, unknown> = {
-  'system:info': { platform: 'mock', version: '0.1.0' },
-  'system:health': { ok: true, details: { mock: true } },
+  // 版本号取构建期注入的 package.json 版本（桌面通道由 Rust system_info 给 CARGO_PKG_VERSION）
+  // 浏览器/Mock 没有托盘进程：后台常驻能力如实为 false，设置页据此置灰
+  'system:info': {
+    name: 'tongtian-tauri',
+    platform: 'mock',
+    version: appVersion(),
+    arch: '',
+    backgroundResident: false,
+  },
 };
 
 const mockAPI = {
@@ -473,12 +642,18 @@ const mockAPI = {
     ) {
       // 与浏览器直连引擎通道共用同一份本地实现（无 Rust 后端时的 Mock 开关兜底）
       const local = handleLocalSecurityChannel(channel, args);
-      return local.handled ? local.value : [];
+      if (local.handled) return local.value;
+      throw new Error(
+        `IPC_CHANNEL_UNHANDLED: Mock 通道未实现 ${channel}（已阻止静默返回空结果）`,
+      );
     }
     // 定时任务：与浏览器直连引擎通道共用同一份本地实现（任务定义/执行记录/立即执行）
     if (channel.startsWith('schedule:') || channel === 'keepAwake:status') {
       const local = handleLocalScheduleChannel(channel, args);
-      return local.handled ? local.value : [];
+      if (local.handled) return local.value;
+      throw new Error(
+        `IPC_CHANNEL_UNHANDLED: Mock 通道未实现 ${channel}（已阻止静默返回空结果）`,
+      );
     }
     // 对齐整改通道（Hooks/连接器/归档/电脑操控）：与引擎直连共用本地权威实现
     {
@@ -500,9 +675,19 @@ const mockAPI = {
       const local = handleLocalSuiteChannel(channel, args);
       if (local.handled) return local.value;
     }
+    // 在线市场：需要下载 + 落盘，浏览器通道如实回报 supported=false（桌面端由 Rust 实现）
+    {
+      const market = handleLocalMarketChannel(channel, args);
+      if (market.handled) return market.value;
+    }
     // MCP 连接器：浏览器通道无握手能力，走本地登记台账（连接如实拒绝，不伪造已连接/工具清单）
     {
       const local = handleLocalMcpChannel(channel, args);
+      if (local.handled) return local.value;
+    }
+    // 项目协作：需要桌面端凭据库与账号服务直连能力，Mock/浏览器通道如实回报不支持
+    {
+      const local = handleLocalCollabChannel(channel);
       if (local.handled) return local.value;
     }
     // 意识（画像/能力文件/长期记忆）：浏览器通道无落盘能力，走本地台账（桌面端由 Rust 读写意识目录）
@@ -514,6 +699,20 @@ const mockAPI = {
     {
       const local = handleLocalConversationChannel(channel, args);
       if (local.handled) return local.value;
+    }
+    // IM 频道：长连接只有引擎进程能持有，浏览器没有可信状态可展示。
+    // 这里不编频道清单也不做假连接——真实验证请用引擎直连（VITE_MOCK=false），
+    // 外部 IM 服务侧的 Mock 开关在引擎（TT_SLACK_API_BASE 指向假 Slack，链路照跑）。
+    if (channel.startsWith('im:')) {
+      throw new Error(
+        'IM_ENGINE_UNAVAILABLE: Mock 模式没有引擎进程，无法持有 IM 长连接；请用 VITE_MOCK=false 启动引擎直连模式',
+      );
+    }
+    // 专家团队：Mock 通道没有 Rust 注册表，不编假专家，明确告知不可用
+    if (channel.startsWith('experts:')) {
+      throw new Error(
+        'EXPERTS_UNSUPPORTED: Mock 模式没有专家注册表，请用桌面版或引擎直连通道',
+      );
     }
     if (channel === 'chat:history') {
       return mockHistory.map((t) => ({
@@ -527,6 +726,8 @@ const mockAPI = {
     }
     if (channel === 'settings:get') return { ...mockSettings };
     if (channel === 'proxy:status') return localProxyStatus(mockSettings);
+    // 内置工具：演示通道给声明清单（与引擎注册表同源，契约测试锁定），不另编一份
+    if (channel === 'agent:builtinTools') return declaredBuiltinToolList('mock');
     // 浏览器预览环境写不了系统启动项：如实报 supported=false，勾了也不算已生效
     if (channel === 'system:autostart') return localAutostart(mockSettings);
     // 系统权限：清单同 Rust 表，状态只问系统能回答的项；浏览器不能拉起系统设置
@@ -547,7 +748,10 @@ const mockAPI = {
       return { ok: true, keys: Object.keys(patch) };
     }
     if (channel.startsWith('auth:')) return handleAuthChannel(channel);
-    return channelMocks[channel] ?? [];
+    if (channel in channelMocks) return channelMocks[channel];
+    throw new Error(
+      `IPC_CHANNEL_UNHANDLED: Mock 通道未实现 ${channel}（已阻止静默返回空结果）`,
+    );
   },
   send: () => undefined,
   on: () => undefined,
@@ -563,7 +767,9 @@ const mockAPI = {
     const now = Date.now();
     const taskId = `mock-task-${now}`;
     // 会话子目录：工作目录（未选则 Mock 缺省）下按对话时间创建
-    const baseDir = req?.workDir || '/mock/workspaces/default/sessions';
+    const baseDir =
+      req?.workDir ||
+      `/mock/workspaces/${req?.workspaceId?.trim() || 'default'}/sessions`;
     const task: MockTaskState = {
       taskId,
       title: (req?.goal ?? '').slice(0, 30),
@@ -573,7 +779,7 @@ const mockAPI = {
       createdAt: now,
       sessionDir: `${baseDir}/${sessionDirName(now)}`,
       // 对话内选择的模型随提交生效（用量归属与选择一致）
-      model: resolveMockModel(req?.modelBinding, req?.modelConfig),
+      model: resolveMockModel(req?.modelBinding, req?.modelId),
     };
     activeMockTask = task;
     schedulePlanFlow(task);
@@ -581,9 +787,19 @@ const mockAPI = {
   },
 
   /** 审阅（approve → 执行流；reject → done(REJECTED)；modify → 重新计划） */
-  chatReview: async (taskId: string, action: 'approve' | 'reject' | 'modify', patch?: unknown[]) => {
+  chatReview: async (taskId: string, action: 'approve' | 'reject' | 'modify' | 'resume', patch?: unknown[]) => {
     const task = activeMockTask ?? mockHistory.find((t) => t.taskId === taskId);
     if (!task) return { ok: false, status: 'TASK_NOT_FOUND' };
+    if (action === 'resume') {
+      // Mock 通道不模拟引擎进程内的检查点；明确告知不可用，不伪造恢复成功
+      emit(seqEvent(taskId, {
+        type: 'error',
+        code: 'CHECKPOINT_UNAVAILABLE',
+        message: 'Mock 模式没有真实引擎的检查点，无法续跑（请连接真实引擎验证）',
+      }));
+      emit(seqEvent(taskId, { type: 'done' }));
+      return { ok: false, status: 'CHECKPOINT_UNAVAILABLE' };
+    }
     if (action === 'approve') {
       scheduleExecutionFlow(task);
       return { ok: true, status: 'executing' };
@@ -657,35 +873,10 @@ const mockAPI = {
     }
     return { taskId, cancelled: false };
   },
-  taskState: async (taskId: string) => ({
-    taskId,
-    workspaceId: 'default',
-    status: activeMockTask?.taskId === taskId ? activeMockTask.status : 'done',
-    retryCount: 0,
-    queuePosition: 0,
-    cancelRequested: false,
-    revision: 1,
-  }),
-  quotaStatus: async () => mockQuotaSnapshot(),
-  leaseInfo: async (): Promise<{ holder: string; leases: LeaseInfo[] }> => ({
-    holder: 'local-device',
-    leases: activeMockTask
-      ? [{
-          taskId: activeMockTask.taskId,
-          leaseId: 'mock-lease-1',
-          holder: 'local-device',
-          heartbeatAt: new Date().toISOString(),
-          leaseUntil: new Date(Date.now() + 30_000).toISOString(),
-          idle: false,
-        }]
-      : [],
-  }),
-  leaseTakeover: async (): Promise<LeaseTakeoverResp> => ({
-    needConfirmation: false,
-    message: '本地单端：可直接获取租约',
-  }),
   /** 重放 Mock：无持久化，返回空窗口（windowExpired 语义） */
   eventReplay: async (taskId: string) => ({ taskId, events: [] }),
+  /** 检查点查询 Mock：没有真实引擎进程，如实返回空（不伪造可续跑入口） */
+  chatCheckpointQuery: async () => ({ checkpoints: {} }),
   /** 附件暂存 Mock：返回 AttachmentMeta（不落盘） */
   fileStageAttachment: async (srcPath: string, taskId?: string) => {
     const fileName = srcPath.split(/[\\/]/).pop() ?? 'attachment.bin';
@@ -707,12 +898,11 @@ const mockAPI = {
 
   // ── System ─────────────────────────────────────────────
   systemInfo: async () => channelMocks['system:info'],
-  systemHealth: async () => channelMocks['system:health'],
 };
 
 /**
- * 未实现的方法统一兜底：返回空数组（多数页面为列表查询）。
- * 已显式实现的方法优先使用。
+ * 未实现的方法统一兜底：显式抛 IPC_CHANNEL_UNHANDLED。
+ * 已显式实现的方法优先使用；空数组会让页面把「没实现」当成「没有数据」。
  */
 const proxiedAPI = new Proxy(mockAPI, {
   get(target, prop: string) {
@@ -720,8 +910,10 @@ const proxiedAPI = new Proxy(mockAPI, {
       return (target as unknown as Record<string, unknown>)[prop];
     }
     return async (...args: unknown[]) => {
-      console.info('[mock-api] fallback method', prop, args);
-      return [];
+      console.info('[mock-api] unhandled method', prop, args);
+      throw new Error(
+        `IPC_CHANNEL_UNHANDLED: Mock API 未实现 ${String(prop)}（已阻止静默返回空结果）`,
+      );
     };
   },
 });
@@ -744,8 +936,10 @@ if (typeof window !== 'undefined' && !window.tongtianAPI) {
           return (target as unknown as Record<string, unknown>)[prop];
         }
         return async (...args: unknown[]) => {
-          console.info('[engine-api] fallback method', prop, args);
-          return [];
+          console.info('[engine-api] unhandled method', prop, args);
+          throw new Error(
+            `IPC_CHANNEL_UNHANDLED: 引擎直连 API 未实现 ${String(prop)}（已阻止静默返回空结果）`,
+          );
         };
       },
     });

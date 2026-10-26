@@ -1,9 +1,10 @@
 /**
  * 用量总览与报表 —— `usage:stats` / `usage:report` 的唯一消费方
  *
- * - 总览条：周期内 Token / 调用 / 活跃模型 / 最近使用（无数据显示「暂无用量记录」，不伪造 0 值）
+ * - 总览条：周期内 Token / 调用 / 活跃模型 / 最近使用 / 平均耗时 / 按币种成本
  * - 报表：点「生成报表」才拉取 `usage:report`（按日趋势 + 模型明细 + 汇总），可复制成文本
- * - 口径：台账只记 token 与调用次数，未采集延迟与单价，故不提供耗时/成本估算
+ * - 口径：台账记录引擎上报的真实 token、端到端耗时与按调用时单价估算的成本；
+ *   未配置单价的调用标为「未计价」，不同币种不合并（见 usage-local.ts）
  */
 
 import React, { useCallback, useEffect, useState } from 'react';
@@ -23,6 +24,7 @@ import {
 } from '@mui/material';
 import { ContentCopy as CopyIcon, Assessment as ReportIcon, Refresh as RefreshIcon } from '@mui/icons-material';
 import { useModelUsageStore } from '../../stores/useModelUsageStore';
+import { fmtCosts, fmtLatency } from '../../lib/usage-local';
 
 const PERIOD_LABEL = { daily: '今日', monthly: '本月', total: '总计' } as const;
 
@@ -35,7 +37,7 @@ function fmtTime(ms: number): string {
   return new Date(ms).toLocaleString('zh-CN', { hour12: false });
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
+function Metric({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
     <Box sx={{ minWidth: 108 }}>
       <Typography variant="caption" color="text.secondary" display="block">
@@ -44,6 +46,11 @@ function Metric({ label, value }: { label: string; value: string }) {
       <Typography variant="body1" sx={{ fontWeight: 600 }}>
         {value}
       </Typography>
+      {hint && (
+        <Typography variant="caption" color="text.secondary" display="block">
+          {hint}
+        </Typography>
+      )}
     </Box>
   );
 }
@@ -99,6 +106,16 @@ const UsageOverviewPanel: React.FC = () => {
             <Metric label="输入 / 输出" value={`${fmtNum(totals.promptTokens)} / ${fmtNum(totals.completionTokens)}`} />
             <Metric label="调用次数" value={fmtNum(totals.calls)} />
             <Metric label="活跃模型" value={String(totals.activeModels)} />
+            <Metric
+              label="平均耗时"
+              value={fmtLatency(totals.avgLatencyMs, totals.latencySamples ?? 0)}
+              hint={(totals.latencySamples ?? 0) > 0 ? `${fmtNum(totals.latencySamples!)} 次样本` : '暂无样本'}
+            />
+            <Metric
+              label="成本"
+              value={fmtCosts(totals.costs, totals.pricedCalls ?? 0)}
+              hint={(totals.unpricedCalls ?? 0) > 0 ? `${fmtNum(totals.unpricedCalls!)} 次未计价` : undefined}
+            />
             <Metric label="用量最高" value={overview?.topModel ?? '—'} />
             <Metric label="最近使用" value={fmtTime(totals.lastUsedAtMs)} />
           </>
@@ -126,7 +143,8 @@ const UsageOverviewPanel: React.FC = () => {
       </Box>
 
       <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1.5 }}>
-        口径：按「模型 × UTC 日」累加引擎上报的真实 token；台账未采集调用延迟与模型单价，故不输出耗时与成本估算。
+        口径：按「模型 × UTC 日」累加引擎上报的真实 token 与耗时；成本 = Token × 调用时配置的单价，
+        未配置单价的调用标为「未计价」而非 0 元，不同币种不合并。
       </Typography>
 
       {reportError && (
@@ -160,7 +178,10 @@ const UsageOverviewPanel: React.FC = () => {
               {report.days.map((d) => (
                 <Box
                   key={d.day}
-                  title={`${d.day}：${fmtNum(d.tokensUsed)} token · ${d.calls} 次调用 · ${d.models} 个模型`}
+                  title={
+                    `${d.day}：${fmtNum(d.tokensUsed)} token · ${d.calls} 次调用 · ${d.models} 个模型` +
+                    ` · ${fmtLatency(d.avgLatencyMs, d.latencySamples ?? 0)} · ${fmtCosts(d.costs, d.pricedCalls ?? 0)}`
+                  }
                   sx={{ flex: 1, textAlign: 'center' }}
                 >
                   <Box
@@ -188,6 +209,8 @@ const UsageOverviewPanel: React.FC = () => {
                   <TableCell align="right">输出 Token</TableCell>
                   <TableCell align="right">合计</TableCell>
                   <TableCell align="right">调用</TableCell>
+                  <TableCell align="right">平均耗时</TableCell>
+                  <TableCell align="right">成本</TableCell>
                   <TableCell align="right">最近使用</TableCell>
                 </TableRow>
               </TableHead>
@@ -199,11 +222,19 @@ const UsageOverviewPanel: React.FC = () => {
                     <TableCell align="right">{fmtNum(m.completionTokens)}</TableCell>
                     <TableCell align="right">{fmtNum(m.tokensUsed)}</TableCell>
                     <TableCell align="right">{m.calls}</TableCell>
+                    <TableCell align="right">{fmtLatency(m.avgLatencyMs, m.latencySamples ?? 0)}</TableCell>
+                    <TableCell align="right">{fmtCosts(m.costs, m.pricedCalls ?? 0)}</TableCell>
                     <TableCell align="right">{fmtTime(m.lastUsedAtMs)}</TableCell>
                   </TableRow>
                 ))}
               </TableBody>
             </Table>
+          )}
+
+          {(report.totals.unpricedCalls ?? 0) > 0 && (
+            <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
+              有 {fmtNum(report.totals.unpricedCalls!)} 次调用未配置输入/输出单价，未计入成本。
+            </Typography>
           )}
 
           {copyHint && (

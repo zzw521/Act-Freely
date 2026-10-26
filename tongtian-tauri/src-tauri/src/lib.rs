@@ -1,20 +1,22 @@
 //! 通天办公 - Tauri 后端入口
 //!
 //! 阶段二：AgentBridge 集成
-//! - agent_status / agent_start_workspace / agent_stop_workspace
+//! - agent_start_workspace
 //! - chat_submit: 提交任务（两阶段协议：stage=plan 生成计划待审阅）
 //! - system_info: 示例 command
 //!
-//! 三层架构演进 P0（附加式扩展，现有签名不变）：
-//! - chat_cancel / task_state / quota_status / lease_info / lease_takeover / event_replay
+//! 三层架构演进 P0（只保留界面真正消费的通道）：
+//! - chat_cancel（工作台终止）/ event_replay（事件缺口与历史恢复）
+//! - 配额闸门与租约管理仍在提交/执行链路上执行，但不提供无人调用的查询命令
 //!
 //! 核心闭环补齐（占位清单第一批）：
 //! - chat_review / chat_control / chat_history（Workbench 审阅/控制/历史真实化）
 //! - model_list/add/update/delete/test/set_default（ModelHub 五件套）
+//! - model_detect_local（零配置本地模型：真实探测本机 Ollama，只接受回环地址）
 //! - model_usage（真实用量台账：引擎 usage 事件按「模型 × 日」累加，daily/monthly/total）
 //! - usage_stats / usage_report（用量总览与按日趋势报表，读同一 model_usage 台账）
 //! - file_list / file_read / file_preview / file_stage_attachment（文件能力 + 附件上传）
-//! - settings_get / settings_set（设置持久化）
+//! - settings_get / settings_set_many（设置持久化；批量 patch 是唯一写入口）
 //! - awareness_get / update / memories / memory_add / memory_delete
 //!   （意识以 `~/.tongtianwork/awareness/main` 下真实文件为事实来源，与引擎同目录，不再第二份数据库副本）
 //!
@@ -28,21 +30,34 @@
 //! - audit_log_query / audit_log_export
 //! - 出站调用（model_test）前经 policy::ensure_domain_allowed 强制出域校验；
 //!   model_*/auth_*/文件与任务关键动作追加审计留痕（脱敏后落库）
+//! - 在线市场：SHA-256 完整性 + Ed25519 发布者签名；信任锚只在本机
+//!   `market.trustedPublishers`，索引自报公钥不能替代用户信任
 
 mod align;
 mod auth;
 mod awareness;
+mod background;
 mod bridge;
+mod browser;
+mod collab;
+mod computer;
+mod expert;
 mod file;
+mod knowledge;
+mod market;
 mod mcp;
 mod model;
+mod plugin;
+mod pptx;
 mod proxy;
+mod remote;
 mod security;
 mod skill;
 mod store;
 mod suite;
 mod system;
 mod task;
+mod terminal;
 mod workspace;
 
 use std::sync::Arc;
@@ -78,19 +93,25 @@ fn now_ms_u64() -> u64 {
 }
 
 #[tauri::command]
-fn system_info() -> Value {
+fn system_info(bg: State<'_, Arc<background::BackgroundState>>) -> Value {
     json!({
         "name": "tongtian-tauri",
         "version": env!("CARGO_PKG_VERSION"),
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
+        // 托盘是否真的创建成功：设置页据此决定「后台常驻」能否开启，
+        // 不能只看平台名，否则托盘建失败时会把窗口藏进没有入口的进程
+        "backgroundResident": bg.tray_ready(),
     })
 }
 
-/// 查询桥接状态（Python 探测结果 + 各 workspace 实例）
+/// 解析引擎 HTTP 端点（按 workspace 取真实端口；未传 workspace 时取任一在跑实例）
 #[tauri::command]
-async fn agent_status(state: State<'_, BridgeState>) -> Result<Value, String> {
-    Ok(agent::bridge_status(&state.inner()).await)
+async fn engine_endpoint(
+    state: State<'_, BridgeState>,
+    workspace_id: Option<String>,
+) -> Result<Value, String> {
+    agent::endpoint_of(&state.inner(), workspace_id.as_deref()).await
 }
 
 /// 启动指定 workspace 的 Agent 实例
@@ -102,17 +123,6 @@ async fn agent_start_workspace(
 ) -> Result<Value, String> {
     let port = agent::start_workspace(&app, &state.inner(), &workspace_id).await?;
     Ok(json!({ "workspaceId": workspace_id, "port": port }))
-}
-
-/// 停止指定 workspace 的 Agent 实例
-#[tauri::command]
-async fn agent_stop_workspace(
-    app: AppHandle,
-    state: State<'_, BridgeState>,
-    workspace_id: String,
-) -> Result<Value, String> {
-    agent::stop_workspace(&state.inner(), &app, &workspace_id).await?;
-    Ok(json!({ "success": true }))
 }
 
 /// 推送任务状态变更事件（status_change，含 wait_reason/成因码）
@@ -160,6 +170,15 @@ fn secure_env_enabled(store: &store::Store) -> bool {
     }
 }
 
+/// 私有模式开关（设置项 privacyMode；未设置或值非布尔真值时按关闭处理）
+fn privacy_enabled(store: &store::Store) -> bool {
+    let raw = store::settings::get(store, "privacyMode").ok().flatten();
+    match raw {
+        Some(v) => matches!(v.trim().trim_matches('"'), "true" | "1"),
+        None => false,
+    }
+}
+
 /// 自选工作目录校验：只接受「存在的目录」，缺省/空白视为未选择。
 /// 引擎会照着下发的路径直接建会话子目录，若不校验就会出现「界面显示 D:\a、产出落在别处」，
 /// 那等于把用户选的目录丢掉——这里改为明确拒绝。
@@ -186,11 +205,16 @@ async fn chat_submit(
     p0: State<'_, Arc<P0Services>>,
     workspace_id: Option<String>,
     goal: String,
+    // 工作台模式：只接受白名单值，未知值显式失败而不是静默按通用模式跑
+    mode: Option<String>,
     attachments: Option<Vec<Value>>,
     conversation_id: Option<String>,
     turn_index: Option<i64>,
     model_binding: Option<String>,
-    model_config: Option<Value>,
+    // 所选已保存模型的 id（端点与密钥由 Rust 从 SQLite + keyring 解析，渲染层不传密钥）
+    model_id: Option<String>,
+    // 本轮负责人专家：只传注册表 id，提示词/模型绑定由引擎从 runtime.experts 取
+    expert_id: Option<String>,
     work_dir: Option<String>,
     history: Option<Vec<Value>>,
 ) -> Result<Value, String> {
@@ -199,6 +223,8 @@ async fn chat_submit(
         .unwrap_or_else(|| "default".into());
     let task_id = format!("task-{}", now_ms_u64());
     let title: String = goal.chars().take(30).collect();
+    // 隐私模式：本轮目标与回复不写正文库、不写可回放事件，任务标题也不落任务表
+    let privacy = privacy_enabled(&p0.store);
 
     // 配额闸门：100% 档阻断新提交（错误码 QUOTA_EXCEEDED，ADJ-R5-4）
     if let Err(code) = p0.quota.check_submit() {
@@ -207,34 +233,77 @@ async fn chat_submit(
 
     // 对话内选择项：先校验工作目录，再受理任务（避免留下必然失败的幽灵任务）
     let work_dir = validate_work_dir(work_dir.as_deref())?;
+    let mode = match mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        None => None,
+        Some(m) if matches!(m, "general" | "design" | "slides" | "writing") => Some(m.to_string()),
+        Some(m) => {
+            return Err(format!(
+                "MODE_INVALID: 未知工作台模式 {m}（可用：general/design/slides/writing）"
+            ))
+        }
+    };
+    // 模型选择在受理阶段就解析：模型不存在/缺密钥时直接拒绝提交，
+    // 不留下一个跑起来才发现调用不了的幽灵任务（Auto 且有默认模型时也在此绑定）
+    let model_config = model::service::runtime_config(&p0.store, model_id.as_deref())?;
+    // 负责人专家在受理阶段校验：不存在/绑定模型不可用直接拒绝，不留下必然失败的任务
+    let expert_id = match expert_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => {
+            let id = raw.to_lowercase();
+            if expert::get(&p0.store, &id)?.is_none() {
+                return Err(format!("EXPERT_NOT_FOUND: 负责人专家 {id} 不存在，请刷新专家团队"));
+            }
+            expert::lead_model_config(&p0.store, &id)?;
+            Some(id)
+        }
+        None => None,
+    };
     let overrides = agent::SubmitOverrides {
+        mode,
         model_binding: model_binding.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
-        model_config: model_config.filter(|v| v.as_object().map_or(false, |o| !o.is_empty())),
+        model_config,
+        expert_id,
         work_dir: work_dir.map(|p| p.display().to_string()),
         history: history.unwrap_or_default(),
+        // 执行面输入（意识/技能）由桥接层装配，这里不替它决定内容
+        ..agent::SubmitOverrides::default()
     };
 
     // 任务注册表受理：转移 #1 (创建)→queued，并推送状态事件
     let record = p0.registry.create(&task_id, &ws);
+    // 记住本轮选中的已保存模型：引擎重启后 resume 要据此重新解析端点与密钥
+    p0.registry.set_model_id(
+        &task_id,
+        model_id.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+    );
     emit_status_change(&app, &record);
-    sync_task_to_db(&p0, &task_id, &title);
+    // 任务标题由目标前 30 字截取，属于正文内容；隐私模式不落任务表
+    if !privacy {
+        sync_task_to_db(&p0, &task_id, &title);
+    }
 
     // 会话正文落库（用户提问）：渲染层带着会话键与轮次号提交，
-    // 未带时以任务 id 作为会话键，保证正文不丢（重启后至少这轮问答可见）
+    // 未带时以任务 id 作为会话键，保证正文不丢（重启后至少这轮问答可见）。
+    // 隐私模式下跳过：本轮内容只存在于当前进程内存。
     let conv_id = conversation_id
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| task_id.clone());
     let turn = turn_index.unwrap_or(0).max(0);
-    if let Err(e) = store::messages::record_user_goal(
-        &p0.store,
-        &conv_id,
-        turn,
-        &task_id,
-        &goal,
-        now_ms_u64() as i64,
-    ) {
-        eprintln!("[store] user message persist failed: {e}");
+    if !privacy {
+        if let Err(e) = store::messages::record_user_goal(
+            &p0.store,
+            &conv_id,
+            turn,
+            &task_id,
+            &goal,
+            now_ms_u64() as i64,
+        ) {
+            eprintln!("[store] user message persist failed: {e}");
+        }
     }
 
     // 本地 local-first 退化：queued 入队即出队（<100ms），立即签发租约转 planning
@@ -270,6 +339,7 @@ async fn chat_submit(
             registry: Some(Arc::clone(&services.registry)),
             store: Some(Arc::clone(&services.store)),
             secure_env: secure_env_enabled(&services.store),
+            privacy,
         };
         let result = agent::send_message_with_attachments(
             &app2,
@@ -314,18 +384,26 @@ async fn chat_submit(
                 let _ = app2.emit(agent::EVENT_CHAT, json!({ "type": "done", "taskId": tid }));
             }
         }
-        sync_task_to_db(&services, &tid, "");
+        if !privacy {
+            sync_task_to_db(&services, &tid, "");
+        }
         // 计划阶段结束释放租约；approve 执行阶段重新签发
         services.leases.release(&tid);
     });
 
-    // 任务受理留痕（PRD §4.7.4）：目标文本入库前经 audit 统一脱敏
+    // 任务受理留痕（PRD §4.7.4）：目标文本入库前经 audit 统一脱敏。
+    // 隐私模式下只记录「发生过一次提交」，不写目标摘要。
+    let audit_details = if privacy {
+        "提交任务（隐私模式：不记录目标与标题）".to_string()
+    } else {
+        format!("提交任务：{title}")
+    };
     security::audit::record_quiet(
         &p0.store,
         security::audit::ACTION_TASK_SUBMIT,
         security::audit::SEV_INFO,
         &task_id,
-        &format!("提交任务：{title}"),
+        &audit_details,
     );
 
     Ok(json!({
@@ -364,6 +442,8 @@ async fn chat_review(
                     record.status
                 ));
             }
+            // 执行阶段沿用提交时的隐私开关：期间用户可能已改设置，以当前值为准
+            let privacy = privacy_enabled(&p0.store);
             // 转移 #9：pending_review→executing；重新签发执行租约
             let lease = p0
                 .leases
@@ -373,7 +453,9 @@ async fn chat_review(
             if let Some(r) = p0.registry.update_status(&task_id, status::EXECUTING, None) {
                 emit_status_change(&app, &r);
             }
-            sync_task_to_db(&p0, &task_id, "");
+            if !privacy {
+                sync_task_to_db(&p0, &task_id, "");
+            }
 
             // 后台消费执行流（step_*/deliver/done 事件）
             let bridge = state.inner().clone();
@@ -388,6 +470,7 @@ async fn chat_review(
                     registry: Some(Arc::clone(&services.registry)),
                     store: Some(Arc::clone(&services.store)),
                     secure_env: secure_env_enabled(&services.store),
+                    privacy,
                 };
                 let result = agent::review_task(
                     &app2, &bridge, &ws2, &tid, "approve", patch, ctx,
@@ -425,7 +508,119 @@ async fn chat_review(
                             .emit(agent::EVENT_CHAT, json!({ "type": "done", "taskId": tid }));
                     }
                 }
-                sync_task_to_db(&services, &tid, "");
+                if !privacy {
+                    sync_task_to_db(&services, &tid, "");
+                }
+                services.leases.release(&tid);
+            });
+            Ok(json!({ "ok": true, "taskId": task_id, "status": status::EXECUTING }))
+        }
+        "resume" => {
+            // 断点续跑：引擎进程内检查点决定能否恢复，Rust 只做状态与租约编排。
+            // 已结束的任务（done/failed/cancelled）才有检查点；执行中请走 control pause/resume。
+            let resumable_status = matches!(
+                record.status.as_str(),
+                status::DONE | status::FAILED | status::CANCELLED
+            );
+            if !resumable_status {
+                return Err(format!(
+                    "VALIDATION_ERROR: 当前状态 {} 不能从检查点恢复（仅 done/failed/cancelled 可恢复）",
+                    record.status
+                ));
+            }
+            // 磁盘检查点不保存密钥：resume 时重新解析模型配置、重新装配执行面输入
+            // （Hook 网关令牌/MCP 凭据只在本机内存与请求体里，不落检查点文件）
+            let model_config = model::service::runtime_config(&p0.store, record.model_id.as_deref())
+                .map_err(|err| {
+                    format!("CHECKPOINT_MODEL_UNAVAILABLE: 断点续跑需要重新解析模型配置，但{err}")
+                })?;
+            let runtime_bundle = {
+                let store = p0.store.clone();
+                let ws_for_runtime = ws.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    bridge::runtime::build(Some(&store), &ws_for_runtime, &[])
+                })
+                .await
+                .map_err(|e| format!("RUNTIME_BUNDLE_PANIC: 执行面输入装配线程异常：{e}"))?
+            };
+            let resume_context = json!({
+                "modelConfig": model_config,
+                "runtime": runtime_bundle.runtime,
+            });
+            let previous_status = record.status.clone();
+            let previous_reason = record.status_reason_code.clone();
+            let privacy = privacy_enabled(&p0.store);
+            let lease = p0
+                .leases
+                .acquire(&task_id, now_ms_u64())
+                .map_err(|t| format!("TASK_ALREADY_RUNNING: {}", t.message))?;
+            p0.registry.bind_lease(&task_id, &lease.lease_id);
+            if let Some(r) = p0.registry.update_status(&task_id, status::EXECUTING, None) {
+                emit_status_change(&app, &r);
+            }
+            if !privacy {
+                sync_task_to_db(&p0, &task_id, "");
+            }
+
+            let bridge = state.inner().clone();
+            let app2 = app.clone();
+            let ws2 = ws.clone();
+            let tid = task_id.clone();
+            let services = p0.inner().clone();
+            tauri::async_runtime::spawn(async move {
+                let ctx = P0Context {
+                    events: Some(Arc::clone(&services.events)),
+                    quota: Some(Arc::clone(&services.quota)),
+                    registry: Some(Arc::clone(&services.registry)),
+                    store: Some(Arc::clone(&services.store)),
+                    secure_env: secure_env_enabled(&services.store),
+                    privacy,
+                };
+                let result = agent::review_task_with(
+                    &app2, &bridge, &ws2, &tid, "resume", patch, ctx,
+                    Some(resume_context),
+                )
+                .await;
+                let cancel_requested = services
+                    .registry
+                    .get(&tid)
+                    .map(|r| r.cancel_requested)
+                    .unwrap_or(false);
+                match result {
+                    Ok(()) => {
+                        let next = if cancel_requested {
+                            status::CANCELLED
+                        } else {
+                            status::DONE
+                        };
+                        if let Some(r) = services.registry.update_status(&tid, next, None) {
+                            emit_status_change(&app2, &r);
+                        }
+                    }
+                    Err(err) => {
+                        // 恢复没有真正开始（检查点不可用/引擎已重启）：回到之前的状态，
+                        // 不能把一个可重试的中断误标成 failed。
+                        eprintln!("[bridge] review resume failed: {err}");
+                        if let Some(r) = services.registry.update_status(
+                            &tid,
+                            &previous_status,
+                            previous_reason.as_deref(),
+                        ) {
+                            emit_status_change(&app2, &r);
+                        }
+                        let _ = app2.emit(
+                            agent::EVENT_CHAT,
+                            json!({ "type": "error", "code": "CHECKPOINT_RESUME_FAILED", "message": err }),
+                        );
+                        let _ = app2.emit(
+                            agent::EVENT_CHAT,
+                            json!({ "type": "done", "taskId": tid }),
+                        );
+                    }
+                }
+                if !privacy {
+                    sync_task_to_db(&services, &tid, "");
+                }
                 services.leases.release(&tid);
             });
             Ok(json!({ "ok": true, "taskId": task_id, "status": status::EXECUTING }))
@@ -438,13 +633,14 @@ async fn chat_review(
                 ));
             }
             // 转移 #10：pending_review→done(REJECTED)；短流消费后落终态
+            let privacy = privacy_enabled(&p0.store);
             let bridge = state.inner().clone();
             let app2 = app.clone();
             let ws2 = ws.clone();
             let tid = task_id.clone();
             let services = p0.inner().clone();
             tauri::async_runtime::spawn(async move {
-                let ctx = P0Context::default();
+                let ctx = P0Context { privacy, ..P0Context::default() };
                 let _ = agent::review_task(&app2, &bridge, &ws2, &tid, "reject", patch, ctx)
                     .await
                     .map_err(|e| eprintln!("[bridge] review reject failed: {e}"));
@@ -454,7 +650,9 @@ async fn chat_review(
                 {
                     emit_status_change(&app2, &r);
                 }
-                sync_task_to_db(&services, &tid, "");
+                if !privacy {
+                    sync_task_to_db(&services, &tid, "");
+                }
                 services.leases.release(&tid);
             });
             Ok(json!({ "ok": true, "taskId": task_id, "status": status::DONE }))
@@ -467,13 +665,14 @@ async fn chat_review(
                 ));
             }
             // 转移 #11：携带 patch 重新生成 plan（状态保持 pending_review）
+            let privacy = privacy_enabled(&p0.store);
             let bridge = state.inner().clone();
             let app2 = app.clone();
             let ws2 = ws.clone();
             let tid = task_id.clone();
             let services = p0.inner().clone();
             tauri::async_runtime::spawn(async move {
-                let ctx = P0Context::default();
+                let ctx = P0Context { privacy, ..P0Context::default() };
                 let result =
                     agent::review_task(&app2, &bridge, &ws2, &tid, "modify", patch, ctx).await;
                 if let Err(e) = result {
@@ -483,12 +682,38 @@ async fn chat_review(
                         json!({ "type": "error", "code": "BRIDGE_ERROR", "message": e }),
                     );
                 }
-                sync_task_to_db(&services, &tid, "");
+                if !privacy {
+                    sync_task_to_db(&services, &tid, "");
+                }
             });
             Ok(json!({ "ok": true, "taskId": task_id, "status": status::PENDING_REVIEW }))
         }
         _ => Err(format!("VALIDATION_ERROR: 未知审阅动作 {action}")),
     }
+}
+
+/// 查询任务检查点状态：刷新页面后据此重建「从检查点继续」入口。
+/// 进程内任务与磁盘检查点都走引擎查询；密钥与对话正文不经过这里。
+#[tauri::command]
+async fn chat_checkpoint_query(
+    state: State<'_, BridgeState>,
+    task_ids: Vec<String>,
+    workspace_id: Option<String>,
+) -> Result<Value, String> {
+    let mut ids: Vec<String> = Vec::new();
+    for raw in task_ids {
+        let id = raw.trim().to_string();
+        if !id.is_empty() && !ids.contains(&id) {
+            ids.push(id);
+        }
+        if ids.len() >= 200 {
+            break;
+        }
+    }
+    if ids.is_empty() {
+        return Ok(serde_json::json!({ "checkpoints": {} }));
+    }
+    agent::query_checkpoints(state.inner(), workspace_id.as_deref(), ids).await
 }
 
 /// 任务控制（转移 #14/#21/#22）：pause(executing→paused) / resume(paused→executing) /
@@ -709,39 +934,6 @@ async fn chat_feedback(
     )])))
 }
 
-/// 查询任务 14 态状态（含 wait_reason/重试计数/租约/成因码）
-#[tauri::command]
-async fn task_state(p0: State<'_, Arc<P0Services>>, task_id: String) -> Result<Value, String> {
-    p0.registry
-        .get(&task_id)
-        .map(|r| serde_json::to_value(&r).unwrap_or(Value::Null))
-        .ok_or_else(|| format!("TASK_NOT_FOUND: {task_id}"))
-}
-
-/// 配额快照（四档预警 70/85/95/100%）
-#[tauri::command]
-async fn quota_status(p0: State<'_, Arc<P0Services>>) -> Result<Value, String> {
-    Ok(serde_json::to_value(p0.quota.snapshot()).unwrap_or(Value::Null))
-}
-
-/// 租约视图（全部活跃租约）
-#[tauri::command]
-async fn lease_info(p0: State<'_, Arc<P0Services>>) -> Result<Value, String> {
-    Ok(json!({
-        "holder": p0.leases.holder_id(),
-        "leases": p0.leases.list(),
-    }))
-}
-
-/// 接管请求（禁止抢占：活跃租约需对端确认，ADJ-R2-4）
-#[tauri::command]
-async fn lease_takeover(
-    p0: State<'_, Arc<P0Services>>,
-    task_id: String,
-) -> Result<Value, String> {
-    Ok(serde_json::to_value(p0.leases.takeover(&task_id, now_ms_u64())).unwrap_or(Value::Null))
-}
-
 /// 事件重放（24h 持久化 + ≥10min 重放窗口，seq > from_seq）
 #[tauri::command]
 async fn event_replay(
@@ -860,6 +1052,13 @@ async fn model_test(
     Ok(serde_json::to_value(resp).unwrap_or(Value::Null))
 }
 
+/// 零配置本地模型：真实探测本机 Ollama（只接受回环地址，不把渲染层变成任意探测通道）
+#[tauri::command]
+async fn model_detect_local(base_url: Option<String>) -> Result<Value, String> {
+    let resp = model::local::detect(base_url.as_deref()).await?;
+    Ok(serde_json::to_value(resp).unwrap_or(Value::Null))
+}
+
 #[tauri::command]
 async fn model_set_default(p0: State<'_, Arc<P0Services>>, id: String) -> Result<Value, String> {
     model::service::set_default(&p0.store, &id)?;
@@ -912,22 +1111,6 @@ async fn settings_get(p0: State<'_, Arc<P0Services>>) -> Result<Value, String> {
     Ok(Value::Object(out))
 }
 
-#[tauri::command]
-async fn settings_set(
-    p0: State<'_, Arc<P0Services>>,
-    key: String,
-    value: String,
-) -> Result<Value, String> {
-    let parsed = serde_json::from_str(&value).unwrap_or(json!(value));
-    // 代理组按键联动，落库前先按最终状态校验（见 settings_set_many 注释）
-    let mut probe = serde_json::Map::new();
-    probe.insert(key.clone(), parsed.clone());
-    proxy::spec_from_patch(&p0.store, &probe)?;
-    store::settings::set(&p0.store, &key, &value)?;
-    apply_setting_side_effect(&p0, &key, &parsed)?;
-    Ok(json!({ "ok": true, "key": key }))
-}
-
 /// 批量写设置（设置页对象 patch）：值为任意 JSON，序列化后落库；
 /// 需要系统行为联动的键（保持唤醒 / 网络代理）写入后立即生效
 #[tauri::command]
@@ -956,11 +1139,22 @@ fn bool_of_setting(value: &Value) -> bool {
     }
 }
 
-/// 设置项落库后的系统行为联动（保持唤醒 / 开机自启 / 网络代理）
+/// 设置项落库后的系统行为联动（保持唤醒 / 开机自启 / 后台常驻 / 网络代理）
 fn apply_setting_side_effect(p0: &P0Services, key: &str, value: &Value) -> Result<(), String> {
     match key {
         task::keep_awake::SETTING_KEY => p0.keep_awake.apply(bool_of_setting(value)),
-        system::autostart::SETTING_KEY => system::autostart::apply(bool_of_setting(value)),
+        system::autostart::SETTING_KEY => system::autostart::apply(
+            bool_of_setting(value),
+            setting_bool(p0, background::SETTING_KEY),
+        ),
+        background::SETTING_KEY => {
+            // 自启命令里的 --hidden 跟随后台常驻：已开启自启时立即改写启动项，
+            // 否则用户会保留「开机弹出主窗口」的旧命令却以为已静默驻留
+            if setting_bool(p0, system::autostart::SETTING_KEY) {
+                system::autostart::apply(true, bool_of_setting(value))?;
+            }
+            Ok(())
+        }
         proxy::SETTING_KEY_MODE | proxy::SETTING_KEY_URL | proxy::SETTING_KEY_BYPASS => {
             // 整组校验后发布：自定义却没填地址 → 保存即失败，不留下半个生效配置
             let spec = proxy::spec(&p0.store)?;
@@ -1028,6 +1222,13 @@ fn keep_awake_requested(p0: &P0Services) -> bool {
 async fn schedule_list(p0: State<'_, Arc<P0Services>>) -> Result<Value, String> {
     let rows = task::schedule::list(&p0.store)?;
     Ok(serde_json::to_value(rows).unwrap_or(Value::Array(vec![])))
+}
+
+/// 一句话解析定时任务（纯本地规则，不调用模型；不支持的写法明确报错）
+#[tauri::command]
+async fn schedule_parse(text: String) -> Result<Value, String> {
+    let parsed = task::schedule::parse_natural(&text)?;
+    Ok(serde_json::to_value(parsed).unwrap_or(Value::Null))
 }
 
 /// 新建定时任务（频率/时刻/星期先规范化，非法即拒）
@@ -1216,6 +1417,7 @@ async fn execute_schedule_inner(
         registry: Some(Arc::clone(&services.registry)),
         store: Some(Arc::clone(&services.store)),
         secure_env: secure_env_enabled(&services.store),
+        privacy: privacy_enabled(&services.store),
     };
 
     // 阶段一：计划流（与手动提交一致，结束后进入 pending_review）
@@ -1282,6 +1484,31 @@ async fn execute_schedule_inner(
 
     sync_task_to_db(services, &task_id, "");
     services.leases.release(&task_id);
+
+    // 结果推送：只影响「执行记录里的附加说明」，推送失败不改任务本身的成败。
+    let (summary, push_failed) = if sched.notify_channel.trim().is_empty() {
+        (summary, false)
+    } else {
+        let push_text = format!("【定时任务】{}\n{}", sched.name, summary);
+        match crate::bridge::im::send(
+            bridge,
+            &sched.notify_channel,
+            &sched.notify_target,
+            &push_text,
+        )
+        .await
+        {
+            Ok(_) => (
+                format!(
+                    "{summary}；已推送到 {}（{}）",
+                    sched.notify_channel, sched.notify_target
+                ),
+                false,
+            ),
+            Err(e) => (format!("{summary}；推送失败：{e}"), true),
+        }
+    };
+
     task::schedule::finish_run(
         &services.store,
         &run_id,
@@ -1294,7 +1521,7 @@ async fn execute_schedule_inner(
     security::audit::record_quiet(
         &services.store,
         security::audit::ACTION_SCHEDULE_RUN,
-        if run_status == task::schedule::RUN_SUCCEEDED {
+        if run_status == task::schedule::RUN_SUCCEEDED && !push_failed {
             security::audit::SEV_INFO
         } else {
             security::audit::SEV_WARNING
@@ -1420,6 +1647,23 @@ async fn file_preview(
     Ok(serde_json::to_value(previews).unwrap_or(Value::Array(vec![])))
 }
 
+/// 用系统默认应用打开本地产物（扩展名白名单；拒绝可执行/脚本类）
+#[tauri::command]
+async fn file_open_external(
+    p0: State<'_, Arc<P0Services>>,
+    path: String,
+) -> Result<(), String> {
+    file::service::open_external(&path)?;
+    security::audit::record_quiet(
+        &p0.store,
+        security::audit::ACTION_FILE_READ,
+        security::audit::SEV_INFO,
+        &path,
+        "用系统默认应用打开产物",
+    );
+    Ok(())
+}
+
 /// 附件暂存（交互补设计 §3.1 附件模式）：复制到运行目录并返回 AttachmentMeta
 #[tauri::command]
 async fn file_stage_attachment(
@@ -1462,6 +1706,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(agent::new_bridge_state())
+        .manage(remote::new_state())
+        .manage(background::new_state())
         .setup(|app| {
             // 随包资源根目录注入：安装后引擎脚本与嵌入式 Python 由此定位（开发模式无此目录）
             if let Ok(resource_dir) = app.path().resource_dir() {
@@ -1500,6 +1746,9 @@ pub fn run() {
             });
             app.manage(services.clone());
 
+            // 后台常驻：托盘建成才允许关窗隐藏；托盘失败时保持「关窗即退出」的原行为
+            setup_background(&app.handle().clone(), &services);
+
             // 保持唤醒：恢复上次开启的状态（真实生效，失败仅告警不阻断启动）
             if keep_awake_requested(&services) {
                 if let Err(e) = services.keep_awake.apply(true) {
@@ -1509,6 +1758,19 @@ pub fn run() {
 
             // 网络代理：启动即发布生效配置，后续 Rust 出网与引擎子进程都读这一份
             proxy::publish(proxy::spec_or_system(&services.store));
+
+            // Hook 网关：引擎执行链路在触发点回到这里，由 Rust 拉起用户放行过的脚本
+            // （配了脚本 ≠ 会执行：未放行的命令网关只如实回报「未执行」）
+            bridge::hook_gate::start(Arc::clone(&services));
+
+            // 电脑操控网关：引擎的截屏/键鼠请求回到这里，由 Rust 做档位门禁、确认与审计
+            bridge::computer_gate::start(Arc::clone(&services));
+
+            // 浏览器 AI+ 网关：引擎的会话申请与逐次放行回到这里
+            bridge::browser_gate::start(Arc::clone(&services));
+
+            // 逐工具审批网关：引擎在副作用工具执行前回到这里，由 Rust 弹原生确认框
+            bridge::tool_gate::start(Arc::clone(&services));
 
             // 事件存储后台任务：异步批量刷盘 + 24h TTL 清理
             event_store_start(&events);
@@ -1533,38 +1795,47 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             system_info,
-            agent_status,
             agent_start_workspace,
-            agent_stop_workspace,
+            engine_endpoint,
             chat_submit,
             chat_review,
+            chat_checkpoint_query,
             chat_control,
             chat_cancel,
             chat_history,
             chat_conversations,
             chat_messages,
             chat_feedback,
-            task_state,
-            quota_status,
-            lease_info,
-            lease_takeover,
             event_replay,
             model_list,
             model_add,
             model_update,
             model_delete,
             model_test,
+            model_detect_local,
             model_set_default,
             model_usage,
             usage_stats,
             usage_report,
             settings_get,
-            settings_set,
             settings_set_many,
             keep_awake_status,
+            bridge::tools::agent_builtin_tools,
+            bridge::im::im_channels,
+            bridge::im::im_configure,
+            bridge::im::im_start,
+            bridge::im::im_stop,
+            bridge::im::im_forget,
+            bridge::im::im_send,
+            bridge::im::im_preferences_get,
+            bridge::im::im_preferences_set,
             system::system_autostart_status,
+            system::badge::badge_support,
+            system::badge::badge_set,
+            system::task_window::open_task_window,
             proxy_status,
             schedule_list,
+            schedule_parse,
             schedule_create,
             schedule_update,
             schedule_toggle,
@@ -1574,10 +1845,27 @@ pub fn run() {
             file_list,
             file_read,
             file_preview,
+            file_open_external,
             file_stage_attachment,
             auth::auth_status,
             auth::auth_login,
             auth::auth_logout,
+            auth::auth_server_probe,
+            collab::collab_status,
+            collab::collab_list_projects,
+            collab::collab_create_project,
+            collab::collab_project_detail,
+            collab::collab_create_invite,
+            collab::collab_list_invites,
+            collab::collab_accept_invite,
+            collab::collab_update_member_role,
+            collab::collab_remove_member,
+            collab::collab_transfer_owner,
+            collab::collab_leave_project,
+            collab::collab_create_task,
+            collab::collab_update_task,
+            collab::collab_add_comment,
+            collab::collab_report_result,
             security::security_scan_data,
             security::security_get_domain_control,
             security::security_set_domain_control,
@@ -1594,6 +1882,7 @@ pub fn run() {
             security::audit_log_export,
             workspace::workspace_list,
             workspace::workspace_create,
+            workspace::workspace_capabilities,
             skill::skill_root,
             skill::skill_list,
             skill::skill_install,
@@ -1603,12 +1892,36 @@ pub fn run() {
             suite::suite_list,
             suite::suite_install,
             suite::suite_uninstall,
+            plugin::plugin_validate,
+            plugin::plugin_template,
+            market::market_config_get,
+            market::market_config_set,
+            market::market_skill_list,
+            market::market_skill_install,
+            market::market_suite_list,
+            market::market_suite_install,
+            market::market_trust_get,
+            market::market_trust_add,
+            market::market_trust_remove,
+            knowledge::knowledge_list,
+            knowledge::knowledge_create,
+            knowledge::knowledge_update,
+            knowledge::knowledge_delete,
+            knowledge::knowledge_add_docs,
+            knowledge::knowledge_remove_doc,
+            knowledge::knowledge_open_dir,
+            pptx::pptx_templates_list,
+            pptx::pptx_template_import,
+            pptx::pptx_template_delete,
+            expert::experts_list,
+            expert::experts_save,
+            expert::experts_delete,
             align::hooks_get,
             align::hooks_set,
             align::hooks_test,
-            align::connector_list,
-            align::connector_authorize,
-            align::connector_revoke,
+            align::hooks_grant,
+            align::hooks_revoke,
+            align::hooks_status,
             align::task_archive,
             align::task_archive_list,
             align::task_unarchive,
@@ -1616,6 +1929,29 @@ pub fn run() {
             align::task_archive_clear,
             align::computer_use_get_policy,
             align::computer_use_set_policy,
+            computer::computer_use_capabilities,
+            computer::computer_use_capture,
+            remote::remote_desktop_capabilities,
+            remote::remote_desktop_status,
+            remote::remote_desktop_start,
+            remote::remote_desktop_frame,
+            remote::remote_desktop_stop,
+            browser::browser_use_get_policy,
+            browser::browser_use_set_policy,
+            browser::browser_use_capabilities,
+            browser::browser_use_start,
+            browser::browser_use_stop,
+            terminal::terminal_get_policy,
+            terminal::terminal_set_policy,
+            terminal::terminal_capabilities,
+            terminal::terminal_open,
+            terminal::terminal_input,
+            terminal::terminal_read,
+            terminal::terminal_close,
+            terminal::terminal_ai,
+            terminal::acp_get_config,
+            terminal::acp_set_config,
+            terminal::acp_status,
             awareness::awareness_get,
             awareness::awareness_update,
             awareness::awareness_memories,
@@ -1626,18 +1962,125 @@ pub fn run() {
             mcp::mcp_remove_server,
             mcp::mcp_connect,
             mcp::mcp_disconnect,
-            mcp::mcp_list_tools
+            mcp::mcp_list_tools,
+            mcp::mcp_oauth_authorize,
+            mcp::mcp_oauth_revoke
         ])
         .build(tauri::generate_context!())
         .expect("error while building tongtian-tauri")
-        .run(|handle, event| {
+        .run(|handle, event| match event {
+            // 关掉最后一个窗口时默认会退出：开启后台常驻且托盘可用则拦截。
+            // 显式退出（code=Some，如托盘「退出」）不拦，避免关不掉。
+            tauri::RunEvent::ExitRequested { code, api, .. } => {
+                let enabled = handle
+                    .try_state::<Arc<P0Services>>()
+                    .map(|s| setting_bool(&s, background::SETTING_KEY))
+                    .unwrap_or(false);
+                let (ready, quitting) = handle
+                    .try_state::<Arc<background::BackgroundState>>()
+                    .map(|s| (s.tray_ready(), s.is_quitting()))
+                    .unwrap_or((false, true));
+                if background::should_prevent_exit(enabled, ready, quitting, code) {
+                    api.prevent_exit();
+                }
+            }
             // 退出时释放唤醒约束子进程，避免遗留孤儿进程
-            if let tauri::RunEvent::Exit = event {
+            tauri::RunEvent::Exit => {
                 if let Some(services) = handle.try_state::<Arc<P0Services>>() {
                     services.keep_awake.stop();
                 }
             }
+            _ => {}
         });
+}
+
+/// 托盘与关窗驻留：托盘创建成功才置 tray_ready，关窗才允许隐藏。
+/// 托盘失败（例如资源缺失）时保持「关窗退出」，不把窗口藏进没有入口的进程。
+fn setup_background(app: &AppHandle, services: &Arc<P0Services>) {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let bg = app
+        .state::<Arc<background::BackgroundState>>()
+        .inner()
+        .clone();
+
+    let result = (|| -> tauri::Result<()> {
+        let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+        let quit = MenuItem::with_id(app, "quit", "退出通天办公", true, None::<&str>)?;
+        let menu = Menu::with_items(app, &[&show, &quit])?;
+
+        let quit_state = Arc::clone(&bg);
+        let mut builder = TrayIconBuilder::with_id("tongtian-main")
+            .menu(&menu)
+            .show_menu_on_left_click(false)
+            .on_menu_event(move |app, event| match event.id().as_ref() {
+                "show" => show_main_window(app),
+                "quit" => {
+                    // 显式退出：先置位，避免被关窗/ExitRequested 的驻留逻辑拦回来
+                    quit_state.request_quit();
+                    app.exit(0);
+                }
+                _ => {}
+            })
+            .on_tray_icon_event(|tray, event| {
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    show_main_window(tray.app_handle());
+                }
+            });
+        if let Some(icon) = app.default_window_icon() {
+            builder = builder.icon(icon.clone());
+        }
+        builder.build(app)?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            bg.mark_tray_ready();
+            // 开机自启带 --hidden：托盘就绪后直接驻留，不弹出主窗口
+            if background::has_hidden_arg(std::env::args())
+                && setting_bool(services, background::SETTING_KEY)
+            {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
+        }
+        Err(e) => eprintln!("[background] 托盘创建失败，关闭窗口仍将退出: {e}"),
+    }
+
+    // 关窗隐藏只在「设置开启 + 托盘真实可用 + 非主动退出」三者同时成立时生效
+    if let Some(window) = app.get_webview_window("main") {
+        let state = Arc::clone(&bg);
+        let handle = app.clone();
+        let services = Arc::clone(services);
+        window.on_window_event(move |event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let enabled = setting_bool(&services, background::SETTING_KEY);
+                if background::should_hide_on_close(enabled, state.tray_ready(), state.is_quitting()) {
+                    api.prevent_close();
+                    if let Some(w) = handle.get_webview_window("main") {
+                        let _ = w.hide();
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// 从托盘回到主窗口：显示、还原最小化、聚焦（窗口已被关闭时静默忽略）
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
 }
 
 /// 启动事件存储刷盘任务（独立函数便于测试替换）

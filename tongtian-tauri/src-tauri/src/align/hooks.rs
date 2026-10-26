@@ -352,6 +352,383 @@ pub fn test_input(event: &str, cwd: &str) -> Value {
     })
 }
 
+// ── 执行面：放行台账 + 事件编排 ────────────────────────────────
+
+/// 引擎执行链路里真实存在触发节点的事件（会话/工具事件在 `engine/hooks_runtime.py`，
+/// 子 Agent 事件在 `engine/subagent_runtime.py`；由契约测试锁定：
+/// 页面只能宣称这里列出的事件会真的触发）
+pub const FIRED_EVENTS: &[&str] = &[
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PreCompact",
+    "Stop",
+    "SubagentStart",
+    "SubagentStop",
+];
+
+/// 配置得了、但当前引擎没有触发点的事件（不假装会触发，页面与事件流都要说出来）
+pub const UNFIRED_EVENTS: &[&str] = &["Notification", "PermissionRequest"];
+
+/// 用工具名做 matcher 比对的事件；其余事件按 `match_target` 取输入里的对应字段
+pub const TOOL_EVENTS: &[&str] = &["PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest"];
+
+fn normalize_cmd(command: &str) -> String {
+    command.trim().to_string()
+}
+
+/// matcher 语义：空 / `*` 匹配全部，其余按正则（不锚定）匹配
+/// 正则写错必须如实报错，不能静默当成「不匹配」——否则用户会以为 Hook 没触发是引擎的问题
+pub fn matcher_matches(matcher: Option<&str>, target: Option<&str>) -> Result<bool, String> {
+    let m = matcher.map(str::trim).filter(|s| !s.is_empty() && *s != "*");
+    let Some(pattern) = m else {
+        return Ok(true);
+    };
+    let Some(text) = target else {
+        // 没有可比对的字段（如 UserPromptSubmit）：matcher 不参与判定
+        return Ok(true);
+    };
+    let re = regex::Regex::new(pattern)
+        .map_err(|e| format!("HOOK_INVALID_MATCHER: matcher「{pattern}」不是合法正则：{e}"))?;
+    Ok(re.is_match(text))
+}
+
+/// 非工具事件的 matcher 比对字段（与引擎 `hooks_runtime.py` 下发的 payload 键一致）
+fn match_target(event: &str, tool: Option<&str>, input: &Value) -> Option<String> {
+    if TOOL_EVENTS.contains(&event) {
+        return tool.map(str::to_string);
+    }
+    let key = match event {
+        "SessionStart" => "source",
+        "SessionEnd" => "reason",
+        "PreCompact" => "trigger",
+        "Notification" => "type",
+        "SubagentStart" | "SubagentStop" => "agent_type",
+        _ => return None,
+    };
+    input
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| Some(String::new()))
+}
+
+/// 放行一条 Hook 命令（幂等：重复放行只刷新时间，不产生多行）
+pub fn grant(store: &Store, command: &str, event: &str, now_ms: i64) -> Result<(), String> {
+    let cmd = normalize_cmd(command);
+    if cmd.is_empty() {
+        return Err("HOOK_INVALID_COMMAND: 空命令不需要放行".to_string());
+    }
+    ensure_event(event)?;
+    store.with_conn(|c| {
+        c.execute(
+            "INSERT INTO hook_grants (command, event, granted_at_ms) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(command) DO UPDATE SET event = excluded.event, \
+                                                 granted_at_ms = excluded.granted_at_ms",
+            rusqlite::params![cmd, event, now_ms],
+        )
+        .map(|_| ())
+        .map_err(|e| format!("HOOK_GRANT_FAILED: {e}"))
+    })
+}
+
+/// 撤销放行：只删授权记录，`hook_configs` 里的配置原样保留（撤权 ≠ 删配置）
+pub fn revoke(store: &Store, command: &str) -> Result<(), String> {
+    let cmd = normalize_cmd(command);
+    store.with_conn(|c| {
+        c.execute("DELETE FROM hook_grants WHERE command = ?1", [cmd.as_str()])
+            .map(|_| ())
+            .map_err(|e| format!("HOOK_REVOKE_FAILED: {e}"))
+    })
+}
+
+/// 配置里已经不再包含的命令，其放行随之作废，返回被作废的命令清单。
+/// 不做这一步会漏：用户删掉某条 Hook、再原样加回来，就绕过了「重新放行」这一步。
+/// 只清 `hook_grants`（本轮刚写入的意愿记录），绝不碰 `hook_configs` 里的存量配置。
+pub fn prune_grants(store: &Store, config: &Value) -> Result<Vec<String>, String> {
+    let keep = configured_commands(config);
+    let stale: Vec<String> = list_grants(store)?
+        .into_iter()
+        .filter_map(|g| g["command"].as_str().map(str::to_string))
+        .filter(|c| !keep.iter().any(|k| k == c))
+        .collect();
+    for cmd in &stale {
+        revoke(store, cmd)?;
+    }
+    Ok(stale)
+}
+
+pub fn is_granted(store: &Store, command: &str) -> Result<bool, String> {
+    let cmd = normalize_cmd(command);
+    store.with_conn(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM hook_grants WHERE command = ?1",
+            [cmd.as_str()],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .map_err(|e| format!("HOOK_GRANT_QUERY_FAILED: {e}"))
+    })
+}
+
+/// 授权台账（含执行次数），供 Hooks 页回显
+pub fn list_grants(store: &Store) -> Result<Vec<Value>, String> {
+    store.with_conn(|c| {
+        let mut stmt = c
+            .prepare(
+                "SELECT command, event, granted_at_ms, run_count, last_run_at_ms \
+                 FROM hook_grants ORDER BY granted_at_ms",
+            )
+            .map_err(|e| format!("HOOK_GRANT_QUERY_FAILED: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(json!({
+                    "command": r.get::<_, String>(0)?,
+                    "event": r.get::<_, String>(1)?,
+                    "grantedAtMs": r.get::<_, i64>(2)?,
+                    "runCount": r.get::<_, i64>(3)?,
+                    "lastRunAtMs": r.get::<_, Option<i64>>(4)?,
+                }))
+            })
+            .map_err(|e| format!("HOOK_GRANT_QUERY_FAILED: {e}"))?;
+        rows.collect::<Result<Vec<Value>, _>>()
+            .map_err(|e| format!("HOOK_GRANT_QUERY_FAILED: {e}"))
+    })
+}
+
+fn mark_run(store: &Store, command: &str, now_ms: i64) {
+    let _ = store.with_conn(|c| {
+        c.execute(
+            "UPDATE hook_grants SET run_count = run_count + 1, last_run_at_ms = ?2 \
+             WHERE command = ?1",
+            rusqlite::params![normalize_cmd(command), now_ms],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    });
+}
+
+/// 配置里出现过的全部命令原文（去重，保持配置顺序）
+pub fn configured_commands(config: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let map = match normalize_hooks(config).as_object().cloned() {
+        Some(m) => m,
+        None => return out,
+    };
+    for groups in map.values() {
+        for group in groups.as_array().cloned().unwrap_or_default() {
+            for cmd in group
+                .get("hooks")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+            {
+                let raw = cmd.get("command").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if !raw.is_empty() && !out.iter().any(|c| c == raw) {
+                    out.push(raw.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 执行面概览：配置了几条、哪些事件有触发点、哪些命令还没放行
+pub fn runtime_summary(store: &Store) -> Result<Value, String> {
+    let config = get(store)?;
+    let hooks = normalize_hooks(&config);
+    let by_event = hooks.as_object().cloned().unwrap_or_default();
+    let commands = configured_commands(&config);
+    let mounted: Vec<&str> = ALL_EVENTS
+        .iter()
+        .copied()
+        .filter(|e| {
+            by_event
+                .get(*e)
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+        })
+        .collect();
+    let mut ungranted: Vec<String> = Vec::new();
+    for cmd in &commands {
+        if !is_granted(store, cmd)? {
+            ungranted.push(cmd.clone());
+        }
+    }
+    // 用户确实配了、但引擎没有触发点的事件 —— 页面要逐条说明，不能让它看起来「配了就会跑」
+    let mounted_unfired: Vec<&str> = mounted
+        .iter()
+        .filter(|e| UNFIRED_EVENTS.contains(e))
+        .copied()
+        .collect();
+    Ok(json!({
+        "configured": commands.len(),
+        "mountedEvents": mounted,
+        "firedEvents": FIRED_EVENTS,
+        "unfiredEvents": UNFIRED_EVENTS,
+        "mountedUnfired": mounted_unfired,
+        "ungranted": ungranted,
+    }))
+}
+
+/// 单条命令的执行台账（渲染成契约里的 `results[]` 元素）
+fn outcome_value(cmd: &Value, run: Option<&HookRun>, granted: bool, err: Option<&str>) -> Value {
+    let command = cmd.get("command").and_then(|v| v.as_str()).unwrap_or("").trim();
+    match run {
+        Some(r) => json!({
+            "command": command,
+            "executed": true,
+            "granted": granted,
+            "exitCode": r.exit_code,
+            "stdout": r.stdout,
+            "stderr": r.stderr,
+            "blocked": r.blocked,
+            "timedOut": r.timed_out,
+        }),
+        None => json!({
+            "command": command,
+            "executed": false,
+            "granted": granted,
+            "reason": err.unwrap_or(if granted { "未执行" } else { "未放行" }),
+        }),
+    }
+}
+
+/// 真实触发一个 Hook 事件：读 `hooks_get` 的同一份配置，按 matcher 过滤，
+/// 已放行的命令走与试运行完全相同的 `run_command`；未放行的不执行但如实回报。
+///
+/// 返回 `blocked`（可阻塞事件 exit 2）与 `notes`（给引擎摊成事件流的中文说明）。
+pub fn fire(
+    store: &Store,
+    event: &str,
+    tool: Option<&str>,
+    payload: &Value,
+    now_ms: i64,
+) -> Result<Value, String> {
+    ensure_event(event)?;
+    let config = get(store)?;
+    let groups = config
+        .get("hooks")
+        .and_then(|h| h.get(event))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if groups.is_empty() {
+        return Ok(json!({ "event": event, "results": [], "blocked": false, "notes": [] }));
+    }
+
+    let target = match_target(event, tool, payload);
+    let input = real_input(event, tool, payload);
+    let mut results: Vec<Value> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut blocked = false;
+
+    for group in &groups {
+        let matcher = group.get("matcher").and_then(|v| v.as_str());
+        match matcher_matches(matcher, target.as_deref()) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                notes.push(format!("Hook「{event}」的 matcher 未生效：{}", e.split(": ").nth(1).unwrap_or(&e)));
+                continue;
+            }
+        }
+        let cmds = group
+            .get("hooks")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for cmd in &cmds {
+            let command = cmd.get("command").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if command.is_empty() {
+                continue;
+            }
+            let secs = clamp_timeout(cmd.get("timeout").and_then(|v| v.as_u64()));
+            if !is_granted(store, command)? {
+                results.push(outcome_value(cmd, None, false, None));
+                notes.push(format!(
+                    "Hook「{event}」命令 `{command}` 尚未放行，本轮没有执行（在 Hooks 页点「放行」后才会真的跑）"
+                ));
+                continue;
+            }
+            let run = run_command(event, command, secs, &input);
+            mark_run(store, command, now_ms);
+            blocked |= run.blocked;
+            results.push(outcome_value(cmd, Some(&run), true, None));
+            if run.blocked {
+                let brief = stdout_brief(&run);
+                let what = if event == "PreToolUse" {
+                    format!("阻断了工具调用「{}」", tool.unwrap_or("?"))
+                } else {
+                    "要求继续执行".to_string()
+                };
+                notes.push(format!("Hook「{event}」{what}（exit 2）：{brief}"));
+            } else if run.timed_out {
+                notes.push(format!(
+                    "Hook「{event}」命令 `{command}` 超时（{secs} 秒）被终止，本轮结果不可信"
+                ));
+            } else if run.exit_code != 0 {
+                notes.push(format!(
+                    "Hook「{event}」命令 `{command}` 执行失败（exit {}）：{}",
+                    run.exit_code,
+                    stdout_brief(&run)
+                ));
+            }
+        }
+    }
+
+    if event == "Stop" && blocked {
+        // Stop 的 exit 2 语义是「别停，继续跑」；引擎回复已结束，续跑做不到，必须如实讲
+        notes.push("Stop Hook 要求继续执行（exit 2），但本轮回复已经收尾，当前执行流不支持续跑".to_string());
+    }
+
+    Ok(json!({
+        "event": event,
+        "results": results,
+        "blocked": if is_blockable(event) { blocked } else { false },
+        "notes": notes,
+    }))
+}
+
+fn stdout_brief(run: &HookRun) -> String {
+    let raw = if run.stdout.trim().is_empty() {
+        run.stderr.as_str()
+    } else {
+        run.stdout.as_str()
+    };
+    let one = raw.trim().chars().take(200).collect::<String>();
+    if one.is_empty() {
+        "（脚本无输出）".to_string()
+    } else {
+        one
+    }
+}
+
+/// 真实任务的事件输入（字段名对齐 contracts.ts HookInput）
+pub fn real_input(event: &str, tool: Option<&str>, payload: &Value) -> Value {
+    let mut v = json!({
+        "session_id": payload.get("sessionId").and_then(|s| s.as_str()).unwrap_or(""),
+        "cwd": payload.get("cwd").and_then(|s| s.as_str()).unwrap_or(""),
+        "hook_event_name": event,
+    });
+    if let Some(t) = tool {
+        v["tool_name"] = json!(t);
+    }
+    if let Some(ti) = payload.get("toolInput") {
+        v["tool_input"] = ti.clone();
+    }
+    for key in ["source", "reason", "trigger", "type", "agent_type", "message", "tool_response"] {
+        if let Some(x) = payload.get(key) {
+            v[key] = x.clone();
+        }
+    }
+    v
+}
+
 /// 事件名合法性校验（command 入口用，非法即拒）
 pub fn ensure_event(event: &str) -> Result<(), String> {
     if ALL_EVENTS.contains(&event) {
@@ -620,6 +997,303 @@ mod tests {
         let run = run_command("Stop", "   ", 5, &test_input("Stop", "."));
         assert_eq!(run.exit_code, 1);
         assert!(run.stderr.starts_with("HOOK_INVALID_COMMAND"), "{}", run.stderr);
+    }
+
+    // ── matcher 语义 ──────────────────────────────────────
+
+    #[test]
+    fn test_matcher_blank_and_star_match_everything() {
+        for m in [None, Some(""), Some("   "), Some("*")] {
+            assert!(matcher_matches(m, Some("Write")).unwrap(), "{m:?}");
+        }
+        // 非工具事件没有可比对字段时，matcher 不参与判定（而不是当成「不匹配」）
+        assert!(matcher_matches(Some("Bash"), None).unwrap());
+    }
+
+    #[test]
+    fn test_matcher_is_unanchored_regex() {
+        assert!(matcher_matches(Some("Bash|Write"), Some("Write")).unwrap());
+        assert!(!matcher_matches(Some("Bash|Write"), Some("Edit")).unwrap());
+        assert!(matcher_matches(Some("^w"), Some("write_text_file")).unwrap());
+        assert!(matcher_matches(Some("rite"), Some("write_text_file")).unwrap(), "不锚定");
+    }
+
+    #[test]
+    fn test_matcher_invalid_regex_reports_instead_of_silently_skipping() {
+        let err = matcher_matches(Some("Write("), Some("Write")).unwrap_err();
+        assert!(err.starts_with("HOOK_INVALID_MATCHER"), "{err}");
+    }
+
+    #[test]
+    fn test_match_target_picks_the_field_the_script_can_key_on() {
+        assert_eq!(match_target("PreToolUse", Some("Write"), &json!({})).as_deref(), Some("Write"));
+        assert_eq!(
+            match_target("SessionStart", None, &json!({"source": "resume"})).as_deref(),
+            Some("resume")
+        );
+        assert_eq!(
+            match_target("SessionEnd", None, &json!({"reason": "cancelled"})).as_deref(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            match_target("PreCompact", None, &json!({"trigger": "auto"})).as_deref(),
+            Some("auto")
+        );
+        // 缺字段时按空串参与匹配（正则 ^$ 之类仍可判定），不能报「匹配不到」
+        assert_eq!(match_target("SessionStart", None, &json!({})).as_deref(), Some(""));
+    }
+
+    // ── 放行台账 ──────────────────────────────────────────
+
+    #[test]
+    fn test_grant_is_idempotent_and_revoke_keeps_config() {
+        let (store, dir) = temp_store("grants");
+        let cfg = json!({"hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": "guard.sh", "timeout": 5}
+        ]}]}});
+        set(&store, &cfg, 10).unwrap();
+
+        assert!(!is_granted(&store, "guard.sh").unwrap());
+        grant(&store, "guard.sh", "PreToolUse", 111).unwrap();
+        grant(&store, "  guard.sh  ", "PreToolUse", 222).unwrap(); // 前后空格算同一条
+        assert!(is_granted(&store, "guard.sh").unwrap());
+
+        let grants = list_grants(&store).unwrap();
+        assert_eq!(grants.len(), 1, "重复放行只刷新时间，不产生多行");
+        assert_eq!(grants[0]["grantedAtMs"], json!(222));
+        assert_eq!(grants[0]["event"], "PreToolUse");
+
+        revoke(&store, "guard.sh").unwrap();
+        assert!(!is_granted(&store, "guard.sh").unwrap());
+        // 撤权 ≠ 删配置：存量配置必须原样还在（数据保护规范）
+        assert_eq!(get(&store).unwrap()["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "guard.sh");
+        let rows: i64 = store
+            .with_conn(|c| c.query_row("SELECT COUNT(*) FROM hook_configs", [], |r| r.get(0)).map_err(|e| e.to_string()))
+            .unwrap();
+        assert_eq!(rows, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_grant_rejects_empty_command_and_unknown_event() {
+        let (store, dir) = temp_store("grant-invalid");
+        assert!(grant(&store, "  ", "Stop", 1).unwrap_err().starts_with("HOOK_INVALID_COMMAND"));
+        assert!(grant(&store, "x", "Nope", 1).unwrap_err().starts_with("HOOK_INVALID_EVENT"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_configured_commands_dedupes_across_events() {
+        let cfg = json!({"hooks": {
+            "PreToolUse": [{"hooks": [{"command": "a.sh"}, {"command": " b.sh "}]}],
+            "Stop": [{"hooks": [{"command": "a.sh"}, {"command": "  "}]}],
+        }});
+        assert_eq!(configured_commands(&cfg), vec!["a.sh", "b.sh"]);
+        assert_eq!(configured_commands(&json!({})), Vec::<String>::new());
+    }
+
+    // ── 执行面概览 ────────────────────────────────────────
+
+    #[test]
+    fn test_runtime_summary_separates_configured_from_executable() {
+        let (store, dir) = temp_store("summary");
+        let cfg = json!({"hooks": {
+            "PreToolUse": [{"hooks": [{"command": "guard.sh"}]}],
+            "Notification": [{"hooks": [{"command": "notify.sh"}]}],
+            "Stop": [],
+        }});
+        set(&store, &cfg, 1).unwrap();
+        grant(&store, "guard.sh", "PreToolUse", 2).unwrap();
+
+        let s = runtime_summary(&store).unwrap();
+        assert_eq!(s["configured"], json!(2));
+        assert_eq!(s["ungranted"], json!(["notify.sh"]));
+        assert!(s["mountedEvents"].as_array().unwrap().contains(&json!("PreToolUse")));
+        assert!(s["firedEvents"].as_array().unwrap().contains(&json!("UserPromptSubmit")));
+        assert!(s["firedEvents"].as_array().unwrap().contains(&json!("SubagentStart")));
+        // 配了但引擎没有触发点的事件要单独列出来，页面才能逐条说明「不会执行」
+        assert_eq!(s["mountedUnfired"], json!(["Notification"]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 真实触发 ──────────────────────────────────────────
+
+    /// notes[] 拼成一段文本再断言：失败时要能看到全部说明，而不是只看第一条
+    fn notes_of(v: &Value) -> String {
+        v["notes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|n| n.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// 落到本用例自己的临时目录（每条命令都是唯一路径，落盘断言不会被上一轮残留蒙混）
+    fn marker_in(dir: &std::path::Path) -> String {
+        dir.join("fired.txt").to_string_lossy().to_string()
+    }
+
+    fn write_cmd(path: &str) -> String {
+        // 不加引号：cmd 的转义规则会把 Rust 传的 \" 变成字面量，重定向路径反而失效
+        if cfg!(windows) {
+            format!("echo fired> {path}")
+        } else {
+            format!("echo fired > '{path}'")
+        }
+    }
+
+    #[test]
+    fn test_fire_without_config_is_silent_noop() {
+        let (store, dir) = temp_store("fire-empty");
+        let out = fire(&store, "PreToolUse", Some("Write"), &json!({}), 1).unwrap();
+        assert_eq!(out["results"], json!([]));
+        assert_eq!(out["blocked"], json!(false));
+        assert_eq!(out["notes"], json!([]));
+        assert!(fire(&store, "NotAnEvent", None, &json!({}), 1).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_fire_does_not_execute_ungranted_command() {
+        let (store, dir) = temp_store("fire-ungranted");
+        let marker = marker_in(&dir);
+        set(&store, &json!({"hooks": {"Stop": [{"hooks": [
+            {"command": write_cmd(&marker), "timeout": 20}
+        ]}]}}), 1).unwrap();
+
+        let out = fire(&store, "Stop", None, &json!({}), 5).unwrap();
+        assert_eq!(out["results"][0]["executed"], json!(false));
+        assert_eq!(out["results"][0]["granted"], json!(false));
+        assert_eq!(out["results"][0]["reason"], "未放行");
+        assert!(notes_of(&out).contains("尚未放行"), "{}", out["notes"]);
+        assert!(!std::path::Path::new(&marker).exists(), "未放行绝不能真的拉起脚本");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_fire_runs_granted_command_once_and_counts_it() {
+        let (store, dir) = temp_store("fire-granted");
+        let cmd = write_cmd(&marker_in(&dir));
+        set(&store, &json!({"hooks": {"PreToolUse": [{"matcher": "Write", "hooks": [
+            {"command": &cmd, "timeout": 20}
+        ]}]}}), 1).unwrap();
+        grant(&store, &cmd, "PreToolUse", 2).unwrap();
+
+        let out = fire(&store, "PreToolUse", Some("Write"), &json!({"toolInput": {"p": 1}}), 7).unwrap();
+        assert_eq!(out["results"][0]["executed"], json!(true));
+        assert_eq!(out["results"][0]["exitCode"], json!(0), "{}", out["results"]);
+        assert_eq!(out["blocked"], json!(false));
+        assert_eq!(out["notes"], json!([]), "成功就该一句话都不多说");
+        let marker = marker_in(&dir);
+        assert!(
+            std::fs::read_to_string(&marker).unwrap_or_default().contains("fired"),
+            "脚本必须真的被执行并落盘：{}", out["results"]
+        );
+
+        fire(&store, "PreToolUse", Some("Write"), &json!({}), 9).unwrap();
+        let grants = list_grants(&store).unwrap();
+        assert_eq!(grants[0]["runCount"], json!(2), "放行台账要记真实执行次数");
+        assert_eq!(grants[0]["lastRunAtMs"], json!(9));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_fire_blocks_only_blockable_events_and_says_so() {
+        let (store, dir) = temp_store("fire-block");
+        let exit2 = if cfg!(windows) { "exit /b 2" } else { "exit 2" };
+        set(&store, &json!({"hooks": {
+            "PreToolUse": [{"hooks": [{"command": exit2}]}],
+            "SessionStart": [{"hooks": [{"command": exit2}]}],
+            "Stop": [{"hooks": [{"command": exit2}]}],
+        }}), 1).unwrap();
+        grant(&store, exit2, "PreToolUse", 2).unwrap();
+
+        let pre = fire(&store, "PreToolUse", Some("write_text_file"), &json!({}), 3).unwrap();
+        assert_eq!(pre["blocked"], json!(true));
+        assert!(notes_of(&pre).contains("阻断了工具调用「write_text_file」"), "{}", pre["notes"]);
+
+        let start = fire(&store, "SessionStart", None, &json!({"source": "desktop"}), 3).unwrap();
+        assert_eq!(start["blocked"], json!(false), "SessionStart 没有阻塞语义");
+
+        let stop = fire(&store, "Stop", None, &json!({}), 3).unwrap();
+        assert_eq!(stop["blocked"], json!(true));
+        assert!(
+            notes_of(&stop).contains("不支持续跑"),
+            "做不到就必须明说：{}", stop["notes"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_fire_skips_nonmatching_group_without_noise() {
+        let (store, dir) = temp_store("fire-matcher");
+        set(&store, &json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"command": "echo should-not-run"}
+        ]}]}}), 1).unwrap();
+        let out = fire(&store, "PreToolUse", Some("write_text_file"), &json!({}), 1).unwrap();
+        assert_eq!(out["results"], json!([]));
+        assert_eq!(out["notes"], json!([]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_fire_surfaces_bad_matcher_instead_of_pretending_it_ran() {
+        let (store, dir) = temp_store("fire-bad-matcher");
+        set(&store, &json!({"hooks": {"PreToolUse": [{"matcher": "Write(", "hooks": [
+            {"command": "echo x"}
+        ]}]}}), 1).unwrap();
+        let out = fire(&store, "PreToolUse", Some("Write"), &json!({}), 1).unwrap();
+        assert!(notes_of(&out).contains("matcher"), "{}", out["notes"]);
+        assert_eq!(out["results"], json!([]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_fire_reports_timeout_and_nonzero_exit() {
+        let (store, dir) = temp_store("fire-fail");
+        let slow = if cfg!(windows) { "ping -n 20 127.0.0.1 >nul & exit /b 0" } else { "sleep 20" };
+        let boom = if cfg!(windows) { "echo 出错啦 & exit /b 3" } else { "echo 出错啦; exit 3" };
+        set(&store, &json!({"hooks": {"PostToolUse": [
+            {"hooks": [{"command": slow, "timeout": 1}]},
+            {"hooks": [{"command": boom, "timeout": 20}]}
+        ]}}), 1).unwrap();
+        grant(&store, slow, "PostToolUse", 2).unwrap();
+        grant(&store, boom, "PostToolUse", 2).unwrap();
+
+        let out = fire(&store, "PostToolUse", Some("Write"), &json!({}), 3).unwrap();
+        assert!(out["results"][0]["timedOut"].as_bool().unwrap(), "{}", out["results"]);
+        assert!(notes_of(&out).contains("超时"), "{}", out["notes"]);
+        assert_eq!(out["results"][1]["exitCode"], json!(3));
+        assert!(notes_of(&out).contains("执行失败"), "{}", out["notes"]);
+        assert_eq!(out["blocked"], json!(false), "PostToolUse 不是可阻塞事件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_real_input_shapes_the_contract_fields_scripts_expect() {
+        let v = real_input(
+            "PreToolUse",
+            Some("write_text_file"),
+            &json!({
+                "sessionId": "task-1", "cwd": "d:/work",
+                "toolInput": {"file_path": "a.md"}, "toolUseId": "call-1",
+                "tool_response": "写入成功", "message": "写报表"
+            }),
+        );
+        assert_eq!(v["session_id"], "task-1");
+        assert_eq!(v["cwd"], "d:/work");
+        assert_eq!(v["hook_event_name"], "PreToolUse");
+        assert_eq!(v["tool_name"], "write_text_file");
+        assert_eq!(v["tool_input"]["file_path"], "a.md");
+        assert_eq!(v["tool_response"], "写入成功");
+        assert_eq!(v["message"], "写报表");
+        assert!(v.get("toolUseId").is_none(), "驼峰键不该漏进脚本输入");
+
+        let light = real_input("SessionStart", None, &json!({"source": "desktop"}));
+        assert_eq!(light["source"], "desktop");
+        assert!(light.get("tool_name").is_none(), "非工具事件不该有空工具名");
     }
 
     fn which(bin: &str) -> Option<std::path::PathBuf> {

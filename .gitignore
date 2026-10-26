@@ -35,6 +35,9 @@ tongtian-tauri/.tools/
 # 根目录临时截图（验证产物放 .qoder/canvases/）
 /*.png
 
+# 实机验证用的隔离数据目录（TT_DATA_HOME / --work-dir 指向这里，避免碰 ~/.tongtianwork 里的真实台账）
+.devtmp/
+
 # tauri-bundler 生成的 WiX 源文件（candle/light 编译产物，非源码）
 tongtian-tauri/src-tauri/*.wxs
 

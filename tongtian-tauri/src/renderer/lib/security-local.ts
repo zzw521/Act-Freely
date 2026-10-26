@@ -58,70 +58,32 @@ let domainControl: LocalDomainControl | null = null;
 const sandboxPolicies: Record<string, Record<string, unknown>> = {};
 
 /**
- * 工作环境用量快照（Mock）：本模块没有磁盘访问能力，
- * 数值只是演示快照，清理仅在内存中归零，不触碰任何真实文件。
+ * 工作环境用量：本模块（Mock / 浏览器直连兜底通道）没有磁盘访问能力。
+ *
+ * 这里曾返回一份写死的「1.2 GB / 1240 个文件」演示快照，界面把它当成实测数字显示 ——
+ * 已改成如实报 supported=false + 全 0 并带原因：数字要么真，要么不显示。
+ * 真实占用由 Rust `security::environment::usage_in` 或引擎
+ * `/api/sandbox/environment/usage` 磁盘实测给出。
  */
-const mockEnv = { bytes: 1_288_490_188, files: 1240 };
-
 function mockEnvUsage(): SandboxEnvUsage {
-  const landed = mockEnv.bytes > 0 || mockEnv.files > 0;
   return {
-    supported: true,
-    bytes: mockEnv.bytes,
-    files: mockEnv.files,
+    supported: false,
+    bytes: 0,
+    files: 0,
     unreadable: 0,
-    workspaceCount: landed ? 1 : 0,
-    workspaces: landed
-      ? [
-          {
-            workspaceId: 'default',
-            path: '(mock) workspaces/default/environment',
-            bytes: mockEnv.bytes,
-            files: mockEnv.files,
-          },
-        ]
-      : [],
-    rootPath: '(mock) workspaces',
+    workspaceCount: 0,
+    workspaces: [],
+    rootPath: '',
     envDirName: 'environment',
+    note: '浏览器预览环境读不到磁盘，占用统计与清理请在桌面版查看',
   };
 }
 
-/** 起始审计样本：覆盖登录/模型调用/越界拦截，便于验证过滤与分页 */
-const auditLogs: LocalAuditEntry[] = [
-  {
-    id: 'local-audit-1',
-    timestamp: new Date(Date.now() - 5 * 60_000).toISOString(),
-    action: 'user_login',
-    severity: 'info',
-    user: '张先生',
-    resource: 'local-device',
-    details: '网页验证登录成功',
-    read: true,
-  },
-  {
-    id: 'local-audit-2',
-    timestamp: new Date(Date.now() - 3 * 60_000).toISOString(),
-    action: 'model_call',
-    severity: 'info',
-    user: '张先生',
-    resource: 'qwen-plus',
-    details: '模型连通性测试通过（842ms）',
-    read: false,
-  },
-  {
-    id: 'local-audit-3',
-    timestamp: new Date(Date.now() - 90_000).toISOString(),
-    action: 'sandbox_violation',
-    severity: 'warning',
-    user: '张先生',
-    resource: 'C:/Windows/System32/***',
-    details: '文件访问越界被拦截：FILE_ACCESS_DENIED',
-    read: false,
-  },
-];
+/** 起始审计样本：无。审计页只列本次会话真实发生的动作（登录、模型测试、策略保存、清理等） */
+const auditLogs: LocalAuditEntry[] = [];
 
-/** 生成条目的自增序号：从种子条数起算，避免与种子 id 冲突（React key 重复） */
-let auditSeq = auditLogs.length;
+/** 条目自增序号（React key 用，从 0 起算） */
+let auditSeq = 0;
 
 function record(
   action: string,
@@ -142,6 +104,9 @@ function record(
   });
 }
 
+/** 裸命令名（与 Rust `policy::normalize_command` 同规则） */
+const COMMAND_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
+
 /** 沙箱策略边界校验（与 Rust `policy::set_sandbox` 同边界，越界抛真实错误码） */
 function validateSandboxPolicy(p: Record<string, unknown>): void {
   const level = (p.executionLevel as string) ?? 'L1';
@@ -158,6 +123,27 @@ function validateSandboxPolicy(p: Record<string, unknown>): void {
     throw new Error(
       'POLICY_INVALID_RANGE: 沙箱资源上限越界（CPU 1-100 / 内存 64-32768MB / 写盘 1-10000MB/s）',
     );
+  }
+  // 受控执行/联网授权：与 Rust `policy::set_sandbox` 同边界（缺省按空数组，同 serde default）
+  const commands = p.execAllowlist ?? [];
+  if (!Array.isArray(commands) || commands.length > 64) {
+    throw new Error('POLICY_INVALID_COMMAND: 命令白名单必须是不超过 64 项的数组');
+  }
+  const badCommand = commands.find(
+    (c) => typeof c !== 'string' || !COMMAND_NAME_RE.test(c.trim()),
+  );
+  if (badCommand !== undefined) {
+    throw new Error(
+      `POLICY_INVALID_COMMAND: 命令「${String(badCommand)}」非法（仅裸命令名，不能带路径或 shell 元字符）`,
+    );
+  }
+  const hosts = p.networkAllowlist ?? [];
+  if (!Array.isArray(hosts) || hosts.length > 64) {
+    throw new Error('POLICY_INVALID_HOST: 联网白名单必须是不超过 64 项的数组');
+  }
+  const badHost = hosts.find((h) => normalizeDomains([h]).length === 0);
+  if (badHost !== undefined) {
+    throw new Error(`POLICY_INVALID_HOST: 主机「${String(badHost)}」非法`);
   }
 }
 
@@ -401,14 +387,30 @@ export function handleLocalSecurityChannel(channel: string, args: unknown[]): Lo
 
   if (channel === 'sandbox:updatePolicy') {
     const policy = (args[0] ?? {}) as Record<string, unknown>;
+    // 先按原始入参校验（空主机不能被「归一化后为空」静默吞掉），再归一化存储
     validateSandboxPolicy(policy);
-    const ws = String(policy.workspaceId);
-    sandboxPolicies[ws] = { ...policy };
+    const execAllowlist: string[] = Array.isArray(policy.execAllowlist)
+      ? (policy.execAllowlist as unknown[])
+          .map((c) => String(c).trim().toLowerCase())
+          .filter((c, i, arr) => c.length > 0 && arr.indexOf(c) === i)
+      : [];
+    const networkAllowlist = normalizeDomains(policy.networkAllowlist);
+    const normalized: Record<string, unknown> = {
+      ...policy,
+      execEnabled: policy.execEnabled === true,
+      execAllowlist,
+      networkEnabled: policy.networkEnabled === true,
+      networkAllowlist,
+    };
+    const ws = String(normalized.workspaceId);
+    sandboxPolicies[ws] = normalized;
     record(
       'config_change',
-      'info',
+      normalized.execEnabled || normalized.networkEnabled ? 'warning' : 'info',
       `sandbox:${ws}`,
-      `沙箱策略更新：级别=${policy.executionLevel} CPU≤${policy.maxCpuPercent}% 内存≤${policy.maxMemoryMB}MB 写盘≤${policy.maxDiskWriteMbps}MB/s`,
+      `沙箱策略更新：级别=${normalized.executionLevel} CPU≤${normalized.maxCpuPercent}% 内存≤${normalized.maxMemoryMB}MB 写盘≤${normalized.maxDiskWriteMbps}MB/s；`
+        + `命令执行=${normalized.execEnabled ? `开启（${execAllowlist.length} 项）` : '关闭'}；`
+        + `联网=${normalized.networkEnabled ? `开启（${networkAllowlist.length} 项）` : '关闭'}`,
     );
     return { handled: true, value: sandboxPolicies[ws] };
   }
@@ -418,26 +420,8 @@ export function handleLocalSecurityChannel(channel: string, args: unknown[]): Lo
   }
 
   if (channel === 'sandbox:envClear') {
-    const freedBytes = mockEnv.bytes;
-    const freedFiles = mockEnv.files;
-    mockEnv.bytes = 0;
-    mockEnv.files = 0;
-    record(
-      'file_write',
-      'info',
-      '(mock) workspaces/*/environment',
-      `清理工作环境文件（Mock 快照）：释放 ${freedBytes} 字节 / ${freedFiles} 个文件`,
-    );
-    const result: SandboxEnvClearResult = {
-      freedBytes,
-      freedFiles,
-      cleared:
-        freedBytes > 0 || freedFiles > 0
-          ? [{ workspaceId: 'default', freedBytes, freedFiles }]
-          : [],
-      failed: [],
-    };
-    return { handled: true, value: result };
+    // 本地通道删不了真实文件，报不支持而不是返回一份「释放了 N 字节」的假回执
+    throw new Error('SANDBOX_ENV_UNSUPPORTED: 浏览器预览环境无法清理工作环境文件，请在桌面版操作');
   }
 
   if (channel === 'audit:query') {

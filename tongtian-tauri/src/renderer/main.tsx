@@ -4,6 +4,7 @@ import ReactDOM from 'react-dom/client';
 import './lib/mock-api';
 import App from './App';
 import ThemedApp from './theme/ThemedApp';
+import { I18nProvider } from './i18n';
 import './styles/globals.css';
 
 const rootElement = document.getElementById('root');
@@ -15,7 +16,9 @@ const root = ReactDOM.createRoot(rootElement);
 root.render(
   <React.StrictMode>
     <ThemedApp>
-      <App />
+      <I18nProvider>
+        <App />
+      </I18nProvider>
     </ThemedApp>
   </React.StrictMode>
 );

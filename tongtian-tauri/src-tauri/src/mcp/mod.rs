@@ -5,18 +5,23 @@
 //! - 「连接」= 按配置真实发起 MCP 握手（`initialize` → `initialized` → `tools/list`），
 //!   成功则缓存工具清单并置 connected，失败则置 failed 并留存服务器返回的错误摘要
 //! - 「断开」= 清除已验证状态与工具缓存；探测进程随探测结束退出，不驻留后台进程
+//! - 远程 Streamable HTTP 支持 OAuth 2.0（授权码 + PKCE），令牌只存系统凭据库；
+//!   授权配置（auth_json）可展示，令牌/授权码不进 IPC、不进日志
 //!
 //! 安全边界：
 //! - `env` / `headers` 的值只在本机存储并注入子进程/请求头，序列化给渲染层时只给键名，
 //!   避免密钥经由 IPC 进入 WebView（可从 DevTools 读到）
 //! - SQL 全部走参数化；子进程参数以数组传递，不经 Shell 解析
 
+pub mod oauth;
+
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_opener::OpenerExt;
 
 use crate::security::audit;
 use crate::store::Store;
@@ -55,6 +60,9 @@ pub struct AddServer {
     pub headers: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub timeout_secs: Option<i64>,
+    /// 远程连接器的 OAuth 配置（仅 Streamable HTTP）；只含非敏感参数
+    #[serde(default)]
+    pub auth: Option<oauth::OAuthConfig>,
 }
 
 /// 服务器行（渲染层 `McpServer`）：只带 env/header 的键名，不带值
@@ -77,6 +85,11 @@ pub struct ServerRow {
     pub connected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probed_at_ms: Option<i64>,
+    /// 非敏感 OAuth 配置（授权地址 / token 地址 / client_id / scopes）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<oauth::OAuthConfig>,
+    /// none / authorized / expired（只反映系统凭据库里是否有可用令牌）
+    pub auth_status: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -93,6 +106,7 @@ pub struct ToolRow {
 /// 连接探测所需的完整配置（含 env/headers 的值，只在 Rust 侧使用）
 #[derive(Debug, Clone)]
 pub struct ProbeTarget {
+    pub server_id: String,
     pub name: String,
     pub transport: String,
     pub command: String,
@@ -101,6 +115,9 @@ pub struct ProbeTarget {
     pub env: BTreeMap<String, String>,
     pub headers: BTreeMap<String, String>,
     pub timeout_secs: i64,
+    pub auth: Option<oauth::OAuthConfig>,
+    /// 当前可用访问令牌（仅 Rust 侧使用，不进列表视图）
+    pub access_token: Option<String>,
 }
 
 // ── 校验与规范化 ──────────────────────────────────────────────
@@ -184,6 +201,20 @@ fn is_secret_free_map(map: &BTreeMap<String, String>) -> bool {
     !map.values().any(|v| v.contains('\n') || v.contains('\r'))
 }
 
+/// OAuth 只适用于 Streamable HTTP；其他传输显式配置 OAuth 视为配置错误
+fn normalize_auth(
+    transport: &str,
+    raw: Option<&oauth::OAuthConfig>,
+) -> Result<Option<oauth::OAuthConfig>, String> {
+    match (transport, raw) {
+        (TRANSPORT_STREAMABLE_HTTP, Some(cfg)) => oauth::normalize_config(cfg).map(Some),
+        (_, Some(_)) => Err(
+            "MCP_OAUTH_INVALID_CONFIG: OAuth 仅支持 Streamable HTTP 连接器".to_string(),
+        ),
+        (_, None) => Ok(None),
+    }
+}
+
 // ── 注册表读写 ────────────────────────────────────────────────
 
 /// 新增连接器：校验后落库，重名拒绝（不覆盖既有配置）
@@ -205,6 +236,15 @@ pub fn add(store: &Store, req: &AddServer, now_ms: i64) -> Result<ServerRow, Str
         return Err("MCP_INVALID_HEADER: 环境变量与请求头不能包含换行".to_string());
     }
     let timeout_secs = normalize_timeout(req.timeout_secs);
+    let auth = normalize_auth(&transport, req.auth.as_ref())?;
+    if auth.is_some() && headers.keys().any(|k| k.eq_ignore_ascii_case("authorization")) {
+        return Err(
+            "MCP_OAUTH_INVALID_CONFIG: 启用 OAuth 时不能再配置 Authorization 请求头，否则会覆盖自动附加的令牌"
+                .to_string(),
+        );
+    }
+    let auth_json =
+        serde_json::to_string(&auth).map_err(|e| format!("MCP_SAVE_FAILED: {e}"))?;
     let server_id = format!("mcp-{}", uuid::Uuid::new_v4());
 
     store.with_conn(|c| {
@@ -223,8 +263,8 @@ pub fn add(store: &Store, req: &AddServer, now_ms: i64) -> Result<ServerRow, Str
         c.execute(
             "INSERT INTO mcp_servers (server_id, name, transport, command, args_json, url, \
              env_json, headers_json, timeout_secs, status, last_error, tools_json, probed_at_ms, \
-             created_at_ms, updated_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, '[]', NULL, ?11, ?11)",
+             created_at_ms, updated_at_ms, auth_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, '[]', NULL, ?11, ?11, ?12)",
             rusqlite::params![
                 server_id,
                 name,
@@ -237,6 +277,7 @@ pub fn add(store: &Store, req: &AddServer, now_ms: i64) -> Result<ServerRow, Str
                 timeout_secs,
                 STATUS_OFFLINE,
                 now_ms,
+                auth_json,
             ],
         )
         .map_err(|e| format!("MCP_SAVE_FAILED: {e}"))?;
@@ -249,7 +290,7 @@ pub fn add(store: &Store, req: &AddServer, now_ms: i64) -> Result<ServerRow, Str
 
 /// 全部连接器（按名称稳定排序）
 pub fn list(store: &Store) -> Result<Vec<ServerRow>, String> {
-    store.with_conn(|c| {
+    let rows = store.with_conn(|c| {
         let mut stmt = c
             .prepare(&format!(
                 "SELECT {COLUMNS} FROM mcp_servers ORDER BY name"
@@ -260,7 +301,8 @@ pub fn list(store: &Store) -> Result<Vec<ServerRow>, String> {
             .map_err(|e| format!("MCP_QUERY_FAILED: {e}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("MCP_QUERY_FAILED: {e}"))
-    })
+    })?;
+    Ok(enrich_auth(store, rows))
 }
 
 /// 单个连接器
@@ -269,7 +311,7 @@ pub fn get(store: &Store, server_id: &str) -> Result<Option<ServerRow>, String> 
     if id.is_empty() {
         return Err("MCP_INVALID_ID: 缺少连接器标识".to_string());
     }
-    store.with_conn(|c| {
+    let row = store.with_conn(|c| {
         c.query_row(
             &format!("SELECT {COLUMNS} FROM mcp_servers WHERE server_id = ?1"),
             [id],
@@ -283,7 +325,27 @@ pub fn get(store: &Store, server_id: &str) -> Result<Option<ServerRow>, String> 
                 Err(format!("MCP_QUERY_FAILED: {e}"))
             }
         })
-    })
+    })?;
+    Ok(row.map(|mut r| {
+        r.auth_status = auth_status_for(store, &r);
+        r
+    }))
+}
+
+/// 授权状态需要读系统凭据库，放在 DB 锁之外补全，避免在 with_conn 内嵌套访问
+fn enrich_auth(store: &Store, mut rows: Vec<ServerRow>) -> Vec<ServerRow> {
+    for row in &mut rows {
+        row.auth_status = auth_status_for(store, row);
+    }
+    rows
+}
+
+fn auth_status_for(store: &Store, row: &ServerRow) -> String {
+    if row.auth.is_some() {
+        oauth::status_for(store, &row.server_id, crate::now_ms_u64() as i64).to_string()
+    } else {
+        oauth::AUTH_NONE.to_string()
+    }
 }
 
 /// 探测目标（含 env/headers 的值；仅在 Rust 侧使用，不返回给渲染层）
@@ -292,22 +354,27 @@ pub fn probe_target(store: &Store, server_id: &str) -> Result<ProbeTarget, Strin
     if id.is_empty() {
         return Err("MCP_INVALID_ID: 缺少连接器标识".to_string());
     }
-    store.with_conn(|c| {
+    let mut target = store.with_conn(|c| {
         c.query_row(
-            "SELECT name, transport, command, args_json, url, env_json, headers_json, timeout_secs \
+            "SELECT server_id, name, transport, command, args_json, url, env_json, headers_json, \
+             timeout_secs, auth_json \
              FROM mcp_servers WHERE server_id = ?1",
             [id],
             |r| {
+                let auth_raw: String = r.get(9)?;
                 Ok(ProbeTarget {
-                    name: r.get(0)?,
-                    transport: r.get(1)?,
-                    command: r.get(2)?,
-                    args: serde_json::from_str(r.get::<_, String>(3)?.as_str()).unwrap_or_default(),
-                    url: r.get(4)?,
-                    env: serde_json::from_str(r.get::<_, String>(5)?.as_str()).unwrap_or_default(),
-                    headers: serde_json::from_str(r.get::<_, String>(6)?.as_str())
+                    server_id: r.get(0)?,
+                    name: r.get(1)?,
+                    transport: r.get(2)?,
+                    command: r.get(3)?,
+                    args: serde_json::from_str(r.get::<_, String>(4)?.as_str()).unwrap_or_default(),
+                    url: r.get(5)?,
+                    env: serde_json::from_str(r.get::<_, String>(6)?.as_str()).unwrap_or_default(),
+                    headers: serde_json::from_str(r.get::<_, String>(7)?.as_str())
                         .unwrap_or_default(),
-                    timeout_secs: r.get(7)?,
+                    timeout_secs: r.get(8)?,
+                    auth: oauth::parse_stored_config(&auth_raw),
+                    access_token: None,
                 })
             },
         )
@@ -317,7 +384,11 @@ pub fn probe_target(store: &Store, server_id: &str) -> Result<ProbeTarget, Strin
             }
             other => format!("MCP_QUERY_FAILED: {other}"),
         })
-    })
+    })?;
+    if target.auth.is_some() {
+        target.access_token = oauth::load_token(store, &target.server_id).map(|t| t.access_token);
+    }
+    Ok(target)
 }
 
 /// 删除连接器配置（仅删这一行，不影响任务/审计等存量数据）
@@ -383,11 +454,49 @@ pub fn tools_of(store: &Store, server_id: &str) -> Result<Vec<ToolRow>, String> 
     })
 }
 
+/// 执行面消费的连接器：只下发「连接」验证过的服务器，带 env/headers 的真实取值
+///
+/// 与 `list` 的分工：列表页只给键名（密钥不经 IPC 进 WebView），这里给值，因为引擎
+/// 要靠它拉起 stdio 子进程或带鉴权头请求 —— 与 `/api/chat` 里的 model_config.apiKey
+/// 属同一信任边界（只发给 127.0.0.1 上的随包子进程）。
+/// 未连接的连接器不下发：配置存在 ≠ 工具可用，不替用户启动没验证过的进程。
+pub fn for_runtime(store: &Store) -> Result<Vec<Value>, String> {
+    let now = crate::now_ms_u64() as i64;
+    let mut out = Vec::new();
+    for r in list(store)?.iter().filter(|r| r.connected) {
+        let t = probe_target(store, &r.server_id)?;
+        let mut headers = t.headers.clone();
+        if t.auth.is_some() {
+            // 授权缺失/过期时不下发：引擎不能带失效凭据去请求，也不能静默跳过鉴权
+            let Some(token) = oauth::runtime_authorized(store, &r.server_id, now) else {
+                continue;
+            };
+            let (key, value) = oauth::bearer_header(&token);
+            headers.insert(key, value);
+        }
+        out.push(json!({
+            "serverId": r.server_id,
+            "name": r.name,
+            "transport": t.transport,
+            "command": t.command,
+            "args": t.args,
+            "url": t.url,
+            "env": t.env,
+            "headers": headers,
+            "timeoutSecs": t.timeout_secs,
+            "tools": r.tools,
+        }));
+    }
+    Ok(out)
+}
+
 const COLUMNS: &str = "server_id, name, transport, command, args_json, url, env_json, headers_json, \
-             timeout_secs, status, last_error, tools_json, probed_at_ms, created_at_ms, updated_at_ms";
+             timeout_secs, status, last_error, tools_json, probed_at_ms, created_at_ms, updated_at_ms, \
+             auth_json";
 
 fn row_to_server(r: &rusqlite::Row) -> rusqlite::Result<ServerRow> {
     let status: String = r.get(9)?;
+    let auth_raw: String = r.get(15)?;
     Ok(ServerRow {
         server_id: r.get(0)?,
         name: r.get(1)?,
@@ -403,6 +512,8 @@ fn row_to_server(r: &rusqlite::Row) -> rusqlite::Result<ServerRow> {
         tools: parse_tools(&r.get::<_, String>(11)?),
         connected: status == STATUS_CONNECTED,
         probed_at_ms: r.get(12)?,
+        auth: oauth::parse_stored_config(&auth_raw),
+        auth_status: oauth::AUTH_NONE.to_string(),
         created_at_ms: r.get(13)?,
         updated_at_ms: r.get(14)?,
     })
@@ -551,6 +662,14 @@ type ProbeFut = std::pin::Pin<
 
 /// 按配置发起真实握手（initialize → initialized → tools/list），返回服务器声明的工具清单
 pub async fn probe(target: &ProbeTarget) -> Result<Vec<ToolRow>, String> {
+    if target.auth.is_some()
+        && target.transport == TRANSPORT_STREAMABLE_HTTP
+        && target.access_token.is_none()
+    {
+        return Err(
+            "MCP_OAUTH_REQUIRED: 连接器尚未取得访问令牌，请先完成 OAuth 授权".to_string(),
+        );
+    }
     let job = target.clone();
     let mut fut: ProbeFut = match job.transport.as_str() {
         TRANSPORT_STDIO => Box::pin(stdio_handshake(job.clone())),
@@ -691,8 +810,13 @@ async fn read_response(
 }
 
 async fn http_handshake(job: ProbeTarget) -> Result<Vec<ToolRow>, String> {
-    // 远端 MCP 走「网络代理」设置；本机 MCP（localhost/127.0.0.1）由 ALWAYS_BYPASS 直连
-    let client = crate::proxy::client();
+    // 远端 MCP 走「网络代理」设置；本机 MCP（localhost/127.0.0.1）直连，
+    // 系统代理常不 bypass 回环，交给代理会得到 401/503 之类与服务器无关的失败
+    let client = if is_loopback_url(&job.url) {
+        crate::proxy::loopback_client()
+    } else {
+        crate::proxy::client()
+    };
 
     let mut init_req = initialize_request(1);
     init_req["params"]["clientInfo"] = client_info();
@@ -714,6 +838,22 @@ async fn http_handshake(job: ProbeTarget) -> Result<Vec<ToolRow>, String> {
     tools_of_response(&listed)
 }
 
+fn is_loopback_url(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    match url.host_str() {
+        Some(host) if host.eq_ignore_ascii_case("localhost") => true,
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
 async fn send_jsonrpc(
     client: &reqwest::Client,
     job: &ProbeTarget,
@@ -724,6 +864,10 @@ async fn send_jsonrpc(
         .post(&job.url)
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream");
+    // OAuth 令牌先行注入；用户显式配置的 Authorization 头优先级更高（同名头覆盖）
+    if let Some(token) = job.access_token.as_deref() {
+        req = req.bearer_auth(token);
+    }
     for (k, v) in &job.headers {
         req = req.header(k.as_str(), v.as_str());
     }
@@ -756,6 +900,13 @@ async fn send_jsonrpc(
         .await
         .map_err(|e| format!("MCP_CONNECTION_FAILED: 读取响应失败：{e}"))?;
     if !status.is_success() {
+        if status == reqwest::StatusCode::UNAUTHORIZED && job.auth.is_some() {
+            return Err(format!(
+                "MCP_OAUTH_REJECTED: 「{}」返回 HTTP 401，授权可能已失效：{}",
+                job.name,
+                truncate(text.trim(), 160)
+            ));
+        }
         return Err(format!(
             "MCP_CONNECTION_FAILED: 「{}」返回 HTTP {status}：{}",
             job.name,
@@ -812,6 +963,8 @@ pub async fn mcp_remove_server(
 ) -> Result<Value, String> {
     let row = get(&p0.store, &server_id)?
         .ok_or_else(|| format!("MCP_SERVER_NOT_FOUND: {}", server_id.trim()))?;
+    // 先清凭据库再删行：配置没了不能把令牌留在系统凭据库里
+    oauth::delete_token(&p0.store, &row.server_id);
     let removed = remove(&p0.store, &server_id)?;
     audit::record_quiet(
         &p0.store,
@@ -823,15 +976,51 @@ pub async fn mcp_remove_server(
     Ok(json!({ "ok": removed, "serverId": row.server_id, "name": row.name }))
 }
 
-/// 连接：按配置真实握手，成功缓存工具清单，失败留存原因
+fn note_connect_failure(store: &Store, server_id: &str, error: &str, now_ms: i64) {
+    // 失败原因同样落库：页面显示「上次连接失败：…」，而不是静默回到未验证态
+    if let Ok(row) = record_probe(store, server_id, STATUS_FAILED, Some(error), &[], now_ms) {
+        audit::record_quiet(
+            store,
+            audit::ACTION_CONFIG_CHANGE,
+            audit::SEV_WARNING,
+            &row.server_id,
+            &format!("MCP 连接器连接失败：{error}"),
+        );
+    }
+}
+
+/// 连接：按配置真实握手；OAuth 连接器先取可用令牌，401 时强制续期并重试一次
 #[tauri::command]
 pub async fn mcp_connect(
     p0: State<'_, Arc<crate::P0Services>>,
     server_id: String,
 ) -> Result<Value, String> {
-    let target = probe_target(&p0.store, &server_id)?;
+    let mut target = probe_target(&p0.store, &server_id)?;
     let now = crate::now_ms_u64() as i64;
-    match probe(&target).await {
+    if let Some(cfg) = target.auth.clone() {
+        match oauth::ensure_access_token(&p0.store, &server_id, &cfg, now).await {
+            Ok(token) => target.access_token = Some(token.access_token),
+            Err(e) => {
+                note_connect_failure(&p0.store, &server_id, &e, now);
+                return Err(e);
+            }
+        }
+    }
+    let mut outcome = probe(&target).await;
+    if let Some(cfg) = target.auth.clone() {
+        if let Err(e) = &outcome {
+            if e.starts_with("MCP_OAUTH_REJECTED") {
+                match oauth::force_refresh(&p0.store, &server_id, &cfg).await {
+                    Ok(token) => {
+                        target.access_token = Some(token.access_token);
+                        outcome = probe(&target).await;
+                    }
+                    Err(refresh_err) => outcome = Err(refresh_err),
+                }
+            }
+        }
+    }
+    match outcome {
         Ok(tools) => {
             let count = tools.len();
             let row = record_probe(&p0.store, &server_id, STATUS_CONNECTED, None, &tools, now)?;
@@ -845,20 +1034,100 @@ pub async fn mcp_connect(
             Ok(to_value(&row))
         }
         Err(e) => {
-            // 失败原因同样落库：页面显示「上次连接失败：…」，而不是静默回到未验证态
-            if let Ok(row) = record_probe(&p0.store, &server_id, STATUS_FAILED, Some(&e), &[], now)
-            {
-                audit::record_quiet(
-                    &p0.store,
-                    audit::ACTION_CONFIG_CHANGE,
-                    audit::SEV_WARNING,
-                    &row.server_id,
-                    &format!("MCP 连接器连接失败：{e}"),
-                );
-            }
+            note_connect_failure(&p0.store, &server_id, &e, now);
             Err(e)
         }
     }
+}
+
+/// 并发授权互斥：同一时刻只允许一条 OAuth 流程（本机回调与用户操作都需唯一）
+static OAUTH_BUSY: Mutex<Option<String>> = Mutex::new(None);
+
+fn begin_oauth(server_id: &str) -> Result<(), String> {
+    let mut busy = OAUTH_BUSY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(current) = busy.as_deref() {
+        return Err(format!(
+            "MCP_OAUTH_IN_PROGRESS: 已有授权流程进行中（{current}），请先完成或稍后再试"
+        ));
+    }
+    *busy = Some(server_id.to_string());
+    Ok(())
+}
+
+fn end_oauth() {
+    *OAUTH_BUSY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// 发起 OAuth 授权：拉起系统浏览器 → 本机回调 → 换令牌入系统凭据库
+///
+/// 令牌与授权码不进入返回值、审计与日志；成功后清掉旧连接态，要求用新令牌重新验证。
+#[tauri::command]
+pub async fn mcp_oauth_authorize(
+    app: AppHandle,
+    p0: State<'_, Arc<crate::P0Services>>,
+    server_id: String,
+) -> Result<Value, String> {
+    let target = probe_target(&p0.store, &server_id)?;
+    let Some(cfg) = target.auth.clone() else {
+        return Err(
+            "MCP_OAUTH_INVALID_CONFIG: 该连接器未配置 OAuth，请先登记授权参数".to_string(),
+        );
+    };
+    begin_oauth(&target.server_id)?;
+    let result = oauth::authorize(&p0.store, &target.server_id, &cfg, |url| {
+        app.opener()
+            .open_url(url, None::<&str>)
+            .map_err(|e| format!("无法打开系统浏览器（{e}）"))
+    })
+    .await;
+    end_oauth();
+    match result {
+        Ok(_) => {
+            let row = disconnect(&p0.store, &target.server_id, crate::now_ms_u64() as i64)?;
+            audit::record_quiet(
+                &p0.store,
+                audit::ACTION_CONNECTOR_AUTH,
+                audit::SEV_INFO,
+                &row.server_id,
+                &format!(
+                    "MCP OAuth 授权完成：{}（{}）",
+                    row.name,
+                    oauth::endpoint_host(&cfg.authorization_url)
+                ),
+            );
+            Ok(to_value(&row))
+        }
+        Err(e) => {
+            audit::record_quiet(
+                &p0.store,
+                audit::ACTION_CONNECTOR_AUTH,
+                audit::SEV_WARNING,
+                &target.server_id,
+                &format!("MCP OAuth 授权失败：{e}"),
+            );
+            Err(e)
+        }
+    }
+}
+
+/// 撤销本地授权：删除系统凭据库里的令牌并清连接态；已颁发令牌由提供方按其策略过期
+#[tauri::command]
+pub async fn mcp_oauth_revoke(
+    p0: State<'_, Arc<crate::P0Services>>,
+    server_id: String,
+) -> Result<Value, String> {
+    let row = get(&p0.store, &server_id)?
+        .ok_or_else(|| format!("MCP_SERVER_NOT_FOUND: {}", server_id.trim()))?;
+    oauth::delete_token(&p0.store, &row.server_id);
+    let row = disconnect(&p0.store, &row.server_id, crate::now_ms_u64() as i64)?;
+    audit::record_quiet(
+        &p0.store,
+        audit::ACTION_CONNECTOR_AUTH,
+        audit::SEV_INFO,
+        &row.server_id,
+        &format!("MCP OAuth 授权已撤销：{}（本地令牌已清除）", row.name),
+    );
+    Ok(to_value(&row))
 }
 
 /// 断开：清除连接状态与工具缓存，配置保留可随时再连
@@ -1104,6 +1373,174 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn oauth_cfg() -> oauth::OAuthConfig {
+        oauth::OAuthConfig {
+            authorization_url: "https://id.example.com/authorize".into(),
+            token_url: "https://id.example.com/token".into(),
+            client_id: "tt-client".into(),
+            scopes: vec!["read".into()],
+        }
+    }
+
+    fn oauth_req(name: &str) -> AddServer {
+        AddServer {
+            name: name.into(),
+            transport: Some("STREAMABLE_HTTP".into()),
+            url: Some("https://mcp.example.com/mcp".into()),
+            auth: Some(oauth_cfg()),
+            ..Default::default()
+        }
+    }
+
+    fn oauth_token(expires_at_ms: Option<i64>) -> oauth::Token {
+        oauth::Token {
+            access_token: "at-secret".into(),
+            refresh_token: Some("rt-secret".into()),
+            token_type: Some("Bearer".into()),
+            expires_at_ms,
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn test_add_persists_oauth_config_without_token() {
+        let (store, dir) = temp_store("oauth-add");
+        let row = add(&store, &oauth_req("远端数据"), now()).unwrap();
+        let auth = row.auth.as_ref().expect("OAuth 配置应随行读回");
+        assert_eq!(auth.client_id, "tt-client");
+        assert_eq!(row.auth_status, oauth::AUTH_NONE);
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(json.contains("authorizationUrl"), "非敏感授权参数可供界面回显");
+        assert!(!json.contains("at-secret") && !json.contains("rt-secret"), "令牌不得进列表视图");
+
+        // 令牌进系统凭据库后，列表状态跟着变
+        let live = crate::now_ms_u64() as i64 + 3_600_000;
+        oauth::save_token(&store, &row.server_id, &oauth_token(Some(live))).unwrap();
+        let listed = get(&store, &row.server_id).unwrap().unwrap();
+        assert_eq!(listed.auth_status, oauth::AUTH_AUTHORIZED);
+        let target = probe_target(&store, &row.server_id).unwrap();
+        assert_eq!(target.access_token.as_deref(), Some("at-secret"));
+        oauth::delete_token(&store, &row.server_id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_oauth_only_for_streamable_http_and_valid_endpoints() {
+        let (store, dir) = temp_store("oauth-invalid");
+        let mut stdio = oauth_req("本地也配 OAuth");
+        stdio.transport = Some("stdio".into());
+        stdio.command = Some("npx".into());
+        stdio.url = None;
+        let err = add(&store, &stdio, now()).unwrap_err();
+        assert!(err.starts_with("MCP_OAUTH_INVALID_CONFIG"), "{err}");
+
+        let mut bad = oauth_req("坏地址");
+        bad.auth = Some(oauth::OAuthConfig {
+            authorization_url: "http://id.example.com/authorize".into(),
+            ..oauth_cfg()
+        });
+        let err = add(&store, &bad, now()).unwrap_err();
+        assert!(err.starts_with("MCP_OAUTH_INVALID_CONFIG"), "{err}");
+        assert!(list(&store).unwrap().is_empty(), "被拒的 OAuth 配置不得落库");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_oauth_rejects_explicit_authorization_header() {
+        let (store, dir) = temp_store("oauth-header-conflict");
+        let mut req = oauth_req("重复授权头");
+        req.headers = Some(BTreeMap::from([(
+            "authorization".into(),
+            "Bearer stale".into(),
+        )]));
+        let err = add(&store, &req, now()).unwrap_err();
+        assert!(err.starts_with("MCP_OAUTH_INVALID_CONFIG"), "{err}");
+        assert!(err.contains("覆盖"), "错误要说清为什么会拒绝：{err}");
+        assert!(list(&store).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_for_runtime_injects_bearer_and_skips_expired_oauth() {
+        let (store, dir) = temp_store("oauth-runtime");
+        let row = add(&store, &oauth_req("受保护数据"), now()).unwrap();
+        let tools = vec![ToolRow {
+            name: "read_rows".into(),
+            description: String::new(),
+            input_schema: json!({ "type": "object" }),
+        }];
+        record_probe(&store, &row.server_id, STATUS_CONNECTED, None, &tools, now()).unwrap();
+
+        // 未授权：即使连过也不下发，避免引擎发匿名请求或带空令牌
+        assert!(for_runtime(&store).unwrap().is_empty());
+
+        let live = crate::now_ms_u64() as i64 + 3_600_000;
+        oauth::save_token(&store, &row.server_id, &oauth_token(Some(live))).unwrap();
+        let rows = for_runtime(&store).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["headers"]["Authorization"], "Bearer at-secret");
+        assert!(!rows[0].to_string().contains("rt-secret"), "刷新令牌不下发");
+
+        // 过期：不下发失效凭据
+        oauth::save_token(&store, &row.server_id, &oauth_token(Some(1))).unwrap();
+        assert!(for_runtime(&store).unwrap().is_empty());
+        oauth::delete_token(&store, &row.server_id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_probe_requires_token_for_oauth_connector() {
+        let target = ProbeTarget {
+            server_id: "mcp-oauth-missing".into(),
+            name: "未授权".into(),
+            transport: TRANSPORT_STREAMABLE_HTTP.into(),
+            command: String::new(),
+            args: vec![],
+            url: "http://127.0.0.1:1/mcp".into(),
+            env: BTreeMap::new(),
+            headers: BTreeMap::new(),
+            timeout_secs: 1,
+            auth: Some(oauth_cfg()),
+            access_token: None,
+        };
+        let err = probe(&target).await.unwrap_err();
+        assert!(err.starts_with("MCP_OAUTH_REQUIRED"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_probe_maps_http_401_to_oauth_rejected() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"error":"unauthorized"}"#;
+                let resp = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let target = ProbeTarget {
+            server_id: "mcp-oauth-401".into(),
+            name: "令牌失效".into(),
+            transport: TRANSPORT_STREAMABLE_HTTP.into(),
+            command: String::new(),
+            args: vec![],
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            env: BTreeMap::new(),
+            headers: BTreeMap::new(),
+            timeout_secs: 5,
+            auth: Some(oauth_cfg()),
+            access_token: Some("expired-at".into()),
+        };
+        let err = probe(&target).await.unwrap_err();
+        assert!(err.starts_with("MCP_OAUTH_REJECTED"), "{err}");
+    }
+
     #[test]
     fn test_record_probe_persists_status_and_tools() {
         let (store, dir) = temp_store("probe-ok");
@@ -1294,6 +1731,7 @@ mod tests {
     #[tokio::test]
     async fn test_probe_rejects_sse_and_unknown_transport() {
         let mut target = ProbeTarget {
+            server_id: "mcp-test-sse".into(),
             name: "sse 服务器".into(),
             transport: TRANSPORT_SSE.into(),
             command: String::new(),
@@ -1302,6 +1740,8 @@ mod tests {
             env: BTreeMap::new(),
             headers: BTreeMap::new(),
             timeout_secs: 1,
+            auth: None,
+            access_token: None,
         };
         let err = probe(&target).await.unwrap_err();
         assert!(err.starts_with("MCP_TRANSPORT_UNSUPPORTED"), "{err}");
@@ -1312,6 +1752,7 @@ mod tests {
     #[tokio::test]
     async fn test_probe_missing_command_fails_honestly() {
         let target = ProbeTarget {
+            server_id: "mcp-test-missing".into(),
             name: "不存在的命令".into(),
             transport: TRANSPORT_STDIO.into(),
             command: "tt-mcp-definitely-not-installed".into(),
@@ -1320,6 +1761,8 @@ mod tests {
             env: BTreeMap::new(),
             headers: BTreeMap::new(),
             timeout_secs: 5,
+            auth: None,
+            access_token: None,
         };
         let err = probe(&target).await.unwrap_err();
         assert!(err.starts_with("MCP_CONNECTION_FAILED"), "{err}");
@@ -1336,6 +1779,7 @@ mod tests {
             vec!["30".into()]
         };
         let target = ProbeTarget {
+            server_id: "mcp-test-timeout".into(),
             name: "无响应服务器".into(),
             transport: TRANSPORT_STDIO.into(),
             command: sleeper.into(),
@@ -1344,11 +1788,47 @@ mod tests {
             env: BTreeMap::new(),
             headers: BTreeMap::new(),
             timeout_secs: 1,
+            auth: None,
+            access_token: None,
         };
         let err = probe(&target).await.unwrap_err();
         assert!(
             err.starts_with("MCP_TIMEOUT") || err.starts_with("MCP_CONNECTION_FAILED"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn for_runtime_only_carries_connected_servers_with_secret_values() {
+        let (store, dir) = temp_store("runtime");
+        let mut req = stdio_req("echo");
+        req.env = Some(BTreeMap::from([("TOKEN".to_string(), "sk-keep-local".to_string())]));
+        let row = add(&store, &req, 1).unwrap();
+        // 只添加未连接：配置存在 ≠ 工具可用，不能替用户启动没验证过的进程
+        assert!(for_runtime(&store).unwrap().is_empty());
+
+        let tools = vec![ToolRow {
+            name: "echo".into(),
+            description: "回显输入".into(),
+            input_schema: json!({ "type": "object" }),
+        }];
+        record_probe(&store, &row.server_id, STATUS_CONNECTED, None, &tools, 2).unwrap();
+
+        let rows = for_runtime(&store).unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r["name"], "echo");
+        assert_eq!(r["transport"], TRANSPORT_STDIO);
+        assert_eq!(r["command"], "npx");
+        assert_eq!(r["args"].as_array().unwrap().len(), 2);
+        // 引擎要靠这些值拉起 stdio 子进程，列表页则只给键名
+        assert_eq!(r["env"]["TOKEN"], "sk-keep-local");
+        assert_eq!(r["tools"][0]["name"], "echo");
+
+        // 断开后不再下发，但配置行仍在（不删存量数据，随时可再连）
+        disconnect(&store, &row.server_id, 3).unwrap();
+        assert!(for_runtime(&store).unwrap().is_empty());
+        assert_eq!(list(&store).unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

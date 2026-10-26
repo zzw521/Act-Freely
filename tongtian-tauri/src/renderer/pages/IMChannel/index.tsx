@@ -1,477 +1,558 @@
 /**
- * 通天办公 - IM 频道页（设计图对齐版）
+ * 通天办公 - IM 频道页
  *
- * 结构：
- * - 页头：标题 + 说明（配置信息仅存本地，不上传云端）
- * - 平台列表：钉钉/飞书/Lark/微信/企业微信/Slack/WhatsApp，各带「配置」入口
- * - 配置弹窗：
- *   - 扫码类（钉钉/飞书/Lark/微信/企业微信/WhatsApp）：二维码占位 + 刷新
- *   - 钉钉/企业微信：快捷绑定（推荐）/ 手动配置 双模式
- *   - Slack：Bot Token / App-Level Token 表单 + 准入策略（配对/开放）
+ * 数据真值只有一个来源：引擎 `im:channels`（桌面端由 Rust 代理 `/api/im/*`，
+ * 浏览器引擎直连问同一个接口）。所以这里不存在「前端支持列表」——
+ * 引擎注册了哪个通道、有没有实现长连接，界面就怎么显示。
  *
- * Mock 开关规范：
- * - 开发阶段（VITE_MOCK !== 'false'）：二维码为本地占位渲染，保存仅模拟提示
- * - 联调阶段（VITE_MOCK === 'false'）：预留真实渠道接入位（二维码下发/Token 校验）
+ * 绑定语义与引擎一致：提交凭据 → 引擎拿真实接口校验（Slack 走 auth.test +
+ * apps.connections.open 两次往返）→ 通过才落盘并起连接，失败什么都不写。
+ * 因此界面上没有「测试连接」这种独立假按钮，也没有需要额外承诺的绑定入口。
  */
 
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import {
-  Box,
-  Typography,
-  Button,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  TextField,
-  Snackbar,
   Alert,
+  Box,
+  Button,
+  Chip,
+  CircularProgress,
+  Dialog,
+  DialogContent,
+  DialogTitle,
+  Divider,
   IconButton,
+  Link,
+  Snackbar,
+  TextField,
+  Tooltip,
+  Typography,
 } from '@mui/material';
 import ChatIcon from '@mui/icons-material/Chat';
 import SendIcon from '@mui/icons-material/Send';
 import ChatBubbleIcon from '@mui/icons-material/ChatBubble';
 import ForumIcon from '@mui/icons-material/Forum';
 import HubIcon from '@mui/icons-material/Hub';
-import WhatsAppIcon from '@mui/icons-material/WhatsApp';
-import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import CloseIcon from '@mui/icons-material/Close';
+import OpenInNewIcon from '@mui/icons-material/OpenInNew';
+import RefreshIcon from '@mui/icons-material/Refresh';
+import { errorTextOf } from '../../../shared/error-messages';
+import type { ImChannelState, ImChannelView } from '../../../shared/contracts';
+import {
+  configureImChannel,
+  forgetImChannel,
+  startImChannel,
+  stopImChannel,
+} from '../../lib/alignment-api';
+import { imChannelMeta, useImChannelStore } from '../../stores/imChannelStore';
 
-const mockEnabled = import.meta.env.VITE_MOCK !== 'false';
+// ── 状态展示 ────────────────────────────────────────────────────────
 
-// ── 平台模型 ──────────────────────────────────────────────────────
+const STATE_META: Record<ImChannelState, { label: string; fg: string; bg: string }> = {
+  not_configured: { label: '未绑定', fg: '#6B7280', bg: '#F3F4F6' },
+  idle: { label: '待启动', fg: '#6B7280', bg: '#F3F4F6' },
+  connecting: { label: '连接中', fg: '#B45309', bg: '#FEF3C7' },
+  connected: { label: '已连接', fg: '#047857', bg: '#D1FAE5' },
+  reconnecting: { label: '重连中', fg: '#B45309', bg: '#FEF3C7' },
+  failed: { label: '连接失败', fg: '#B91C1C', bg: '#FEE2E2' },
+  stopped: { label: '已停止', fg: '#4B5563', bg: '#EEF0F2' },
+};
 
-type ChannelId = 'dingtalk' | 'feishu' | 'lark' | 'wechat' | 'wecom' | 'slack' | 'whatsapp';
+/** 通道图标按 kind 上色；引擎新增通道时落到中性图标，不需要前端同步改表 */
+const ICONS: Record<string, { icon: React.ElementType; bg: string }> = {
+  dingtalk: { icon: ChatIcon, bg: '#1677FF' },
+  feishu: { icon: SendIcon, bg: '#3370FF' },
+  lark: { icon: SendIcon, bg: '#00B578' },
+  wechat: { icon: ChatBubbleIcon, bg: '#07C160' },
+  wecom: { icon: ForumIcon, bg: '#2B7FFF' },
+  slack: { icon: HubIcon, bg: '#611F69' },
+};
 
-interface ChannelDef {
-  id: ChannelId;
-  name: string;
-  desc: string;
-  icon: React.ElementType;
-  iconColor: string;
-  iconBg: string;
+/** 引擎 account 里的值是服务端下发的原始类型：裸布尔会被 React 直接丢掉，界面就成了「有标签没值」 */
+function accountText(value: unknown): string {
+  if (typeof value === 'boolean') return value ? '是' : '否';
+  return String(value ?? '');
 }
 
-const CHANNELS: ChannelDef[] = [
-  { id: 'dingtalk', name: '钉钉', desc: '通过钉钉机器人接收并回复用户消息', icon: ChatIcon, iconColor: '#FFFFFF', iconBg: '#1677FF' },
-  { id: 'feishu', name: '飞书', desc: '通过飞书机器人接收并回复用户消息', icon: SendIcon, iconColor: '#FFFFFF', iconBg: '#3370FF' },
-  { id: 'lark', name: 'Lark', desc: '通过 Lark 机器人接收并回复用户消息', icon: SendIcon, iconColor: '#FFFFFF', iconBg: '#00B578' },
-  { id: 'wechat', name: '微信', desc: '通过微信机器人接收并回复用户消息', icon: ChatBubbleIcon, iconColor: '#FFFFFF', iconBg: '#07C160' },
-  { id: 'wecom', name: '企业微信', desc: '通过企业微信机器人接收并回复用户消息', icon: ForumIcon, iconColor: '#FFFFFF', iconBg: '#2B7FFF' },
-  { id: 'slack', name: 'Slack', desc: '通过 Socket Mode 接收和回复 Slack 消息', icon: HubIcon, iconColor: '#FFFFFF', iconBg: '#611F69' },
-  { id: 'whatsapp', name: 'WhatsApp', desc: '通过 WhatsApp 多设备协议接收并回复用户消息', icon: WhatsAppIcon, iconColor: '#FFFFFF', iconBg: '#25D366' },
-];
-
-/** 扫码类弹窗文案（Slack 为表单弹窗，单独处理） */
-const QR_DIALOGS: Record<Exclude<ChannelId, 'slack'>, {
-  title: string;
-  subtitle: string;
-  /** 是否展示「快捷绑定（推荐）/ 手动配置」双模式 */
-  dualMode?: boolean;
-  refreshLabel: string;
-  /** 刷新按钮是否黑色实心（微信为黑色） */
-  darkRefresh?: boolean;
-}> = {
-  dingtalk: { title: '配置钉钉', subtitle: '在钉钉中扫码完成应用注册', dualMode: true, refreshLabel: '刷新二维码' },
-  feishu: { title: '配置飞书', subtitle: '使用飞书扫描下方二维码，自动创建并配置机器人', refreshLabel: '刷新二维码' },
-  lark: { title: '配置 Lark', subtitle: '使用 Lark 扫描下方二维码，自动创建并配置机器人', refreshLabel: '刷新二维码' },
-  wechat: { title: '扫码登录', subtitle: '请使用微信扫描下方二维码完成连接', refreshLabel: '重新生成', darkRefresh: true },
-  wecom: { title: '配置企业微信', subtitle: '选择一种方式连接企业微信机器人', dualMode: true, refreshLabel: '刷新二维码' },
-  whatsapp: {
-    title: '扫码登录 WhatsApp',
-    subtitle: '打开手机 WhatsApp → 设置 → 已关联的设备 → 关联设备，扫描下方二维码完成登录。',
-    refreshLabel: '刷新二维码',
-  },
+/** 引擎 account 里已知的账号事实字段名；未收录的键按原名展示，不做翻译式承诺 */
+const ACCOUNT_LABELS: Record<string, string> = {
+  team: '工作区',
+  botUser: '机器人',
+  appId: 'App ID',
+  apiBase: '接口地址',
+  appKey: 'AppKey（脱敏）',
+  tokenExpireIn: 'Token 有效秒',
+  botId: 'BotID（脱敏）',
+  wsUrl: '长连接地址',
+  heartbeatSeconds: '心跳秒',
+  oneConnectionPerBot: '单连接限制',
+  subscribeTopic: '订阅 Topic',
+  subscribeEvent: '订阅事件',
+  connectionId: '连接标识（脱敏）',
+  pingIntervalSeconds: '保活间隔秒',
 };
 
-// ── 二维码占位组件（Mock：确定性伪随机图案，联调阶段替换为真实二维码） ──
-
-const FakeQr: React.FC<{ seed: string; size?: number }> = ({ seed, size = 180 }) => {
-  const cells = useMemo(() => {
-    // 简单确定性伪随机（xorshift 变体），同一 seed 图案稳定
-    let h = 0;
-    for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
-    const rand = () => {
-      h ^= h << 13;
-      h ^= h >>> 17;
-      h ^= h << 5;
-      h >>>= 0;
-      return h / 4294967295;
-    };
-    const n = 25;
-    const grid: boolean[][] = [];
-    for (let r = 0; r < n; r++) {
-      grid.push([]);
-      for (let c = 0; c < n; c++) grid[r].push(rand() > 0.55);
-    }
-    // 三个定位角
-    const finder = (r0: number, c0: number) => {
-      for (let r = 0; r < 7; r++) {
-        for (let c = 0; c < 7; c++) {
-          const edge = r === 0 || r === 6 || c === 0 || c === 6;
-          const core = r >= 2 && r <= 4 && c >= 2 && c <= 4;
-          grid[r0 + r][c0 + c] = edge || core;
-        }
-      }
-    };
-    finder(0, 0);
-    finder(0, 18);
-    finder(18, 0);
-    return grid;
-  }, [seed]);
-
-  const n = cells.length;
-  const cell = size / n;
-  return (
-    <Box
-      sx={{
-        width: size,
-        height: size,
-        border: '1px solid #EEF0F2',
-        borderRadius: '12px',
-        p: 1,
-        background: '#fff',
-        flexShrink: 0,
-      }}
-    >
-      <svg width={size - 8} height={size - 8} viewBox={`0 0 ${size - 8} ${size - 8}`}>
-        {cells.map((row, r) =>
-          row.map((on, c) =>
-            on ? (
-              <rect key={`${r}-${c}`} x={c * ((size - 8) / n)} y={r * ((size - 8) / n)} width={(size - 8) / n} height={(size - 8) / n} fill="#111827" />
-            ) : null,
-          ),
-        )}
-      </svg>
-    </Box>
-  );
-};
+const timeOfText = (ms: number) =>
+  new Date(ms).toLocaleString('zh-CN', { hour12: false }).replace(/\//g, '-');
 
 // ── 页面组件 ──────────────────────────────────────────────────────
 
 const IMChannel: React.FC = () => {
-  const [configId, setConfigId] = useState<ChannelId | null>(null);
-  const [qrSeed, setQrSeed] = useState(0);
-  const [bindMode, setBindMode] = useState<'quick' | 'manual'>('quick');
-  const [toast, setToast] = useState<string | null>(null);
+  const { channels, sessions, loading, loaded, error, loadSessions } = useImChannelStore(
+    useShallow((s) => ({
+      channels: s.channels,
+      sessions: s.channelSessions,
+      loading: s.loading,
+      loaded: s.loaded,
+      error: s.error,
+      loadSessions: s.loadSessions,
+    })),
+  );
 
-  // Slack 表单状态
-  const [botToken, setBotToken] = useState('');
-  const [appToken, setAppToken] = useState('');
-  const [policy, setPolicy] = useState<'pairing' | 'open'>('pairing');
+  const [openKind, setOpenKind] = useState<string | null>(null);
+  const [form, setForm] = useState<Record<string, string>>({});
+  const [savingError, setSavingError] = useState('');
+  const [busyKind, setBusyKind] = useState('');
+  const [toast, setToast] = useState<{ text: string; severity: 'success' | 'info' } | null>(null);
 
-  const channel = CHANNELS.find((c) => c.id === configId) ?? null;
+  useEffect(() => {
+    void loadSessions();
+  }, [loadSessions]);
 
-  const openConfig = (id: ChannelId) => {
-    setConfigId(id);
-    setQrSeed((s) => s + 1);
-    setBindMode('quick');
-    setBotToken('');
-    setAppToken('');
-    setPolicy('pairing');
+  // 数据刷新由常驻的侧边栏统一负责（见 components/Layout/Sidebar.tsx）：
+  // 引擎持有长连接但不向界面推送事件，两处各自轮询会变成每 4s 问两遍同一个接口。
+
+  const openChannel = useMemo(
+    () => channels.find((c) => c.kind === openKind) ?? null,
+    [channels, openKind],
+  );
+
+  const beginConfigure = (c: ImChannelView) => {
+    setForm({});
+    setSavingError('');
+    setOpenKind(c.kind);
   };
 
-  // Slack 保存（Mock 开关：开发阶段本地模拟，联调阶段接 Socket Mode 校验）
-  const slackValid = botToken.trim().length > 0 && appToken.trim().length > 0;
-  const handleSlackSave = () => {
-    if (!slackValid) return;
-    setConfigId(null);
-    if (mockEnabled) {
-      setToast('Slack 配置已保存（开发阶段 Mock，Socket Mode 接入即将上线）');
-      return;
+  const submitConfigure = async () => {
+    if (!openChannel) return;
+    setBusyKind(openChannel.kind);
+    setSavingError('');
+    try {
+      // 空输入不提交：引擎按「补丁叠加现值」合并，留空即沿用已登记的那一项
+      const payload: Record<string, string> = {};
+      Object.entries(form).forEach(([key, value]) => {
+        if (value.trim()) payload[key] = value.trim();
+      });
+      const account = await configureImChannel(openChannel.kind, payload);
+      setOpenKind(null);
+      // 绑定即起连接，界面要立刻问一次引擎，否则卡片停在绑定前的旧状态
+      await loadSessions();
+      const who = account.team || account.botUser || '';
+      setToast({ text: `已绑定并连接${who ? `：${who}` : ''}`, severity: 'success' });
+    } catch (err) {
+      setSavingError(errorTextOf(err, '绑定失败'));
+    } finally {
+      setBusyKind('');
     }
-    // 联调阶段：真实 Slack Token 校验与接入位
-    setToast('Slack 配置保存请求已提交');
   };
 
-  const handleSlackTest = () => {
-    if (!slackValid) return;
-    setToast(mockEnabled ? '连接测试通过（开发阶段 Mock）' : '正在测试连接…');
+  const runAction = async (kind: string, action: 'start' | 'stop' | 'forget') => {
+    setBusyKind(kind);
+    try {
+      if (action === 'start') await startImChannel(kind);
+      if (action === 'stop') await stopImChannel(kind);
+      if (action === 'forget') {
+        await forgetImChannel(kind);
+        setOpenKind(null);
+      }
+      await loadSessions();
+      setToast({
+        text:
+          action === 'start'
+            ? '已请求建立长连接，状态以引擎返回为准'
+            : action === 'stop'
+              ? '已断开长连接，凭据保留'
+              : '已解绑该频道；IM 会话历史保留在本地',
+        severity: 'info',
+      });
+    } catch (err) {
+      setToast({ text: errorTextOf(err, '操作失败'), severity: 'info' });
+    } finally {
+      setBusyKind('');
+    }
   };
 
-  const IconChip: React.FC<{ c: ChannelDef; size?: number }> = ({ c, size = 40 }) => {
-    const Icon = c.icon;
-    return (
-      <Box
-        sx={{
-          width: size,
-          height: size,
-          borderRadius: '10px',
-          background: c.iconBg,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          flexShrink: 0,
-        }}
-      >
-        <Icon sx={{ fontSize: size * 0.55, color: c.iconColor }} />
-      </Box>
-    );
-  };
+  const engineDown = !loading && loaded && error !== '';
 
   return (
     <Box sx={{ maxWidth: 860, mx: 'auto' }}>
-      {/* 页头 */}
-      <Typography variant="h5" sx={{ fontWeight: 700 }}>IM 频道</Typography>
-      <Typography sx={{ fontSize: '13px', color: '#6B7280', mt: 0.5, mb: 3 }}>
-        配置 IM 频道，让通天办公接收来自钉钉、飞书等平台的消息。频道配置信息仅存储在本地，不会上传到云端。
+      <Typography variant="h5" sx={{ fontWeight: 700, color: 'var(--tt-text-1)' }}>IM 频道</Typography>
+      <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-3, #6B7280)', mt: 0.5, mb: 2 }}>
+        把通天办公接进 IM：机器人收到消息后在本地发起任务，结果回到原会话。
+        凭据与会话台账只存在本机引擎数据目录，长连接由本地引擎进程持有，不上传云端。
       </Typography>
 
-      {/* 平台配置列表 */}
-      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
-        {CHANNELS.map((c) => (
-          <Box
-            key={c.id}
-            sx={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 2,
-              border: '1px solid #EEF0F2',
-              borderRadius: '14px',
-              p: 2,
-              background: '#FFFFFF',
-              transition: 'box-shadow 0.18s ease',
-              '&:hover': { boxShadow: '0 4px 16px rgba(15, 23, 42, 0.06)' },
-            }}
-          >
-            <IconChip c={c} />
-            <Box sx={{ flexGrow: 1, minWidth: 0 }}>
-              <Typography sx={{ fontSize: '14px', fontWeight: 600, color: '#111827' }}>{c.name}</Typography>
-              <Typography sx={{ fontSize: '12.5px', color: '#6B7280', mt: 0.25 }}>{c.desc}</Typography>
-            </Box>
-            <Button
-              variant="contained"
-              onClick={() => openConfig(c.id)}
-              sx={{
-                bgcolor: '#111827',
-                borderRadius: '10px',
-                textTransform: 'none',
-                fontSize: '13px',
-                fontWeight: 600,
-                px: 2.5,
-                flexShrink: 0,
-                '&:hover': { bgcolor: '#4F46E5' },
-              }}
-            >
-              配置
-            </Button>
-          </Box>
-        ))}
+      <Alert severity="info" sx={{ mb: 2, fontSize: '12.5px', alignItems: 'flex-start' }}>
+        Slack / 钉钉 / 企业微信 / 飞书的协议实现只在本地假服务端做过双向对拍，
+        尚未用真实企业凭据做端到端验证；真实服务端是否可用，以绑定后引擎返回的状态为准。
+        飞书首次绑定要等官方 SDK 冷启动，可能需要 8~33 秒，期间停在「连接中」属正常现象。
+        个人微信没有可用的官方机器人长连接，保持未接入（不使用非官方协议）。
+      </Alert>
+
+      <Box sx={{ display: 'flex', justifyContent: 'flex-end', mb: 1.5 }}>
+        <Button
+          size="small"
+          startIcon={loading ? <CircularProgress size={14} /> : <RefreshIcon sx={{ fontSize: 16 }} />}
+          onClick={() => void loadSessions()}
+          disabled={loading}
+          sx={{ textTransform: 'none', fontSize: '13px', color: 'var(--tt-text-2, #4B5563)' }}
+        >
+          刷新状态
+        </Button>
       </Box>
 
-      {/* ── 扫码类配置弹窗 ── */}
-      {channel && channel.id !== 'slack' && (() => {
-        const cfg = QR_DIALOGS[channel.id as Exclude<ChannelId, 'slack'>];
-        return (
-          <Dialog open onClose={() => setConfigId(null)} PaperProps={{ sx: { width: 420, borderRadius: '16px', p: 1, position: 'relative' } }}>
-            <IconButton
-              aria-label="close"
-              onClick={() => setConfigId(null)}
-              sx={{ position: 'absolute', right: 10, top: 10, color: '#9CA3AF', zIndex: 1 }}
+      {engineDown && (
+        <Alert
+          severity="warning"
+          sx={{ mb: 2, fontSize: '13px', alignItems: 'flex-start' }}
+          action={
+            <Button size="small" onClick={() => void loadSessions()} sx={{ textTransform: 'none', fontSize: '12.5px' }}>
+              重试
+            </Button>
+          }
+        >
+          {errorTextOf(error, 'IM 频道状态读取失败')}
+        </Alert>
+      )}
+
+      {!engineDown && loaded && channels.length === 0 && (
+        <Alert severity="info" sx={{ mb: 2, fontSize: '13px' }}>
+          引擎当前没有注册任何 IM 通道。
+        </Alert>
+      )}
+
+      {/* 通道清单：完全来自引擎注册表，未实现长连接的通道也在列表里，但为禁用态 */}
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+        {channels.map((c) => {
+          const meta = imChannelMeta(c.kind, c.label);
+          const visual = ICONS[c.kind] ?? { icon: HubIcon, bg: meta.color };
+          const Icon = visual.icon;
+          const state = STATE_META[c.state];
+          const busy = busyKind === c.kind;
+          return (
+            <Box
+              key={c.kind}
+              sx={{
+                display: 'flex',
+                alignItems: 'flex-start',
+                gap: 2,
+                border: '1px solid var(--tt-border-soft, #EEF0F2)',
+                borderRadius: '14px',
+                p: 2,
+                background: 'var(--tt-surface, #FFFFFF)',
+                opacity: c.supported ? 1 : 0.72,
+              }}
             >
-              <CloseIcon sx={{ fontSize: 18 }} />
-            </IconButton>
-            <DialogTitle sx={{ pb: 0.5, textAlign: 'center' }}>
-              <Box sx={{ display: 'flex', justifyContent: 'center', mb: 1 }}>
-                <IconChip c={channel} size={44} />
-              </Box>
-              <Typography sx={{ fontSize: '16px', fontWeight: 700 }}>{cfg.title}</Typography>
-              <Typography sx={{ fontSize: '12.5px', color: '#9CA3AF', mt: 0.5, px: 2 }}>{cfg.subtitle}</Typography>
-            </DialogTitle>
-            <DialogContent sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', pt: '8px !important' }}>
-              {/* 双模式：快捷绑定（推荐）/ 手动配置 */}
-              {cfg.dualMode && (
-                <Box sx={{ width: '100%', mb: 1.5 }}>
-                  {([
-                    ['quick', '快捷绑定（推荐）'],
-                    ['manual', '手动配置'],
-                  ] as const).map(([key, label]) => (
-                    <Box
-                      key={key}
-                      onClick={() => setBindMode(key)}
-                      sx={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 1,
-                        px: 1.5,
-                        py: 1,
-                        borderRadius: '10px',
-                        cursor: 'pointer',
-                        border: bindMode === key ? '1.5px solid #111827' : '1.5px solid transparent',
-                        background: bindMode === key ? '#FAFBFC' : 'transparent',
-                        transition: 'all 0.15s ease',
-                        '&:hover': { background: '#FAFBFC' },
-                      }}
-                    >
-                      <Box
-                        sx={{
-                          width: 16,
-                          height: 16,
-                          borderRadius: '50%',
-                          border: bindMode === key ? '5px solid #111827' : '1.5px solid #D1D5DB',
-                          boxSizing: 'border-box',
-                        }}
-                      />
-                      <Typography sx={{ fontSize: '13px', fontWeight: bindMode === key ? 600 : 400, color: '#374151' }}>
-                        {label}
-                      </Typography>
-                    </Box>
-                  ))}
-                </Box>
-              )}
-
-              {/* 二维码（Mock 占位渲染） */}
-              <FakeQr seed={`${channel.id}-${qrSeed}`} />
-              <Typography sx={{ fontSize: '12px', color: '#9CA3AF', mt: 1.5, textAlign: 'center', px: 1 }}>
-                {channel.id === 'wecom' ? '打开企业微信，扫描二维码完成机器人创建' : cfg.subtitle}
-              </Typography>
-
-              {/* 刷新按钮 */}
-              <Button
-                fullWidth={cfg.darkRefresh}
-                variant={cfg.darkRefresh ? 'contained' : 'outlined'}
-                onClick={() => setQrSeed((s) => s + 1)}
+              <Box
                 sx={{
-                  mt: 2,
-                  mb: 1,
+                  width: 40,
+                  height: 40,
                   borderRadius: '10px',
-                  textTransform: 'none',
-                  fontSize: '13px',
-                  fontWeight: 600,
-                  px: 3,
-                  ...(cfg.darkRefresh
-                    ? { bgcolor: '#111827', '&:hover': { bgcolor: '#4F46E5' } }
-                    : { color: '#4B5563', borderColor: '#E5E7EB', '&:hover': { borderColor: '#9CA3AF', background: 'rgba(15,23,42,0.03)' } }),
+                  background: c.supported ? visual.bg : 'var(--tt-text-4, #9CA3AF)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  flexShrink: 0,
                 }}
               >
-                {cfg.refreshLabel}
-              </Button>
-            </DialogContent>
-          </Dialog>
-        );
-      })()}
+                <Icon sx={{ fontSize: 22, color: '#FFFFFF' }} />
+              </Box>
 
-      {/* ── Slack 表单配置弹窗 ── */}
-      {channel?.id === 'slack' && (
-        <Dialog open onClose={() => setConfigId(null)} PaperProps={{ sx: { width: 520, borderRadius: '16px', p: 1, position: 'relative' } }}>
+              <Box sx={{ flexGrow: 1, minWidth: 0 }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+                  <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'var(--tt-text-1)' }}>{c.label}</Typography>
+                  <Chip
+                    label={c.supported ? state.label : '尚未接入'}
+                    size="small"
+                    sx={{
+                      height: 20,
+                      fontSize: '11.5px',
+                      fontWeight: 600,
+                      color: c.supported ? state.fg : '#6B7280',
+                      background: c.supported ? state.bg : 'var(--tt-bg, #F3F4F6)',
+                    }}
+                  />
+                  {c.configured && c.state === 'connected' && c.connectedAtMs && (
+                    <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-3, #6B7280)' }}>
+                      自 {timeOfText(c.connectedAtMs)}
+                    </Typography>
+                  )}
+                  {c.reconnects > 0 && (
+                    <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-3, #6B7280)' }}>
+                      重连 {c.reconnects} 次
+                    </Typography>
+                  )}
+                </Box>
+
+                {!c.supported && (
+                  <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-3, #6B7280)', mt: 0.5 }}>
+                    {c.unsupportedReason}
+                  </Typography>
+                )}
+
+                {c.supported && c.configured && Object.keys(c.account).length > 0 && (
+                  <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', mt: 0.75 }}>
+                    {Object.entries(c.account).map(([key, value]) => (
+                      <Typography key={key} sx={{ fontSize: '12px', color: 'var(--tt-text-3, #6B7280)' }}>
+                        {ACCOUNT_LABELS[key] ?? key}：{accountText(value)}
+                      </Typography>
+                    ))}
+                  </Box>
+                )}
+
+                {c.supported && !c.configured && (
+                  <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-3, #6B7280)', mt: 0.5 }}>
+                    {c.setupNote}
+                  </Typography>
+                )}
+
+                {c.lastError && (
+                  <Typography sx={{ fontSize: '12px', color: '#B91C1C', mt: 0.75 }}>
+                    最近错误：{errorTextOf(`${c.lastError.code}: ${c.lastError.detail}`, c.lastError.code)}
+                    （{timeOfText(c.lastError.atMs)}）
+                  </Typography>
+                )}
+
+                {c.sessions > 0 && (
+                  <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-3, #6B7280)', mt: 0.5 }}>
+                    本频道会话 {c.sessions} 个
+                  </Typography>
+                )}
+              </Box>
+
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexShrink: 0 }}>
+                {!c.supported ? (
+                  <Tooltip title={c.unsupportedReason} placement="left">
+                    <span>
+                      <Button size="small" disabled sx={{ textTransform: 'none', fontSize: '13px' }}>
+                        配置
+                      </Button>
+                    </span>
+                  </Tooltip>
+                ) : (
+                  <>
+                    {c.configured && (c.state === 'connected' || c.state === 'connecting' || c.state === 'reconnecting') ? (
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        disabled={busy}
+                        onClick={() => void runAction(c.kind, 'stop')}
+                        sx={{ textTransform: 'none', fontSize: '13px', borderColor: 'var(--tt-border, #E5E7EB)' }}
+                      >
+                        {busy ? '处理中' : '断开'}
+                      </Button>
+                    ) : (
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        disabled={busy || !c.configured}
+                        onClick={() => void runAction(c.kind, 'start')}
+                        sx={{ textTransform: 'none', fontSize: '13px', borderColor: 'var(--tt-border, #E5E7EB)' }}
+                      >
+                        {busy ? '处理中' : '启动连接'}
+                      </Button>
+                    )}
+                    <Button
+                      size="small"
+                      variant="contained"
+                      disableElevation
+                      onClick={() => beginConfigure(c)}
+                      sx={{
+                        textTransform: 'none',
+                        fontSize: '13px',
+                        fontWeight: 600,
+                        borderRadius: '10px',
+                        bgcolor: '#111827',
+                        '&:hover': { bgcolor: '#4F46E5' },
+                      }}
+                    >
+                      {c.configured ? '改凭据' : '配置凭据'}
+                    </Button>
+                    {c.configured && (
+                      <Button
+                        size="small"
+                        disabled={busy}
+                        onClick={() => void runAction(c.kind, 'forget')}
+                        sx={{ textTransform: 'none', fontSize: '13px', color: 'var(--tt-text-3, #6B7280)' }}
+                      >
+                        解绑
+                      </Button>
+                    )}
+                  </>
+                )}
+              </Box>
+            </Box>
+          );
+        })}
+      </Box>
+
+      {/* IM 发起的会话：引擎台账真实记录，没有就如实空 */}
+      <Box sx={{ mt: 4 }}>
+        <Typography sx={{ fontSize: '14px', fontWeight: 700, mb: 1, color: 'var(--tt-text-1)' }}>IM 发起的会话</Typography>
+        <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-3, #6B7280)', mb: 1.5 }}>
+          从 IM 收到的消息会在本地发起任务，入站原文与回贴内容写进引擎侧的会话台账。
+        </Typography>
+        {sessions.length === 0 ? (
+          <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-3, #6B7280)', py: 2 }}>
+            还没有来自 IM 的消息。绑定并连上频道后，从会话里 @机器人即可触发任务。
+          </Typography>
+        ) : (
+          <Box sx={{ border: '1px solid var(--tt-border-soft, #EEF0F2)', borderRadius: '14px', overflow: 'hidden' }}>
+            {sessions.map((s, i) => {
+              const meta = imChannelMeta(s.source, channels.find((c) => c.kind === s.source)?.label);
+              return (
+                <Box key={s.id}>
+                  {i > 0 && <Divider />}
+                  <Box sx={{ px: 2, py: 1.5, display: 'flex', alignItems: 'center', gap: 1.5 }}>
+                    <Box
+                      component="span"
+                      sx={{ width: 7, height: 7, borderRadius: '50%', background: meta.color, flexShrink: 0 }}
+                    />
+                    <Box sx={{ flexGrow: 1, minWidth: 0 }}>
+                      <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)' }}>
+                        {s.title || '（无标题）'}
+                      </Typography>
+                      <Typography
+                        sx={{
+                          fontSize: '11.5px',
+                          color: 'var(--tt-text-3, #6B7280)',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {meta.label} · {timeOfText(s.updatedAt)}
+                      </Typography>
+                    </Box>
+                    <Chip
+                      label={`${s.messageCount} 条消息`}
+                      size="small"
+                      sx={{ height: 20, fontSize: '11px', bgcolor: 'var(--tt-bg, #F3F4F6)' }}
+                    />
+                  </Box>
+                </Box>
+              );
+            })}
+          </Box>
+        )}
+      </Box>
+
+      {/* 凭据弹窗：字段清单由引擎下发，界面不写死「哪个 IM 要什么」 */}
+      {openChannel && (
+        <Dialog
+          open
+          onClose={() => setOpenKind(null)}
+          PaperProps={{ sx: { width: 540, borderRadius: '16px', p: 1, position: 'relative' } }}
+        >
           <IconButton
             aria-label="close"
-            onClick={() => setConfigId(null)}
+            onClick={() => setOpenKind(null)}
             sx={{ position: 'absolute', right: 10, top: 10, color: '#9CA3AF', zIndex: 1 }}
           >
             <CloseIcon sx={{ fontSize: 18 }} />
           </IconButton>
           <DialogTitle sx={{ pb: 0.5 }}>
-            <Typography sx={{ fontSize: '16px', fontWeight: 700 }}>配置 Slack</Typography>
-            <Typography sx={{ fontSize: '12.5px', color: '#9CA3AF', mt: 0.25 }}>
-              填写 Slack Bot Token 与 App-Level Token 以通过 Socket Mode 接入
+            <Typography sx={{ fontSize: '16px', fontWeight: 700, color: 'var(--tt-text-1)' }}>配置 {openChannel.label}</Typography>
+            <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-3, #6B7280)', mt: 0.5, lineHeight: 1.7 }}>
+              {openChannel.setupNote}
             </Typography>
+            {openChannel.setupUrl && (
+              <Link
+                href={openChannel.setupUrl}
+                target="_blank"
+                rel="noreferrer"
+                sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.5, fontSize: '12.5px', mt: 0.75 }}
+              >
+                打开 {openChannel.label} 应用后台
+                <OpenInNewIcon sx={{ fontSize: 14 }} />
+              </Link>
+            )}
           </DialogTitle>
           <DialogContent sx={{ pt: '12px !important' }}>
-            <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>
-              Bot Token <Box component="span" sx={{ color: '#EF4444' }}>*</Box>
-            </Typography>
-            <TextField
-              value={botToken}
-              onChange={(e) => setBotToken(e.target.value)}
-              fullWidth
-              size="small"
-              placeholder="xoxb-..."
-              sx={{ mb: 2, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
-            />
-
-            <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>
-              App-Level Token <Box component="span" sx={{ color: '#EF4444' }}>*</Box>
-            </Typography>
-            <TextField
-              value={appToken}
-              onChange={(e) => setAppToken(e.target.value)}
-              fullWidth
-              size="small"
-              placeholder="xapp-..."
-              sx={{ mb: 2.5, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
-            />
-
-            {/* 准入策略 */}
-            <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>准入策略</Typography>
-            {([
-              ['pairing', '配对模式', '需配对后才能对话'],
-              ['open', '开放模式', '所有人/群可直接对话'],
-            ] as const).map(([key, label, sub]) => (
-              <Box
-                key={key}
-                onClick={() => setPolicy(key)}
-                sx={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 1,
-                  px: 1.5,
-                  py: 1.1,
-                  mb: 0.75,
-                  borderRadius: '10px',
-                  cursor: 'pointer',
-                  border: policy === key ? '1.5px solid #10B981' : '1.5px solid #EEF0F2',
-                  background: policy === key ? 'rgba(16, 185, 129, 0.04)' : '#FFFFFF',
-                  transition: 'all 0.15s ease',
-                }}
-              >
-                <Box sx={{ flexGrow: 1 }}>
-                  <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#111827' }}>{label}</Typography>
-                  <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF', mt: 0.15 }}>{sub}</Typography>
-                </Box>
-                {policy === key && <CheckCircleIcon sx={{ fontSize: 18, color: '#10B981' }} />}
+            {openChannel.fields.map((f) => (
+              <Box key={f.key} sx={{ mb: 2 }}>
+                <Typography sx={{ fontSize: '12.5px', fontWeight: 600, mb: 0.75 }}>
+                  {f.label}
+                  {f.required && <Box component="span" sx={{ color: '#EF4444' }}> *</Box>}
+                  {f.present && (
+                    <Box component="span" sx={{ color: 'var(--tt-text-3, #9CA3AF)', fontWeight: 400, ml: 1 }}>
+                      已登记
+                    </Box>
+                  )}
+                </Typography>
+                <TextField
+                  type="password"
+                  value={form[f.key] ?? ''}
+                  onChange={(e) => setForm((prev) => ({ ...prev, [f.key]: e.target.value }))}
+                  fullWidth
+                  size="small"
+                  autoComplete="off"
+                  placeholder={f.present ? '留空即沿用已登记的值' : f.placeholder}
+                  sx={{ '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
+                  helperText={f.note}
+                />
+                {f.helpUrl && (
+                  <Link href={f.helpUrl} target="_blank" rel="noreferrer" sx={{ fontSize: '11.5px' }}>
+                    查看这一项在哪里获取
+                  </Link>
+                )}
               </Box>
             ))}
-            {policy === 'pairing' && (
-              <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF', lineHeight: 1.7, mb: 1 }}>
-                保存后，用户私聊机器人或在群中 @机器人时会自动触发配对请求，您可在频道卡片的「配对管理」中点击「允许」。配对以会话为单位：私聊允许后该用户可对话，群聊允许后群内所有成员均可对话。
-              </Typography>
+
+            {savingError && (
+              <Alert severity="error" sx={{ mb: 1.5, fontSize: '12.5px', alignItems: 'flex-start' }}>
+                {savingError}
+              </Alert>
             )}
 
-            {/* 测试连接 / 保存 */}
-            <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1, mt: 2, mb: 1 }}>
+            <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-3, #9CA3AF)', lineHeight: 1.7, mb: 1.5 }}>
+              凭据只写入本机引擎数据目录（0600 权限），接口与日志一律脱敏，不会回显明文。
+              保存时引擎会真实调用 {openChannel.label} 的接口校验，校验不通过不会落盘，也不会起连接。
+            </Typography>
+
+            <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1, mt: 1, mb: 1 }}>
               <Button
-                onClick={handleSlackTest}
-                disabled={!slackValid}
-                sx={{
-                  color: slackValid ? '#4B5563' : '#9CA3AF',
-                  border: '1px solid #E5E7EB',
-                  borderRadius: '10px',
-                  textTransform: 'none',
-                  fontSize: '13px',
-                  fontWeight: 600,
-                  px: 2.5,
-                  '&:hover': { background: 'rgba(15, 23, 42, 0.03)' },
-                  '&.Mui-disabled': { color: '#9CA3AF', borderColor: '#E5E7EB' },
-                }}
+                onClick={() => setOpenKind(null)}
+                sx={{ textTransform: 'none', fontSize: '13px', color: 'var(--tt-text-2, #4B5563)' }}
               >
-                测试连接
+                取消
               </Button>
               <Button
                 variant="contained"
-                disabled={!slackValid}
-                onClick={handleSlackSave}
+                disableElevation
+                disabled={busyKind === openChannel.kind}
+                onClick={() => void submitConfigure()}
                 sx={{
-                  bgcolor: slackValid ? '#111827' : '#E5E7EB',
+                  bgcolor: '#111827',
                   borderRadius: '10px',
                   textTransform: 'none',
                   fontSize: '13px',
                   fontWeight: 700,
                   px: 3,
                   '&:hover': { bgcolor: '#4F46E5' },
-                  '&.Mui-disabled': { bgcolor: '#E5E7EB', color: '#9CA3AF' },
                 }}
               >
-                保存
+                {busyKind === openChannel.kind ? '校验中…' : '校验并绑定'}
               </Button>
             </Box>
           </DialogContent>
         </Dialog>
       )}
 
-      {/* 占位提示 toast（不静默） */}
-      <Snackbar open={!!toast} autoHideDuration={3000} onClose={() => setToast(null)} anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}>
-        <Alert severity="info" onClose={() => setToast(null)} sx={{ fontSize: '13px' }}>
-          {toast}
+      <Snackbar open={!!toast} autoHideDuration={4000} onClose={() => setToast(null)} anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}>
+        <Alert severity={toast?.severity ?? 'info'} onClose={() => setToast(null)} sx={{ fontSize: '13px' }}>
+          {toast?.text}
         </Alert>
       </Snackbar>
     </Box>

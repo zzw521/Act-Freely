@@ -5,10 +5,9 @@
  * 以 `vi.resetModules()` 动态导入，使每个用例拿到干净的模块级台账。
  *
  * 覆盖：
- * - 与 Rust `align::{hooks,connector,archive,mod}` 的常量/错误码契约一致性（扫描 Rust 源码）
+ * - 与 Rust `align::{hooks,archive,mod}` 的常量/错误码契约一致性（扫描 Rust 源码）
  * - Hook 配置逐条校验（六类错误码）与「未保存过即空」诚实语义
  * - 试运行在非桌面通道如实降级（HOOK_TEST_UNSUPPORTED），不假报 exitCode 0
- * - 连接器授权幂等 upsert、serverRef 沿用（COALESCE 同口径）、撤销前置校验
  * - 归档只写标记、重复归档刷新不追加脏行、清空需确认词 DELETE
  * - 电脑操控档位校验与持久化标记
  * - 通道分发器路由与未命中兜底
@@ -100,6 +99,33 @@ describe('对齐整改：与 Rust 常量契约一致（Rust 侧改动未同步�
   it('BLOCKABLE_EVENTS 与 Rust 一致（仅这三类支持 exit 2 阻塞）', async () => {
     const { BLOCKABLE_EVENTS } = await freshModule();
     expect(BLOCKABLE_EVENTS).toEqual(rustStrArray(rustHooks(), 'BLOCKABLE_EVENTS'));
+  });
+
+  it('有触发点/无触发点事件与 Rust FIRED_EVENTS、UNFIRED_EVENTS 逐项一致', async () => {
+    const { FIRED_HOOK_EVENTS, UNFIRED_HOOK_EVENTS, HOOK_EVENTS } = await freshModule();
+    expect(FIRED_HOOK_EVENTS).toEqual(rustStrArray(rustHooks(), 'FIRED_EVENTS'));
+    expect(UNFIRED_HOOK_EVENTS).toEqual(rustStrArray(rustHooks(), 'UNFIRED_EVENTS'));
+    // 两类必须互斥且并起来正好覆盖 12 类，否则页面会漏说或多说「配了会不会跑」
+    expect(FIRED_HOOK_EVENTS.some((e) => UNFIRED_HOOK_EVENTS.includes(e))).toBe(false);
+    expect([...FIRED_HOOK_EVENTS, ...UNFIRED_HOOK_EVENTS].sort()).toEqual([...HOOK_EVENTS].sort());
+  });
+
+  it('页面事件表的 fired 标记与 Rust FIRED_EVENTS 一致（防止文案宣称不存在的触发点）', async () => {
+    const { FIRED_HOOK_EVENTS } = await freshModule();
+    const src = readFileSync(
+      fileURLToPath(new URL('../../../src/renderer/pages/HooksManager/index.tsx', import.meta.url)),
+      'utf8',
+    );
+    const rows = [...src.matchAll(/\{\s*name:\s*'([^']+)'[^}]*?fired:\s*(true|false)\s*\}/g)];
+    expect(rows.length, '未解析到事件表定义').toBe(12);
+    const firedInPage = rows.filter((m) => m[2] === 'true').map((m) => m[1]);
+    expect(firedInPage.sort()).toEqual([...FIRED_HOOK_EVENTS].sort());
+  });
+
+  it('命令文本改写后旧放行不会残留（本地 prune 与 Rust prune_grants 同口径）', async () => {
+    const src = rustHooks();
+    expect(src).toContain('pub fn prune_grants');
+    expect(rustMod()).toContain('prune_grants(');
   });
 
   it('超时上下界与 Rust DEFAULT/MAX_TIMEOUT_SEC 一致', async () => {
@@ -211,7 +237,7 @@ describe('Hooks：读写与诚实空态', () => {
   it('保存后读回同一份配置，返回 events 计数', async () => {
     const { saveLocalHooks, localHooks } = await freshWithStorage();
     const cfg = { hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo s' }] }] } };
-    expect(saveLocalHooks(cfg)).toEqual({ ok: true, events: 1 });
+    expect(saveLocalHooks(cfg)).toEqual({ ok: true, events: 1, revoked: [] });
     expect(localHooks()).toEqual(cfg);
   });
 
@@ -220,6 +246,124 @@ describe('Hooks：读写与诚实空态', () => {
     saveLocalHooks({ hooks: { Notification: [{ hooks: [{ command: 'echo n' }] }] } });
     expectCode(() => saveLocalHooks({ hooks: { BadEvent: [] } }), 'HOOK_INVALID_EVENT');
     expect(localHooks()).toEqual({ hooks: { Notification: [{ hooks: [{ command: 'echo n' }] }] } });
+  });
+});
+
+describe('Hooks：放行台账（配置 ≠ 执行）', () => {
+  it('放行需合法事件与非空命令', async () => {
+    const { grantLocalHooks } = await freshWithStorage();
+    expect(grantLocalHooks('PreToolUse', ' echo guard.sh ')).toEqual({ ok: true, granted: true });
+    expectCode(() => grantLocalHooks('Nope', 'echo'), 'HOOK_INVALID_EVENT');
+    expectCode(() => grantLocalHooks('Stop', '   '), 'HOOK_INVALID_COMMAND');
+  });
+
+  it('放行按命令原文去重：重复放行只刷新记录，不追加第二条', async () => {
+    const m = await freshWithStorage();
+    m.grantLocalHooks('PreToolUse', 'echo guard.sh');
+    const first = m.localHookGrants()[0];
+    m.grantLocalHooks('Stop', 'echo guard.sh');
+    const ledger = m.localHookGrants();
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0]).toMatchObject({ command: 'echo guard.sh', event: 'Stop', runCount: 0 });
+    expect(ledger[0].grantedAtMs).toBeGreaterThanOrEqual(first.grantedAtMs);
+  });
+
+  it('撤销放行只删授权，配置原样保留（撤权 ≠ 删配置）', async () => {
+    const m = await freshWithStorage();
+    const cfg = { hooks: { PreToolUse: [{ hooks: [{ command: 'echo guard.sh' }] }] } };
+    m.saveLocalHooks(cfg);
+    m.grantLocalHooks('PreToolUse', 'echo guard.sh');
+    expect(m.revokeLocalHooks('echo guard.sh')).toEqual({ ok: true, granted: false });
+    expect(m.localHookGrants()).toEqual([]);
+    expect(m.localHooks()).toEqual(cfg);
+    expect(m.localHooksStatus().ungranted).toEqual(['echo guard.sh']);
+  });
+
+  it('配置里删掉命令后其放行一并作废，并回报作废清单', async () => {
+    const m = await freshWithStorage();
+    m.saveLocalHooks({
+      hooks: { PreToolUse: [{ hooks: [{ command: 'echo a' }, { command: 'echo b' }] }] },
+    });
+    m.grantLocalHooks('PreToolUse', 'echo a');
+    m.grantLocalHooks('PreToolUse', 'echo b');
+    const res = m.saveLocalHooks({ hooks: { PreToolUse: [{ hooks: [{ command: 'echo a' }] }] } });
+    expect(res).toEqual({ ok: true, events: 1, revoked: ['echo b'] });
+    expect(m.localHookGrants().map((g) => g.command)).toEqual(['echo a']);
+  });
+
+  it('删掉再原样加回不会残留旧放行（放行只认命令文本，不认「同一条 Hook」）', async () => {
+    const m = await freshWithStorage();
+    const cfg = { hooks: { PreToolUse: [{ hooks: [{ command: 'echo a' }] }] } };
+    m.saveLocalHooks(cfg);
+    m.grantLocalHooks('PreToolUse', 'echo a');
+    expect(m.localHooksStatus().ungranted).toEqual([]);
+    m.saveLocalHooks({ hooks: {} });
+    m.saveLocalHooks(cfg);
+    expect(m.localHooksStatus().ungranted).toEqual(['echo a']);
+  });
+
+  it('执行面概览：挂载事件、无触发点事件、未放行清单与通道降级说明', async () => {
+    const m = await freshWithStorage();
+    m.saveLocalHooks({
+      hooks: {
+        PreToolUse: [{ hooks: [{ command: 'echo a' }] }],
+        Notification: [{ hooks: [{ command: 'echo n' }] }],
+      },
+    });
+    m.grantLocalHooks('PreToolUse', 'echo a');
+    const s = m.localHooksStatus();
+    expect(s).toMatchObject({
+      configured: 2,
+      mountedEvents: ['PreToolUse', 'Notification'],
+      mountedUnfired: ['Notification'],
+      ungranted: ['echo n'],
+    });
+    expect(s.firedEvents).toHaveLength(10);
+    expect(s.unfiredEvents).toHaveLength(2);
+    expect(s.grants).toHaveLength(1);
+    expect(s.gateError).toContain('不会执行');
+  });
+
+  it('放行台账整本返回，不因当前配置筛选而隐藏记录（与 Rust list_grants 同口径）', async () => {
+    const m = await freshWithStorage();
+    m.grantLocalHooks('PreToolUse', 'echo orphan');
+    const s = m.localHooksStatus();
+    expect(s.configured).toBe(0);
+    expect(s.grants.map((g) => g.command)).toEqual(['echo orphan']);
+  });
+
+  it('放行台账写穿本地持久层，重启后仍在', async () => {
+    await freshWithStorage();
+    const first = await freshModule();
+    first.saveLocalHooks({ hooks: { Stop: [{ hooks: [{ command: 'echo s' }] }] } });
+    first.grantLocalHooks('Stop', 'echo s');
+    const second = await freshModule();
+    expect(second.localHookGrants().map((g) => g.command)).toEqual(['echo s']);
+    expect(second.localHooksStatus().ungranted).toEqual([]);
+  });
+
+  it('损坏的放行存档降级为空台账，不阻断页面', async () => {
+    await freshWithStorage();
+    currentStore.set('tt:hookGrants', JSON.stringify([{ command: '', event: 'Stop' }, null, 7]));
+    const m = await freshModule();
+    expect(m.localHookGrants()).toEqual([]);
+    expect(m.localHooksStatus().grants).toEqual([]);
+  });
+
+  it('通道分发：hooks:grant / hooks:revoke / hooks:status 路由到本地台账', async () => {
+    const m = await freshWithStorage();
+    expect(m.handleLocalAlignmentChannel('hooks:grant', [{ event: 'PreToolUse', command: 'echo a' }])).toEqual({
+      handled: true,
+      value: { ok: true, granted: true },
+    });
+    const view = m.handleLocalAlignmentChannel('hooks:status', []) as { value: { grants: unknown[] } };
+    expect(view.value.grants).toHaveLength(1);
+    expect(m.handleLocalAlignmentChannel('hooks:revoke', [{ command: 'echo a' }])).toEqual({
+      handled: true,
+      value: { ok: true, granted: false },
+    });
+    const after = m.handleLocalAlignmentChannel('hooks:status', []) as { value: { grants: unknown[] } };
+    expect(after.value.grants).toHaveLength(0);
   });
 });
 
@@ -237,57 +381,6 @@ describe('Hooks：试运行在非桌面通道如实降级', () => {
     const { testLocalHook } = await freshModule();
     expectCode(() => testLocalHook('Nope', 'echo'), 'HOOK_INVALID_EVENT');
     expectCode(() => testLocalHook('Stop', ''), 'HOOK_INVALID_COMMAND');
-  });
-});
-
-// ── 连接器授权 ───────────────────────────────────────────────
-
-describe('连接器：授权/撤销（无记录即空，不伪造已授权）', () => {
-  it('初始为空，授权后返回已授权视图', async () => {
-    const { localConnectors, authorizeLocalConnector } = await freshWithStorage();
-    expect(localConnectors()).toEqual([]);
-    const view = authorizeLocalConnector('github', 'market', 'https://github.example/mcp');
-    expect(view).toMatchObject({
-      connectorId: 'github',
-      category: 'market',
-      installed: true,
-      authStatus: 'authorized',
-      serverRef: 'https://github.example/mcp',
-    });
-    expect(view.updatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-  });
-
-  it('重复授权幂等更新，不产生脏行；列表按 id 排序', async () => {
-    const { localConnectors, authorizeLocalConnector } = await freshWithStorage();
-    authorizeLocalConnector('slack', 'builtin');
-    authorizeLocalConnector('github', 'builtin');
-    authorizeLocalConnector('slack', 'builtin');
-    expect(localConnectors().map((c) => c.connectorId)).toEqual(['github', 'slack']);
-    expect(localConnectors()).toHaveLength(2);
-  });
-
-  it('本次未给 serverRef 时沿用已有（与 Rust COALESCE 一致）', async () => {
-    const { authorizeLocalConnector } = await freshWithStorage();
-    authorizeLocalConnector('github', 'market', 'ref-1');
-    expect(authorizeLocalConnector('github', 'market').serverRef).toBe('ref-1');
-    expect(authorizeLocalConnector('github', 'market', 'ref-2').serverRef).toBe('ref-2');
-  });
-
-  it('分类缺省为 builtin，非法分类抛 CONNECTOR_INVALID_CATEGORY', async () => {
-    const { authorizeLocalConnector } = await freshWithStorage();
-    expect(authorizeLocalConnector('x').category).toBe('builtin');
-    expectCode(() => authorizeLocalConnector('x', 'weird'), 'CONNECTOR_INVALID_CATEGORY');
-    expectCode(() => authorizeLocalConnector('  ', 'builtin'), 'CONNECTOR_INVALID_ID');
-  });
-
-  it('撤销保留条目并降级为未授权；无授权记录时明确报错', async () => {
-    const { authorizeLocalConnector, revokeLocalConnector, localConnectors } = await freshWithStorage();
-    expectCode(() => revokeLocalConnector('github'), 'CONNECTOR_NOT_FOUND');
-    authorizeLocalConnector('github', 'market', 'r');
-    expect(revokeLocalConnector('github')).toMatchObject({ installed: false, authStatus: 'none' });
-    expect(localConnectors()).toHaveLength(1);
-    // 撤销后再授权可恢复
-    expect(authorizeLocalConnector('github', 'market').authStatus).toBe('authorized');
   });
 });
 
@@ -374,7 +467,6 @@ describe('分发器：handleLocalAlignmentChannel 路由', () => {
   it('只读通道无需载荷即安全返回空态', async () => {
     const { handleLocalAlignmentChannel } = await freshWithStorage();
     expect(handleLocalAlignmentChannel('hooks:get', [])).toEqual({ handled: true, value: { hooks: {} } });
-    expect(handleLocalAlignmentChannel('connector:list', [])).toEqual({ handled: true, value: [] });
     expect(handleLocalAlignmentChannel('task:archiveList', [])).toEqual({ handled: true, value: [] });
     expect(handleLocalAlignmentChannel('computerUse:getPolicy', [])).toEqual({
       handled: true,
@@ -386,15 +478,7 @@ describe('分发器：handleLocalAlignmentChannel 路由', () => {
     const { handleLocalAlignmentChannel } = await freshWithStorage();
     expect(handleLocalAlignmentChannel('hooks:set', [{ hooks: { Stop: [{ hooks: [{ command: 'echo' }] }] } }])).toEqual({
       handled: true,
-      value: { ok: true, events: 1 },
-    });
-    expect(handleLocalAlignmentChannel('connector:authorize', [{ connectorId: 'github', category: 'builtin' }])).toMatchObject({
-      handled: true,
-      value: { connectorId: 'github', installed: true },
-    });
-    expect(handleLocalAlignmentChannel('connector:revoke', [{ connectorId: 'github' }])).toEqual({
-      handled: true,
-      value: { ok: true, connectorId: 'github' },
+      value: { ok: true, events: 1, revoked: [] },
     });
     expect(handleLocalAlignmentChannel('task:archive', [{ taskId: 't-9', title: 'T', workspaceId: 'ws' }])).toMatchObject({
       handled: true,
@@ -422,20 +506,17 @@ describe('分发器：handleLocalAlignmentChannel 路由', () => {
 // ── 持久化与重启 ─────────────────────────────────────────────
 
 describe('持久化：写穿 localStorage，重启后 hydrate', () => {
-  it('四类台账均在重启后还原（含归档顺序与策略 persisted 标记）', async () => {
+  it('三类台账均在重启后还原（含归档顺序与策略 persisted 标记）', async () => {
     await freshWithStorage();
     const first = await freshModule();
     first.saveLocalHooks({ hooks: { Stop: [{ hooks: [{ command: 'echo s' }] }] } });
-    first.authorizeLocalConnector('github', 'market', 'r');
-    first.authorizeLocalConnector('slack', 'builtin');
     first.archiveLocalTask('t-old', '旧', 'ws', 1000);
     first.archiveLocalTask('t-new', '新', 'ws', 5000);
     first.setLocalComputerUsePolicy('auto');
-    expect(currentStore.size).toBeGreaterThanOrEqual(4);
+    expect(currentStore.size).toBeGreaterThanOrEqual(3);
 
     const second = await freshModule();
     expect(second.localHooks()).toEqual({ hooks: { Stop: [{ hooks: [{ command: 'echo s' }] }] } });
-    expect(second.localConnectors().map((c) => c.connectorId)).toEqual(['github', 'slack']);
     expect(second.localArchived().map((r) => r.taskId)).toEqual(['t-new', 't-old']);
     expect(second.localComputerUsePolicy()).toEqual({ policy: 'auto', persisted: true });
   });
@@ -443,11 +524,9 @@ describe('持久化：写穿 localStorage，重启后 hydrate', () => {
   it('本地存档损坏时降级为空台账，不抛错阻断页面', async () => {
     await freshWithStorage();
     currentStore.set('tt:hooks', '{not json');
-    currentStore.set('tt:connectors', JSON.stringify([{ connectorId: 'ok' }, null]));
     currentStore.set('tt:archived', JSON.stringify([{ nope: 1 }, { taskId: 't-1', archivedAtMs: 7 }]));
-    const { localHooks, localConnectors, localArchived } = await freshModule();
+    const { localHooks, localArchived } = await freshModule();
     expect(localHooks()).toEqual({ hooks: {} });
-    expect(localConnectors()).toHaveLength(1);
     const row = localArchived()[0];
     expect(row).toMatchObject({ taskId: 't-1', title: '(无标题任务)', workspaceId: 'default' });
     expect(row.archivedAt).toBe(new Date(7).toISOString());
@@ -461,6 +540,7 @@ describe('持久化：写穿 localStorage，重启后 hydrate', () => {
     expect(m.saveLocalHooks({ hooks: { Stop: [{ hooks: [{ command: 'echo' }] }] } })).toEqual({
       ok: true,
       events: 1,
+      revoked: [],
     });
     expect(m.localHooks().hooks.Stop).toBeDefined();
     expect(m.archiveLocalTask('t-mem', '内存', 'ws', 1).taskId).toBe('t-mem');
@@ -470,13 +550,11 @@ describe('持久化：写穿 localStorage，重启后 hydrate', () => {
   it('resetLocalAlignment 同时清内存与本地持久层', async () => {
     const m = await freshWithStorage();
     m.saveLocalHooks({ hooks: { Stop: [{ hooks: [{ command: 'echo' }] }] } });
-    m.authorizeLocalConnector('github', 'builtin');
     m.archiveLocalTask('t-1', 'A', 'ws', 1);
     m.setLocalComputerUsePolicy('disabled');
-    expect(currentStore.size).toBe(4);
+    expect(currentStore.size).toBe(3);
     m.resetLocalAlignment();
     expect(m.localHooks()).toEqual({ hooks: {} });
-    expect(m.localConnectors()).toEqual([]);
     expect(m.localArchived()).toEqual([]);
     expect(m.localComputerUsePolicy()).toEqual({ policy: 'ask_every_time', persisted: false });
     expect(currentStore.size).toBe(0);

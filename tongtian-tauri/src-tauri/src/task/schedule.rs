@@ -12,6 +12,7 @@
 
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 pub const FREQ_HOURLY: &str = "hourly";
 pub const FREQ_DAILY: &str = "daily";
@@ -45,6 +46,10 @@ pub struct ScheduleRow {
     pub last_run_at_ms: Option<i64>,
     pub last_status: Option<String>,
     pub last_task_id: Option<String>,
+    /// 执行完成后推送的 IM 通道（空＝不推送）
+    pub notify_channel: String,
+    /// 推送目标会话（Slack 频道 ID / 钉钉会话 ID 等）
+    pub notify_target: String,
 }
 
 /// 单次执行记录
@@ -70,6 +75,19 @@ pub struct NewSchedule {
     pub time_of_day: String,
     pub weekday: Option<i64>,
     pub workspace_id: Option<String>,
+    pub notify_channel: Option<String>,
+    pub notify_target: Option<String>,
+}
+
+/// 自然语言解析结果：字段可直接回填新建表单，`note` 说明做了哪些默认假设
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedSchedule {
+    pub freq: String,
+    pub time_of_day: String,
+    pub weekday: Option<i64>,
+    pub name: String,
+    pub note: Option<String>,
 }
 
 // ── 规范化（错误码与前端 error-messages 对齐） ──────────────────
@@ -118,6 +136,35 @@ pub fn normalize_name(v: &str) -> Result<String, String> {
     Ok(t.chars().take(60).collect())
 }
 
+/// 推送配置规范化：通道与目标要么都空（不推送），要么都填
+pub fn normalize_notify(
+    channel: Option<&str>,
+    target: Option<&str>,
+) -> Result<(String, String), String> {
+    let ch = channel.unwrap_or("").trim().to_ascii_lowercase();
+    let tg = target.unwrap_or("").trim().to_string();
+    if ch.is_empty() && tg.is_empty() {
+        return Ok((String::new(), String::new()));
+    }
+    if ch.is_empty() {
+        return Err("SCHEDULE_INVALID_NOTIFY: 已填写推送目标，但未选择推送通道".into());
+    }
+    if tg.is_empty() {
+        return Err("SCHEDULE_INVALID_NOTIFY: 已选择推送通道，但未填写目标会话".into());
+    }
+    if ch.len() > 32
+        || !ch
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        return Err(format!("SCHEDULE_INVALID_NOTIFY: 推送通道不合法（{ch}）"));
+    }
+    if tg.chars().count() > 128 {
+        return Err("SCHEDULE_INVALID_NOTIFY: 推送目标过长（上限 128 字）".into());
+    }
+    Ok((ch, tg))
+}
+
 fn parse_hhmm(v: &str) -> Option<(i64, i64)> {
     let t = v.trim();
     let (hs, ms) = t.split_once(':')?;
@@ -127,6 +174,351 @@ fn parse_hhmm(v: &str) -> Option<(i64, i64)> {
         return None;
     }
     Some((h, m))
+}
+
+// ── 自然语言解析（「每周一上午9点生成周报」→ 表单字段） ──────────
+
+fn pattern(cell: &'static OnceLock<regex::Regex>, pat: &str) -> &'static regex::Regex {
+    cell.get_or_init(|| regex::Regex::new(pat).expect("内置正则必须有效"))
+}
+
+fn re_interval_hours() -> &'static regex::Regex {
+    static R: OnceLock<regex::Regex> = OnceLock::new();
+    pattern(&R, r"(?:每|每隔)\s*[0-9一二三四五六七八九十两]+\s*(?:个)?\s*(?:小时|钟头)")
+}
+
+fn re_interval_minutes() -> &'static regex::Regex {
+    static R: OnceLock<regex::Regex> = OnceLock::new();
+    pattern(&R, r"(?:每|每隔)\s*[0-9一二三四五六七八九十两]+\s*(?:分钟|分)")
+}
+
+fn re_weekly() -> &'static regex::Regex {
+    static R: OnceLock<regex::Regex> = OnceLock::new();
+    pattern(&R, r"每(?:周|星期|礼拜)\s*([一二三四五六日天七1-7])")
+}
+
+fn re_hourly() -> &'static regex::Regex {
+    static R: OnceLock<regex::Regex> = OnceLock::new();
+    pattern(&R, r"每(?:个)?小时")
+}
+
+fn re_monthly_day() -> &'static regex::Regex {
+    static R: OnceLock<regex::Regex> = OnceLock::new();
+    pattern(&R, r"每月\s*([0-9]{1,2}|[一二三四五六七八九十]{1,3})\s*[号日]")
+}
+
+fn re_monthly() -> &'static regex::Regex {
+    static R: OnceLock<regex::Regex> = OnceLock::new();
+    pattern(&R, r"每月")
+}
+
+fn re_daily() -> &'static regex::Regex {
+    static R: OnceLock<regex::Regex> = OnceLock::new();
+    pattern(&R, r"每(?:天|日)|天天")
+}
+
+fn re_period() -> &'static regex::Regex {
+    static R: OnceLock<regex::Regex> = OnceLock::new();
+    pattern(&R, r"(凌晨|清晨|早晨|早上|上午|中午|下午|傍晚|晚上|夜里|夜间|晚间)")
+}
+
+fn re_colon_time() -> &'static regex::Regex {
+    static R: OnceLock<regex::Regex> = OnceLock::new();
+    pattern(&R, r"(\d{1,2})\s*[:：]\s*(\d{1,2})")
+}
+
+fn re_point_time() -> &'static regex::Regex {
+    static R: OnceLock<regex::Regex> = OnceLock::new();
+    pattern(
+        &R,
+        r"([0-9]{1,2}|[零一二三四五六七八九十两]{1,3})\s*[点时](?:\s*(半)|([0-9]{1,2})\s*分?)?",
+    )
+}
+
+fn re_minute_only() -> &'static regex::Regex {
+    static R: OnceLock<regex::Regex> = OnceLock::new();
+    pattern(&R, r"([0-9]{1,2})\s*分(?:钟)?")
+}
+
+/// 中文数字（1–99）：零/一/二/两…十、十一、二十三
+fn cn_number(v: &str) -> Option<i64> {
+    let t = v.trim();
+    if let Ok(n) = t.parse::<i64>() {
+        return Some(n);
+    }
+    let digit = |c: char| -> Option<i64> {
+        Some(match c {
+            '零' => 0,
+            '一' => 1,
+            '二' | '两' => 2,
+            '三' => 3,
+            '四' => 4,
+            '五' => 5,
+            '六' => 6,
+            '七' => 7,
+            '八' => 8,
+            '九' => 9,
+            _ => return None,
+        })
+    };
+    if let Some((tens, ones)) = t.split_once('十') {
+        let hi = if tens.is_empty() {
+            1
+        } else {
+            tens.chars().next().and_then(digit)?
+        };
+        let lo = if ones.is_empty() {
+            0
+        } else {
+            ones.chars().next().and_then(digit)?
+        };
+        return Some(hi * 10 + lo);
+    }
+    let mut chars = t.chars();
+    let n = digit(chars.next()?)?;
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(n)
+}
+
+fn weekday_of(v: &str) -> Option<i64> {
+    Some(match v {
+        "一" | "1" => 1,
+        "二" | "2" => 2,
+        "三" | "3" => 3,
+        "四" | "4" => 4,
+        "五" | "5" => 5,
+        "六" | "6" => 6,
+        "日" | "天" | "七" | "7" => 7,
+        _ => return None,
+    })
+}
+
+/// 时段词 → 24 小时制偏移。返回 None 表示该组合不是合法时刻。
+fn apply_period(h: i64, period: Option<&str>) -> Option<i64> {
+    let h = match period {
+        Some("凌晨") => {
+            if h == 12 {
+                0
+            } else {
+                h
+            }
+        }
+        Some("清晨") | Some("早晨") | Some("早上") | Some("上午") => {
+            if h == 12 {
+                0
+            } else {
+                h
+            }
+        }
+        Some("中午") => {
+            if h < 11 {
+                h + 12
+            } else {
+                h
+            }
+        }
+        Some("下午") | Some("傍晚") => {
+            if h < 12 {
+                h + 12
+            } else {
+                h
+            }
+        }
+        Some("晚上") | Some("夜里") | Some("夜间") | Some("晚间") => {
+            if h == 12 {
+                0
+            } else if h < 12 {
+                h + 12
+            } else {
+                h
+            }
+        }
+        _ => h,
+    };
+    (0..=23).contains(&h).then_some(h)
+}
+
+struct TimeHit {
+    hour: i64,
+    minute: i64,
+    token: String,
+}
+
+fn find_time(raw: &str, freq: &str) -> Option<TimeHit> {
+    let period = re_period().find(raw).map(|m| m.as_str().to_string());
+    if let Some(c) = re_colon_time().captures(raw) {
+        let h: i64 = c.get(1)?.as_str().parse().ok()?;
+        let m: i64 = c.get(2)?.as_str().parse().ok()?;
+        // 已经是 24 小时制（>12）时忽略时段词："晚上 20:00" 就是 20:00
+        let hour = if h > 12 {
+            h
+        } else {
+            apply_period(h, period.as_deref())?
+        };
+        return Some(TimeHit {
+            hour,
+            minute: m,
+            token: c.get(0)?.as_str().to_string(),
+        });
+    }
+    if let Some(c) = re_point_time().captures(raw) {
+        let h = cn_number(c.get(1)?.as_str())?;
+        let minute = if c.get(2).is_some() {
+            30
+        } else {
+            c.get(3)
+                .map(|m| m.as_str().parse::<i64>().ok())
+                .unwrap_or(Some(0))?
+        };
+        let hour = if h > 12 {
+            h
+        } else {
+            apply_period(h, period.as_deref())?
+        };
+        return Some(TimeHit {
+            hour,
+            minute,
+            token: c.get(0)?.as_str().to_string(),
+        });
+    }
+    // 每小时任务允许只写分钟："每小时的第 30 分"
+    if freq == FREQ_HOURLY {
+        if let Some(c) = re_minute_only().captures(raw) {
+            let minute: i64 = c.get(1)?.as_str().parse().ok()?;
+            return Some(TimeHit {
+                hour: 0,
+                minute,
+                token: c.get(0)?.as_str().to_string(),
+            });
+        }
+    }
+    None
+}
+
+fn clean_schedule_name(raw: &str, tokens: &[String]) -> String {
+    let mut s = raw.to_string();
+    for t in tokens {
+        if !t.is_empty() {
+            s = s.replacen(t.as_str(), "", 1);
+        }
+    }
+    const LEADING: &[&str] = &[
+        "请帮我", "麻烦", "帮我", "请", "定时", "提醒我", "提醒", "我要", "我想", "需要",
+        "的第", "第", "的",
+    ];
+    const TRAILING: &[&str] = &["提醒我", "提醒", "执行", "任务"];
+    loop {
+        let before = s.clone();
+        s = s.trim().to_string();
+        for f in LEADING {
+            if let Some(rest) = s.strip_prefix(f) {
+                s = rest.trim_start().to_string();
+            }
+        }
+        for f in TRAILING {
+            if let Some(head) = s.strip_suffix(f) {
+                s = head.trim_end().to_string();
+            }
+        }
+        if s == before {
+            break;
+        }
+    }
+    let trimmed = s.trim_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '，' | ',' | '。' | '；' | ';' | '：' | ':' | '！' | '!' | '？' | '?' | '、' | '-' | '—')
+    });
+    if trimmed.is_empty() {
+        "定时任务".to_string()
+    } else {
+        trimmed.chars().take(60).collect()
+    }
+}
+
+/// 把一句话解析成定时任务字段。只接受本调度器真实支持的四种频率；
+/// 不支持的间隔/月内日期明确报错，不猜一个近似值。
+pub fn parse_natural(text: &str) -> Result<ParsedSchedule, String> {
+    let raw = text.trim();
+    if raw.is_empty() {
+        return Err(
+            "SCHEDULE_PARSE_EMPTY: 请用一句话描述执行时间，例如「每周一上午 9 点生成周报」".into(),
+        );
+    }
+    if re_interval_hours().is_match(raw) || re_interval_minutes().is_match(raw) {
+        return Err(
+            "SCHEDULE_UNSUPPORTED_FREQ: 暂不支持按「每 N 小时 / 每 N 分钟」间隔调度，请改用每小时、每天、每周或每月".into(),
+        );
+    }
+
+    let mut tokens: Vec<String> = Vec::new();
+    let mut freq: Option<String> = None;
+    let mut weekday: Option<i64> = None;
+
+    if let Some(c) = re_weekly().captures(raw) {
+        let wd = weekday_of(c.get(1).map(|m| m.as_str()).unwrap_or(""))
+            .ok_or_else(|| format!("SCHEDULE_PARSE_FAILED: 无法识别星期（{raw}）"))?;
+        freq = Some(FREQ_WEEKLY.into());
+        weekday = Some(wd);
+        tokens.push(c.get(0).map(|m| m.as_str()).unwrap_or("").to_string());
+    } else if let Some(c) = re_monthly_day().captures(raw) {
+        let day = cn_number(c.get(1).map(|m| m.as_str()).unwrap_or(""))
+            .ok_or_else(|| format!("SCHEDULE_PARSE_FAILED: 无法识别日期（{raw}）"))?;
+        if day != 1 {
+            return Err(format!(
+                "SCHEDULE_UNSUPPORTED_DAY: 当前调度只支持每月 1 日（收到 {day} 号），请改用每周或每天"
+            ));
+        }
+        freq = Some(FREQ_MONTHLY.into());
+        tokens.push(c.get(0).map(|m| m.as_str()).unwrap_or("").to_string());
+    } else if let Some(m) = re_hourly().find(raw) {
+        freq = Some(FREQ_HOURLY.into());
+        tokens.push(m.as_str().to_string());
+    } else if let Some(m) = re_monthly().find(raw) {
+        freq = Some(FREQ_MONTHLY.into());
+        tokens.push(m.as_str().to_string());
+    } else if let Some(m) = re_daily().find(raw) {
+        freq = Some(FREQ_DAILY.into());
+        tokens.push(m.as_str().to_string());
+    }
+
+    let mut note = None;
+    let freq = match freq {
+        Some(f) => f,
+        None => {
+            note = Some("未写频率，已按每天处理".to_string());
+            FREQ_DAILY.to_string()
+        }
+    };
+
+    let hit = find_time(raw, &freq).ok_or_else(|| {
+        if freq == FREQ_HOURLY {
+            "SCHEDULE_PARSE_NO_TIME: 没识别到分钟，请补充「每小时的第 30 分」这类时间".to_string()
+        } else {
+            "SCHEDULE_PARSE_NO_TIME: 没识别到执行时刻，请补充「上午 9 点」这类时间".to_string()
+        }
+    })?;
+    if !(0..=23).contains(&hit.hour) || !(0..=59).contains(&hit.minute) {
+        return Err(format!(
+            "SCHEDULE_PARSE_TIME: 无法识别有效时刻（{}:{}）",
+            hit.hour, hit.minute
+        ));
+    }
+    tokens.push(hit.token.clone());
+    if let Some(p) = re_period().find(raw) {
+        if !hit.token.contains(p.as_str()) {
+            tokens.push(p.as_str().to_string());
+        }
+    }
+
+    let name = clean_schedule_name(raw, &tokens);
+    Ok(ParsedSchedule {
+        freq,
+        time_of_day: format!("{:02}:{:02}", hit.hour, hit.minute),
+        weekday,
+        name,
+        note,
+    })
 }
 
 // ── 下次执行时间（纯函数，可单测） ─────────────────────────────
@@ -209,12 +601,14 @@ fn map_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRow> {
         last_run_at_ms: r.get::<_, Option<i64>>(11)?,
         last_status: r.get::<_, Option<String>>(12)?,
         last_task_id: r.get::<_, Option<String>>(13)?,
+        notify_channel: r.get(14)?,
+        notify_target: r.get(15)?,
     })
 }
 
 const SELECT_COLS: &str = "schedule_id, name, description, freq, time_of_day, weekday, enabled, \
                            workspace_id, created_at_ms, updated_at_ms, next_run_at_ms, \
-                           last_run_at_ms, last_status, last_task_id";
+                           last_run_at_ms, last_status, last_task_id, notify_channel, notify_target";
 
 /// 全部定时任务（按下次执行时间升序，无下次执行者排后）
 pub fn list(store: &Store) -> Result<Vec<ScheduleRow>, String> {
@@ -259,6 +653,10 @@ pub fn create(store: &Store, req: &NewSchedule, now_ms: i64) -> Result<ScheduleR
         .clone()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "default".into());
+    let (notify_channel, notify_target) = normalize_notify(
+        req.notify_channel.as_deref(),
+        req.notify_target.as_deref(),
+    )?;
     let row = ScheduleRow {
         schedule_id: format!("sched-{now_ms}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
         name,
@@ -274,12 +672,15 @@ pub fn create(store: &Store, req: &NewSchedule, now_ms: i64) -> Result<ScheduleR
         last_run_at_ms: None,
         last_status: None,
         last_task_id: None,
+        notify_channel,
+        notify_target,
     };
     store.with_conn(|c| {
         c.execute(
             "INSERT INTO scheduled_tasks (schedule_id, name, description, freq, time_of_day, \
-             weekday, enabled, workspace_id, created_at_ms, updated_at_ms, next_run_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             weekday, enabled, workspace_id, created_at_ms, updated_at_ms, next_run_at_ms, \
+             notify_channel, notify_target) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             rusqlite::params![
                 row.schedule_id,
                 row.name,
@@ -292,6 +693,8 @@ pub fn create(store: &Store, req: &NewSchedule, now_ms: i64) -> Result<ScheduleR
                 row.created_at_ms,
                 row.updated_at_ms,
                 row.next_run_at_ms,
+                row.notify_channel,
+                row.notify_target,
             ],
         )
         .map_err(|e| format!("SCHEDULE_SAVE_FAILED: {e}"))?;
@@ -311,6 +714,8 @@ pub struct UpdateSchedule {
     pub time_of_day: Option<String>,
     pub weekday: Option<i64>,
     pub workspace_id: Option<String>,
+    pub notify_channel: Option<String>,
+    pub notify_target: Option<String>,
 }
 
 /// 启用/禁用：禁用清空下次执行时间，启用按当前时刻重算
@@ -374,6 +779,34 @@ pub fn update(store: &Store, req: &UpdateSchedule, now_ms: i64) -> Result<Schedu
         Some(_) => "default".to_string(),
         None => cur.workspace_id.clone(),
     };
+    // 推送配置：都不传＝保持；通道传空串＝关闭推送（同时清目标）；
+    // 只改目标沿用原通道；切换通道但没给目标时不继承旧会话标识。
+    let (notify_channel, notify_target) =
+        if req.notify_channel.is_none() && req.notify_target.is_none() {
+            (cur.notify_channel.clone(), cur.notify_target.clone())
+        } else {
+            let ch = req
+                .notify_channel
+                .as_deref()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .unwrap_or_else(|| cur.notify_channel.clone());
+            if ch.is_empty() {
+                (String::new(), String::new())
+            } else {
+                let tg = req
+                    .notify_target
+                    .as_deref()
+                    .map(|v| v.trim().to_string())
+                    .unwrap_or_else(|| {
+                        if ch == cur.notify_channel {
+                            cur.notify_target.clone()
+                        } else {
+                            String::new()
+                        }
+                    });
+                normalize_notify(Some(&ch), Some(&tg))?
+            }
+        };
 
     let next = if cur.enabled {
         Some(next_run_at_ms(&freq, &time_of_day, weekday, now_ms))
@@ -384,7 +817,8 @@ pub fn update(store: &Store, req: &UpdateSchedule, now_ms: i64) -> Result<Schedu
     store.with_conn(|c| {
         c.execute(
             "UPDATE scheduled_tasks SET name = ?2, description = ?3, freq = ?4, time_of_day = ?5, \
-             weekday = ?6, workspace_id = ?7, next_run_at_ms = ?8, updated_at_ms = ?9 \
+             weekday = ?6, workspace_id = ?7, next_run_at_ms = ?8, updated_at_ms = ?9, \
+             notify_channel = ?10, notify_target = ?11 \
              WHERE schedule_id = ?1",
             rusqlite::params![
                 req.schedule_id,
@@ -396,6 +830,8 @@ pub fn update(store: &Store, req: &UpdateSchedule, now_ms: i64) -> Result<Schedu
                 workspace_id,
                 next,
                 now_ms,
+                notify_channel,
+                notify_target,
             ],
         )
         .map_err(|e| format!("SCHEDULE_SAVE_FAILED: {e}"))?;
@@ -409,6 +845,8 @@ pub fn update(store: &Store, req: &UpdateSchedule, now_ms: i64) -> Result<Schedu
     row.time_of_day = time_of_day;
     row.weekday = weekday;
     row.workspace_id = workspace_id;
+    row.notify_channel = notify_channel;
+    row.notify_target = notify_target;
     row.next_run_at_ms = next;
     row.updated_at_ms = now_ms;
     Ok(row)
@@ -596,6 +1034,8 @@ mod tests {
             time_of_day: time.into(),
             weekday,
             workspace_id: None,
+            notify_channel: None,
+            notify_target: None,
         }
     }
 
@@ -1021,6 +1461,154 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows[0].started_at_ms > rows[1].started_at_ms, "按开始时间倒序");
         assert_eq!(list_runs(&store, None, 0).unwrap().len(), 3, "limit=0 取缺省 100");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_natural_daily_with_period_and_name() {
+        let p = parse_natural("每天上午9点汇总品牌舆情").unwrap();
+        assert_eq!(p.freq, FREQ_DAILY);
+        assert_eq!(p.time_of_day, "09:00");
+        assert_eq!(p.weekday, None);
+        assert_eq!(p.name, "汇总品牌舆情");
+        assert_eq!(p.note, None);
+
+        let p = parse_natural("每天下午 3 点半提醒我提交日报").unwrap();
+        assert_eq!(p.time_of_day, "15:30");
+        assert_eq!(p.name, "提交日报");
+    }
+
+    #[test]
+    fn test_parse_natural_weekly_and_monthly() {
+        let p = parse_natural("每周一上午 9:00 生成周报").unwrap();
+        assert_eq!(p.freq, FREQ_WEEKLY);
+        assert_eq!(p.weekday, Some(1));
+        assert_eq!(p.time_of_day, "09:00");
+        assert_eq!(p.name, "生成周报");
+
+        let p = parse_natural("每周日晚上8点备份数据").unwrap();
+        assert_eq!(p.weekday, Some(7));
+        assert_eq!(p.time_of_day, "20:00");
+        assert_eq!(p.name, "备份数据");
+
+        let p = parse_natural("每月1号凌晨2点清理缓存").unwrap();
+        assert_eq!(p.freq, FREQ_MONTHLY);
+        assert_eq!(p.time_of_day, "02:00");
+        assert_eq!(p.name, "清理缓存");
+    }
+
+    #[test]
+    fn test_parse_natural_hourly() {
+        let p = parse_natural("每小时的第30分钟检查服务").unwrap();
+        assert_eq!(p.freq, FREQ_HOURLY);
+        assert_eq!(p.time_of_day, "00:30");
+        assert_eq!(p.name, "检查服务");
+
+        let p = parse_natural("每小时 15 分同步数据").unwrap();
+        assert_eq!(p.time_of_day, "00:15");
+        assert_eq!(p.name, "同步数据");
+    }
+
+    #[test]
+    fn test_parse_natural_defaults_to_daily_with_note() {
+        let p = parse_natural("上午10点开晨会").unwrap();
+        assert_eq!(p.freq, FREQ_DAILY);
+        assert_eq!(p.time_of_day, "10:00");
+        assert_eq!(p.name, "开晨会");
+        assert_eq!(p.note.as_deref(), Some("未写频率，已按每天处理"));
+    }
+
+    #[test]
+    fn test_parse_natural_night_and_noon_edges() {
+        assert_eq!(parse_natural("每天晚上12点归档").unwrap().time_of_day, "00:00");
+        assert_eq!(parse_natural("每天中午1点午会").unwrap().time_of_day, "13:00");
+        assert_eq!(parse_natural("每天中午12点午餐").unwrap().time_of_day, "12:00");
+        assert_eq!(parse_natural("每天24:00 不允许").unwrap_err().len() > 0, true);
+    }
+
+    #[test]
+    fn test_parse_natural_rejects_unsupported_and_missing_time() {
+        let err = parse_natural("每2小时同步一次").unwrap_err();
+        assert!(err.starts_with("SCHEDULE_UNSUPPORTED_FREQ:"), "{err}");
+        let err = parse_natural("每隔30分钟检查").unwrap_err();
+        assert!(err.starts_with("SCHEDULE_UNSUPPORTED_FREQ:"), "{err}");
+        let err = parse_natural("每月15号发工资").unwrap_err();
+        assert!(err.starts_with("SCHEDULE_UNSUPPORTED_DAY:"), "{err}");
+        let err = parse_natural("每天汇总舆情").unwrap_err();
+        assert!(err.starts_with("SCHEDULE_PARSE_NO_TIME:"), "{err}");
+        let err = parse_natural("  ").unwrap_err();
+        assert!(err.starts_with("SCHEDULE_PARSE_EMPTY:"), "{err}");
+    }
+
+    #[test]
+    fn test_normalize_notify_pairs_channel_and_target() {
+        assert_eq!(normalize_notify(None, None).unwrap(), (String::new(), String::new()));
+        assert_eq!(
+            normalize_notify(Some(" Slack "), Some(" C123 ")).unwrap(),
+            ("slack".into(), "C123".into())
+        );
+        assert!(normalize_notify(Some(""), Some("C123"))
+            .unwrap_err()
+            .starts_with("SCHEDULE_INVALID_NOTIFY:"));
+        assert!(normalize_notify(Some("slack"), Some(""))
+            .unwrap_err()
+            .starts_with("SCHEDULE_INVALID_NOTIFY:"));
+        assert!(normalize_notify(Some("sl/ack"), Some("C1"))
+            .unwrap_err()
+            .starts_with("SCHEDULE_INVALID_NOTIFY:"));
+    }
+
+    #[test]
+    fn test_create_and_update_notify_fields() {
+        let (store, dir) = temp_store("notify");
+        let mut req = new_req("每天", "08:00", None);
+        req.notify_channel = Some("slack".into());
+        req.notify_target = Some("C123".into());
+        let row = create(&store, &req, base_ms()).unwrap();
+        assert_eq!(row.notify_channel, "slack");
+        assert_eq!(row.notify_target, "C123");
+        assert_eq!(get(&store, &row.schedule_id).unwrap().unwrap(), row);
+
+        // 只改目标：沿用通道
+        let edited = update(
+            &store,
+            &UpdateSchedule {
+                schedule_id: row.schedule_id.clone(),
+                notify_target: Some("C999".into()),
+                ..Default::default()
+            },
+            base_ms(),
+        )
+        .unwrap();
+        assert_eq!(edited.notify_channel, "slack");
+        assert_eq!(edited.notify_target, "C999");
+
+        // 切换通道但没给目标：不继承旧会话，直接拒绝
+        let err = update(
+            &store,
+            &UpdateSchedule {
+                schedule_id: row.schedule_id.clone(),
+                notify_channel: Some("dingtalk".into()),
+                ..Default::default()
+            },
+            base_ms(),
+        )
+        .unwrap_err();
+        assert!(err.starts_with("SCHEDULE_INVALID_NOTIFY:"), "{err}");
+
+        // 通道置空：连目标一起关闭
+        let cleared = update(
+            &store,
+            &UpdateSchedule {
+                schedule_id: row.schedule_id.clone(),
+                notify_channel: Some("".into()),
+                ..Default::default()
+            },
+            base_ms(),
+        )
+        .unwrap();
+        assert_eq!(cleared.notify_channel, "");
+        assert_eq!(cleared.notify_target, "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

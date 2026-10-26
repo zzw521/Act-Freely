@@ -6,9 +6,54 @@ fastapi==0.136.3
 uvicorn==0.49.0
 agentscope==1.0.20
 
+# 上下文压缩的 token 计数（OpenAITokenCounter 实际依赖 tiktoken 分词表）。
+# 此前只是 agentscope 的传递依赖；引擎现在显式构造计数器，缺包会让压缩不可用。
+tiktoken==0.12.0
+
 # agentscope 的模型适配层按后端分别依赖这两个 SDK
 dashscope==1.25.21
 openai==2.33.0
 
 # FastAPI 解析 multipart 表单（附件暂存）
 python-multipart==0.0.9
+
+# 幻灯片模式生成真实 .pptx（generate_pptx 工具）：基于 python-pptx 写 Open XML，
+# 不依赖本机 Office。缺失时工具会如实报「未安装」，而不是产出改名后的假 pptx。
+python-pptx==1.0.2
+
+# Slack Socket Mode 长连接：引擎侧直接用 aiohttp 的 WebSocket 客户端
+# （Rust 侧离线依赖树里没有任何 WS crate，只能放在引擎进程里跑）。
+# 它此前只是 agentscope 的传递依赖，现在被引擎直接 import，必须显式声明，
+# 否则上游哪天换实现就会在运行时才发现连不上。
+aiohttp==3.13.3
+certifi==2026.02.25
+
+# 钉钉 Stream 通道的协议来源：官方 SDK 的帧模型与回执线（CallbackMessage /
+# SystemMessage / ChatbotMessage / AckMessage / Headers / topic 常量）。
+# 只借它的协议，传输仍走上面那个 aiohttp，所以随包运行时同时要装它的
+# requests / websockets 依赖 —— 少了任一个，钉钉通道会如实退回「尚未接入」。
+dingtalk-stream==0.24.3
+
+# 企业微信智能机器人长连接通道的协议来源：官方 SDK 的 cmd 常量、req_id 拼法与默认地址
+# （aibot.WsCmd / generate_req_id / ws.DEFAULT_WS_URL / types.MessageType）。
+# 同钉钉一样只借协议，传输仍走上面的 aiohttp；它的 websockets / cryptography / certifi
+# 依赖已在锁表里，真正新增的只有 pyee（SDK 的事件发射器，与 websockets 一起是它的包声明）。
+# 少装任一个，企业微信通道会如实退回「尚未接入」而不是给一个点不开的输入框。
+wecom-aibot-python-sdk==1.0.2
+
+# 飞书长连接通道的协议来源：官方 SDK 的握手端点、帧头键名、错误码与 protobuf 分帧
+# （lark_oapi.ws.const / ws.enum / ws.model / ws.pb.pbbp2_pb2.Frame）。飞书与前两家不同，
+# 它的帧不是 JSON 文本而是 protobuf 二进制 envelope，自己照文档手搓字段名迟早和线上对不上。
+#
+# 代价必须写清楚，否则下一个人会把它当普通依赖在引擎启动时 import：
+#   * 根包 `lark_oapi/__init__.py` 里有一句 `from .api import *`，会把上万个生成的
+#     OpenAPI 模型全部加载 —— 本机实测 import 一次 11120 个模块、7.7~13.2 秒。
+#     所以 engine/feishu_channel.py 只能在模块里用 find_spec 探测（0.03 秒），
+#     真正 import 推迟到用户点「启动连接」那次，不能让引擎启动陪它等十秒。
+#   * 解压 20.3 MB / 10733 个文件，比钉钉（+0.4 MB）与企业微信（+0.26 MB）大两个量级。
+#   * 它声明 websockets<16，和钉钉/企业微信一起解析出来的唯一可用版本是 15.0.1，
+#     于是随包运行时的 websockets 从 16.0 降一级。引擎自己从不 import websockets
+#     （传输统一走 aiohttp），降级影响面只有那两家 SDK 自身的导入路径，
+#     已由三条通道的引擎自测复验。
+# 缺这个包时通道如实退回「尚未接入」，不会给一个必然失败的输入框。
+lark-oapi==1.7.5

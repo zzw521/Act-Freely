@@ -21,8 +21,7 @@
   "include": [
     "src/renderer/**/*.ts",
     "src/renderer/**/*.tsx",
-    "src/shared/**/*.ts",
-    "src/preload/index.d.ts"
+    "src/shared/**/*.ts"
   ],
   "exclude": ["node_modules", "dist", "src-tauri"]
 }

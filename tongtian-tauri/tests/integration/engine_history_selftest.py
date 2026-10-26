@@ -11,6 +11,7 @@ Rust 侧装配的请求体没有这些键，引擎侧自然既不落会话也不
 3. POST /api/chat(stage=plan)：modelBinding / modelConfig / workDir / history 落到会话
 4. POST /api/chat/review(approve)：执行流拿到的是 None（由会话补齐）+ 会话级 work_dir
 5. 缺省键不清空：后续提交不带这些键时，会话里已有的设置逐项保留
+6. 新契约 modelId：按 models.json 解析端点/密钥；未知 id 直接拒绝，不静默回落默认
 
 所有写入都在临时目录（tempfile.mkdtemp）内，不触碰任何真实工作目录；模型调用与
 执行流均被替身拦截，不产生任何网络请求。fastapi/httpx 不可用时输出 SKIP 并 0 退出。
@@ -19,6 +20,7 @@ Rust 侧装配的请求体没有这些键，引擎侧自然既不落会话也不
 """
 
 import asyncio
+import os
 import shutil
 import sys
 import tempfile
@@ -48,11 +50,23 @@ def main() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="tt-chat-overrides-"))
     work_dir = tmp / "work"
     work_dir.mkdir()
+    # 隔离模型配置：本自测不应读取真实 ~/.tongtianwork/models.json 的默认模型
+    home = tmp / "home"
+    home.mkdir()
+    prev_home = os.environ.get("TONGTIANWORK_HOME")
+    os.environ["TONGTIANWORK_HOME"] = str(home)
     original_plan = engine_server._generate_plan
     original_run = engine_server._run_execution
     try:
         # 计划生成替身：避免真实模型调用（本自测只验证覆盖项的接收与沿用）
-        async def fake_plan(goal: str):
+        async def fake_plan(goal: str, context: str = "", mode: str = "general",
+                            images: list | None = None, pii_mode: str = "off",
+                            on_redaction=None, model_binding: str | None = None,
+                            model_config: dict | None = None):
+            # context 是本轮材料（附件正文）压成的计划上下文；
+            # mode/images 是后续接入的工作台模式与视觉输入，替身一并接收
+            assert isinstance(context, str), "计划上下文必须是字符串"
+            assert isinstance(mode, str), "工作台模式必须是字符串"
             return ([{"step_id": "step-1", "name": goal[:10], "description": goal}], None)
 
         engine_server._generate_plan = fake_plan
@@ -163,9 +177,57 @@ def main() -> None:
         client.post("/api/chat", json={"message": "第二条", "task_id": bad_task, "stage": "plan", "history": []})
         check("健壮性：空历史不会覆盖会话里已有的历史",
               bad.history == [{"role": "user", "content": "合法"}])
+
+        # 7 ── 新契约 modelId：引擎从 models.json 解析，不要求渲染层携带 apiKey
+        created = client.post("/api/models", json={
+            "name": "自测模型",
+            "source": "openai_compat",
+            "baseUrl": "https://models.example/v1",
+            "apiKey": "sk-selftest-secret",
+            "modelName": "selftest-model",
+            "contextWindow": 8192,
+        })
+        check("模型：新增返回 200", created.status_code == 200, created.text[:200])
+        model_id = (created.json().get("model") or {}).get("id", "")
+        check("模型：读取视图不回传明文密钥", "sk-selftest-secret" not in created.text,
+              created.text[:200])
+
+        id_task = "selftest-model-id"
+        id_resp = client.post("/api/chat", json={
+            "message": "按所选已保存模型执行",
+            "task_id": id_task,
+            "stage": "plan",
+            "modelId": model_id,
+        })
+        check("modelId：提交返回 200 且产出计划", id_resp.status_code == 200 and b"event: plan" in id_resp.content,
+              id_resp.text[:200])
+        id_session = engine_server._TASK_SESSIONS.get(id_task)
+        check("modelId：解析出端点与密钥并落到会话",
+              id_session is not None and id_session.model_config == {
+                  "baseUrl": "https://models.example/v1",
+                  "apiKey": "sk-selftest-secret",
+                  "modelName": "selftest-model",
+                  "source": "openai_compat",
+              }, str(getattr(id_session, "model_config", None)))
+        check("modelId：会话记住所选条目 id（approve 重跑沿用）",
+              id_session is not None and id_session.model_id == model_id)
+
+        missing = client.post("/api/chat", json={
+            "message": "未知模型",
+            "task_id": "selftest-model-missing",
+            "stage": "plan",
+            "modelId": "m-does-not-exist",
+        })
+        check("modelId：未知 id 返回 404 + MODEL_NOT_FOUND",
+              missing.status_code == 404 and missing.json().get("code") == "MODEL_NOT_FOUND",
+              missing.text[:200])
     finally:
         engine_server._generate_plan = original_plan
         engine_server._run_execution = original_run
+        if prev_home is None:
+            os.environ.pop("TONGTIANWORK_HOME", None)
+        else:
+            os.environ["TONGTIANWORK_HOME"] = prev_home
         shutil.rmtree(tmp, ignore_errors=True)
 
     print("-" * 50)

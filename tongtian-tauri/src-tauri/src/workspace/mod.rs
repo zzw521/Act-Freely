@@ -1,8 +1,9 @@
 //! 工作空间（workspace）目录事实来源
 //!
 //! command：
-//! - workspace_list:   列出 `{data_home}/workspaces/*` 真实存在的工作空间，并合并 Agent 实例运行态
-//! - workspace_create: 以增量方式创建目录（幂等：已存在直接返回，不覆盖任何既有内容）
+//! - workspace_list:         列出 `{data_home}/workspaces/*` 真实存在的工作空间，并合并 Agent 实例运行态
+//! - workspace_create:       以增量方式创建目录（幂等：已存在直接返回，不覆盖任何既有内容）
+//! - workspace_capabilities: 后端抽象与数据根事实（本机目录可用；容器/SSH 未提供；自定义根走环境变量）
 //!
 //! 设计约束：
 //! - 目录即事实来源，不引入新表，因此无需迁移，历史数据不受影响；
@@ -164,6 +165,92 @@ pub async fn workspace_create(workspace_id: String) -> Result<Value, String> {
     Ok(create_in(&python_env::base_dir(), &workspace_id)?)
 }
 
+/// 数据根来源（kind, variable）：与 `python_env::base_dir` 的优先级逐条对齐。
+/// 纯函数接受已读取的环境值，便于离线覆盖优先级，不触碰进程环境。
+pub fn data_root_source_from(
+    env_home: Option<&str>,
+    appdata: Option<&str>,
+    userprofile: Option<&str>,
+    home: Option<&str>,
+) -> (&'static str, &'static str) {
+    if env_home.map(|v| !v.trim().is_empty()).unwrap_or(false) {
+        return ("env", "TONGTIAN_HOME");
+    }
+    if cfg!(windows) {
+        if appdata.map(|v| !v.trim().is_empty()).unwrap_or(false) {
+            return ("appdata", "APPDATA");
+        }
+    }
+    if userprofile.map(|v| !v.trim().is_empty()).unwrap_or(false) {
+        return ("home", "USERPROFILE");
+    }
+    if home.map(|v| !v.trim().is_empty()).unwrap_or(false) {
+        return ("home", "HOME");
+    }
+    ("cwd", "")
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// 工作区后端与数据根能力视图。
+///
+/// 容器/SSH 后端需要守护进程、凭据托管与远程执行代理，当前版本没有实现，
+/// 因此 `supported=false` 并给出原因；不把它们伪装成可切换的选项。
+#[tauri::command]
+pub async fn workspace_capabilities() -> Result<Value, String> {
+    let env_home = env_nonempty("TONGTIAN_HOME");
+    let appdata = env_nonempty("APPDATA");
+    let userprofile = env_nonempty("USERPROFILE");
+    let home = env_nonempty("HOME");
+    let (source, variable) = data_root_source_from(
+        env_home.as_deref(),
+        appdata.as_deref(),
+        userprofile.as_deref(),
+        home.as_deref(),
+    );
+    let base = python_env::base_dir();
+    Ok(json!({
+        "activeBackend": "local",
+        "backends": [
+            {
+                "id": "local",
+                "label": "本机目录",
+                "supported": true,
+                "isolation": "每个工作区独立目录 + 独立引擎实例；文件与沙箱策略按工作区隔离",
+                "reason": ""
+            },
+            {
+                "id": "docker",
+                "label": "容器工作区",
+                "supported": false,
+                "isolation": "需要本机 Docker 守护进程、镜像与卷编排",
+                "reason": "当前版本没有容器编排与镜像管理，无法提供容器隔离；工作区仍在本机目录运行"
+            },
+            {
+                "id": "ssh",
+                "label": "SSH 远程工作区",
+                "supported": false,
+                "isolation": "需要主机配对、凭据托管与远程执行代理",
+                "reason": "当前版本没有远程主机配对与远程执行代理；跨机器协作请使用「项目协作」"
+            }
+        ],
+        "dataRoot": base.to_string_lossy(),
+        "dataRootExists": base.is_dir(),
+        "dataRootSource": source,
+        "dataRootVariable": variable,
+        "customRoot": {
+            "supported": true,
+            "variable": "TONGTIAN_HOME",
+            "requiresRestart": true,
+            "reason": "设置 TONGTIAN_HOME 后重启应用生效；不会自动搬移已有数据，避免误覆盖存量工作区"
+        },
+        "deleteSupported": false,
+        "maxIdLen": MAX_ID_LEN
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +350,31 @@ mod tests {
             .starts_with("WORKSPACE_INVALID_ID"));
         assert!(!base.join("workspaces").join("escape").exists());
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn data_root_source_prefers_env_then_appdata_then_home() {
+        assert_eq!(
+            data_root_source_from(Some("D:/tt-home"), Some("C:/ap"), Some("C:/u"), Some("C:/h")),
+            ("env", "TONGTIAN_HOME")
+        );
+        assert_eq!(
+            data_root_source_from(Some("   "), Some("C:/ap"), Some("C:/u"), Some("C:/h")),
+            if cfg!(windows) {
+                ("appdata", "APPDATA")
+            } else {
+                ("home", "USERPROFILE")
+            }
+        );
+        assert_eq!(
+            data_root_source_from(None, None, Some("C:/u"), Some("C:/h")),
+            ("home", "USERPROFILE")
+        );
+        assert_eq!(
+            data_root_source_from(None, None, None, Some("/home/u")),
+            ("home", "HOME")
+        );
+        assert_eq!(data_root_source_from(None, None, None, None), ("cwd", ""));
     }
 
     #[test]

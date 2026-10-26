@@ -6,7 +6,8 @@
  * - 触发口径：哪些事件该提醒（deliver/等待审阅/失败），重复事件不轰炸
  * - 真实投递：授权到位才发；窗口在前台时不打扰；未授权/不支持都如实回报原因
  * - 提示音：只在完成时响，被自动播放策略挡住时不算成功
- * - 能力边界：Windows 任务栏不支持未读计数，界面显示只读说明而不是可点的假开关
+ * - 能力边界：Windows 用图标叠加、macOS 用 Dock 计数，其他平台明确不支持；
+ *   开关绑定真实能力，关闭时下发 0，没有「拨了没反应」的假开关
  * - 页面：开通知必须走权限申请，拿不到授权不把开关拨成「已开」
  */
 
@@ -247,23 +248,29 @@ describe('完成提示音', () => {
 // ── 能力边界与页面 ───────────────────────────────────────────────
 
 describe('任务栏角标的平台边界', () => {
-  it('Windows 如实不支持，macOS 才具备能力', async () => {
-    const m = await loadNotify();
-    const win = m.badgeSupport('windows');
-    expect(win.supported).toBe(false);
-    expect(win.why).toContain('不支持未读计数');
-    expect(m.badgeSupport('macos').supported).toBe(true);
-    expect(m.badgeSupport('linux').supported).toBe(false);
+  it('Rust 按平台选择真实通道：Windows 图标叠加、macOS Dock 计数、其他平台明确拒绝', () => {
+    const rust = read('../../../src-tauri/src/system/badge.rs');
+    expect(rust).toContain('set_overlay_icon');
+    expect(rust).toContain('set_badge_count');
+    expect(rust).toContain('BADGE_UNSUPPORTED: 当前平台');
+    expect(rust).toContain('count.min(99)');
   });
 
-  it('设置页不再放一个拨了没用的角标开关，改为只读说明', () => {
+  it('设置页开关绑定真实能力，浏览器通道降级为只读说明', () => {
     const src = settingsPage();
-    expect(src).not.toContain('在任务栏展示任务未读红点与数量');
-    expect(src).toContain('const NotificationSettings: React.FC = () => {');
-    expect(src).toContain('<NotificationSettings />');
-    expect(src).toContain('badgeSupport()');
-    expect(src).toContain("{badge.supported ? '待接入' : '当前平台不支持'}");
-    expect(src).toContain('可改用桌面通知与声音提醒');
+    expect(src).toContain('badgeCapability()');
+    expect(src).toContain('checked={badgeUnread && Boolean(badge?.supported)}');
+    expect(src).toContain('disabled={!badge?.supported}');
+    expect(src).toContain('badge ? badge.detail :');
+    expect(src).not.toContain("{badge.supported ? '待接入' : '当前平台不支持'}");
+  });
+
+  it('未聚焦才累计、回前台清零，开关关闭时下发 0', () => {
+    const src = read('../../../src/renderer/lib/badge-local.ts');
+    expect(src).toContain('const count = enabled ? unreadTasks.size : 0;');
+    expect(src).toContain('installBadgeFocusReset');
+    expect(src).toContain('window.addEventListener(\'focus\', onFocus);');
+    expect(storeSrc()).toContain('if (!focused) markTaskUnread(taskId);');
   });
 
   it('开通知走权限申请，未授权不把开关拨成已开', () => {

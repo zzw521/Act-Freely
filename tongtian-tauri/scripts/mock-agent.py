@@ -21,11 +21,29 @@
 
 import argparse
 import json
+import sys
 import threading
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+
+
+def _force_utf8_stdio() -> None:
+    """日志一律按 UTF-8 输出。
+
+    父进程（vitest / 终端）用非 UTF-8 代码页时，Python 的 stdout 会退化成 charmap
+    编码，打印中文目标直接抛 UnicodeEncodeError —— 由于 print 发生在请求处理线程里，
+    异常会让该请求的连接被直接关闭，客户端只看到 "other side closed"。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+_force_utf8_stdio()
 
 # 重放窗口（与 engine/server.py 参数对齐）
 REPLAY_WINDOW_MAX_EVENTS = 2048
@@ -93,6 +111,18 @@ class MockAgentHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        # 任何未预期异常都要回一个错误响应：直接让线程崩掉的话，客户端只能看到
+        # 连接被关（"other side closed"），排查时拿不到任何原因
+        try:
+            self._route_post()
+        except Exception as exc:  # noqa: BLE001 - Mock 服务需要把失败原因吐给调用方
+            print(f"[mock-agent] POST {self.path} failed: {exc}", flush=True)
+            try:
+                self._send_json(500, {"error": type(exc).__name__, "detail": str(exc)})
+            except Exception:
+                pass
+
+    def _route_post(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/chat":
             self._handle_chat()

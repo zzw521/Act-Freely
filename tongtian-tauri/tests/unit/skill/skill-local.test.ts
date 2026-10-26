@@ -121,8 +121,10 @@ describe('Rust skill 模块 · 数据保护策略', () => {
     expect(src).toContain('已存在，请先卸载后再安装（不覆盖既有技能）');
     // 生产路径不得对技能目录做物理删除（temp 清理只出现在 tests 内）
     const prod = src.slice(0, src.indexOf('#[cfg(test)]'));
-    expect(prod).not.toContain('remove_dir(');
-    expect(prod).not.toContain('remove_dir_all(');
+    // 唯一允许的物理删除是安装失败时清理本次新建的暂存目录；
+    // 已存在的技能目录只能 rename 进回收目录，绝不做 remove_dir(_all)。
+    const removals = prod.match(/remove_dir(?:_all)?\([^)]*\)/g) ?? [];
+    expect(removals).toEqual(['remove_dir_all(staging)']);
   });
 
   it('卸载把目录 rename 进 skills_removed 回收目录', () => {

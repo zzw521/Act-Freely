@@ -26,6 +26,8 @@ interface AppState {
   taskMonitorOpen: boolean;
   /** 全局任务搜索面板是否打开（快捷键 Ctrl + G） */
   taskSearchOpen: boolean;
+  /** QuickPick 应用内快速任务窗是否打开（Alt+Space / 双击 Ctrl） */
+  quickPickOpen: boolean;
   /** 当前会话内的查找条是否打开（快捷键 Ctrl + F） */
   findBarOpen: boolean;
   /** 全局加载状态 */
@@ -55,6 +57,8 @@ interface AppState {
   setTaskMonitorOpen: (open: boolean) => void;
   /** 设置全局任务搜索面板显隐 */
   setTaskSearchOpen: (open: boolean) => void;
+  /** 设置 QuickPick 快速任务窗显隐 */
+  setQuickPickOpen: (open: boolean) => void;
   /** 设置会话内查找条显隐 */
   setFindBarOpen: (open: boolean) => void;
   /** 设置全局加载 */
@@ -72,6 +76,7 @@ export const useAppStore = create<AppState>((set) => ({
   sidebarCollapsed: false,
   taskMonitorOpen: true,
   taskSearchOpen: false,
+  quickPickOpen: false,
   findBarOpen: false,
   globalLoading: false,
   loadingMessage: '',
@@ -107,6 +112,10 @@ export const useAppStore = create<AppState>((set) => ({
 
   setTaskSearchOpen: (open: boolean) => {
     set({ taskSearchOpen: open });
+  },
+
+  setQuickPickOpen: (open: boolean) => {
+    set({ quickPickOpen: open });
   },
 
   setFindBarOpen: (open: boolean) => {

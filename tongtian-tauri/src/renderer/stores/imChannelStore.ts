@@ -3,78 +3,108 @@
  *
  * 业务口径：
  * - 通过软件端发起的任务 → 归「任务」（workbenchStore.historyTasks）
- * - 通过 IM（钉钉/飞书/企业微信/微信）发起的会话 → 归「频道」（本 store）
+ * - 通过 IM 发起的会话 → 归「频道」（本 store，数据来自引擎会话台账）
  *
- * Mock 开关规范：
- * - 开发阶段（VITE_MOCK !== 'false'）：使用本地模拟会话数据
- * - 联调阶段（VITE_MOCK === 'false'）：预留真实接口位，当前降级返回空列表
+ * 真值来源只有一个：引擎 `im:channels`。这里不维护第二份频道清单，
+ * 也不在前端写死「支持哪些 IM」——否则界面宣称的能力会超过引擎的真实能力。
  */
 
 import { create } from 'zustand';
+import type { ImChannelView, ImSession } from '../../shared/contracts';
+import { getImChannels } from '../lib/alignment-api';
 
-// ── 类型定义 ──────────────────────────────────────────────────────────
+/** IM 渠道标识：由引擎清单下发，前端不穷举 */
+export type ImChannelSource = string;
 
-/** IM 渠道标识 */
-export type ImChannelSource = 'dingtalk' | 'feishu' | 'wecom' | 'wechat';
+const FALLBACK_META = { label: 'IM 频道', color: '#94A3B8' };
 
-/** 渠道展示元信息 */
-export const IM_CHANNEL_META: Record<ImChannelSource, { label: string; color: string }> = {
+/** 已知渠道的展示色；引擎新增渠道时自动落到中性色，不需要前端同步改表 */
+const KNOWN_META: Record<string, { label: string; color: string }> = {
   dingtalk: { label: '钉钉', color: '#3B82F6' },
   feishu: { label: '飞书', color: '#8B5CF6' },
   wecom: { label: '企业微信', color: '#10B981' },
   wechat: { label: '微信', color: '#22C55E' },
+  slack: { label: 'Slack', color: '#611F69' },
 };
+
+/** 渠道展示元信息（label 优先取引擎下发的中文名，前端表只补颜色） */
+export function imChannelMeta(source: string, engineLabel?: string) {
+  const known = KNOWN_META[source];
+  return {
+    label: engineLabel || known?.label || source || FALLBACK_META.label,
+    color: known?.color || FALLBACK_META.color,
+  };
+}
 
 /** IM 发起的会话 */
 export interface ChannelSession {
   id: string;
-  /** 会话标题（IM 消息首句或任务摘要） */
+  /** 会话标题（首条入站消息首行，引擎侧截断） */
   title: string;
   /** 来源渠道 */
   source: ImChannelSource;
-  /** 发起时间戳 */
+  /** 最近一次消息时间戳 */
   updatedAt: number;
+  /** 台账内消息条数（入站+回贴；单会话上限由引擎侧常量决定） */
+  messageCount: number;
 }
 
 interface ImChannelState {
-  /** IM 会话列表（频道页签数据源） */
+  /** IM 会话列表（侧边栏频道页签数据源） */
   channelSessions: ChannelSession[];
+  /** 引擎通道清单 + 真实连接状态 */
+  channels: ImChannelView[];
   loading: boolean;
   loaded: boolean;
+  /** 最近一次拉取失败的原始错误（`CODE: detail`），页面用 errorTextOf 展示 */
+  error: string;
 
-  /** 加载 IM 会话列表 */
   loadSessions: () => Promise<void>;
 }
 
-// ── Mock 数据（开发阶段） ─────────────────────────────────────────────
+function toSessionRows(sessions: ImSession[]): ChannelSession[] {
+  return sessions.map((s) => ({
+    id: s.id,
+    title: s.title,
+    source: s.source,
+    updatedAt: s.updatedAtMs,
+    messageCount: s.messages?.length ?? 0,
+  }));
+}
 
-const mockEnabled = import.meta.env.VITE_MOCK !== 'false';
-
-// 频道页签默认不提供示例会话，等待真实 IM 会话接入
-const mockSessions: ChannelSession[] = [];
-
-// ── Store 实现 ────────────────────────────────────────────────────────
+/** 并发/轮询下只采纳最后一次结果，避免旧响应覆盖新状态 */
+let seq = 0;
 
 export const useImChannelStore = create<ImChannelState>((set, get) => ({
   channelSessions: [],
+  channels: [],
   loading: false,
   loaded: false,
+  error: '',
 
   loadSessions: async () => {
-    if (get().loading) return;
+    const my = ++seq;
     set({ loading: true });
     try {
-      if (mockEnabled) {
-        // 开发阶段：本地模拟数据
-        await new Promise((r) => setTimeout(r, 120));
-        set({ channelSessions: mockSessions, loading: false, loaded: true });
-        return;
-      }
-      // 联调阶段：真实接口接入位（IM Webhook 会话列表）
-      set({ channelSessions: [], loading: false, loaded: true });
-    } catch {
-      // 会话加载失败不阻断主流程
-      set({ loading: false });
+      const snap = await getImChannels();
+      if (my !== seq) return;
+      set({
+        channelSessions: toSessionRows(snap.sessions),
+        channels: snap.channels,
+        loading: false,
+        loaded: true,
+        error: '',
+      });
+    } catch (err) {
+      if (my !== seq) return;
+      // 引擎未运行/无响应是真实状态，如实保留错误供页面展示，不清空已有清单
+      set({
+        loading: false,
+        loaded: true,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   },
 }));
+
+export type { ImChannelState };

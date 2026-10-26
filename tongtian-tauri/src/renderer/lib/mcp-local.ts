@@ -9,7 +9,15 @@
  * - 与 Rust 同样的脱敏边界：视图只暴露 env/header 的键名，页面拿不到值
  */
 
-import type { MCPTool, McpAddReq, McpServer, McpStatus, McpTransport } from '../../shared/contracts';
+import type {
+  MCPTool,
+  McpAddReq,
+  McpAuthStatus,
+  McpOAuthConfig,
+  McpServer,
+  McpStatus,
+  McpTransport,
+} from '../../shared/contracts';
 
 export const TRANSPORT_STDIO: McpTransport = 'stdio';
 export const TRANSPORT_STREAMABLE_HTTP: McpTransport = 'streamable_http';
@@ -37,6 +45,10 @@ export const TRANSPORT_LABEL_TEXT: Record<McpTransport, string> = {
 const DEFAULT_TIMEOUT_SECS = 60;
 const MAX_TIMEOUT_SECS = 600;
 const MAX_NAME_LEN = 60;
+const MAX_AUTH_URL_LEN = 2048;
+const MAX_CLIENT_ID_LEN = 512;
+const MAX_SCOPES = 20;
+const MAX_SCOPE_LEN = 200;
 const KEY_SERVERS = 'tt:mcp-servers';
 
 // ── 输入规范化（错误码与 Rust / error-messages 对齐） ──────────
@@ -106,6 +118,70 @@ function assertSecretFreeMap(map: Record<string, string>, label: string): void {
   }
 }
 
+// ── OAuth 配置规范化（与 Rust `mcp::oauth::normalize_config` 同口径） ──
+
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+}
+
+function normalizeAuthUrl(raw: string, label: string): string {
+  const url = String(raw ?? '').trim();
+  if (!url) throw new Error(`MCP_OAUTH_INVALID_CONFIG: ${label}不能为空`);
+  if (url.length > MAX_AUTH_URL_LEN) {
+    throw new Error(`MCP_OAUTH_INVALID_CONFIG: ${label}过长`);
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`MCP_OAUTH_INVALID_CONFIG: ${label}不是合法 URL，请填写完整的 http(s) 地址`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error(`MCP_OAUTH_INVALID_CONFIG: ${label}不能包含用户名或密码`);
+  }
+  if (parsed.protocol === 'https:') return url;
+  if (parsed.protocol === 'http:' && isLoopbackHost(parsed.hostname)) return url;
+  throw new Error(
+    `MCP_OAUTH_INVALID_CONFIG: ${label}必须使用 HTTPS；仅 localhost / 127.0.0.1 / ::1 允许 HTTP`,
+  );
+}
+
+export function normalizeOAuthConfig(raw?: McpOAuthConfig | null): McpOAuthConfig | undefined {
+  if (!raw) return undefined;
+  const authorizationUrl = normalizeAuthUrl(raw.authorizationUrl, '授权地址');
+  const tokenUrl = normalizeAuthUrl(raw.tokenUrl, 'token 地址');
+  const clientId = String(raw.clientId ?? '').trim();
+  if (!clientId) throw new Error('MCP_OAUTH_INVALID_CONFIG: client_id 不能为空');
+  if (clientId.length > MAX_CLIENT_ID_LEN || /\s/.test(clientId)) {
+    throw new Error('MCP_OAUTH_INVALID_CONFIG: client_id 非法（不能包含空白且不超过 512 字符）');
+  }
+  const scopes: string[] = [];
+  for (const item of Array.isArray(raw.scopes) ? raw.scopes : []) {
+    const scope = String(item ?? '').trim();
+    if (!scope) continue;
+    if (scope.length > MAX_SCOPE_LEN || /\s/.test(scope)) {
+      throw new Error(`MCP_OAUTH_INVALID_CONFIG: 授权范围「${scope}」非法`);
+    }
+    if (!scopes.includes(scope)) scopes.push(scope);
+  }
+  if (scopes.length > MAX_SCOPES) {
+    throw new Error('MCP_OAUTH_INVALID_CONFIG: 授权范围过多（不超过 20 项）');
+  }
+  return { authorizationUrl, tokenUrl, clientId, scopes };
+}
+
+function normalizeAuthFor(
+  transport: McpTransport,
+  raw?: McpOAuthConfig | null,
+): McpOAuthConfig | undefined {
+  if (!raw) return undefined;
+  if (transport !== TRANSPORT_STREAMABLE_HTTP) {
+    throw new Error('MCP_OAUTH_INVALID_CONFIG: OAuth 仅支持 Streamable HTTP 连接器');
+  }
+  return normalizeOAuthConfig(raw);
+}
+
 // ── 台账读写 ─────────────────────────────────────────────────
 
 interface LocalServerRow {
@@ -118,6 +194,8 @@ interface LocalServerRow {
   env: Record<string, string>;
   headers: Record<string, string>;
   timeoutSecs: number;
+  auth?: McpOAuthConfig;
+  authStatus: McpAuthStatus;
   status: McpStatus;
   lastError?: string;
   tools: MCPTool[];
@@ -152,6 +230,20 @@ function hydrate(): void {
           env: normalizeMap(r?.env),
           headers: normalizeMap(r?.headers),
           timeoutSecs: normalizeTimeout(r?.timeoutSecs),
+          ...(r?.auth
+            ? {
+                auth: {
+                  authorizationUrl: String(r.auth.authorizationUrl ?? ''),
+                  tokenUrl: String(r.auth.tokenUrl ?? ''),
+                  clientId: String(r.auth.clientId ?? ''),
+                  scopes: Array.isArray(r.auth.scopes)
+                    ? r.auth.scopes.map((s) => String(s))
+                    : [],
+                },
+              }
+            : {}),
+          // 浏览器通道不持有令牌：授权状态永远是 none，不伪造已授权
+          authStatus: 'none' as McpAuthStatus,
           status: (r?.status ?? STATUS_OFFLINE) as McpStatus,
           lastError: r?.lastError ? String(r.lastError) : undefined,
           tools: Array.isArray(r?.tools) ? r.tools : [],
@@ -187,6 +279,8 @@ function toView(row: LocalServerRow): McpServer {
     envKeys: Object.keys(row.env).sort(),
     headerKeys: Object.keys(row.headers).sort(),
     timeoutSecs: row.timeoutSecs,
+    ...(row.auth ? { auth: row.auth } : {}),
+    authStatus: row.authStatus,
     status: row.status,
     ...(row.lastError ? { lastError: row.lastError } : {}),
     tools: row.tools,
@@ -227,6 +321,12 @@ export function addLocalServer(req: McpAddReq, nowMs: number = Date.now()): McpS
   assertSecretFreeMap(env, '环境变量');
   assertSecretFreeMap(headers, '请求头');
   const timeoutSecs = normalizeTimeout(req.timeoutSecs);
+  const auth = normalizeAuthFor(transport, req.auth);
+  if (auth && Object.keys(headers).some((k) => k.toLowerCase() === 'authorization')) {
+    throw new Error(
+      'MCP_OAUTH_INVALID_CONFIG: 启用 OAuth 时不能再配置 Authorization 请求头，否则会覆盖自动附加的令牌',
+    );
+  }
   if (ledger.some((r) => r.name === name)) {
     throw new Error(`MCP_SERVER_EXISTS: 已存在同名连接器「${name}」`);
   }
@@ -241,6 +341,8 @@ export function addLocalServer(req: McpAddReq, nowMs: number = Date.now()): McpS
     env,
     headers,
     timeoutSecs,
+    ...(auth ? { auth } : {}),
+    authStatus: 'none',
     status: STATUS_OFFLINE,
     tools: [],
     createdAtMs: nowMs,
@@ -379,6 +481,16 @@ export function handleLocalMcpChannel(channel: string, args: unknown[]): LocalMc
       return { handled: true, value: disconnectLocalServer(serverId) };
     case 'mcp:listTools':
       return { handled: true, value: toolsOfLocalServer(serverId) };
+    case 'mcp:oauthAuthorize':
+      findRow(serverId);
+      throw new Error(
+        'MCP_OAUTH_UNSUPPORTED: 浏览器通道无法发起 OAuth 授权与保存令牌，请在桌面版通天办公中完成',
+      );
+    case 'mcp:oauthRevoke':
+      findRow(serverId);
+      throw new Error(
+        'MCP_OAUTH_UNSUPPORTED: 浏览器通道不持有访问令牌，无需撤销；请在桌面版通天办公中管理授权',
+      );
     default:
       return { handled: false };
   }

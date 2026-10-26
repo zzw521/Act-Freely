@@ -24,7 +24,10 @@ pub mod classify;
 pub mod compliance;
 pub mod environment;
 pub mod permissions;
+pub mod pii;
 pub mod policy;
+pub mod skill_scan;
+pub mod tool_approval;
 
 use std::sync::Arc;
 

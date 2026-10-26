@@ -8,21 +8,8 @@
 //
 // 云端切换时仅替换 TransportProvider 实现，契约零改动（seq/14 态/错误码不变）。
 
-import type { ChatEvent, ChatSubmitReq, TaskMeta } from '../../shared/types';
-import type { LeaseInfo, LeaseTakeoverResp, QuotaSnapshot } from '../../shared/contracts';
-
-export interface TaskStateResp {
-  taskId: string;
-  workspaceId: string;
-  status: string;
-  waitReason?: string | null;
-  retryCount: number;
-  statusReasonCode?: string | null;
-  queuePosition: number;
-  leaseId?: string | null;
-  cancelRequested: boolean;
-  revision: number;
-}
+import type { ChatEvent, ChatSubmitReq } from '../../shared/types';
+import type { QuotaSnapshot } from '../../shared/contracts';
 
 export interface EventReplayItem {
   seq?: number | null;
@@ -37,11 +24,6 @@ export interface TransportProvider {
 
   chatSubmit(req: ChatSubmitReq): Promise<{ taskId: string; workspaceId?: string; quota?: QuotaSnapshot }>;
   chatCancel(taskId: string, workspaceId?: string): Promise<{ taskId: string; cancelled: boolean }>;
-  taskState(taskId: string): Promise<TaskStateResp>;
-
-  quotaStatus(): Promise<QuotaSnapshot>;
-  leaseInfo(): Promise<{ holder: string; leases: LeaseInfo[] }>;
-  leaseTakeover(taskId: string): Promise<LeaseTakeoverResp>;
 
   /** 事件重放（24h 持久化，seq > fromSeq） */
   eventReplay(taskId: string, fromSeq?: number): Promise<{ taskId: string; events: EventReplayItem[] }>;
@@ -52,28 +34,12 @@ export interface TransportProvider {
   systemInfo(): Promise<Record<string, unknown>>;
 }
 
-/** 任务元数据便捷提取（UI 展示 queued 位次/状态成因） */
-export function taskMetaOf(state: TaskStateResp): TaskMeta {
-  return {
-    waitReason: (state.waitReason ?? null) as TaskMeta['waitReason'],
-    queuePosition: state.queuePosition,
-    retryCount: state.retryCount,
-    leaseHolder: state.leaseId ?? undefined,
-    statusReasonCode: state.statusReasonCode ?? undefined,
-    revision: state.revision,
-  };
-}
-
 // ── 实现 1：Tauri command/event（经 window.tongtianAPI 注入） ──
 
 type WindowAPI = {
   invoke: (channel: string) => Promise<unknown>;
   chatSubmit?: TransportProvider['chatSubmit'];
   chatCancel?: TransportProvider['chatCancel'];
-  taskState?: TransportProvider['taskState'];
-  quotaStatus?: TransportProvider['quotaStatus'];
-  leaseInfo?: TransportProvider['leaseInfo'];
-  leaseTakeover?: TransportProvider['leaseTakeover'];
   eventReplay?: TransportProvider['eventReplay'];
   onChatEvent: TransportProvider['onChatEvent'];
   systemInfo?: () => Promise<Record<string, unknown>>;
@@ -102,30 +68,6 @@ export class TauriTransport implements TransportProvider {
     return api.chatCancel
       ? api.chatCancel(taskId, workspaceId)
       : Promise.resolve({ taskId, cancelled: false });
-  }
-  taskState(taskId: string) {
-    const api = windowAPI();
-    return api.taskState
-      ? api.taskState(taskId)
-      : (api.invoke('task:state') as Promise<TaskStateResp>);
-  }
-  quotaStatus() {
-    const api = windowAPI();
-    return api.quotaStatus
-      ? api.quotaStatus()
-      : (api.invoke('quota:status') as Promise<QuotaSnapshot>);
-  }
-  leaseInfo() {
-    const api = windowAPI();
-    return api.leaseInfo
-      ? api.leaseInfo()
-      : (api.invoke('lease:info') as Promise<{ holder: string; leases: LeaseInfo[] }>);
-  }
-  leaseTakeover(taskId: string) {
-    const api = windowAPI();
-    return api.leaseTakeover
-      ? api.leaseTakeover(taskId)
-      : (api.invoke('lease:takeover') as Promise<LeaseTakeoverResp>);
   }
   eventReplay(taskId: string, fromSeq = 0) {
     const api = windowAPI();
@@ -172,18 +114,6 @@ export class BffTransport implements TransportProvider {
     return this.notReady();
   }
   chatCancel(): never {
-    return this.notReady();
-  }
-  taskState(): never {
-    return this.notReady();
-  }
-  quotaStatus(): never {
-    return this.notReady();
-  }
-  leaseInfo(): never {
-    return this.notReady();
-  }
-  leaseTakeover(): never {
     return this.notReady();
   }
   eventReplay(): never {

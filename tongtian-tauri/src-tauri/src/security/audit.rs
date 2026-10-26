@@ -29,6 +29,34 @@ pub const ACTION_SANDBOX_VIOLATION: &str = "sandbox_violation";
 pub const ACTION_DATA_CHECK: &str = "data_check";
 /// 提交前合规闸门留痕（resource 记判定结果，details 记端点与等级；拒绝时升级为 warning）
 pub const ACTION_COMPLIANCE_CHECK: &str = "compliance_check";
+/// 用户 Hook 在真实任务里拉起进程留痕（resource 记事件名，details 记命令与退出码）
+pub const ACTION_HOOK_RUN: &str = "hook_run";
+/// 受控命令执行（P1：仅白名单命令、无 shell；resource 记命令，details 记退出码）
+pub const ACTION_EXEC_RUN: &str = "exec_run";
+/// 受控联网获取（P1：仅白名单公网主机；resource 记 URL，details 记状态与大小）
+pub const ACTION_NETWORK_FETCH: &str = "network_fetch";
+/// 电脑操控截屏（P1/P2：resource 记来源，details 记尺寸与大小；不含画面内容）
+pub const ACTION_COMPUTER_CAPTURE: &str = "computer_capture";
+/// 电脑操控操作（P1/P2：resource 记来源，details 记动作与坐标；不记输入正文）
+pub const ACTION_COMPUTER_ACTION: &str = "computer_action";
+/// 受控浏览器会话（启动/结束；resource 记浏览器，details 记配置目录与端口）
+pub const ACTION_BROWSER_SESSION: &str = "browser_session";
+/// 受控浏览器页面操作（导航/快照/点击/输入/滚动/截屏；不记页面正文与输入正文）
+pub const ACTION_BROWSER_ACTION: &str = "browser_action";
+/// 在线市场安装（resource 记条目标识，details 记来源主机与版本；不记下载地址查询串）
+pub const ACTION_MARKET_INSTALL: &str = "market_install";
+/// MCP 连接器 OAuth 授权/撤销（resource 记连接器标识，details 不记令牌与授权码）
+pub const ACTION_CONNECTOR_AUTH: &str = "connector_auth";
+/// 逐工具审批（放行/拒绝；resource 记工具名，details 记入参摘要与结果，不含正文与密钥）
+pub const ACTION_TOOL_APPROVAL: &str = "tool_approval";
+/// 终端 AI+：会话开关 / 输入 / AI 建议（输入正文不落库，只记来源与字符数）
+pub const ACTION_TERMINAL_SESSION: &str = "terminal_session";
+pub const ACTION_TERMINAL_INPUT: &str = "terminal_input";
+pub const ACTION_TERMINAL_AI: &str = "terminal_ai";
+/// ACP 委派：配置变更写桌面审计，协议级明细由引擎写 {home}/acp/audit.jsonl
+pub const ACTION_ACP_CONFIG: &str = "acp_config";
+/// 远程桌面：只记会话开始/结束/到期与帧数，画面内容不入库
+pub const ACTION_REMOTE_SESSION: &str = "remote_session";
 
 pub const SEV_INFO: &str = "info";
 pub const SEV_WARNING: &str = "warning";

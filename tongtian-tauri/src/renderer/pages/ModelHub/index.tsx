@@ -10,6 +10,7 @@
  */
 
 import React, { useState, useEffect } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   Box,
   Typography,
@@ -44,6 +45,7 @@ import {
 } from '@mui/icons-material';
 import ModelForm from '../../components/ModelForm';
 import ModelStatsPanel from '../../components/ModelStatsPanel';
+import LocalModelDetect from '../../components/LocalModelDetect';
 import UsageOverviewPanel from '../../components/UsageOverviewPanel';
 import { useModelStore } from '../../stores';
 import { useModelUsageStore } from '../../stores/useModelUsageStore';
@@ -73,7 +75,9 @@ const ModelHub: React.FC = () => {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingModel, setEditingModel] = useState<Partial<ModelConfig> | undefined>();
   const [testing, setTesting] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<0 | 1>(0); // 0=模型列表, 1=用量统计
+  // 支持从设置页「用量统计」入口带 ?tab=usage 直达；之后页签点击仍由本地状态驱动
+  const [searchParams] = useSearchParams();
+  const [activeTab, setActiveTab] = useState<0 | 1>(searchParams.get('tab') === 'usage' ? 1 : 0); // 0=模型列表, 1=用量统计
 
   // 从 store 获取状态
   const { models, status, error, setModels, removeModel, setError } = useModelStore(
@@ -261,22 +265,25 @@ const ModelHub: React.FC = () => {
 
       {/* 搜索框 */}
       {activeTab === 0 && (
-        <Paper sx={{ mb: 3, p: 2, borderRadius: '12px' }}>
-          <TextField
-            fullWidth
-            placeholder="搜索模型名称或标识符..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            InputProps={{
-              startAdornment: (
-                <InputAdornment position="start">
-                  <SearchIcon />
-                </InputAdornment>
-              ),
-            }}
-            sx={{ '& .MuiOutlinedInput-root': { borderRadius: '8px' } }}
-          />
-        </Paper>
+        <>
+          <LocalModelDetect existing={rawModels} onAdded={loadModels} />
+          <Paper sx={{ mb: 3, p: 2, borderRadius: '12px' }}>
+            <TextField
+              fullWidth
+              placeholder="搜索模型名称或标识符..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              InputProps={{
+                startAdornment: (
+                  <InputAdornment position="start">
+                    <SearchIcon />
+                  </InputAdornment>
+                ),
+              }}
+              sx={{ '& .MuiOutlinedInput-root': { borderRadius: '8px' } }}
+            />
+          </Paper>
+        </>
       )}
 
       {/* 用量统计周期选择器 */}
@@ -323,7 +330,7 @@ const ModelHub: React.FC = () => {
                   暂无模型
                 </Typography>
                 <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-                  点击右上角"新增模型"添加第一个模型
+                  点击右上角"新增模型"添加，或用上方"检测本机 Ollama"一键导入本地模型
                 </Typography>
               </Paper>
             </Grid>

@@ -32,7 +32,11 @@ pub struct AgentEvent {
 }
 
 /// 已知事件类型白名单（三层架构演进新增 status_change/quota_warning）
-const KNOWN_TYPES: [&str; 10] = [
+/// sandbox_denied / tool_audit 只用于审计留痕，不映射为前端 ChatEvent
+/// （拒绝已由 step 事件展示，成功调用由工具步骤展示）
+/// usage / route_switch 同样只做台账与审计：前者记账真实用量，后者记录故障转移，
+/// 用户可见说明由引擎的 step 事件承担。
+const KNOWN_TYPES: [&str; 15] = [
     "plan",
     "step_start",
     "step_progress",
@@ -43,6 +47,14 @@ const KNOWN_TYPES: [&str; 10] = [
     "error",
     "status_change",
     "quota_warning",
+    "sandbox_denied",
+    "tool_audit",
+    // 任务检查点：是否可从快照继续（磁盘检查点在引擎重启后仍有效）
+    "checkpoint",
+    // 真实 token/延迟/成本用量（引擎每次模型调用后上报）
+    "usage",
+    // 模型故障转移（主模型失败后切到备用模型）
+    "route_switch",
 ];
 
 /// 增量式 SSE 解析器：持续 feed 字节块，产出完整事件
@@ -298,6 +310,30 @@ pub fn adapt_to_chat_event(event: &AgentEvent, task_id: &str) -> Option<Value> {
             "usedTokens": d.get("usedTokens").or_else(|| d.get("used_tokens")).and_then(|v| v.as_u64()).unwrap_or(0),
             "quotaTokens": d.get("quotaTokens").or_else(|| d.get("quota_tokens")).and_then(|v| v.as_u64()).unwrap_or(0),
         }))),
+        "checkpoint" => {
+            let count = |keys: &[&str]| -> u64 {
+                keys.iter()
+                    .find_map(|k| d.get(*k).and_then(|v| v.as_u64()))
+                    .unwrap_or(0)
+            };
+            Some(with_meta(serde_json::json!({
+                "type": "checkpoint",
+                "taskId": task_id,
+                "resumable": d.get("resumable").and_then(|v| v.as_bool()).unwrap_or(false),
+                "reason": str_field(&["reason"]),
+                "savedAt": str_field(&["savedAt", "saved_at"]),
+                "scope": str_field(&["scope"]),
+                "snapshotMessages": count(&["snapshotMessages", "snapshot_messages"]),
+                "restoredMessages": count(&["restoredMessages", "restored_messages"]),
+                "executedTools": count(&["executedTools", "executed_tools"]),
+                "sideEffects": count(&["sideEffects", "side_effects"]),
+                "skippedDuplicates": count(&["skippedDuplicates", "skipped_duplicates"]),
+                "modelCalls": count(&["modelCalls", "model_calls"]),
+                "mediaOmitted": count(&["mediaOmitted", "media_omitted"]),
+                "droppedMessages": count(&["droppedMessages", "dropped_messages"]),
+                "captureError": str_field(&["captureError", "capture_error"]),
+            })))
+        }
         _ => None,
     }
 }
@@ -467,6 +503,35 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_sandbox_denied_event() {
+        // 审计事件必须在白名单内，否则会被解析层静默丢弃、审计永远为空
+        let events = chunk(
+            "event: sandbox_denied\ndata: {\"tool\":\"write_text_file\",\"reason\":\"不在白名单\"}\n\n",
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "sandbox_denied");
+        assert_eq!(events[0].data["tool"], "write_text_file");
+    }
+
+    #[test]
+    fn test_parse_usage_and_route_switch_events() {
+        // 这两类事件不进前端 ChatEvent，但必须在解析层保留：
+        // 否则 Rust 侧永远收不到用量与故障转移，台账/审计都是空的。
+        let events = chunk(
+            "event: usage\ndata: {\"usage\":{\"promptTokens\":10,\"completionTokens\":5,\"model\":\"m\",\"latencyMs\":120,\"costMicros\":80,\"priced\":true}}\n\n\
+             event: route_switch\ndata: {\"from\":\"m\",\"to\":\"backup\",\"reason\":\"500\"}\n\n",
+        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "usage");
+        assert_eq!(events[0].data["usage"]["latencyMs"], 120);
+        assert_eq!(events[1].kind, "route_switch");
+        assert_eq!(events[1].data["to"], "backup");
+        // 用户可见说明由 step 事件承担，这两类不映射为聊天事件
+        assert!(adapt_to_chat_event(&events[0], "t-1").is_none());
+        assert!(adapt_to_chat_event(&events[1], "t-1").is_none());
+    }
+
+    #[test]
     fn test_keepalive_comment_ignored() {
         // `: keepalive` 注释行不产出事件
         let events = chunk(": keepalive\n\nevent: done\ndata: {}\n\n");
@@ -505,6 +570,38 @@ mod tests {
         let chat = adapt_to_chat_event(&event, "t-1").unwrap();
         assert_eq!(chat["level"], "100");
         assert_eq!(chat["usedTokens"], 1000);
+    }
+
+    #[test]
+    fn test_adapt_checkpoint_event() {
+        let event = AgentEvent {
+            kind: "checkpoint".into(),
+            data: serde_json::json!({
+                "resumable": true,
+                "reason": "执行中断：模型超时",
+                "savedAt": "2026-10-22 09:30:00",
+                "scope": "same-process",
+                "snapshot_messages": 6,
+                "restored_messages": 0,
+                "executed_tools": 2,
+                "side_effects": 2,
+                "skipped_duplicates": 1,
+                "model_calls": 3,
+                "media_omitted": 1,
+                "dropped_messages": 4,
+                "capture_error": ""
+            }),
+            seq: Some(12),
+        };
+        let chat = adapt_to_chat_event(&event, "t-1").unwrap();
+        assert_eq!(chat["type"], "checkpoint");
+        assert_eq!(chat["taskId"], "t-1");
+        assert_eq!(chat["resumable"], true);
+        assert_eq!(chat["reason"], "执行中断：模型超时");
+        assert_eq!(chat["snapshotMessages"], 6);
+        assert_eq!(chat["skippedDuplicates"], 1);
+        assert_eq!(chat["mediaOmitted"], 1);
+        assert_eq!(chat["seq"], 12);
     }
 
     #[test]

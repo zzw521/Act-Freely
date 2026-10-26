@@ -44,11 +44,20 @@ describe('Rust 开机自启动实现', () => {
   });
 
   it('写入后回读校验，不一致即报错（不把 reg 的退出码 0 当成生效）', () => {
-    const apply = rustAuto().split('pub fn apply(enabled: bool)')[1].split('\n}\n')[0];
+    const apply = rustAuto().split('pub fn apply(enabled: bool, background: bool)')[1].split('\n}\n')[0];
     expect(apply).toContain('let now = registered()?;');
     expect(apply).toContain('AUTOSTART_FAILED: 启动项写入后回读不到，未确认生效');
     expect(apply).toContain('启动项未能删除');
     expect(apply).toContain('启动项已存在但指向其他程序');
+  });
+
+  it('后台常驻开启时启动命令带 --hidden，且参数变化会被识别为待更新', () => {
+    const src = rustAuto();
+    expect(src).toContain('crate::background::command_for(&launch_command(), background)');
+    expect(src).toContain('crate::background::command_for(&exe, background)');
+    expect(src).toContain('启动项参数未更新');
+    // 期望命令随设置变化，否则 stale 永远判不出来
+    expect(src).toContain('let expected = launch_command_for(background);');
   });
 
   it('回读解析按整段值名匹配，中文/空格路径都能取回', () => {
@@ -58,14 +67,15 @@ describe('Rust 开机自启动实现', () => {
   });
 
   it('非 Windows 开启如实报 UNSUPPORTED，关闭按既成事实放行', () => {
-    const apply = rustAuto().split('pub fn apply(enabled: bool)')[1].split('\n}\n')[0];
+    const apply = rustAuto().split('pub fn apply(enabled: bool, background: bool)')[1].split('\n}\n')[0];
     expect(apply).toContain('if !enabled {');
     expect(apply).toContain('AUTOSTART_UNSUPPORTED');
   });
 
   it('autoStart 写入即联动启动项，命令已注册（设置项不再是写空的布尔）', () => {
     const lib = rustLib();
-    expect(lib).toContain('system::autostart::SETTING_KEY => system::autostart::apply(bool_of_setting(value)),');
+    expect(lib).toContain('system::autostart::SETTING_KEY => system::autostart::apply(');
+    expect(lib).toContain('setting_bool(p0, background::SETTING_KEY),');
     expect(lib).toContain('system::system_autostart_status,');
     expect(lib).toContain('mod system;');
     expect(rustMod()).toContain('pub async fn system_autostart_status');
@@ -73,7 +83,7 @@ describe('Rust 开机自启动实现', () => {
   });
 
   it('状态视图同时给意愿与事实（界面才能指出两者不一致）', () => {
-    const status = rustAuto().split('pub fn status()')[1].split('\n}\n')[0];
+    const status = rustAuto().split('pub fn status(background: bool)')[1].split('\n}\n')[0];
     for (const key of ['supported', 'enabled', 'command', 'currentCommand', 'stale', 'valueName', 'runKey']) {
       expect(status).toContain(`"${key}"`);
     }

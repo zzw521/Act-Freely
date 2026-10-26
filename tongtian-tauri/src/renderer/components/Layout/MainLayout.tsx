@@ -8,7 +8,7 @@
  * 侧边栏不会被卸载重建（避免弹窗锚点失效、页签状态丢失）
  */
 
-import React, { Suspense, useState } from 'react';
+import React, { Suspense, useEffect, useState } from 'react';
 import {
   Alert,
   Box,
@@ -21,8 +21,10 @@ import { Outlet, useLocation } from 'react-router-dom';
 import Sidebar from './Sidebar';
 import ResizeHandle from './ResizeHandle';
 import TaskSearchDialog from '../TaskSearchDialog';
+import QuickPickDialog from '../QuickPickDialog';
 import { useAppStore } from '../../stores/useAppStore';
 import { useAppShortcuts } from '../../lib/use-app-shortcuts';
+import { installBadgeFocusReset } from '../../lib/badge-local';
 
 /** 懒加载页面占位 */
 const PageLoader: React.FC = () => (
@@ -41,6 +43,8 @@ const MainLayout: React.FC = () => {
   // 侧边栏宽度：右边界长按拖拽调宽（200~400）
   const [sidebarWidth, setSidebarWidth] = useState(240);
   const location = useLocation();
+  // 独立任务窗口（#/?conv=...&pop=1）：只渲染工作台，不再套一层侧边栏
+  const isPopupWindow = new URLSearchParams(location.search).get('pop') === '1';
   // Workbench（/）采用全高三栏布局，无外层 padding；其他页面保留内边距
   const isWorkbench = location.pathname === '/';
   // 全局通知：各页 `showNotification` 写入 store，由此处统一渲染（否则调用方点了没反应）
@@ -52,6 +56,9 @@ const MainLayout: React.FC = () => {
   // 应用内快捷键在此统一注册（设置页快捷键分区展示的就是这份清单）
   useAppShortcuts();
 
+  // 任务栏未读：窗口回到前台即清零（后台完成的任务不再显示未读）
+  useEffect(() => installBadgeFocusReset(), []);
+
   const handleDrawerToggle = () => {
     if (isMobile) setOpen(!open);
     else toggleSidebar();
@@ -62,19 +69,21 @@ const MainLayout: React.FC = () => {
 
   return (
     <Box sx={{ display: 'flex', height: '100vh', overflow: 'hidden', background: theme.palette.background.default }}>
-      {/* 侧边栏（右边界可拖拽调宽） */}
-      <Box sx={{ position: 'relative', height: '100%', flexShrink: 0 }}>
-        <Sidebar open={drawerOpen} onDrawerToggle={handleDrawerToggle} panelWidth={sidebarWidth} />
-        {drawerOpen && !isMobile && (
-          <ResizeHandle
-            side="left"
-            width={sidebarWidth}
-            min={200}
-            max={400}
-            onWidthChange={setSidebarWidth}
-          />
-        )}
-      </Box>
+      {/* 侧边栏（右边界可拖拽调宽）；独立任务窗口不显示 */}
+      {!isPopupWindow && (
+        <Box sx={{ position: 'relative', height: '100%', flexShrink: 0 }}>
+          <Sidebar open={drawerOpen} onDrawerToggle={handleDrawerToggle} panelWidth={sidebarWidth} />
+          {drawerOpen && !isMobile && (
+            <ResizeHandle
+              side="left"
+              width={sidebarWidth}
+              min={200}
+              max={400}
+              onWidthChange={setSidebarWidth}
+            />
+          )}
+        </Box>
+      )}
 
       {/* 内容区域（全高，页面自带头部与内边距） */}
       <Box
@@ -121,6 +130,9 @@ const MainLayout: React.FC = () => {
 
       {/* 全局任务搜索面板：Ctrl + G 拉起，Enter 切到命中的会话 */}
       <TaskSearchDialog open={taskSearchOpen} onClose={() => setTaskSearchOpen(false)} />
+
+      {/* QuickPick 快速任务窗：应用内快捷键，真实提交任务 */}
+      <QuickPickDialog />
     </Box>
   );
 };

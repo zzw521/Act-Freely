@@ -1,8 +1,12 @@
 //! 文件服务：file_list / file_read / file_preview / 附件暂存
 //!
-//! 白名单规则（交互补设计 §4.3）：Agent 文件操作范围 =
-//! `workspaces/{id}/files/` ∪ SandboxPolicy.file_allowlist（settings_kv 暂存，缺省为空）。
-//! 越界访问返回 FILE_ACCESS_DENIED；大小上限 2MB（FILE_TOO_LARGE）。
+//! 白名单规则（交互补设计 §4.3）：文件操作范围 =
+//! `workspaces/{id}/files/` ∪ SandboxPolicy.file_allowlist，再扣除 file_blocklist。
+//! 策略以 `security_policies` 的 `sandbox:{ws}` 为准；未保存过策略时才兼容读取旧版
+//! `settings_kv` 键 `sandbox.file_allowlist.{ws}`（不迁移、不覆盖存量数据）。
+//! 越界访问返回 FILE_ACCESS_DENIED，命中黑名单返回 SANDBOX_FILE_BLOCKED；
+//! 策略损坏时返回 POLICY_CORRUPT（fail-closed，不静默放宽）。
+//! 大小上限 2MB（FILE_TOO_LARGE）。
 //!
 //! 全部能力函数提供 `_in(home, ...)` 变体注入数据根目录（测试隔离，避免进程级 env 竞争），
 //! 公开入口缺省走 python_env::base_dir()（TONGTIAN_HOME 可覆盖，双目录设计规范）。
@@ -17,6 +21,8 @@ use crate::store::Store;
 const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
 /// 附件单文件上限（交互补设计 §3.3：50MB）
 const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
+/// 图片附件上限（要 base64 进请求体，按厂商常见的 10MB 图片限制收紧）
+const MAX_IMAGE_ATTACH_BYTES: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -68,16 +74,40 @@ pub fn workspace_files_root(workspace_id: &str) -> PathBuf {
     workspace_files_root_in(&data_home(), workspace_id)
 }
 
-/// 允许访问的根目录集合
-fn allowed_roots_in(home: &Path, store: &Store, workspace_id: &str) -> Vec<PathBuf> {
-    let mut roots = vec![workspace_files_root_in(home, workspace_id)];
-    // SandboxPolicy.file_allowlist 暂存于 settings_kv（键：sandbox.file_allowlist.{ws}）
-    let key = format!("sandbox.file_allowlist.{workspace_id}");
-    if let Ok(Some(json)) = crate::store::settings::get(store, &key) {
-        if let Ok(arr) = serde_json::from_str::<Vec<String>>(&json) {
-            roots.extend(arr.into_iter().map(PathBuf::from));
-        }
+/// 工作区沙箱的文件范围
+struct SandboxPaths {
+    allow: Vec<String>,
+    block: Vec<String>,
+}
+
+/// 读取文件白/黑名单：沙箱策略优先，未配置策略时才回退旧版 settings_kv。
+fn sandbox_paths(store: &Store, workspace_id: &str) -> Result<SandboxPaths, String> {
+    if let Some(p) = crate::security::policy::get_sandbox(store, workspace_id)? {
+        return Ok(SandboxPaths {
+            allow: p.file_allowlist,
+            block: p.file_blocklist,
+        });
     }
+    let key = format!("sandbox.file_allowlist.{workspace_id}");
+    let allow = match crate::store::settings::get(store, &key)? {
+        Some(json) => serde_json::from_str::<Vec<String>>(&json)
+            .map_err(|e| format!("POLICY_CORRUPT: {key} 白名单解析失败（{e}）"))?,
+        None => Vec::new(),
+    };
+    Ok(SandboxPaths {
+        allow,
+        block: Vec::new(),
+    })
+}
+
+/// 允许访问的根目录集合
+fn allowed_roots_in(
+    home: &Path,
+    workspace_id: &str,
+    paths: &SandboxPaths,
+) -> Vec<PathBuf> {
+    let mut roots = vec![workspace_files_root_in(home, workspace_id)];
+    roots.extend(paths.allow.iter().map(PathBuf::from));
     roots
 }
 
@@ -109,16 +139,27 @@ fn canonicalize_existing(path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// 路径消毒：规范化后校验是否位于白名单根之内
+/// 路径消毒：黑名单先行（含规范化前后两种形式），再校验是否位于白名单根之内
 fn check_within_whitelist_in(
     home: &Path,
     store: &Store,
     workspace_id: &str,
     path: &Path,
 ) -> Result<PathBuf, String> {
+    let paths = sandbox_paths(store, workspace_id)?;
     let canon = canonicalize_existing(path)
         .ok_or_else(|| format!("FILE_ACCESS_DENIED: 路径无法解析 {}", path.display()))?;
-    for root in allowed_roots_in(home, store, workspace_id) {
+    let raw_text = path.to_string_lossy();
+    let canon_text = canon.to_string_lossy();
+    if let Some(rule) = crate::security::policy::path_blocked(&paths.block, &raw_text)
+        .or_else(|| crate::security::policy::path_blocked(&paths.block, &canon_text))
+    {
+        return Err(format!(
+            "SANDBOX_FILE_BLOCKED: {} 命中沙箱文件黑名单（{rule}）",
+            path.display()
+        ));
+    }
+    for root in allowed_roots_in(home, workspace_id, &paths) {
         if let Some(root_canon) = canonicalize_existing(&root) {
             if canon.starts_with(&root_canon) {
                 return Ok(canon);
@@ -196,7 +237,8 @@ pub fn read_file(store: &Store, workspace_id: &str, file_path: &str) -> Result<S
     read_file_in(&data_home(), store, workspace_id, file_path)
 }
 
-fn mime_of(path: &Path) -> &'static str {
+/// 扩展名 → MIME（附件暂存与执行面正文抽取共用这一张表）
+pub(crate) fn mime_of(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
         Some("txt") => "text/plain",
         Some("md") => "text/markdown",
@@ -206,6 +248,14 @@ fn mime_of(path: &Path) -> &'static str {
         Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         Some("pdf") => "application/pdf",
+        // 图片：前端附件白名单允许 png/jpg/jpeg/gif/webp，这里必须同表，
+        // 否则选图后会被 stage_attachment 当成 octet-stream 拒绝（界面说支持、实际必失败）
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("tif") | Some("tiff") => "image/tiff",
         Some("doc") => "application/msword",
         Some("xls") => "application/vnd.ms-excel",
         Some("ppt") => "application/vnd.ms-powerpoint",
@@ -333,7 +383,7 @@ pub fn stage_attachment_in(
         .map(|n| n.to_string_lossy().to_string())
         .ok_or_else(|| format!("FILE_REJECTED: 无法解析文件名 {src_path}"))?;
 
-    // 格式校验（docx/xlsx/pdf/csv/txt/md/json）
+    // 格式校验（docx/xlsx/pdf/csv/txt/md/json + 图片）
     let mime = mime_of(src);
     let allowed = matches!(
         mime,
@@ -344,15 +394,22 @@ pub fn stage_attachment_in(
             | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             | "application/pdf"
-    );
+    ) || mime.starts_with("image/");
     if !allowed {
         return Err(format!("FILE_REJECTED: 不支持的附件格式（{mime}）"));
     }
 
     let size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
-    if size > MAX_ATTACHMENT_BYTES {
+    // 图片要转 base64 随请求进引擎，单独限 10MB；文本/Office 仍用 50MB 上限
+    let limit = if mime.starts_with("image/") {
+        MAX_IMAGE_ATTACH_BYTES
+    } else {
+        MAX_ATTACHMENT_BYTES
+    };
+    if size > limit {
         return Err(format!(
-            "FILE_REJECTED: 附件超出 50MB 上限（{} bytes）",
+            "FILE_REJECTED: 附件超出 {}MB 上限（{} bytes）",
+            limit / (1024 * 1024),
             size
         ));
     }
@@ -389,6 +446,43 @@ pub fn stage_attachment(
     src_path: &str,
 ) -> Result<AttachmentMeta, String> {
     stage_attachment_in(&data_home(), workspace_id, task_id, src_path)
+}
+
+/// 允许交给系统默认应用打开的扩展名（文档/图片/可直接预览的文本）。
+/// 刻意不含 exe/com/bat/cmd/ps1/msi/lnk/reg 等可执行或脚本类：
+/// 产物路径来自模型，点击即执行代码不是「打开文件」应有的副作用。
+const OPEN_EXTERNAL_EXTS: &[&str] = &[
+    "docx", "doc", "xlsx", "xls", "pptx", "ppt", "pdf", "csv", "txt", "md", "json",
+    "html", "htm", "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff",
+];
+
+/// 校验「可交给系统默认应用打开」：必须存在且扩展名在白名单内
+fn ensure_openable(path: &str) -> Result<PathBuf, String> {
+    let p = PathBuf::from(path);
+    if !p.is_file() {
+        return Err(format!("FILE_NOT_FOUND: {path}"));
+    }
+    let ext = p
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !OPEN_EXTERNAL_EXTS.contains(&ext.as_str()) {
+        let shown = if ext.is_empty() { "（无扩展名）".to_string() } else { format!(".{ext}") };
+        return Err(format!(
+            "FILE_REJECTED: 出于安全考虑不打开 {shown} 文件（仅支持文档/图片/HTML/文本）"
+        ));
+    }
+    Ok(p)
+}
+
+/// 用系统默认应用打开本地产物。
+///
+/// 只做「打开」：不解析、不改写、不绕过工作区边界校验——文件是否落在工作区内
+/// 由产物来源（引擎交付事件）保证，这里只拦可执行与脚本类扩展名。
+pub fn open_external(path: &str) -> Result<(), String> {
+    let p = ensure_openable(path)?;
+    tauri_plugin_opener::open_path(&p, None::<&str>)
+        .map_err(|e| format!("OPEN_FAILED: 无法调用系统默认应用：{e}"))
 }
 
 #[cfg(test)]
@@ -666,6 +760,126 @@ mod tests {
         .unwrap();
         let content = read_file_in(&home, &store, &ws, extra.join("x.txt").to_str().unwrap()).unwrap();
         assert_eq!(content, "ok");
+        cleanup(&home);
+    }
+
+    fn sample_policy(ws: &str, allow: Vec<String>, block: Vec<String>) -> crate::security::policy::SandboxPolicy {
+        crate::security::policy::SandboxPolicy {
+            workspace_id: ws.to_string(),
+            execution_level: "L1".to_string(),
+            file_allowlist: allow,
+            file_blocklist: block,
+            tool_allowlist: Vec::new(),
+            tool_blocklist: Vec::new(),
+            exec_enabled: false,
+            exec_allowlist: Vec::new(),
+            network_enabled: false,
+            network_allowlist: Vec::new(),
+            max_cpu_percent: 50,
+            max_memory_mb: 512,
+            max_disk_write_mbps: 10,
+            updated_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn test_policy_allowlist_takes_precedence_and_blocklist_denies() {
+        let (home, ws, files, store) = temp_home("policy");
+        let extra = home.join("extra-dir");
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(extra.join("ok.txt"), "ok").unwrap();
+        std::fs::write(extra.join("secret.txt"), "secret").unwrap();
+        std::fs::write(files.join("blocked.txt"), "x").unwrap();
+
+        // 有策略时旧版 settings 白名单不参与（不迁移、不合并）
+        let legacy = home.join("legacy-dir");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("old.txt"), "old").unwrap();
+        crate::store::settings::set(
+            &store,
+            &format!("sandbox.file_allowlist.{ws}"),
+            &serde_json::to_string(&vec![legacy.to_string_lossy().to_string()]).unwrap(),
+        )
+        .unwrap();
+
+        crate::security::policy::set_sandbox(
+            &store,
+            &sample_policy(
+                &ws,
+                vec![extra.to_string_lossy().to_string()],
+                vec![
+                    extra.join("secret.txt").to_string_lossy().to_string(),
+                    files.join("blocked.txt").to_string_lossy().to_string(),
+                ],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_file_in(&home, &store, &ws, extra.join("ok.txt").to_str().unwrap()).unwrap(),
+            "ok"
+        );
+        let err = read_file_in(&home, &store, &ws, extra.join("secret.txt").to_str().unwrap()).unwrap_err();
+        assert!(err.starts_with("SANDBOX_FILE_BLOCKED"), "{err}");
+        // 黑名单优先于默认工作区目录
+        let err = read_file_in(&home, &store, &ws, files.join("blocked.txt").to_str().unwrap()).unwrap_err();
+        assert!(err.starts_with("SANDBOX_FILE_BLOCKED"), "{err}");
+        let err = read_file_in(&home, &store, &ws, legacy.join("old.txt").to_str().unwrap()).unwrap_err();
+        assert!(err.starts_with("FILE_ACCESS_DENIED"), "{err}");
+        cleanup(&home);
+    }
+
+    #[test]
+    fn test_policy_glob_blocklist_covers_descendants() {
+        let (home, ws, _files, store) = temp_home("policy-glob");
+        let dir = home.join("drafts");
+        std::fs::create_dir_all(dir.join("deep")).unwrap();
+        std::fs::write(dir.join("deep").join("a.txt"), "a").unwrap();
+        let rule = format!("{}/**", dir.to_string_lossy());
+        crate::security::policy::set_sandbox(
+            &store,
+            &sample_policy(&ws, vec![dir.to_string_lossy().to_string()], vec![rule]),
+        )
+        .unwrap();
+        let err = read_file_in(&home, &store, &ws, dir.join("deep").join("a.txt").to_str().unwrap())
+            .unwrap_err();
+        assert!(err.starts_with("SANDBOX_FILE_BLOCKED"), "{err}");
+        cleanup(&home);
+    }
+
+    #[test]
+    fn test_corrupt_legacy_allowlist_is_fail_closed() {
+        let (home, ws, files, store) = temp_home("corrupt");
+        std::fs::write(files.join("a.txt"), "a").unwrap();
+        crate::store::settings::set(
+            &store,
+            &format!("sandbox.file_allowlist.{ws}"),
+            "{oops",
+        )
+        .unwrap();
+        let err = read_file_in(&home, &store, &ws, files.join("a.txt").to_str().unwrap()).unwrap_err();
+        assert!(err.starts_with("POLICY_CORRUPT"), "{err}");
+        cleanup(&home);
+    }
+
+    #[test]
+    fn test_open_external_allowlist_rejects_executables_and_missing() {
+        let (home, _ws, files, _store) = temp_home("open-ext");
+        let deck = files.join("deck.pptx");
+        std::fs::write(&deck, b"PK").unwrap();
+        assert!(ensure_openable(deck.to_str().unwrap()).is_ok());
+
+        let exe = files.join("evil.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        let err = ensure_openable(exe.to_str().unwrap()).unwrap_err();
+        assert!(err.starts_with("FILE_REJECTED"), "{err}");
+
+        let ps1 = files.join("run.ps1");
+        std::fs::write(&ps1, b"Write-Host hi").unwrap();
+        assert!(ensure_openable(ps1.to_str().unwrap()).is_err());
+
+        let err = ensure_openable(files.join("gone.pdf").to_str().unwrap()).unwrap_err();
+        assert!(err.starts_with("FILE_NOT_FOUND"), "{err}");
         cleanup(&home);
     }
 }

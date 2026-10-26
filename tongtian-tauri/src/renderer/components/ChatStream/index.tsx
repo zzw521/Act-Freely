@@ -36,12 +36,57 @@ import Markdown from 'react-markdown';
 import { Message, Role, ChatEvent, StepType } from '../../../shared/types';
 import FilePreview from '../FilePreview';
 import { useAppSettings } from '../../lib/use-app-settings';
+import { openArtifact } from '../../lib/artifact-open';
+import { useI18n } from '../../i18n';
 
 // re-export for external usage of event types
 export type { ChatEvent } from '../../../shared/types';
 
 /** 评价表默认值（模块级常量，避免每次渲染新建对象） */
 const EMPTY_FEEDBACK: Record<number, 'up' | 'down'> = {};
+
+/**
+ * 生成式 UI 沙箱预览。
+ * sandbox 故意不带 allow-same-origin：脚本可以跑，但拿不到父页面 DOM、localStorage 与本机入口。
+ */
+const SandboxedHtml: React.FC<{ code: string }> = ({ code }) => {
+  const { t: tr } = useI18n();
+  return (
+  <Box
+    sx={{
+      my: 1.25,
+      border: '1px solid var(--tt-border-soft)',
+      borderRadius: '10px',
+      overflow: 'hidden',
+      bgcolor: '#fff',
+    }}
+  >
+    <Box
+      sx={{
+        px: 1.25,
+        py: 0.5,
+        bgcolor: 'var(--tt-surface-2)',
+        borderBottom: '1px solid var(--tt-border-soft)',
+        display: 'flex',
+        alignItems: 'center',
+        gap: 0.75,
+        flexWrap: 'wrap',
+      }}
+    >
+      <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-3)' }}>{tr('生成式 UI · 沙箱内渲染')}</Typography>
+      <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
+        {tr('脚本可运行，但无法访问本机数据')}
+      </Typography>
+    </Box>
+    <iframe
+      title={tr('生成式 UI 预览')}
+      sandbox="allow-scripts allow-forms"
+      srcDoc={code}
+      style={{ display: 'block', width: '100%', height: 420, border: 0, background: '#fff' }}
+    />
+  </Box>
+  );
+};
 
 interface ChatStreamProps {
   messages: Message[];
@@ -66,6 +111,7 @@ interface ChatStreamProps {
 }
 
 const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, isLoading, regeneratingTurn, onRegenerate, feedback = EMPTY_FEEDBACK, onFeedback, highlightTurn }) => {
+  const { t: tr, locale } = useI18n();
   const messagesEndRef = useRef<HTMLDivElement>(null);
   // 每轮执行过程默认折叠，点击展开查看详情
   const [openTurns, setOpenTurns] = useState<Record<number, boolean>>({});
@@ -74,17 +120,59 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
   // 产物文件预览
   const [previewPath, setPreviewPath] = useState<string | null>(null);
 
-  // 对话字号（偏好设置「对话字号」真实生效）
+  // 对话字号、字体与产物打开方式（偏好设置真实生效）
   const [appSettings] = useAppSettings();
   const chatFontSize = (appSettings.chatFontSize as number) ?? 14;
+  const previewMode = (appSettings.previewMode as string) ?? '应用内预览';
+  // 默认展开工具调用：只影响「初始是否展开」，逐轮手动切换仍然优先
+  const expandToolCalls = Boolean(appSettings.expandToolCalls);
+
+  // 实验开关：这两项在渲染层真实消费，其余在设置页如实标注未提供
+  const experiments = (appSettings.experiments as Record<string, boolean> | undefined) ?? {};
+  // 助手过程默认展开条件：设置项打开，或实验开关 collapse 关掉（默认展开）
+  const defaultProcessOpen = experiments.collapse === false || expandToolCalls;
+  // 生成式 UI：```html 代码块渲染为沙箱 iframe，而不是显示源码
+  const generativeUI = Boolean(experiments.generativeUI);
+
+  /** Markdown 渲染（生成式 UI 开启时接管 html 代码块） */
+  const renderMarkdown = (text: string) => (
+    <Markdown
+      components={
+        generativeUI
+          ? {
+              pre({ children }) {
+                if (React.isValidElement(children)) {
+                  const props = children.props as { className?: string; children?: React.ReactNode };
+                  const lang = /language-([\w-]+)/.exec(props.className ?? '')?.[1]?.toLowerCase();
+                  if (lang === 'html' || lang === 'htm') {
+                    return <SandboxedHtml code={String(props.children ?? '')} />;
+                  }
+                }
+                return <pre>{children}</pre>;
+              },
+            }
+          : undefined
+      }
+    >
+      {text}
+    </Markdown>
+  );
 
   // 自动滚动到底部
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, events, turnEvents]);
 
-  const toggleTurn = (turnIdx: number) => {
-    setOpenTurns((prev) => ({ ...prev, [turnIdx]: !prev[turnIdx] }));
+  /** 逐轮手动切换：以当前实际展开态取反，兼容「默认展开工具调用」的初始值 */
+  const toggleTurn = (turnIdx: number, currentOpen: boolean) => {
+    setOpenTurns((prev) => ({ ...prev, [turnIdx]: !currentOpen }));
+  };
+
+  /** 产物点击：按「预览方式」分流；系统打开失败时提示并回退应用内 */
+  const handleOpenArtifact = async (path: string) => {
+    const result = await openArtifact(path, previewMode);
+    if (result.error) setActionMsg(result.error);
+    if (result.previewPath) setPreviewPath(result.previewPath);
   };
 
   // ── 回复操作栏 ─────────────────────────────────────────
@@ -95,7 +183,24 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
     try {
       await onFeedback(turnIdx, feedback[turnIdx] === kind ? null : kind);
     } catch (err: unknown) {
-      setActionMsg(err instanceof Error ? err.message : '评价保存失败');
+      setActionMsg(err instanceof Error ? err.message : tr('评价保存失败'));
+    }
+  };
+
+  /** 分享产出文件：把本轮真实产物路径复制到剪贴板（不伪造分享链接） */
+  const copyArtifactPaths = (evts: ChatEvent[]) => {
+    const paths = evts
+      .filter((e) => e.type === 'deliver')
+      .flatMap((e) => e.artifacts ?? []);
+    if (paths.length === 0) {
+      setActionMsg(tr('本轮没有可分享的产出文件'));
+      return;
+    }
+    const done = () => setActionMsg(tr('已复制 {count} 个产出文件路径，可直接粘贴发送', { count: paths.length }));
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(paths.join('\n')).then(done).catch(() => setActionMsg(tr('复制失败，请手动选择文本')));
+    } else {
+      setActionMsg(tr('当前环境不支持剪贴板复制'));
     }
   };
 
@@ -110,15 +215,15 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
         return [finalText || summary, ...(e.artifacts ?? [])].filter(Boolean).join('\n');
       })
       .join('\n')
-      .trim() || '任务完成';
+      .trim() || tr('任务完成');
     const done = () => {
       setCopiedTurn(turnIdx);
       setTimeout(() => setCopiedTurn((c) => (c === turnIdx ? null : c)), 2000);
     };
     if (navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(text).then(done).catch(() => setActionMsg('复制失败，请手动选择文本'));
+      navigator.clipboard.writeText(text).then(done).catch(() => setActionMsg(tr('复制失败，请手动选择文本')));
     } else {
-      setActionMsg('当前环境不支持剪贴板复制');
+      setActionMsg(tr('当前环境不支持剪贴板复制'));
     }
   };
 
@@ -140,7 +245,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
             />
           )}
           <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-3)', mt: running ? 0.5 : 0 }}>
-            正在执行: {event.description}…
+            {tr('正在执行: {desc}…', { desc: event.description ?? '' })}
           </Typography>
         </Box>
       );
@@ -152,9 +257,9 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
           <Typography
             sx={{
               fontSize: '12px',
-              color: '#94A3B8',
+              color: 'var(--tt-text-3)',
               fontFamily: "'SF Mono', Consolas, monospace",
-              bgcolor: '#F8FAFC',
+              bgcolor: 'var(--tt-chat-code-bg)',
               borderRadius: '6px',
               px: 1,
               py: 0.5,
@@ -172,7 +277,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
         <Box key={`evt-${idx}`} sx={{ mb: 1.5, display: 'flex', alignItems: 'flex-start', gap: 0.75 }}>
           <CheckCircleIcon sx={{ fontSize: 16, color: '#22C55E', mt: '2px' }} />
           <Box>
-            <Typography sx={{ fontSize: '13px', color: '#15803D', fontWeight: 500 }}>步骤完成</Typography>
+            <Typography sx={{ fontSize: '13px', color: '#15803D', fontWeight: 500 }}>{tr('步骤完成')}</Typography>
             {event.output && (
               <Typography sx={{ fontSize: '12px', color: '#94A3B8' }}>{event.output.substring(0, 200)}</Typography>
             )}
@@ -185,7 +290,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
       return (
         <Box key={`evt-${idx}`} sx={{ mb: 1.5, display: 'flex', alignItems: 'flex-start', gap: 0.75 }}>
           <ErrorOutlineIcon sx={{ fontSize: 16, color: '#EF4444', mt: '2px' }} />
-          <Typography sx={{ fontSize: '13px', color: '#DC2626' }}>步骤失败: {event.error}</Typography>
+          <Typography sx={{ fontSize: '13px', color: '#DC2626' }}>{tr('步骤失败: {error}', { error: event.error ?? '' })}</Typography>
         </Box>
       );
     }
@@ -207,13 +312,14 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
     const failedCount = processEvents.filter((e) => e.type === 'step_failed').length;
     const lastStart = [...processEvents].reverse().find((e) => e.type === 'step_start');
     const processRunning = running && failedCount === 0;
-    const processOpen = Boolean(openTurns[turnIdx]);
+    // 显式切换优先，其次是设置项/实验开关决定的默认态
+    const processOpen = openTurns[turnIdx] ?? defaultProcessOpen;
     const headerText =
       processRunning && lastStart && lastStart.type === 'step_start'
-        ? `正在执行：${lastStart.description}…`
+        ? tr('正在执行：{desc}…', { desc: lastStart.description ?? '' })
         : failedCount > 0
-          ? `执行过程（${doneCount} 个步骤完成，${failedCount} 个失败）`
-          : `执行过程 · ${doneCount} 个步骤已完成`;
+          ? tr('执行过程（{done} 个步骤完成，{failed} 个失败）', { done: doneCount, failed: failedCount })
+          : tr('执行过程 · {done} 个步骤已完成', { done: doneCount });
 
     return (
       <Box
@@ -234,7 +340,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
         </Avatar>
         <Box sx={{ maxWidth: '80%', minWidth: 0, flexGrow: 1 }}>
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
-            <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-2)' }}>通天助手</Typography>
+            <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-2)' }}>{tr('通天助手')}</Typography>
           </Box>
           <Box
             sx={{
@@ -250,7 +356,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
             {processEvents.length > 0 && (
               <Box sx={{ mb: delivers.length > 0 || running ? 1.25 : 0 }}>
                 <Box
-                  onClick={() => toggleTurn(turnIdx)}
+                  onClick={() => toggleTurn(turnIdx, processOpen)}
                   sx={{
                     display: 'flex',
                     alignItems: 'center',
@@ -288,7 +394,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                   />
                 </Box>
                 <Collapse in={processOpen}>
-                  <Box sx={{ mt: 1, px: 1.5, py: 1, borderRadius: '10px', border: '1px solid var(--tt-border-soft)', background: '#FBFCFD' }}>
+                  <Box sx={{ mt: 1, px: 1.5, py: 1, borderRadius: '10px', border: '1px solid var(--tt-border-soft)', background: 'var(--tt-chat-process-bg)' }}>
                     {processEvents.map((e, i) => renderEventDetail(e, i, running))}
                   </Box>
                 </Collapse>
@@ -302,7 +408,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
               if (arts.length === 0) {
                 return (
                   <Box key={`deliver-${idx}`} className="markdown-body" sx={{ color: 'var(--tt-text-2)', fontSize: chatFontSize }}>
-                    <Markdown>{finalText || '任务完成'}</Markdown>
+                    {renderMarkdown(finalText || tr('任务完成'))}
                   </Box>
                 );
               }
@@ -311,22 +417,26 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                   <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
                     <Inventory2Icon sx={{ fontSize: 18, color: '#16A34A' }} />
                     <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#15803D' }}>
-                      任务已完成，这是你的交付物
+                      {tr('任务已完成，这是你的交付物')}
                     </Typography>
                   </Box>
                   {finalText && (
                     <Box className="markdown-body" sx={{ color: 'var(--tt-text-2)', fontSize: chatFontSize, mb: 1 }}>
-                      <Markdown>{finalText}</Markdown>
+                      {renderMarkdown(finalText)}
                     </Box>
                   )}
                   <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
                     {arts.map((artifact, artIdx) => (
-                      <Tooltip key={`${artifact}-${artIdx}`} title="点击打开文件" placement="top">
+                      <Tooltip
+                        key={`${artifact}-${artIdx}`}
+                        title={tr(previewMode === '系统默认程序' ? '点击用系统默认程序打开' : '点击在应用内预览')}
+                        placement="top"
+                      >
                         <Chip
                           label={artifact}
                           size="small"
                           clickable
-                          onClick={() => setPreviewPath(artifact)}
+                          onClick={() => void handleOpenArtifact(artifact)}
                           sx={{
                             fontSize: '12px',
                             height: 24,
@@ -372,30 +482,30 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
           {/* 回复操作栏：点赞/点踩/复制/分享（仅有文件产出时）/重新生成 */}
           {!running && (
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.25, mt: 0.75 }}>
-              <Tooltip title="点赞">
+              <Tooltip title={tr('点赞')}>
                 <IconButton size="small" sx={{ width: 26, height: 26 }} onClick={() => toggleFeedback(turnIdx, 'up')}>
                   <ThumbUpOutlinedIcon sx={{ fontSize: 15, color: feedback[turnIdx] === 'up' ? '#16A34A' : '#9CA3AF' }} />
                 </IconButton>
               </Tooltip>
-              <Tooltip title="点踩">
+              <Tooltip title={tr('点踩')}>
                 <IconButton size="small" sx={{ width: 26, height: 26 }} onClick={() => toggleFeedback(turnIdx, 'down')}>
                   <ThumbDownOutlinedIcon sx={{ fontSize: 15, color: feedback[turnIdx] === 'down' ? '#EF4444' : '#9CA3AF' }} />
                 </IconButton>
               </Tooltip>
-              <Tooltip title={copiedTurn === turnIdx ? '已复制' : '复制回复'}>
+              <Tooltip title={copiedTurn === turnIdx ? tr('已复制') : tr('复制回复')}>
                 <IconButton size="small" sx={{ width: 26, height: 26 }} onClick={() => copyTurn(turnIdx, evts)}>
                   <ContentCopyIcon sx={{ fontSize: 14, color: copiedTurn === turnIdx ? '#16A34A' : '#9CA3AF' }} />
                 </IconButton>
               </Tooltip>
-              {/* 分享：仅在本轮有文件产出时显示 */}
+              {/* 分享：仅在本轮有文件产出时显示；复制真实产物路径，不伪造分享链接 */}
               {delivers.some((d) => (d.artifacts ?? []).length > 0) && (
-                <Tooltip title="分享产出文件">
-                  <IconButton size="small" sx={{ width: 26, height: 26 }} onClick={() => setActionMsg('分享功能即将上线')}>
+                <Tooltip title={tr('复制产出文件路径')}>
+                  <IconButton size="small" sx={{ width: 26, height: 26 }} onClick={() => copyArtifactPaths(evts)}>
                     <ShareIcon sx={{ fontSize: 15, color: 'var(--tt-text-4)' }} />
                   </IconButton>
                 </Tooltip>
               )}
-              <Tooltip title={regeneratingTurn === turnIdx ? '重新生成中…' : '重新生成'}>
+              <Tooltip title={regeneratingTurn === turnIdx ? tr('重新生成中…') : tr('重新生成')}>
                 <span>
                   <IconButton
                     size="small"
@@ -408,7 +518,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                 </span>
               </Tooltip>
               {copiedTurn === turnIdx && (
-                <Typography sx={{ fontSize: '11px', color: '#16A34A', ml: 0.5 }}>已复制</Typography>
+                <Typography sx={{ fontSize: '11px', color: '#16A34A', ml: 0.5 }}>{tr('已复制')}</Typography>
               )}
             </Box>
           )}
@@ -455,6 +565,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                   background: 'linear-gradient(135deg, #22C55E 0%, #16A34A 100%)',
                   color: '#fff',
                   fontSize: chatFontSize,
+                  fontFamily: 'var(--tt-chat-font)',
                   lineHeight: 1.6,
                   boxShadow: '0 2px 8px rgba(22, 163, 74, 0.25)',
                   whiteSpace: 'pre-wrap',
@@ -464,7 +575,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                 {msg.content as string}
               </Box>
               <Typography sx={{ fontSize: '11px', color: '#94A3B8', mt: 0.5, textAlign: 'right' }}>
-                {new Date(msg.ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+                {new Date(msg.ts).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' })}
               </Typography>
             </Box>
           </Box>,
@@ -499,10 +610,10 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
           <Box sx={{ maxWidth: '80%', minWidth: 0 }}>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
               <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-2)' }}>
-                {isAi ? '通天助手' : '工具调用'}
+                {isAi ? tr('通天助手') : tr('工具调用')}
               </Typography>
               <Typography sx={{ fontSize: '11px', color: '#CBD5E1' }}>
-                {new Date(msg.ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+                {new Date(msg.ts).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' })}
               </Typography>
               {isTool && Boolean(msg.attachments?.['toolName']) && (
                 <Chip
@@ -524,13 +635,13 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                 px: 2,
                 py: 1.5,
                 borderRadius: '4px 16px 16px 16px',
-                bgcolor: isAi ? '#FFFFFF' : '#F8FAFC',
-                border: '1px solid #E2E8F0',
-                boxShadow: '0 1px 3px rgba(15, 23, 42, 0.04)',
+                bgcolor: isAi ? 'var(--tt-chat-assistant-bg)' : 'var(--tt-chat-process-bg)',
+                border: '1px solid var(--tt-border)',
+                boxShadow: 'var(--tt-shadow-card)',
               }}
             >
               <Box className="markdown-body" sx={{ color: 'var(--tt-text-2)', fontSize: chatFontSize }}>
-                <Markdown>{msg.content as string}</Markdown>
+                {renderMarkdown(msg.content as string)}
               </Box>
 
               {Array.isArray(msg.attachments?.['files']) && (

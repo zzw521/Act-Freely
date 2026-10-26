@@ -15,12 +15,20 @@
 //! - `stats`：周期汇总（`usage:stats`，顶部总览条）
 //! - `report`：按日趋势 + 明细 + 汇总（`usage:report`，可复制成报表文本）
 //!
-//! 台账只存 token 与调用次数，**未采集延迟与单价**，因此以上读法都不输出
-//! 平均耗时/成本估算这类无数据来源的指标（避免伪造数字）。
+//! 台账存 token、调用次数、端到端延迟与按币种成本；旧数据没有延迟/单价时
+//! 如实返回 `avgLatencyMs = null` 与空成本清单，不拿 0 冒充真实测量值。
 
 use serde::{Deserialize, Serialize};
 
 use crate::store::Store;
+
+/// 按币种分桶的成本（micros，1 货币单位 = 1,000,000 micros）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageCost {
+    pub currency: String,
+    pub micros: i64,
+}
 
 /// 用量行（前端 ModelUsageStats 的数据源，camelCase 对齐前端）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -36,6 +44,15 @@ pub struct UsageRow {
     pub tokens_used: i64,
     pub calls: i64,
     pub last_used_at_ms: i64,
+    /// 平均端到端耗时；没有延迟样本（旧数据）时为 null
+    pub avg_latency_ms: Option<i64>,
+    /// 参与平均的调用数
+    pub latency_samples: i64,
+    /// 按币种分开的成本；未配置单价的调用不计入
+    pub costs: Vec<UsageCost>,
+    /// 计价 / 未计价调用次数（未配置单价不能当 0 元）
+    pub priced_calls: i64,
+    pub unpriced_calls: i64,
 }
 
 /// UTC 日期 `yyyy-mm-dd`（复用审计模块的自实现历法，避免引入 chrono）
@@ -73,31 +90,76 @@ pub fn record(
     prompt_tokens: u64,
     completion_tokens: u64,
 ) -> Result<(), String> {
+    record_sample(store, model_name, prompt_tokens, completion_tokens, None, None, None, false)
+}
+
+/// 记一次带延迟与成本的模型调用。
+///
+/// - 延迟为端到端耗时（流式为整段生成耗时），缺失时只累加 token/次数；
+/// - 成本只有配置了单价才有值，按调用时的币种写入 `model_usage_cost`；
+/// - 未计价调用与已计价调用分开统计，不能把「没配单价」当 0 元。
+#[allow(clippy::too_many_arguments)]
+pub fn record_sample(
+    store: &Store,
+    model_name: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    latency_ms: Option<i64>,
+    cost_micros: Option<i64>,
+    currency: Option<&str>,
+    priced: bool,
+) -> Result<(), String> {
     let name = model_name.trim();
     if name.is_empty() {
         return Ok(());
     }
     let now = crate::bridge::event_store::now_ms() as i64;
     let day = utc_day(now);
+    let latency = latency_ms.unwrap_or(0).max(0);
+    let latency_samples = i64::from(latency_ms.is_some());
+    let cost = cost_micros.filter(|v| *v >= 0);
+    let currency = currency
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("CNY")
+        .to_uppercase();
     store.with_conn(|c| {
         c.execute(
-            "INSERT INTO model_usage (model_name, day, prompt_tokens, completion_tokens, calls, last_used_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, 1, ?5) \
+            "INSERT INTO model_usage (model_name, day, prompt_tokens, completion_tokens, calls, \
+                 last_used_at_ms, latency_ms_total, latency_samples) \
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7) \
              ON CONFLICT(model_name, day) DO UPDATE SET \
                  prompt_tokens = prompt_tokens + excluded.prompt_tokens, \
                  completion_tokens = completion_tokens + excluded.completion_tokens, \
                  calls = calls + excluded.calls, \
-                 last_used_at_ms = excluded.last_used_at_ms",
+                 last_used_at_ms = excluded.last_used_at_ms, \
+                 latency_ms_total = latency_ms_total + excluded.latency_ms_total, \
+                 latency_samples = latency_samples + excluded.latency_samples",
             rusqlite::params![
                 name,
                 day,
                 prompt_tokens as i64,
                 completion_tokens as i64,
-                now
+                now,
+                latency,
+                latency_samples
             ],
         )
-        .map(|_| ())
-        .map_err(|e| format!("USAGE_RECORD_FAILED: {e}"))
+        .map_err(|e| format!("USAGE_RECORD_FAILED: {e}"))?;
+        if priced {
+            if let Some(cost) = cost {
+                c.execute(
+                    "INSERT INTO model_usage_cost (model_name, day, currency, cost_micros, priced_calls) \
+                     VALUES (?1, ?2, ?3, ?4, 1) \
+                     ON CONFLICT(model_name, day, currency) DO UPDATE SET \
+                         cost_micros = cost_micros + excluded.cost_micros, \
+                         priced_calls = priced_calls + excluded.priced_calls",
+                    rusqlite::params![name, day, currency, cost],
+                )
+                .map_err(|e| format!("USAGE_RECORD_FAILED: {e}"))?;
+            }
+        }
+        Ok(())
     })
 }
 
@@ -108,16 +170,95 @@ pub fn record_quiet(store: &Store, model_name: &str, prompt_tokens: u64, complet
     }
 }
 
+/// 带延迟/成本的尽力而为记账
+#[allow(clippy::too_many_arguments)]
+pub fn record_sample_quiet(
+    store: &Store,
+    model_name: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    latency_ms: Option<i64>,
+    cost_micros: Option<i64>,
+    currency: Option<&str>,
+    priced: bool,
+) {
+    if let Err(e) = record_sample(
+        store,
+        model_name,
+        prompt_tokens,
+        completion_tokens,
+        latency_ms,
+        cost_micros,
+        currency,
+        priced,
+    ) {
+        eprintln!("[usage] 记账失败（不阻断执行）: {e}");
+    }
+}
+
+/// 成本按模型/日期查询的周期过滤（列名与主表不同，单独构造避免拼接用户输入）
+fn cost_period_filter(period: &str, now: i64) -> (&'static str, Option<String>) {
+    match period {
+        "daily" => ("WHERE c.day = ?1", Some(utc_day(now))),
+        "monthly" => ("WHERE c.day LIKE ?1", Some(format!("{}%", utc_month(now)))),
+        _ => ("", None),
+    }
+}
+
+/// 成本明细：model_name → (按币种成本, 计价调用数)
+fn costs_by_model(
+    store: &Store,
+    period: &str,
+    now: i64,
+) -> Result<std::collections::HashMap<String, (Vec<UsageCost>, i64)>, String> {
+    let (where_sql, arg) = cost_period_filter(period, now);
+    let sql = format!(
+        "SELECT c.model_name, c.currency, SUM(c.cost_micros), SUM(c.priced_calls) \
+         FROM model_usage_cost c {where_sql} \
+         GROUP BY c.model_name, c.currency \
+         ORDER BY c.model_name ASC, c.currency ASC"
+    );
+    store.with_conn(|c| {
+        let mut stmt = c
+            .prepare(&sql)
+            .map_err(|e| format!("USAGE_QUERY_FAILED: {e}"))?;
+        let map = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(String, UsageCost, i64)> {
+            Ok((
+                r.get(0)?,
+                UsageCost { currency: r.get(1)?, micros: r.get(2)? },
+                r.get(3)?,
+            ))
+        };
+        let mut out: std::collections::HashMap<String, (Vec<UsageCost>, i64)> =
+            std::collections::HashMap::new();
+        let rows = match arg {
+            Some(a) => stmt.query_map([a], map),
+            None => stmt.query_map([], map),
+        }
+        .map_err(|e| format!("USAGE_QUERY_FAILED: {e}"))?;
+        for row in rows {
+            let (model, cost, priced) =
+                row.map_err(|e| format!("USAGE_QUERY_FAILED: {e}"))?;
+            let entry = out.entry(model).or_default();
+            entry.0.push(cost);
+            entry.1 += priced;
+        }
+        Ok(out)
+    })
+}
+
 /// 按周期聚合查询（period 已由 `normalize_period` 校验）
 pub fn query(store: &Store, period: &str) -> Result<Vec<UsageRow>, String> {
     let period = normalize_period(period)?;
     let now = crate::bridge::event_store::now_ms() as i64;
     let (where_sql, arg) = period_filter(&period, now);
+    let costs = costs_by_model(store, &period, now)?;
     let sql = format!(
         "SELECT u.model_name, \
                 COALESCE((SELECT m.name FROM model_configs m WHERE m.model_name = u.model_name \
                           ORDER BY m.is_default DESC, m.updated_at DESC LIMIT 1), u.model_name) AS display_name, \
-                SUM(u.prompt_tokens), SUM(u.completion_tokens), SUM(u.calls), MAX(u.last_used_at_ms) \
+                SUM(u.prompt_tokens), SUM(u.completion_tokens), SUM(u.calls), MAX(u.last_used_at_ms), \
+                SUM(u.latency_ms_total), SUM(u.latency_samples) \
          FROM model_usage u {where_sql} \
          GROUP BY u.model_name \
          ORDER BY SUM(u.prompt_tokens) + SUM(u.completion_tokens) DESC, u.model_name ASC"
@@ -128,14 +269,31 @@ pub fn query(store: &Store, period: &str) -> Result<Vec<UsageRow>, String> {
         let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<UsageRow> {
             let prompt: i64 = r.get(2)?;
             let completion: i64 = r.get(3)?;
+            let calls: i64 = r.get(4)?;
+            let latency_total: i64 = r.get(6)?;
+            let latency_samples: i64 = r.get(7)?;
+            let model_name: String = r.get(0)?;
+            let (model_costs, priced_calls) = costs
+                .get(&model_name)
+                .cloned()
+                .unwrap_or_else(|| (Vec::new(), 0));
             Ok(UsageRow {
-                model_name: r.get(0)?,
+                model_name,
                 display_name: r.get(1)?,
                 prompt_tokens: prompt,
                 completion_tokens: completion,
                 tokens_used: prompt + completion,
-                calls: r.get(4)?,
+                calls,
                 last_used_at_ms: r.get(5)?,
+                avg_latency_ms: if latency_samples > 0 {
+                    Some(latency_total / latency_samples)
+                } else {
+                    None
+                },
+                latency_samples,
+                costs: model_costs,
+                priced_calls,
+                unpriced_calls: (calls - priced_calls).max(0),
             })
         };
         let rows = match arg {
@@ -147,7 +305,7 @@ pub fn query(store: &Store, period: &str) -> Result<Vec<UsageRow>, String> {
     })
 }
 
-/// 周期汇总（`usage:stats` 与 `usage:report` 共用；无延迟/单价来源，故不含耗时与成本）
+/// 周期汇总（`usage:stats` 与 `usage:report` 共用）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageTotals {
@@ -159,6 +317,22 @@ pub struct UsageTotals {
     pub active_models: usize,
     /// 周期内最后一次调用时间（无用量为 0）
     pub last_used_at_ms: i64,
+    /// 按调用数加权的平均耗时；没有延迟样本时为 null
+    pub avg_latency_ms: Option<i64>,
+    pub latency_samples: i64,
+    pub costs: Vec<UsageCost>,
+    pub priced_calls: i64,
+    pub unpriced_calls: i64,
+}
+
+fn merge_cost(target: &mut Vec<UsageCost>, source: &[UsageCost]) {
+    for cost in source {
+        match target.iter_mut().find(|c| c.currency == cost.currency) {
+            Some(slot) => slot.micros += cost.micros,
+            None => target.push(cost.clone()),
+        }
+    }
+    target.sort_by(|a, b| a.currency.cmp(&b.currency));
 }
 
 fn totals_of(rows: &[UsageRow]) -> UsageTotals {
@@ -169,14 +343,30 @@ fn totals_of(rows: &[UsageRow]) -> UsageTotals {
         calls: 0,
         active_models: rows.len(),
         last_used_at_ms: 0,
+        avg_latency_ms: None,
+        latency_samples: 0,
+        costs: Vec::new(),
+        priced_calls: 0,
+        unpriced_calls: 0,
     };
+    let mut weighted_latency: i64 = 0;
     for r in rows {
         t.prompt_tokens += r.prompt_tokens;
         t.completion_tokens += r.completion_tokens;
         t.tokens_used += r.tokens_used;
         t.calls += r.calls;
         t.last_used_at_ms = t.last_used_at_ms.max(r.last_used_at_ms);
+        t.latency_samples += r.latency_samples;
+        weighted_latency += r.avg_latency_ms.unwrap_or(0) * r.latency_samples;
+        merge_cost(&mut t.costs, &r.costs);
+        t.priced_calls += r.priced_calls;
+        t.unpriced_calls += r.unpriced_calls;
     }
+    t.avg_latency_ms = if t.latency_samples > 0 {
+        Some(weighted_latency / t.latency_samples)
+    } else {
+        None
+    };
     t
 }
 
@@ -199,6 +389,12 @@ pub struct DayPoint {
     pub calls: i64,
     /// 当日活跃模型数
     pub models: usize,
+    /// 当日平均耗时；没有延迟样本时为 null
+    pub avg_latency_ms: Option<i64>,
+    pub latency_samples: i64,
+    pub costs: Vec<UsageCost>,
+    pub priced_calls: i64,
+    pub unpriced_calls: i64,
 }
 
 /// 报表返回体（前端 `UsageReport`：趋势 + 明细 + 汇总，自包含便于导出）
@@ -224,11 +420,54 @@ pub fn stats(store: &Store, period: &str) -> Result<StatsView, String> {
     })
 }
 
+/// 成本按日分桶（趋势图用）
+fn costs_by_day(
+    store: &Store,
+    period: &str,
+    now: i64,
+) -> Result<std::collections::HashMap<String, (Vec<UsageCost>, i64)>, String> {
+    let (where_sql, arg) = cost_period_filter(period, now);
+    let sql = format!(
+        "SELECT c.day, c.currency, SUM(c.cost_micros), SUM(c.priced_calls) \
+         FROM model_usage_cost c {where_sql} \
+         GROUP BY c.day, c.currency \
+         ORDER BY c.day ASC, c.currency ASC"
+    );
+    store.with_conn(|c| {
+        let mut stmt = c
+            .prepare(&sql)
+            .map_err(|e| format!("USAGE_REPORT_FAILED: {e}"))?;
+        let map = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(String, UsageCost, i64)> {
+            Ok((
+                r.get(0)?,
+                UsageCost { currency: r.get(1)?, micros: r.get(2)? },
+                r.get(3)?,
+            ))
+        };
+        let mut out: std::collections::HashMap<String, (Vec<UsageCost>, i64)> =
+            std::collections::HashMap::new();
+        let rows = match arg {
+            Some(a) => stmt.query_map([a], map),
+            None => stmt.query_map([], map),
+        }
+        .map_err(|e| format!("USAGE_REPORT_FAILED: {e}"))?;
+        for row in rows {
+            let (day, cost, priced) =
+                row.map_err(|e| format!("USAGE_REPORT_FAILED: {e}"))?;
+            let entry = out.entry(day).or_default();
+            entry.0.push(cost);
+            entry.1 += priced;
+        }
+        Ok(out)
+    })
+}
+
 fn daily_points(store: &Store, period: &str, now: i64) -> Result<Vec<DayPoint>, String> {
     let (where_sql, arg) = period_filter(period, now);
+    let costs = costs_by_day(store, period, now)?;
     let sql = format!(
         "SELECT u.day, SUM(u.prompt_tokens) + SUM(u.completion_tokens), SUM(u.calls), \
-                COUNT(DISTINCT u.model_name) \
+                COUNT(DISTINCT u.model_name), SUM(u.latency_ms_total), SUM(u.latency_samples) \
          FROM model_usage u {where_sql} \
          GROUP BY u.day \
          ORDER BY u.day ASC"
@@ -239,10 +478,27 @@ fn daily_points(store: &Store, period: &str, now: i64) -> Result<Vec<DayPoint>, 
             .map_err(|e| format!("USAGE_REPORT_FAILED: {e}"))?;
         let map = |r: &rusqlite::Row<'_>| -> rusqlite::Result<DayPoint> {
             let models: i64 = r.get(3)?;
+            let latency_total: i64 = r.get(4)?;
+            let latency_samples: i64 = r.get(5)?;
+            let day: String = r.get(0)?;
+            let calls: i64 = r.get(2)?;
+            let (day_costs, priced_calls) = costs
+                .get(&day)
+                .cloned()
+                .unwrap_or_else(|| (Vec::new(), 0));
             Ok(DayPoint {
-                day: r.get(0)?,
+                avg_latency_ms: if latency_samples > 0 {
+                    Some(latency_total / latency_samples)
+                } else {
+                    None
+                },
+                latency_samples,
+                costs: day_costs,
+                priced_calls,
+                unpriced_calls: (calls - priced_calls).max(0),
+                day,
                 tokens_used: r.get(1)?,
-                calls: r.get(2)?,
+                calls,
                 models: models.max(0) as usize,
             })
         };

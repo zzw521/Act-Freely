@@ -47,7 +47,8 @@ const ModelForm: React.FC<ModelFormProps> = ({
     name: initialData?.name || '',
     source: initialData?.source || ModelSource.OPENAI_COMPAT,
     baseUrl: initialData?.baseUrl || '',
-    apiKey: initialData?.apiKeyEncrypted ? '●●●●●●●●' : '',
+    // 读取视图只给 hasApiKey，不回传密钥或旧式密文字段
+    apiKey: initialData?.hasApiKey ? '●●●●●●●●' : '',
     modelName: initialData?.modelName || '',
     contextWindow: initialData?.contextWindow || 4096,
     isDefault: initialData?.isDefault || false,

@@ -459,14 +459,17 @@ describe('会话恢复接线：三条通道 + 提交/落库参数', () => {
   });
 
   it('Mock 交付事件带回复正文（与引擎/Rust deliver 同字段）', () => {
-    expect(read('renderer/lib/mock-api.ts')).toContain('final_text: `已按目标');
+    const src = read('renderer/lib/mock-api.ts');
+    expect(src).toContain("final_text: task.title.includes('[test:html]')");
+    expect(src).toContain('已按目标「${task.title}」完成分析与处理');
   });
 
   it('store：提交与重新生成都携带会话键/轮次，正文两侧都落库', () => {
     const src = read('renderer/store/workbenchStore.ts');
     expect(src).toContain('conversationId: convId,');
     expect(src).toContain('turnIndex,');
-    expect(src).toContain('conversationId: conv.id, turnIndex: turnIdx');
+    expect(src).toContain('conversationId: conv.id,');
+    expect(src).toContain('turnIndex: turnIdx,');
     expect(src).toContain("role: 'user',");
     expect(src).toContain("role: 'assistant',");
     // 启动重建会话：会话列表 + 正文 + 归档过滤

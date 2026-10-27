@@ -266,7 +266,8 @@ pub async fn start_workspace(
     // 跟随系统 = 不注入（继承父进程环境）；不使用 = 清空；自定义 = 写入并保留回环直连
     let proxy_spec = crate::proxy::current();
 
-    let mut child = tokio::process::Command::new(&args[0])
+    let mut command = tokio::process::Command::new(&args[0]);
+    command
         .args(&args[1..])
         .current_dir(&work_dir)
         .env("PYTHONUNBUFFERED", "1")
@@ -278,7 +279,10 @@ pub async fn start_workspace(
         .env("TT_TERMINAL_TOKEN", crate::terminal::engine_token())
         .envs(proxy_spec.env_vars())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // 引擎是常驻进程：不抑制控制台，安装版会一直挂着一个黑色窗口
+    crate::win_console::hide_console_async(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|e| format!("BRIDGE_SPAWN_FAILED: {e}"))?;
 
@@ -312,14 +316,26 @@ pub async fn start_workspace(
     // 等待健康检查通过（最长 30s）
     let deadline = Instant::now() + Duration::from_millis(HEALTH_CHECK_MAX_WAIT_MS as u64);
     let mut ready = false;
+    let mut early_exit = None;
     while Instant::now() < deadline {
         if health_ok(&bridge.lock().await.http, port).await {
             ready = true;
             break;
         }
-        // 进程提前退出则快速失败
-        if !process_alive(pid) {
-            break;
+        // 进程提前退出则快速失败。必须留下退出码：安装包漏带模块时引擎会秒退，
+        // 若仍报 30s 超时，排查方向会被完全带偏（见 2026-10 的 im_channels 事故）。
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                early_exit = Some(status.to_string());
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                log(&format!("try_wait failed for {workspace_id}: {e}"));
+                if !process_alive(pid) {
+                    break;
+                }
+            }
         }
         tokio::time::sleep(Duration::from_millis(HEALTH_CHECK_POLL_MS)).await;
     }
@@ -330,6 +346,12 @@ pub async fn start_workspace(
             inst.status = InstanceStatus::Error;
         }
         emit_status(app, workspace_id, InstanceStatus::Error);
+        if let Some(status) = early_exit {
+            log(&format!("engine for {workspace_id} exited before ready: {status}"));
+            return Err(format!(
+                "BRIDGE_ENGINE_EXITED: Agent 引擎启动后立即退出（{status}），请查看引擎日志"
+            ));
+        }
         return Err("BRIDGE_START_TIMEOUT: Agent 健康检查超时（30s）".into());
     }
 
@@ -383,9 +405,11 @@ fn process_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}")])
-            .output()
+        // 每 10s 调一次：不加 CREATE_NO_WINDOW 会周期性闪出控制台窗口
+        let mut cmd = std::process::Command::new("tasklist");
+        cmd.args(["/FI", &format!("PID eq {pid}")]);
+        crate::win_console::hide_console(&mut cmd);
+        cmd.output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
             .unwrap_or(false)
     }

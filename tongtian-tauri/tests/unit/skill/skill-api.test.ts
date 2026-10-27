@@ -51,7 +51,7 @@ describe('skillAPI · 写通道如实失败', () => {
   });
 
   it('拒绝文案指向桌面端而非泛泛失败', () => {
-    expect(errorMessageOf(ErrorCode.SKILL_UNSUPPORTED)).toContain('桌面版通天办公');
+    expect(errorMessageOf(ErrorCode.SKILL_UNSUPPORTED)).toContain('桌面版任我行');
   });
 });
 

@@ -173,14 +173,14 @@ describe('PERMISSION_* 契约收口', () => {
 
   it('ErrorCode 枚举收录 PERMISSION_UNSUPPORTED 且有文案', () => {
     expect(contracts()).toContain('PERMISSION_UNSUPPORTED = ');
-    expect(errorMessageOf(ErrorCode.PERMISSION_UNSUPPORTED)).toContain('桌面版通天办公');
+    expect(errorMessageOf(ErrorCode.PERMISSION_UNSUPPORTED)).toContain('桌面版任我行');
   });
 
   it('拒绝值按 errorTextOf 归一为「文案（详情）」', () => {
     expect(errorTextOf('PERMISSION_PANE_UNAVAILABLE: Windows 无此开关')).toContain(
       '当前系统没有这项权限的开关入口',
     );
-    expect(errorTextOf(handleMessage())).toBe('当前运行通道无法打开系统隐私设置，请在桌面版通天办公中管理权限（浏览器通道无系统设置入口）');
+    expect(errorTextOf(handleMessage())).toBe('当前运行通道无法打开系统隐私设置，请在桌面版任我行中管理权限（浏览器通道无系统设置入口）');
   });
 
   it('两条通道都有消费方：IPC 常量 → tauri-api → Rust command 注册', () => {
@@ -316,7 +316,7 @@ describe('Mock 分发路径', () => {
     try {
       await mod.openSystemPermissionSettings('microphone');
     } catch (e) {
-      expect(errorTextOf(e)).toContain('请在桌面版通天办公中管理权限');
+      expect(errorTextOf(e)).toContain('请在桌面版任我行中管理权限');
     }
   });
 });

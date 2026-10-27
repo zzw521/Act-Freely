@@ -81,7 +81,7 @@ import type { PptxTemplatesState } from '../../shared/pptx-templates';
 function getAPI() {
   const api = window.tongtianAPI;
   if (!api) {
-    throw new Error('tongtianAPI is not available. 请从桌面版通天办公或已注入通道的页面打开');
+    throw new Error('tongtianAPI is not available. 请从桌面版任我行或已注入通道的页面打开');
   }
   return api;
 }
@@ -105,7 +105,10 @@ export const chatAPI = {
   },
 
   /** 取消任务（转移 #3/#8/#19/#23/#28） */
-  cancel(taskId: string, workspaceId?: string): Promise<{ taskId: string; cancelled: boolean }> {
+  cancel(
+    taskId: string,
+    workspaceId?: string,
+  ): Promise<{ taskId: string; cancelled: boolean; status?: string }> {
     return getAPI().chatCancel(taskId, workspaceId);
   },
 
@@ -814,7 +817,10 @@ function callRequired<T>(method: string, ...args: unknown[]): Promise<T> {
 
 export const p0API = {
   /** 取消任务（转移 #3/#8/#19/#23/#28 → cancelled） */
-  cancel(taskId: string, workspaceId?: string): Promise<{ taskId: string; cancelled: boolean }> {
+  cancel(
+    taskId: string,
+    workspaceId?: string,
+  ): Promise<{ taskId: string; cancelled: boolean; status?: string }> {
     return callRequired('chatCancel', taskId, workspaceId);
   },
 

@@ -112,9 +112,10 @@ pub fn code_means_absent(action: Action, code: i32) -> bool {
 
 #[cfg(windows)]
 fn run_reg(args: &[String]) -> Result<std::process::Output, String> {
-    Command::new("reg")
-        .args(args)
-        .output()
+    let mut cmd = Command::new("reg");
+    cmd.args(args);
+    crate::win_console::hide_console(&mut cmd);
+    cmd.output()
         .map_err(|e| format!("AUTOSTART_FAILED: 无法调用系统启动项配置命令（{e}）"))
 }
 

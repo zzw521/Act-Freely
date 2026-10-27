@@ -48,6 +48,7 @@ import { useWorkMode, MODE_PLACEHOLDERS } from '../../lib/use-work-mode';
 import { usePptxTemplates } from '../../lib/use-pptx-templates';
 import { useWorkbenchStore } from '../../store/workbenchStore';
 import { useI18n } from '../../i18n';
+import Panda from '../Panda';
 import { useNavigate } from 'react-router-dom';
 import { errorTextOf } from '../../../shared/error-messages';
 
@@ -65,6 +66,10 @@ interface ChatInputProps {
   ) => void;
   /** 是否处于加载状态（思考/流式生成中） */
   loading?: boolean;
+  /** 任务是否可停止（排队/规划/执行中）：为真时主按钮变方形停止键，与发送共用同一个位置 */
+  stoppable?: boolean;
+  /** 停止当前任务 */
+  onStop?: () => void;
   /** 占位符文本 */
   placeholder?: string;
   /** 最大行数（超过后出现滚动条） */
@@ -75,6 +80,8 @@ interface ChatInputProps {
   workDir?: string;
   /** 选择工作目录回调（真实目录选择） */
   onSelectWorkDir?: (dir: string) => void;
+  /** 对话态紧凑模式：收起提示词建议，避免和消息流争夺空间 */
+  compact?: boolean;
 }
 
 // 附件约束（交互补设计 §3.3；含图片格式，原「插入图片」已合并到添加文件）
@@ -128,11 +135,14 @@ const BUILTIN_MODELS: ModelOption[] = BUILTIN_CHAT_MODELS;
 const ChatInput: React.FC<ChatInputProps> = ({
   onSend,
   loading = false,
+  stoppable = false,
+  onStop,
   placeholder = '描述任务，输入 /调用技能',
   maxRows = 8,
   initialText,
   workDir,
   onSelectWorkDir,
+  compact = false,
 }) => {
   const { t: tr } = useI18n();
   const [value, setValue] = useState(initialText ?? '');
@@ -371,7 +381,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
 
   const handleSend = useCallback(async () => {
     const trimmed = value.trim();
-    if (!trimmed || loading || staging) return;
+    if (!trimmed || loading || stoppable || staging) return;
     // 附件暂存：浏览器真实文件读内容上传对话接口；Tauri 路径逐个 file_stage_attachment，失败卡片标红可重试
     const metas: AttachmentMeta[] = [];
     if (attachments.length > 0) {
@@ -424,7 +434,16 @@ const ChatInput: React.FC<ChatInputProps> = ({
     setAttachError(null);
     setReferencedSkill(null);
     setTimeout(() => inputRef.current?.focus(), 50);
-  }, [value, loading, staging, attachments, referencedSkill, selectedModel, onSend, activeMode, chatExpertId]);
+  }, [value, loading, stoppable, staging, attachments, referencedSkill, selectedModel, onSend, activeMode, chatExpertId]);
+
+  /** 主按钮：空闲发送，任务运行中停止。两种动作放在同一个键位，图标随状态切换 */
+  const handlePrimaryAction = useCallback(() => {
+    if (stoppable) {
+      onStop?.();
+      return;
+    }
+    void handleSend();
+  }, [stoppable, onStop, handleSend]);
 
   /** 选择工作目录：Tauri 走系统目录对话框；浏览器用 File System Access API */
   const handlePickWorkDir = useCallback(async () => {
@@ -459,10 +478,11 @@ const ChatInput: React.FC<ChatInputProps> = ({
     inputRef.current?.focus();
   }, []);
 
-  const canSend = value.trim().length > 0 && !loading;
+  const canSend = value.trim().length > 0 && !loading && !stoppable;
   // 只在「空输入、无附件、未引用技能、非生成中」时给建议，避免和用户已写内容抢空间
   const showSuggestions =
     promptSuggestionEnabled &&
+    !compact &&
     !loading &&
     value.trim() === '' &&
     attachments.length === 0 &&
@@ -485,8 +505,8 @@ const ChatInput: React.FC<ChatInputProps> = ({
 
   return (
     <Box>
-    {/* 工作台模式胶囊组：设置页只启用一个模式时不出现，避免单选装饰 */}
-    {enabledModeDefs.length > 1 && (
+    {/* 工作台模式胶囊组：只在新任务（空态）出现；建立任务后输入框不再展示模式选择 */}
+    {!compact && enabledModeDefs.length > 1 && (
       <Box
         role="group"
         aria-label={tr('工作台模式')}
@@ -523,60 +543,19 @@ const ChatInput: React.FC<ChatInputProps> = ({
         })}
       </Box>
     )}
-    {/* 幻灯片模式模板选择：只列可用模板；导入通道在设置页，避免输入框里再堆一个假的导入按钮 */}
-    {activeMode === 'slides' && (
-      <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 0.75, mb: 1, px: 0.25 }}>
-        <Tooltip title={tr('幻灯片模式按所选模板生成 .pptx；可在「设置 → 工作台 → 幻灯片模板」导入本机模板')}>
-          <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>{tr('模板')}</Typography>
-        </Tooltip>
-        <Box
-          component="select"
-          data-pptx-picker=""
-          value={pptx.selectedId}
-          disabled={pptx.loading || pptxSwitching || pptxOptions.length === 0}
-          onChange={(e: React.ChangeEvent<HTMLSelectElement>) => void handlePptxSelect(e.target.value)}
-          sx={{
-            appearance: 'auto',
-            px: 1,
-            py: 0.4,
-            pr: 0.75,
-            borderRadius: '8px',
-            border: '1px solid var(--tt-border)',
-            bgcolor: 'var(--tt-surface)',
-            fontSize: '12px',
-            color: 'var(--tt-text-2)',
-            cursor: 'pointer',
-            outline: 'none',
-            '&:hover': { borderColor: '#14B8A6' },
-            '&:disabled': { opacity: 0.55, cursor: 'not-allowed' },
-          }}
-        >
-          {pptxOptions.map((t) => (
-            <option key={t.id} value={t.id}>
-              {t.name}
-              {t.builtin ? '' : tr('（导入）')}
-            </option>
-          ))}
-        </Box>
-        {pptx.loading && <CircularProgress size={12} />}
-        {pptxError && <Typography sx={{ fontSize: '12px', color: '#EF4444' }}>{pptxError}</Typography>}
-        {!pptx.desktop && (
-          <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>{tr('浏览器直连仅内置主题')}</Typography>
-        )}
-      </Box>
-    )}
+    {/* 幻灯片模式模板选择已移到输入框下方的目录行之后 */}
     <Box
       sx={{
         bgcolor: 'var(--tt-surface)',
-        borderRadius: '20px',
+        borderRadius: '24px',
         border: `1px solid ${focused ? '#14B8A6' : '#E5E7EB'}`,
         boxShadow: focused
-          ? '0 0 0 3px rgba(20, 184, 166, 0.12), 0 8px 30px rgba(15, 23, 42, 0.06)'
-          : '0 2px 12px rgba(15, 23, 42, 0.04)',
+          ? '0 0 0 3px rgba(20, 184, 166, 0.12), 0 12px 36px rgba(15, 23, 42, 0.08)'
+          : '0 6px 24px rgba(15, 23, 42, 0.05)',
         transition: 'border-color 0.2s ease, box-shadow 0.2s ease',
         px: 2,
-        pt: 1.75,
-        pb: 1.25,
+        pt: 1.5,
+        pb: 1.1,
       }}
     >
       {/* 引用块区：附件卡片（输入框上方；技能引用块已改为输入框内嵌） */}
@@ -604,6 +583,10 @@ const ChatInput: React.FC<ChatInputProps> = ({
       {/* 文本输入（/ 前缀实时唤起技能选择；技能引用块与文字同行内联） */}
       <Box ref={inputWrapRef}>
         <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.75 }}>
+          {/* 状态灯：空闲眨眼、思考托腮、任务运行中戴安全帽。表情只由 props 派生，不落任何可持久化状态 */}
+          <Box sx={{ width: 22, height: 22, flexShrink: 0, mt: '3px' }}>
+            <Panda size={22} state={stoppable ? 'working' : loading ? 'thinking' : 'idle'} />
+          </Box>
           {referencedSkill && (() => {
             const active = Boolean(skillBlockAnchor); // 点击展开时才变色
             const meta = SKILL_SOURCE_META[referencedSkill.source];
@@ -702,8 +685,8 @@ const ChatInput: React.FC<ChatInputProps> = ({
         </Box>
       </Box>
 
-      {/* 提示词建议：设置页开关控制；点击只回填，不替用户发送 */}
-      {showSuggestions && (
+      {/* 提示词建议：设置页开关控制；点击只回填，不替用户发送；已有输入时收起避免干扰 */}
+      {showSuggestions && !value.trim() && !attachments.length && (
         <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 0.75, mt: 1.1 }}>
           <AutoAwesomeIcon sx={{ fontSize: 14, color: '#14B8A6', flexShrink: 0 }} />
           <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mr: 0.25 }}>{tr('试试这样问')}</Typography>
@@ -828,30 +811,31 @@ const ChatInput: React.FC<ChatInputProps> = ({
             </span>
           </Tooltip>
 
-          {/* 发送按钮 */}
-          <Tooltip title={canSend ? tr('发送 (Enter)') : loading ? tr('生成中…') : tr('请输入内容')}>
+          {/* 发送 / 停止：同一个按钮，任务运行中换成方形停止键（像录像机的停止键） */}
+          <Tooltip title={stoppable ? tr('停止任务') : canSend ? tr('发送 (Enter)') : tr('请输入内容')}>
             <span>
               <IconButton
-                onClick={handleSend}
-                disabled={!canSend && !loading}
+                onClick={handlePrimaryAction}
+                aria-label={stoppable ? tr('停止任务') : tr('发送')}
+                disabled={!canSend && !stoppable}
                 sx={{
                   width: 34,
                   height: 34,
                   borderRadius: '50%',
-                  bgcolor: canSend ? '#14B8A6' : loading ? '#F59E0B' : '#E5E7EB',
-                  color: canSend || loading ? '#fff' : '#9CA3AF',
+                  bgcolor: canSend ? '#14B8A6' : stoppable ? '#F59E0B' : '#E5E7EB',
+                  color: canSend || stoppable ? '#fff' : '#9CA3AF',
                   boxShadow: canSend ? '0 2px 8px rgba(20, 184, 166, 0.35)' : 'none',
                   transition: 'all 0.2s ease',
                   '&:hover': {
-                    bgcolor: canSend ? '#0D9488' : loading ? '#D97706' : '#E5E7EB',
+                    bgcolor: canSend ? '#0D9488' : stoppable ? '#D97706' : '#E5E7EB',
                   },
                   '&.Mui-disabled': {
-                    bgcolor: loading ? '#F59E0B' : '#E5E7EB',
-                    color: loading ? '#fff' : '#9CA3AF',
+                    bgcolor: stoppable ? '#F59E0B' : '#E5E7EB',
+                    color: stoppable ? '#fff' : '#9CA3AF',
                   },
                 }}
               >
-                {loading ? <StopIcon sx={{ fontSize: 18 }} /> : <ArrowUpwardIcon sx={{ fontSize: 18 }} />}
+                {stoppable ? <StopIcon sx={{ fontSize: 18 }} /> : <ArrowUpwardIcon sx={{ fontSize: 18 }} />}
               </IconButton>
             </span>
           </Tooltip>
@@ -1348,6 +1332,49 @@ const ChatInput: React.FC<ChatInputProps> = ({
         </Tooltip>
         <Typography sx={{ fontSize: '12px', color: '#C0C4CA' }}>{tr('内容由 AI 生成，请注意核实')}</Typography>
       </Box>
+
+      {/* 幻灯片模板：放在工作目录之后；只列可用模板，导入通道在设置页 */}
+      {activeMode === 'slides' && (
+        <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 0.75, mt: 0.5, px: 0.5 }}>
+          <Tooltip title={tr('幻灯片模式按所选模板生成 .pptx；可在「设置 → 工作台 → 幻灯片模板」导入本机模板')}>
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>{tr('模板')}</Typography>
+          </Tooltip>
+          <Box
+            component="select"
+            data-pptx-picker=""
+            value={pptx.selectedId}
+            disabled={pptx.loading || pptxSwitching || pptxOptions.length === 0}
+            onChange={(e: React.ChangeEvent<HTMLSelectElement>) => void handlePptxSelect(e.target.value)}
+            sx={{
+              appearance: 'auto',
+              px: 1,
+              py: 0.4,
+              pr: 0.75,
+              borderRadius: '8px',
+              border: '1px solid var(--tt-border)',
+              bgcolor: 'var(--tt-surface)',
+              fontSize: '12px',
+              color: 'var(--tt-text-2)',
+              cursor: 'pointer',
+              outline: 'none',
+              '&:hover': { borderColor: '#14B8A6' },
+              '&:disabled': { opacity: 0.55, cursor: 'not-allowed' },
+            }}
+          >
+            {pptxOptions.map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.name}
+                {t.builtin ? '' : tr('（导入）')}
+              </option>
+            ))}
+          </Box>
+          {pptx.loading && <CircularProgress size={12} />}
+          {pptxError && <Typography sx={{ fontSize: '12px', color: '#EF4444' }}>{pptxError}</Typography>}
+          {!pptx.desktop && (
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>{tr('浏览器直连仅内置主题')}</Typography>
+          )}
+        </Box>
+      )}
     </Box>
   );
 };

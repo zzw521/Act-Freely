@@ -98,12 +98,16 @@ describe('设置页模板管理', () => {
 });
 
 describe('输入框幻灯片模板选择', () => {
-  it('仅在幻灯片模式出现，且只列可用模板', () => {
+  it('仅在幻灯片模式出现，且位于工作目录行之后', () => {
     const src = chatInput();
     const pickerIdx = src.indexOf('data-pptx-picker');
     expect(pickerIdx).toBeGreaterThan(-1);
     const guardIdx = src.lastIndexOf("{activeMode === 'slides' && (", pickerIdx);
     expect(guardIdx).toBeGreaterThan(-1);
+    // 模板选择放在「选择工作目录」下方，不再挤在输入框上方
+    const workDirIdx = src.indexOf("tr('选择工作目录')");
+    expect(workDirIdx).toBeGreaterThan(-1);
+    expect(pickerIdx).toBeGreaterThan(workDirIdx);
     expect(src).toContain('const pptxOptions = pptx.templates.filter((t) => t.available);');
     expect(src).toContain('usePptxTemplates({ active: activeMode === \'slides\' })');
   });

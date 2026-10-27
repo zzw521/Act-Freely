@@ -25,7 +25,7 @@ export function handleLocalCollabChannel(channel: string): LocalCollabResult {
   return {
     handled: true,
     value: Promise.reject(
-      new Error('COLLAB_UNSUPPORTED: 当前运行通道无法访问协作服务，请在桌面版通天办公中使用项目协作'),
+      new Error('COLLAB_UNSUPPORTED: 当前运行通道无法访问协作服务，请在桌面版任我行中使用项目协作'),
     ),
   };
 }

@@ -46,3 +46,6 @@ tongtian-tauri/vendor/
 
 # 早期探索遗留的 embeddable 压缩包（已被 scripts 中带 SHA 校验的下载取代）
 tongtian-tauri/src-tauri/vendor/
+
+# 图片生成中间产物（最终封面已压成 WebP 放在 src/renderer/assets/showcase/）
+vibe_images/

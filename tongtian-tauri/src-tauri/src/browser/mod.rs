@@ -604,11 +604,13 @@ fn kill_pid(pid: u32) -> Result<(), String> {
     if pid == 0 {
         return Ok(());
     }
-    let status = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
+    let mut cmd = Command::new("taskkill");
+    cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    crate::win_console::hide_console(&mut cmd);
+    let status = cmd
         .status()
         .map_err(|e| format!("BROWSER_USE_STOP_FAILED: 结束受控浏览器失败：{e}"))?;
     if status.success() {

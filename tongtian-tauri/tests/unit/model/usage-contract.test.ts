@@ -444,7 +444,7 @@ describe('usage-local：汇总、趋势与报表', () => {
       latencyMs: 1200, costMicros: 1080, currency: 'CNY', priced: true,
     });
     const md = usage.reportToMarkdown(usage.localReportView('monthly', now));
-    expect(md).toContain('# 通天办公 模型用量报表（本月）');
+    expect(md).toContain('# 任我行 模型用量报表（本月）');
     expect(md).toContain('## 按日趋势');
     expect(md).toContain('## 模型明细');
     expect(md).toContain('通义千问');

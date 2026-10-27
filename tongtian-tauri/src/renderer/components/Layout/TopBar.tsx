@@ -61,7 +61,7 @@ const TopBar: React.FC<TopBarProps> = ({
   const navigate = useNavigate();
   const location = useLocation();
 
-  const title = routeTitles[location.pathname] ?? '通天办公';
+  const title = routeTitles[location.pathname] ?? '任我行';
 
   // 合规硬开关：与合规概览/出域控制共用同一份策略，不维护本地副本
   const compliance = useSecurityStore((s) => s.compliance);

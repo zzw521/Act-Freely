@@ -58,6 +58,7 @@ mod suite;
 mod system;
 mod task;
 mod terminal;
+mod win_console;
 mod workspace;
 
 use std::sync::Arc;
@@ -856,6 +857,8 @@ async fn chat_cancel(
     Ok(json!({
         "taskId": task_id,
         "cancelled": cancellable,
+        // 已终态时把真实状态带回渲染层：否则界面只能停在停止键上反复取消
+        "status": record.status,
         "engine": engine_resp.unwrap_or(Value::Null),
     }))
 }
@@ -1749,6 +1752,9 @@ pub fn run() {
             // 后台常驻：托盘建成才允许关窗隐藏；托盘失败时保持「关窗即退出」的原行为
             setup_background(&app.handle().clone(), &services);
 
+            // 品牌外观：自定义名称/图标在每次启动时恢复（窗口标题、任务栏与托盘图标）
+            system::branding::apply_startup(&app.handle().clone(), &services.store);
+
             // 保持唤醒：恢复上次开启的状态（真实生效，失败仅告警不阻断启动）
             if keep_awake_requested(&services) {
                 if let Err(e) = services.keep_awake.apply(true) {
@@ -1832,6 +1838,8 @@ pub fn run() {
             system::system_autostart_status,
             system::badge::badge_support,
             system::badge::badge_set,
+            system::branding::branding_get,
+            system::branding::branding_customize,
             system::task_window::open_task_window,
             proxy_status,
             schedule_list,
@@ -2007,7 +2015,7 @@ fn setup_background(app: &AppHandle, services: &Arc<P0Services>) {
 
     let result = (|| -> tauri::Result<()> {
         let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
-        let quit = MenuItem::with_id(app, "quit", "退出通天办公", true, None::<&str>)?;
+        let quit = MenuItem::with_id(app, "quit", "退出应用", true, None::<&str>)?;
         let menu = Menu::with_items(app, &[&show, &quit])?;
 
         let quit_state = Arc::clone(&bg);

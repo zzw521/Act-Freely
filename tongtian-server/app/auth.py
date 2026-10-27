@@ -427,10 +427,24 @@ _PAGE_CSS = """
         color: #065F46; background: rgba(16, 185, 129, 0.10); line-height: 1.6; }
 """
 
-_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+_CSP = (
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
+    "base-uri 'none'; frame-ancestors 'none'"
+)
 
 
-def _page(title: str, body_html: str, status: int = 200) -> HTMLResponse:
+def _page(
+    title: str,
+    body_html: str,
+    status: int = 200,
+    form_action_origin: str | None = None,
+) -> HTMLResponse:
+    # Chrome 会把 form-action 套到表单提交后的 302 跳转上；回跳地址是另一个端口的
+    # loopback，必须显式放行，否则浏览器直接拦掉跳转，桌面端永远收不到 code。
+    form_action = "'self'"
+    if form_action_origin:
+        form_action = f"'self' {form_action_origin}"
+    csp = _CSP.replace("form-action 'self'", f"form-action {form_action}")
     body = f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(title)} - 通天办公</title><style>{_PAGE_CSS}</style></head>
@@ -441,7 +455,7 @@ def _page(title: str, body_html: str, status: int = 200) -> HTMLResponse:
     return HTMLResponse(
         body,
         status_code=status,
-        headers={"Content-Security-Policy": _CSP, "X-Content-Type-Options": "nosniff"},
+        headers={"Content-Security-Policy": csp, "X-Content-Type-Options": "nosniff"},
     )
 
 
@@ -471,6 +485,7 @@ def _login_page(state: str, redirect_uri: str, error: str = "", status: int = 20
 </form>
 <div class="switch">还没有账号？<a href="{link}">立即注册</a></div>""",
         status,
+        form_action_origin=_loopback_origin(redirect_uri),
     )
 
 
@@ -490,6 +505,7 @@ def _register_page(state: str, redirect_uri: str, error: str = "", status: int =
 </form>
 <div class="switch">已有账号？<a href="{link}">直接登录</a></div>""",
         status,
+        form_action_origin=_loopback_origin(redirect_uri),
     )
 
 
@@ -499,6 +515,21 @@ def _success_page(nickname: str) -> HTMLResponse:
         f"""<h2>登录成功</h2>
 <div class="ok">{html.escape(nickname)}，验证通过。正在返回通天办公桌面端，如未自动跳转可关闭此页面。</div>""",
     )
+
+
+def _loopback_origin(redirect_uri: str) -> str | None:
+    """回跳地址的 origin（含端口），用于放行表单提交后的跨端口跳转。"""
+    if not _loopback_redirect(redirect_uri):
+        return None
+    try:
+        parts = urllib.parse.urlsplit(redirect_uri)
+        port = parts.port
+    except ValueError:
+        return None
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{parts.scheme}://{host}:{port}" if port else f"{parts.scheme}://{host}"
 
 
 def _loopback_redirect(redirect_uri: str) -> bool:

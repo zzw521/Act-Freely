@@ -8,7 +8,7 @@
  * 支持 ?s=xxx 深度链接
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Box, Typography, IconButton, Switch, Slider, TextField, Button, Chip, CircularProgress, Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions, Tooltip } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
@@ -20,6 +20,8 @@ import CameraAltOutlinedIcon from '@mui/icons-material/CameraAltOutlined';
 import KeyboardOutlinedIcon from '@mui/icons-material/KeyboardOutlined';
 import PsychologyOutlinedIcon from '@mui/icons-material/PsychologyOutlined';
 import SystemUpdateAltOutlinedIcon from '@mui/icons-material/SystemUpdateAltOutlined';
+import BrandingWatermarkOutlinedIcon from '@mui/icons-material/BrandingWatermarkOutlined';
+import ImageOutlinedIcon from '@mui/icons-material/ImageOutlined';
 import ArchiveOutlinedIcon from '@mui/icons-material/ArchiveOutlined';
 import DashboardOutlinedIcon from '@mui/icons-material/DashboardOutlined';
 import MemoryOutlinedIcon from '@mui/icons-material/MemoryOutlined';
@@ -39,6 +41,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useWorkbenchStore } from '../../store/workbenchStore';
 import { usePreferenceStore } from '../../stores/usePreferenceStore';
 import { useAuthStore } from '../../stores/useAuthStore';
+import { useBrandingStore } from '../../stores/useBrandingStore';
 import { useAppStore } from '../../stores/useAppStore';
 import ModelSettings from '../../components/ModelSettings';
 import BrowserUsePanel from '../../pages/BrowserUsePanel';
@@ -79,7 +82,8 @@ import type { AuthServerProbe } from '../../../shared/contracts';
 import { resolveEngineBaseUrl } from '../../lib/engine-endpoint';
 import { engineFetch } from '../../lib/engine-http';
 import { useI18n } from '../../i18n';
-import type { AppSettingsData, AcpConfigState, AcpServerStatus, AutostartStatus, AwarenessView, AwarenessPatch, AwarenessFileEntry, AwarenessFileName, AwarenessProfile, AwarenessStyleId, ImPreferences, MemoryEntry, PermissionState, PiiOutboundMode, ProxyStatus, SandboxEnvUsage, SystemCapability, SystemPermissionStatus, TerminalCapabilities, ToolApprovalMode } from '../../../shared/contracts';
+import brandLogo from '../../assets/brand-logo.png';
+import type { AppSettingsData, AcpConfigState, AcpServerStatus, AutostartStatus, AwarenessView, AwarenessPatch, AwarenessFileEntry, AwarenessFileName, AwarenessProfile, AwarenessStyleId, BrandingInfo, ImPreferences, MemoryEntry, PermissionState, PiiOutboundMode, ProxyStatus, SandboxEnvUsage, SystemCapability, SystemPermissionStatus, TerminalCapabilities, ToolApprovalMode } from '../../../shared/contracts';
 
 // ── 三分组分区定义 ─────────────────────────────────────────────────
 
@@ -105,6 +109,7 @@ const sectionGroups: SectionGroup[] = [
       { id: 'snapshot', label: '应用快照', icon: CameraAltOutlinedIcon },
       { id: 'shortcuts', label: '快捷键', icon: KeyboardOutlinedIcon },
       { id: 'awareness', label: '意识', icon: PsychologyOutlinedIcon },
+      { id: 'branding', label: '品牌外观', icon: BrandingWatermarkOutlinedIcon },
       { id: 'update', label: '更新应用', icon: SystemUpdateAltOutlinedIcon },
       { id: 'archive', label: '已归档', icon: ArchiveOutlinedIcon },
     ],
@@ -581,7 +586,7 @@ const ProfilePanel: React.FC = () => {
           mockMode
             ? '当前为 Mock 登录（TT_AUTH_MOCK=true），不连接服务端；关闭后可用综合服务端账号登录'
             : serverProbe
-              ? `${serverProbe.baseUrl}${serverProbe.reachable ? ` · ${serverProbe.service ?? '通天办公服务端'}${serverProbe.version ? ` v${serverProbe.version}` : ''}` : ' · 未连接'}`
+              ? `${serverProbe.baseUrl}${serverProbe.reachable ? ` · ${serverProbe.service ?? '综合服务端'}${serverProbe.version ? ` v${serverProbe.version}` : ''}` : ' · 未连接'}`
               : '正在探测综合服务端…'
         }
         control={
@@ -972,7 +977,7 @@ const SystemPermissionSection: React.FC = () => {
 
       {view && !view.openSupported ? (
         <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mt: 1 }}>
-          当前是浏览器预览通道：通知与麦克风的状态已向网页问过，其余项问不到；且无法打开系统隐私设置，请在桌面版通天办公中完成授权。
+          当前是浏览器预览通道：通知与麦克风的状态已向网页问过，其余项问不到；且无法打开系统隐私设置，请在桌面版任我行中完成授权。
         </Typography>
       ) : null}
 
@@ -1040,7 +1045,7 @@ const AutoStartSetting: React.FC = () => {
             : `已登记到系统启动项：${status.command ?? ''}`
           : status.requested
             ? '设置里开着，但系统启动项里没有本程序（可能被安全软件清理），请重新开启'
-            : '登录电脑时自动启动通天办公（写入当前用户的系统启动项）';
+            : '登录电脑时自动启动任我行（写入当前用户的系统启动项）';
 
   return (
     <SettingRow
@@ -1167,7 +1172,7 @@ const NotificationSettings: React.FC = () => {
       setError(
         p === 'unsupported'
           ? '当前环境不提供系统通知能力，无法开启'
-          : '系统未授权通知，请在系统设置中允许通天办公发送通知后再开',
+          : '系统未授权通知，请在系统设置中允许任我行发送通知后再开',
       );
       // 没拿到授权就不把开关写成「已开」：界面必须和系统事实一致
       return;
@@ -1585,7 +1590,7 @@ const ShortcutsPanel: React.FC = () => {
       />
       <SettingRow
         label="触发按键"
-        sub="应用内快捷键：仅当通天办公窗口位于前台时生效；系统级全局热键尚未提供"
+        sub="应用内快捷键：仅当任我行窗口位于前台时生效；系统级全局热键尚未提供"
         control={
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, justifyContent: 'flex-end' }}>
             <Typography sx={{ fontSize: '11.5px', color: quickPickOn ? '#0D9488' : 'var(--tt-text-4)' }}>
@@ -2213,6 +2218,397 @@ const AwarenessPanel: React.FC = () => {
           </Button>
           <Button size="small" variant="contained" onClick={saveStyle} sx={{ bgcolor: 'var(--tt-text-1)', fontSize: '12px' }}>
             保存
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+};
+
+// ── 分区：品牌外观（单次自定义名称与图标） ─────────────────────
+
+/** epoch ms → 本地时间（设置页展示「修改机会使用时间」） */
+function formatBrandTime(ms: number): string {
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return '';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** PNG 文件 → base64（与 Rust `branding_customize` 的入参一致；非 PNG 直接拒绝） */
+async function pngFileToBase64(file: File): Promise<string> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const magic = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  if (bytes.length < 8 || magic.some((b, i) => bytes[i] !== b)) {
+    throw new Error('NOT_PNG');
+  }
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+/** 品牌标识预览：自定义图标优先，否则展示安装包默认品牌图 */
+const BrandMark: React.FC<{ name: string; icon: string | null; size?: number }> = ({
+  name,
+  icon,
+  size = 36,
+}) =>
+  icon ? (
+    <Box
+      component="img"
+      src={icon}
+      alt={name}
+      sx={{
+        width: size,
+        height: size,
+        borderRadius: '10px',
+        objectFit: 'cover',
+        border: '1px solid var(--tt-border-soft)',
+        flexShrink: 0,
+      }}
+    />
+  ) : (
+    <Box
+      sx={{
+        width: size,
+        height: size,
+        borderRadius: '10px',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        flexShrink: 0,
+        bgcolor: '#fff',
+        border: '1px solid var(--tt-border-soft)',
+      }}
+    >
+      <Box
+        component="img"
+        src={brandLogo}
+        alt={name}
+        sx={{ width: '76%', height: '76%', objectFit: 'contain', display: 'block' }}
+      />
+    </Box>
+  );
+
+/**
+ * 品牌外观。
+ * 约束：安装后只有一次修改机会（Rust 落 `appBrandCustomizedAt` 后即锁定）；
+ * 只改窗口标题、任务栏/托盘图标与界面内品牌，快捷方式与应用文件名由安装包决定。
+ */
+const BrandingPanel: React.FC = () => {
+  const { t: tr } = useI18n();
+  const info = useBrandingStore((s) => s.info);
+  const loaded = useBrandingStore((s) => s.loaded);
+  const customize = useBrandingStore((s) => s.customize);
+
+  const [name, setName] = useState(info.name);
+  const [iconBase64, setIconBase64] = useState<string | null>(null);
+  const [iconPreview, setIconPreview] = useState<string | null>(null);
+  const [iconName, setIconName] = useState('');
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [result, setResult] = useState<BrandingInfo | null>(null);
+  const fileRef = useRef<HTMLInputElement | null>(null);
+  const nameInitialized = useRef(false);
+
+  // 首次读到真实品牌后回填输入框；之后不覆盖用户正在输入的内容
+  useEffect(() => {
+    if (!loaded || nameInitialized.current) return;
+    setName(info.name);
+    nameInitialized.current = true;
+  }, [loaded, info.name]);
+
+  // 预览用 object URL 在替换/卸载时释放
+  useEffect(
+    () => () => {
+      if (iconPreview) URL.revokeObjectURL(iconPreview);
+    },
+    [iconPreview],
+  );
+
+  const canEdit = info.platform !== 'browser' && !info.customized;
+  const trimmed = name.trim();
+  const nameChanged = trimmed !== '' && trimmed !== info.name;
+  const dirty = nameChanged || Boolean(iconBase64);
+
+  const pickFile = async (file: File | undefined) => {
+    if (!file) return;
+    setError('');
+    if (file.type && file.type !== 'image/png') {
+      setError(tr('只支持 PNG 图片，其它格式请先转换'));
+      return;
+    }
+    if (file.size > 4 * 1024 * 1024) {
+      setError(tr('图片不能超过 4 MB'));
+      return;
+    }
+    try {
+      const b64 = await pngFileToBase64(file);
+      setIconBase64(b64);
+      setIconName(file.name);
+      setIconPreview(URL.createObjectURL(file));
+    } catch {
+      setError(tr('文件不是有效的 PNG 图片'));
+    }
+  };
+
+  const clearIcon = () => {
+    setIconBase64(null);
+    setIconName('');
+    setIconPreview(null);
+  };
+
+  const submit = async () => {
+    if (!canEdit || busy) return;
+    setConfirmOpen(false);
+    setBusy(true);
+    setError('');
+    try {
+      const next = await customize({
+        name: nameChanged ? trimmed : null,
+        iconBase64: iconBase64 ?? null,
+      });
+      setResult(next);
+      clearIcon();
+    } catch (e) {
+      setError(errorTextOf(e, tr('品牌修改失败')));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const appliedTargets = result
+    ? ([
+        result.applied?.windowTitle ? tr('窗口标题') : '',
+        result.applied?.windowIcon ? tr('任务栏图标') : '',
+        result.applied?.trayIcon ? tr('托盘图标') : '',
+      ].filter(Boolean) as string[])
+    : [];
+
+  return (
+    <Box sx={{ maxWidth: 860 }}>
+      <PanelTitle title="品牌外观" desc="修改应用显示名称与图标；安装后仅有一次修改机会" />
+
+      <SettingRow
+        label={tr('当前品牌')}
+        sub={info.customized ? tr('已使用自定义品牌') : tr('安装包默认品牌')}
+        control={
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.25 }}>
+            <BrandMark name={info.name} icon={iconPreview ?? info.iconDataUrl} size={34} />
+            <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'var(--tt-text-1)' }}>
+              {info.name}
+            </Typography>
+          </Box>
+        }
+      />
+      <SettingRow
+        label={tr('署名')}
+        sub={tr('开发者与版权归属，随安装包发布')}
+        control={
+          <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-2)' }}>
+            {info.attribution}
+          </Typography>
+        }
+      />
+
+      {info.customized ? (
+        <>
+          <SettingRow
+            label={tr('修改机会')}
+            sub={
+              info.customizedAt
+                ? tr('已于 {time} 使用，应用内不再提供第二次修改', {
+                    time: formatBrandTime(info.customizedAt),
+                  })
+                : tr('已使用')
+            }
+            control={<Typography sx={{ fontSize: '13px', color: 'var(--tt-text-3)' }}>{tr('已使用')}</Typography>}
+          />
+          {result && (
+            <Box
+              sx={{
+                mt: 1.5,
+                p: 2,
+                borderRadius: '12px',
+                border: '1px solid rgba(20, 184, 166, 0.35)',
+                bgcolor: 'rgba(20, 184, 166, 0.08)',
+              }}
+            >
+              <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)' }}>
+                {appliedTargets.length > 0
+                  ? tr('已生效：{targets}', { targets: appliedTargets.join('、') })
+                  : tr('界面内品牌已更新，系统窗口不在当前通道')}
+              </Typography>
+              {result.warnings?.map((w) => (
+                <Typography key={w} sx={{ fontSize: '12px', color: 'var(--tt-text-3)', mt: 0.5 }}>
+                  {w}
+                </Typography>
+              ))}
+            </Box>
+          )}
+        </>
+      ) : !canEdit ? (
+        <SettingRow
+          label={tr('修改入口')}
+          unavailable
+          sub={tr('当前通道没有桌面窗口与托盘，请在 Windows 桌面版中修改')}
+          control={<Typography sx={{ fontSize: '13px', color: 'var(--tt-text-3)' }}>—</Typography>}
+        />
+      ) : (
+        <Box
+          sx={{
+            mt: 2,
+            p: 2.5,
+            borderRadius: '14px',
+            border: '1px solid var(--tt-border)',
+            bgcolor: 'var(--tt-surface)',
+          }}
+        >
+          <Typography sx={{ fontSize: '13.5px', fontWeight: 600, color: 'var(--tt-text-1)' }}>
+            {tr('应用名称')}
+          </Typography>
+          <TextField
+            size="small"
+            fullWidth
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            inputProps={{ maxLength: 24 }}
+            sx={{ mt: 1, maxWidth: 360 }}
+          />
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mt: 0.75 }}>
+            {tr('1–24 个字符；留空表示保留当前名称')}
+          </Typography>
+
+          <Typography sx={{ fontSize: '13.5px', fontWeight: 600, color: 'var(--tt-text-1)', mt: 2.5 }}>
+            {tr('应用图标')}
+          </Typography>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mt: 1 }}>
+            <BrandMark name={trimmed || info.name} icon={iconPreview ?? info.iconDataUrl} size={44} />
+            <Button
+              size="small"
+              variant="outlined"
+              startIcon={<ImageOutlinedIcon />}
+              disabled={busy}
+              onClick={() => fileRef.current?.click()}
+              sx={{ textTransform: 'none', borderRadius: '8px' }}
+            >
+              {tr('选择 PNG 图片')}
+            </Button>
+            {iconBase64 && (
+              <Button size="small" onClick={clearIcon} disabled={busy} sx={{ textTransform: 'none' }}>
+                {tr('清除')}
+              </Button>
+            )}
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/png"
+              hidden
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                e.target.value = '';
+                void pickFile(file);
+              }}
+            />
+          </Box>
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mt: 0.75 }}>
+            {tr('PNG，16×16 至 1024×1024 像素，不超过 4 MB')}
+            {iconName ? ` · ${iconName}` : ''}
+          </Typography>
+
+          <Box
+            sx={{
+              mt: 2,
+              p: 1.5,
+              borderRadius: '10px',
+              border: '1px solid rgba(245, 158, 11, 0.35)',
+              bgcolor: 'rgba(245, 158, 11, 0.08)',
+            }}
+          >
+            <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-2)', lineHeight: 1.7 }}>
+              {tr('保存后立即生效且不可恢复，应用内不再提供第二次修改。')}
+            </Typography>
+            <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-3)', lineHeight: 1.7, mt: 0.5 }}>
+              {tr('生效范围：窗口标题、任务栏/托盘图标与界面内名称；已安装的桌面快捷方式名称与应用文件名不会改变。')}
+            </Typography>
+          </Box>
+
+          {info.platform === 'mock' && (
+            <Typography sx={{ fontSize: '12px', color: '#B45309', mt: 1 }}>
+              {tr('Mock 模式：修改只保存在浏览器内存，不写入窗口标题或系统图标')}
+            </Typography>
+          )}
+
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mt: 2 }}>
+            <Button
+              variant="contained"
+              disabled={!dirty || busy}
+              onClick={() => setConfirmOpen(true)}
+              sx={{
+                textTransform: 'none',
+                borderRadius: '9px',
+                background: 'linear-gradient(90deg, #14B8A6 0%, #06B6D4 100%)',
+                '&.Mui-disabled': { background: 'rgba(148, 163, 184, 0.25)' },
+              }}
+            >
+              {busy ? tr('正在应用…') : tr('保存并应用（仅一次）')}
+            </Button>
+            {!dirty && (
+              <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>
+                {tr('修改名称或选择图片后可提交')}
+              </Typography>
+            )}
+          </Box>
+          {error && (
+            <Typography sx={{ fontSize: '12.5px', color: '#DC2626', mt: 1.5 }}>{error}</Typography>
+          )}
+        </Box>
+      )}
+
+      <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mt: 1.5, lineHeight: 1.7 }}>
+        {tr('图标与名称保存在本机运行目录，重启后自动恢复；卸载重装不会重置已使用的修改机会。')}
+      </Typography>
+
+      <Dialog
+        open={confirmOpen}
+        onClose={() => !busy && setConfirmOpen(false)}
+        PaperProps={{ sx: { borderRadius: '14px', minWidth: 360 } }}
+      >
+        <DialogTitle sx={{ fontSize: '15px', fontWeight: 700 }}>
+          {tr('确认使用唯一的修改机会？')}
+        </DialogTitle>
+        <DialogContent>
+          <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-2)', lineHeight: 1.8 }}>
+            {tr('保存后立即生效，且应用内不再提供第二次修改或恢复默认的入口。')}
+          </Typography>
+          <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-1)', mt: 1.5 }}>
+            {tr('新名称：')}
+            {nameChanged ? trimmed : info.name}
+          </Typography>
+          <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-1)', mt: 0.5 }}>
+            {tr('新图标：')}
+            {iconBase64 ? tr('已选择 PNG 图片') : tr('保持不变')}
+          </Typography>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button
+            onClick={() => setConfirmOpen(false)}
+            disabled={busy}
+            sx={{ color: 'var(--tt-text-3)', fontSize: '13px', textTransform: 'none' }}
+          >
+            {tr('取消')}
+          </Button>
+          <Button
+            onClick={() => void submit()}
+            disabled={busy}
+            variant="contained"
+            sx={{ fontSize: '13px', textTransform: 'none', background: '#14B8A6' }}
+          >
+            {tr('确认修改')}
           </Button>
         </DialogActions>
       </Dialog>
@@ -3342,6 +3738,8 @@ const Settings: React.FC = () => {
         return <ShortcutsPanel />;
       case 'awareness':
         return <AwarenessPanel />;
+      case 'branding':
+        return <BrandingPanel />;
       case 'update':
         return <UpdatePanel />;
       case 'workbench':

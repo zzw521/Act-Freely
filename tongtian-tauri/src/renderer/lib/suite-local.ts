@@ -106,7 +106,7 @@ export function handleLocalSuiteChannel(channel: string, args: unknown[]): Local
         handled: true,
         value: Promise.reject(
           new Error(
-            'PLUGIN_UNSUPPORTED: 浏览器通道无法读取插件包目录与内置模板，请在桌面版通天办公使用插件 SDK',
+            'PLUGIN_UNSUPPORTED: 浏览器通道无法读取插件包目录与内置模板，请在桌面版任我行使用插件 SDK',
           ),
         ),
       };

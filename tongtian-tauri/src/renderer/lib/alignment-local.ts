@@ -497,7 +497,7 @@ export function localComputerUseCapabilities(): ComputerUseCapabilities {
 /** 本地通道无法截屏：如实报错，不返回占位图 */
 export function captureLocalComputerUseScreen(): never {
   throw new Error(
-    'COMPUTER_USE_UNSUPPORTED: 当前通道没有系统截屏能力，请在 Windows 桌面版通天办公中自检',
+    'COMPUTER_USE_UNSUPPORTED: 当前通道没有系统截屏能力，请在 Windows 桌面版任我行中自检',
   );
 }
 
@@ -605,7 +605,7 @@ export function localBrowserUseCapabilities(): BrowserUseCapabilities {
 /** 本地通道没有受控浏览器：如实报错，不假装启动成功 */
 export function startLocalBrowserUseSession(): never {
   throw new Error(
-    'BROWSER_USE_NOT_FOUND: 当前通道没有受控浏览器执行器，请在桌面版通天办公中使用',
+    'BROWSER_USE_NOT_FOUND: 当前通道没有受控浏览器执行器，请在桌面版任我行中使用',
   );
 }
 
@@ -624,7 +624,7 @@ const localAcpConfig = (): AcpConfigState => ({
   timeoutSeconds: 600,
   persisted: false,
   permissions: ['deny', 'allow'],
-  error: '当前通道没有桌面端设置存储，ACP 委派配置只在桌面版通天办公中生效',
+  error: '当前通道没有桌面端设置存储，ACP 委派配置只在桌面版任我行中生效',
 });
 
 /**
@@ -640,7 +640,7 @@ export function localTerminalCapabilities(): TerminalCapabilities {
     pipe: false,
     maxSessions: 0,
     inputLimit: LOCAL_TERMINAL_INPUT_LIMIT,
-    reason: '浏览器/Mock 通道没有本机 shell 进程，终端 AI+ 只在桌面版通天办公中可用',
+    reason: '浏览器/Mock 通道没有本机 shell 进程，终端 AI+ 只在桌面版任我行中可用',
     engineRunning: false,
     engineUrl: null,
     acp: localAcpConfig(),
@@ -653,7 +653,7 @@ export function localTerminalPolicy(): { enabled: boolean; persisted: boolean } 
 
 function terminalUnsupported(): never {
   throw new Error(
-    'TERMINAL_UNSUPPORTED: 当前通道没有本机 shell 进程，终端 AI+ 只在桌面版通天办公中可用',
+    'TERMINAL_UNSUPPORTED: 当前通道没有本机 shell 进程，终端 AI+ 只在桌面版任我行中可用',
   );
 }
 
@@ -666,7 +666,7 @@ export const suggestLocalTerminal = terminalUnsupported;
 
 export function setLocalAcpConfig(): never {
   throw new Error(
-    'TERMINAL_UNSUPPORTED: 当前通道没有桌面端设置存储，ACP 配置只在桌面版通天办公中生效',
+    'TERMINAL_UNSUPPORTED: 当前通道没有桌面端设置存储，ACP 配置只在桌面版任我行中生效',
   );
 }
 

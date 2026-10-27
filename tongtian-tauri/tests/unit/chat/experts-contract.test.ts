@@ -42,7 +42,7 @@ describe('对话内专家选择一路透传', () => {
     expect(input).toContain('const setChatExpertId = useWorkbenchStore((s) => s.setChatExpertId);');
     expect(input).toContain('chatExpertId || undefined,');
     expect(input).toContain(
-      '}, [value, loading, staging, attachments, referencedSkill, selectedModel, onSend, activeMode, chatExpertId]);',
+      '}, [value, loading, stoppable, staging, attachments, referencedSkill, selectedModel, onSend, activeMode, chatExpertId]);',
     );
     // 清理失效选择：专家被删后不能带着旧 id 提交出必然失败的任务
     expect(input).toContain('if (current && !list.some((e) => e.id === current)) setChatExpertId(\'\');');

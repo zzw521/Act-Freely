@@ -37,6 +37,8 @@ flate2 = "1.1"
 crc32fast = "1.5"
 # 专家套件包上传：zip 字节经 IPC 以 base64 透传（该版本已在依赖树内，离线可解析）
 base64 = "0.22"
+# 品牌图标 PNG 解码（0.17.16 已在依赖树内，离线可解析；不引入 image 大依赖）
+png = "0.17"
 # Hook matcher（`Bash|Write`、`mcp__.*`）：regex 1.13.1 已在依赖树内，离线可解析
 regex = "1.13"
 # 在线市场下载完整性校验：sha2 0.10 已在依赖树内（tauri-codegen 传递依赖），离线可解析

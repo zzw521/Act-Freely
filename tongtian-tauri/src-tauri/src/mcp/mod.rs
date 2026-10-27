@@ -708,6 +708,7 @@ async fn stdio_handshake(job: ProbeTarget) -> Result<Vec<ToolRow>, String> {
     for (k, v) in &job.env {
         cmd.env(k, v);
     }
+    crate::win_console::hide_console_async(&mut cmd);
 
     let mut child = cmd.spawn().map_err(|e| {
         format!(

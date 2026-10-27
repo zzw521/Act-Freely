@@ -122,7 +122,7 @@ describe('设置页未接入的开关统一禁用并标注', () => {
     // 开关真实写入 app settings，并各自带真实消费说明
     expect(src).toContain('updateAppSettings({ quickPickEnabled:');
     expect(src).toContain('updateAppSettings({ privacyMode:');
-    expect(src).toContain('应用内快捷键：仅当通天办公窗口位于前台时生效；系统级全局热键尚未提供');
+    expect(src).toContain('应用内快捷键：仅当任我行窗口位于前台时生效；系统级全局热键尚未提供');
     expect(src).toContain('新任务的目标与回复不写入本地会话库');
   });
 

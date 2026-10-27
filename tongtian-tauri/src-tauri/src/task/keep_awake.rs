@@ -92,19 +92,21 @@ impl KeepAwake {
 
 #[cfg(windows)]
 fn spawn_holder() -> Result<Child, String> {
-    Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            HOLDER_SCRIPT,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+        HOLDER_SCRIPT,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    // -WindowStyle Hidden 只在 PowerShell 自己拿到控制台后生效，先抑制窗口创建
+    crate::win_console::hide_console(&mut cmd);
+    cmd.spawn()
         .map_err(|e| format!("SCHEDULE_KEEP_AWAKE_FAILED: 唤醒约束进程启动失败（{e}）"))
 }
 

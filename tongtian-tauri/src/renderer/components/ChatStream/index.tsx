@@ -21,7 +21,6 @@ import {
   Snackbar,
   Alert,
 } from '@mui/material';
-import SmartToyIcon from '@mui/icons-material/SmartToy';
 import BuildIcon from '@mui/icons-material/Build';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
@@ -35,6 +34,7 @@ import RefreshIcon from '@mui/icons-material/Refresh';
 import Markdown from 'react-markdown';
 import { Message, Role, ChatEvent, StepType } from '../../../shared/types';
 import FilePreview from '../FilePreview';
+import Panda, { type PandaState } from '../Panda';
 import { useAppSettings } from '../../lib/use-app-settings';
 import { openArtifact } from '../../lib/artifact-open';
 import { useI18n } from '../../i18n';
@@ -314,6 +314,14 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
     const processRunning = running && failedCount === 0;
     // 显式切换优先，其次是设置项/实验开关决定的默认态
     const processOpen = openTurns[turnIdx] ?? defaultProcessOpen;
+    // 头像随本轮流转：还没出步骤时托腮思考，有步骤时戴安全帽干活，失败时挠头
+    const pandaState: PandaState = processRunning
+      ? processEvents.length > 0
+        ? 'working'
+        : 'thinking'
+      : failedCount > 0
+        ? 'oops'
+        : 'idle';
     const headerText =
       processRunning && lastStart && lastStart.type === 'step_start'
         ? tr('正在执行：{desc}…', { desc: lastStart.description ?? '' })
@@ -327,51 +335,51 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
         sx={{
           display: 'flex',
           gap: 1.5,
-          mb: 2.5,
+          mb: 3.5,
           alignItems: 'flex-start',
+          // 回复操作栏默认淡出，悬停整轮时再完整显示
+          '&:hover .turn-actions': { opacity: 1 },
           // 查找命中轮次：描边标出位置，不改布局
           ...(highlightTurn === turnIdx ? { outline: '2px solid #0D9488', outlineOffset: 4, borderRadius: '10px' } : {}),
         }}
       >
-        <Avatar
-          sx={{ width: 32, height: 32, flexShrink: 0, bgcolor: '#16A34A', boxShadow: '0 2px 8px rgba(22, 163, 74, 0.3)' }}
+        <Box
+          sx={{
+            width: 32,
+            height: 32,
+            flexShrink: 0,
+            mt: '1px',
+            borderRadius: '50%',
+            overflow: 'hidden',
+            bgcolor: 'var(--tt-surface-2)',
+            border: '1px solid var(--tt-border-soft)',
+          }}
         >
-          <SmartToyIcon sx={{ fontSize: 18 }} />
-        </Avatar>
-        <Box sx={{ maxWidth: '80%', minWidth: 0, flexGrow: 1 }}>
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
-            <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-2)' }}>{tr('通天助手')}</Typography>
+          <Panda state={pandaState} size={30} />
+        </Box>
+        <Box sx={{ minWidth: 0, flexGrow: 1 }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.25 }}>
+            <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-2)' }}>{tr('通通')}</Typography>
           </Box>
-          <Box
-            sx={{
-              px: 2,
-              py: 1.5,
-              borderRadius: '4px 16px 16px 16px',
-              bgcolor: 'var(--tt-surface)',
-              border: '1px solid #E2E8F0',
-              boxShadow: '0 1px 3px rgba(15, 23, 42, 0.04)',
-            }}
-          >
+          <Box sx={{ py: 0.25 }}>
             {/* 思考与工具调用（模型过程）：内嵌在回复中，默认折叠 */}
             {processEvents.length > 0 && (
               <Box sx={{ mb: delivers.length > 0 || running ? 1.25 : 0 }}>
                 <Box
                   onClick={() => toggleTurn(turnIdx, processOpen)}
                   sx={{
-                    display: 'flex',
+                    display: 'inline-flex',
                     alignItems: 'center',
-                    gap: 1,
+                    gap: 0.75,
                     px: 1.25,
-                    py: 0.75,
-                    borderRadius: '10px',
-                    border: '1px solid #E2E8F0',
-                    background: 'var(--tt-surface-2)',
+                    py: 0.45,
+                    borderRadius: '999px',
+                    border: '1px solid var(--tt-border-soft)',
+                    background: 'transparent',
                     cursor: 'pointer',
-                    width: 'fit-content',
-                    minWidth: 220,
                     maxWidth: '100%',
-                    transition: 'background 0.15s ease',
-                    '&:hover': { background: 'var(--tt-surface-2)' },
+                    transition: 'background 0.15s ease, border-color 0.15s ease',
+                    '&:hover': { background: 'var(--tt-surface-2)', borderColor: 'var(--tt-border)' },
                   }}
                 >
                   {processRunning ? (
@@ -407,7 +415,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
               const finalText = (event as { final_text?: string }).final_text ?? '';
               if (arts.length === 0) {
                 return (
-                  <Box key={`deliver-${idx}`} className="markdown-body" sx={{ color: 'var(--tt-text-2)', fontSize: chatFontSize }}>
+                  <Box key={`deliver-${idx}`} className="markdown-body" sx={{ color: 'var(--tt-text-2)', fontSize: chatFontSize, maxWidth: '72ch' }}>
                     {renderMarkdown(finalText || tr('任务完成'))}
                   </Box>
                 );
@@ -415,13 +423,15 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
               return (
                 <Box key={`deliver-${idx}`}>
                   <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                    <Inventory2Icon sx={{ fontSize: 18, color: '#16A34A' }} />
+                    <Box sx={{ width: 40, height: 40, flexShrink: 0 }}>
+                      <Panda state="done" size={40} />
+                    </Box>
                     <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#15803D' }}>
                       {tr('任务已完成，这是你的交付物')}
                     </Typography>
                   </Box>
                   {finalText && (
-                    <Box className="markdown-body" sx={{ color: 'var(--tt-text-2)', fontSize: chatFontSize, mb: 1 }}>
+                    <Box className="markdown-body" sx={{ color: 'var(--tt-text-2)', fontSize: chatFontSize, mb: 1, maxWidth: '72ch' }}>
                       {renderMarkdown(finalText)}
                     </Box>
                   )}
@@ -429,23 +439,25 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                     {arts.map((artifact, artIdx) => (
                       <Tooltip
                         key={`${artifact}-${artIdx}`}
-                        title={tr(previewMode === '系统默认程序' ? '点击用系统默认程序打开' : '点击在应用内预览')}
+                        title={`${artifact} · ${tr(previewMode === '系统默认程序' ? '点击用系统默认程序打开' : '点击在应用内预览')}`}
                         placement="top"
                       >
                         <Chip
-                          label={artifact}
+                          icon={<Inventory2Icon sx={{ fontSize: 14 }} />}
+                          label={artifact.split(/[\\/]/).filter(Boolean).pop() ?? artifact}
                           size="small"
                           clickable
                           onClick={() => void handleOpenArtifact(artifact)}
                           sx={{
                             fontSize: '12px',
-                            height: 24,
-                            bgcolor: '#F0FDF4',
-                            color: '#15803D',
-                            border: '1px solid #BBF7D0',
+                            height: 26,
+                            bgcolor: 'var(--tt-surface-2)',
+                            color: 'var(--tt-text-2)',
+                            border: '1px solid var(--tt-border)',
                             fontWeight: 500,
                             maxWidth: '100%',
-                            '&:hover': { bgcolor: '#DCFCE7', borderColor: '#86EFAC' },
+                            '& .MuiChip-icon': { color: '#16A34A' },
+                            '&:hover': { bgcolor: 'var(--tt-surface)', borderColor: '#86EFAC', color: '#15803D' },
                           }}
                         />
                       </Tooltip>
@@ -457,7 +469,17 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
 
             {/* 思考中（本轮运行中且尚无交付） */}
             {running && delivers.length === 0 && processEvents.length === 0 && (
-              <Box sx={{ display: 'flex', gap: 0.5, py: 0.5 }}>
+              <Box
+                sx={{
+                  display: 'inline-flex',
+                  gap: 0.6,
+                  alignItems: 'center',
+                  px: 1.25,
+                  py: 0.9,
+                  borderRadius: '12px 12px 12px 4px',
+                  bgcolor: 'var(--tt-surface-2)',
+                }}
+              >
                 {[0, 1, 2].map((i) => (
                   <Box
                     key={i}
@@ -465,7 +487,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                       width: 6,
                       height: 6,
                       borderRadius: '50%',
-                      bgcolor: '#22C55E',
+                      bgcolor: '#14B8A6',
                       animation: 'thinkingBounce 1.2s infinite ease-in-out',
                       animationDelay: `${i * 0.15}s`,
                       '@keyframes thinkingBounce': {
@@ -481,7 +503,17 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
 
           {/* 回复操作栏：点赞/点踩/复制/分享（仅有文件产出时）/重新生成 */}
           {!running && (
-            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.25, mt: 0.75 }}>
+            <Box
+              className="turn-actions"
+              sx={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 0.25,
+                mt: 0.5,
+                opacity: 0.5,
+                transition: 'opacity 0.15s ease',
+              }}
+            >
               <Tooltip title={tr('点赞')}>
                 <IconButton size="small" sx={{ width: 26, height: 26 }} onClick={() => toggleFeedback(turnIdx, 'up')}>
                   <ThumbUpOutlinedIcon sx={{ fontSize: 15, color: feedback[turnIdx] === 'up' ? '#16A34A' : '#9CA3AF' }} />
@@ -550,33 +582,32 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
             sx={{
               display: 'flex',
               justifyContent: 'flex-end',
-              mb: 2.5,
+              mb: 2,
               ...(highlightTurn === currentTurn
                 ? { outline: '2px solid #0D9488', outlineOffset: 4, borderRadius: '16px' }
                 : {}),
             }}
           >
-            <Box sx={{ maxWidth: '75%' }}>
+            <Box sx={{ maxWidth: '72%', display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
               <Box
+                title={new Date(msg.ts).toLocaleString(locale)}
                 sx={{
-                  px: 2,
-                  py: 1.25,
+                  px: 1.75,
+                  py: 1.1,
                   borderRadius: '16px 16px 4px 16px',
-                  background: 'linear-gradient(135deg, #22C55E 0%, #16A34A 100%)',
-                  color: '#fff',
+                  // 半透明中性底：亮色主题下是浅灰，暗色主题下是微亮，不再写死一块亮色
+                  bgcolor: 'rgba(100, 116, 139, 0.10)',
+                  color: 'var(--tt-text-1)',
+                  border: '1px solid var(--tt-border-soft)',
                   fontSize: chatFontSize,
                   fontFamily: 'var(--tt-chat-font)',
-                  lineHeight: 1.6,
-                  boxShadow: '0 2px 8px rgba(22, 163, 74, 0.25)',
+                  lineHeight: 1.65,
                   whiteSpace: 'pre-wrap',
                   wordBreak: 'break-word',
                 }}
               >
                 {msg.content as string}
               </Box>
-              <Typography sx={{ fontSize: '11px', color: '#94A3B8', mt: 0.5, textAlign: 'right' }}>
-                {new Date(msg.ts).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' })}
-              </Typography>
             </Box>
           </Box>,
         );
@@ -591,26 +622,35 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
         return;
       }
 
-      // AI / 工具文本消息：左对齐卡片（保留原样式）
+      // AI / 工具文本消息：助手纯文本，工具调用保留轻量卡片
       const isAi = !isTool;
       nodes.push(
-        <Box key={msg.id} sx={{ display: 'flex', gap: 1.5, mb: 2.5, alignItems: 'flex-start' }}>
-          <Avatar
-            sx={{
-              width: 32,
-              height: 32,
-              flexShrink: 0,
-              bgcolor: isAi ? '#16A34A' : '#64748B',
-              boxShadow: isAi ? '0 2px 8px rgba(22, 163, 74, 0.3)' : 'none',
-            }}
-          >
-            {isAi ? <SmartToyIcon sx={{ fontSize: 18 }} /> : <BuildIcon sx={{ fontSize: 16 }} />}
-          </Avatar>
+        <Box key={msg.id} sx={{ display: 'flex', gap: 1.5, mb: 3.5, alignItems: 'flex-start' }}>
+          {isAi ? (
+            <Box
+              sx={{
+                width: 32,
+                height: 32,
+                flexShrink: 0,
+                mt: '1px',
+                borderRadius: '50%',
+                overflow: 'hidden',
+                bgcolor: 'var(--tt-surface-2)',
+                border: '1px solid var(--tt-border-soft)',
+              }}
+            >
+              <Panda state="idle" size={30} />
+            </Box>
+          ) : (
+            <Avatar sx={{ width: 28, height: 28, flexShrink: 0, mt: '2px', bgcolor: '#64748B' }}>
+              <BuildIcon sx={{ fontSize: 15 }} />
+            </Avatar>
+          )}
 
-          <Box sx={{ maxWidth: '80%', minWidth: 0 }}>
+          <Box sx={{ minWidth: 0, flexGrow: 1 }}>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
               <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-2)' }}>
-                {isAi ? tr('通天助手') : tr('工具调用')}
+                {isAi ? tr('通通') : tr('工具调用')}
               </Typography>
               <Typography sx={{ fontSize: '11px', color: '#CBD5E1' }}>
                 {new Date(msg.ts).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' })}
@@ -632,15 +672,14 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
 
             <Box
               sx={{
-                px: 2,
-                py: 1.5,
-                borderRadius: '4px 16px 16px 16px',
-                bgcolor: isAi ? 'var(--tt-chat-assistant-bg)' : 'var(--tt-chat-process-bg)',
-                border: '1px solid var(--tt-border)',
-                boxShadow: 'var(--tt-shadow-card)',
+                px: isAi ? 0 : 2,
+                py: isAi ? 0.25 : 1.5,
+                borderRadius: '12px',
+                bgcolor: isTool ? 'var(--tt-chat-process-bg)' : 'transparent',
+                border: isTool ? '1px solid var(--tt-border-soft)' : 'none',
               }}
             >
-              <Box className="markdown-body" sx={{ color: 'var(--tt-text-2)', fontSize: chatFontSize }}>
+              <Box className="markdown-body" sx={{ color: 'var(--tt-text-2)', fontSize: chatFontSize, maxWidth: '72ch' }}>
                 {renderMarkdown(msg.content as string)}
               </Box>
 

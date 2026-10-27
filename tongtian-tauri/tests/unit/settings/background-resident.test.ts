@@ -74,7 +74,7 @@ describe('Rust：托盘接管与退出路径', () => {
     const lib = rustLib();
     const setup = lib.split('fn setup_background')[1].split('\n}\n\n/// 从托盘回到主窗口')[0];
     expect(setup).toContain('MenuItem::with_id(app, "show", "显示主窗口"');
-    expect(setup).toContain('MenuItem::with_id(app, "quit", "退出通天办公"');
+    expect(setup).toContain('MenuItem::with_id(app, "quit", "退出应用"');
     expect(setup).toContain('quit_state.request_quit();');
     expect(setup).toContain('app.exit(0);');
     // 左键单击回到主窗口，右键才出菜单

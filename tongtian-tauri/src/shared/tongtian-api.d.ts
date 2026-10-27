@@ -74,7 +74,10 @@ interface TongtianAPI {
   /** 批量查询检查点摘要（刷新/重启后恢复续跑入口；不含会话正文与密钥） */
   chatCheckpointQuery(taskIds: string[], workspaceId?: string): Promise<{ checkpoints: Record<string, unknown> }>;
   /** 取消任务（转移 #3/#8/#19/#23/#28） */
-  chatCancel(taskId: string, workspaceId?: string): Promise<{ taskId: string; cancelled: boolean }>;
+  chatCancel(
+    taskId: string,
+    workspaceId?: string,
+  ): Promise<{ taskId: string; cancelled: boolean; status?: string }>;
   /** 附件暂存（交互补设计 §3.1） */
   fileStageAttachment(srcPath: string, taskId?: string, workspaceId?: string): Promise<Record<string, unknown>>;
   onChatEvent(callback: (event: ChatEvent) => void): () => void;

@@ -125,6 +125,9 @@ export const tauriAPI = {
     // 任务栏未读角标（Windows 图标叠加 / macOS Dock 计数）
     if (channel === 'badge:support') return invoke('badge_support');
     if (channel === 'badge:set') return invoke('badge_set', { count: Number(args[0] ?? 0) });
+    // 品牌外观：单次自定义名称与 PNG 图标（返回本次真实生效范围）
+    if (channel === 'branding:get') return invoke('branding_get');
+    if (channel === 'branding:customize') return invoke('branding_customize', { req: args[0] });
     // 独立任务窗口（popWindow 实验特性）
     if (channel === 'task:openWindow') {
       return invoke('open_task_window', {
@@ -668,8 +671,15 @@ export const tauriAPI = {
 
   // ── 三层架构演进 P0 新增 command ──────────────────
   /** 取消任务（转移 #3/#8/#19/#23/#28 → cancelled） */
-  chatCancel: (taskId: string, workspaceId?: string): Promise<{ taskId: string; cancelled: boolean }> =>
-    invoke('chat_cancel', { taskId, workspaceId }) as Promise<{ taskId: string; cancelled: boolean }>,
+  chatCancel: (
+    taskId: string,
+    workspaceId?: string,
+  ): Promise<{ taskId: string; cancelled: boolean; status?: string }> =>
+    invoke('chat_cancel', { taskId, workspaceId }) as Promise<{
+      taskId: string;
+      cancelled: boolean;
+      status?: string;
+    }>,
 
   /** 事件重放（24h 持久化，seq > fromSeq） */
   eventReplay: (taskId: string, fromSeq = 0): Promise<{ taskId: string; events: unknown[] }> =>

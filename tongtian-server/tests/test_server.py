@@ -354,7 +354,21 @@ def test_legacy_web_login():
     status, headers, _ = http(
         "GET", f"/auth/login?state={state}&redirect_uri={urllib.parse.quote(callback)}"
     )
-    check("登录页可访问且带 CSP", status == 200 and headers.get("Content-Security-Policy") is not None)
+    csp = headers.get("Content-Security-Policy") or ""
+    check("登录页可访问且带 CSP", status == 200 and csp != "")
+    # Chrome 会把 form-action 套到表单 302 回跳上，跨端口 loopback 必须显式放行
+    check("CSP 放行 loopback 回跳端口", "form-action 'self' http://127.0.0.1:19999" in csp, csp)
+
+    evil = "https://evil.example.com/callback"
+    status, headers, _ = http(
+        "GET", f"/auth/login?state={state}&redirect_uri={urllib.parse.quote(evil)}"
+    )
+    evil_csp = headers.get("Content-Security-Policy") or ""
+    check(
+        "CSP 不放行非 loopback 回跳",
+        status == 200 and "evil.example.com" not in evil_csp and "form-action 'self';" in evil_csp,
+        evil_csp,
+    )
 
     status, headers, body = http(
         "POST",

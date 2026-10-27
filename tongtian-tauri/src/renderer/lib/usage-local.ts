@@ -344,7 +344,7 @@ export function reportToMarkdown(report: UsageReport): string {
   const cost = fmtCosts(t.costs, t.pricedCalls ?? 0);
   const unpriced = t.unpricedCalls ?? 0;
   const lines: string[] = [
-    `# 通天办公 模型用量报表（${PERIOD_LABEL[report.period]}）`,
+    `# 任我行 模型用量报表（${PERIOD_LABEL[report.period]}）`,
     '',
     `- 生成时间：${fmtTime(report.generatedAtMs)}`,
     `- 汇总：Token ${fmtNum(t.tokensUsed)}（输入 ${fmtNum(t.promptTokens)} / 输出 ${fmtNum(t.completionTokens)}）`,

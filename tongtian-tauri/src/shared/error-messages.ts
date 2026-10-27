@@ -31,6 +31,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   [ErrorCode.BRIDGE_ERROR]: '与 Agent 引擎通信失败',
   [ErrorCode.BRIDGE_PYTHON_NOT_FOUND]: '未检测到 Python 环境，请先安装 Python 3.10+',
   [ErrorCode.BRIDGE_START_TIMEOUT]: 'Agent 引擎启动超时',
+  [ErrorCode.BRIDGE_ENGINE_EXITED]: 'Agent 引擎启动后立即退出，请查看引擎日志或重新安装应用',
   [ErrorCode.BRIDGE_SCRIPT_NOT_FOUND]: 'Agent 引擎脚本缺失，安装包资源不完整',
   [ErrorCode.BRIDGE_NO_FREE_PORT]: '本地端口 18000-19000 已占满，请重启应用后重试',
   [ErrorCode.BRIDGE_WORKDIR_FAILED]: '任务工作目录创建失败，请检查工作目录权限',
@@ -70,7 +71,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   [ErrorCode.SKILL_EXECUTION_FAILED]: '技能执行失败，请查看执行过程明细后重试',
   [ErrorCode.SKILL_INCOMPATIBLE]: '该技能包不符合安装要求（仅支持含 SKILL.md 的技能目录）',
   [ErrorCode.SKILL_UNSUPPORTED]:
-    '当前运行通道不支持技能增删，请在桌面版通天办公中管理技能',
+    '当前运行通道不支持技能增删，请在桌面版任我行中管理技能',
   [ErrorCode.SKILL_SCAN_BLOCKED]:
     '技能被安全扫描拦截：SKILL.md 包含高风险指令，未安装或启用',
 
@@ -84,7 +85,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   [ErrorCode.PLUGIN_INVALID_PACKAGE]:
     '插件包无法预检：请确认上传的是含 plugin.json 的 .zip，且未超过大小上限',
   [ErrorCode.PLUGIN_UNSUPPORTED]:
-    '当前运行通道无法预检插件包，请在桌面版通天办公中使用',
+    '当前运行通道无法预检插件包，请在桌面版任我行中使用',
 
   // ── 本地知识库（RAG） ──
   [ErrorCode.KNOWLEDGE_INVALID_NAME]: '知识库名称不合法：不能为空，最多 60 字，且不能包含路径分隔符',
@@ -102,11 +103,11 @@ const ERROR_MESSAGES: Record<string, string> = {
   [ErrorCode.KNOWLEDGE_OPEN_FAILED]: '打开知识库目录失败',
   [ErrorCode.KNOWLEDGE_DIR_INVALID]: '知识库目录不在本机知识库根目录下，已拒绝检索',
   [ErrorCode.KNOWLEDGE_QUERY_EMPTY]: '检索词为空',
-  [ErrorCode.KNOWLEDGE_UNSUPPORTED]: '当前运行通道没有知识库落盘能力，请在桌面版通天办公中使用',
+  [ErrorCode.KNOWLEDGE_UNSUPPORTED]: '当前运行通道没有知识库落盘能力，请在桌面版任我行中使用',
 
   // ── 在线技能 / 套件市场 ──
   [ErrorCode.MARKET_UNSUPPORTED]:
-    '当前运行通道没有市场下载与落盘能力，请在桌面版通天办公中使用在线市场',
+    '当前运行通道没有市场下载与落盘能力，请在桌面版任我行中使用在线市场',
   [ErrorCode.MARKET_INVALID_URL]:
     '市场索引地址不合法：远程地址必须使用 HTTPS；本机调试可使用 http://127.0.0.1 或 http://localhost',
   [ErrorCode.MARKET_NOT_CONFIGURED]: '尚未配置在线市场索引地址，请先在市场窗口中填写',
@@ -201,7 +202,7 @@ const ERROR_MESSAGES: Record<string, string> = {
     '当前系统没有这项权限的开关入口，请在系统设置的隐私页面中管理',
   [ErrorCode.PERMISSION_OPEN_FAILED]: '无法打开系统设置面板，请手动进入系统设置的隐私页面',
   [ErrorCode.PERMISSION_UNSUPPORTED]:
-    '当前运行通道无法打开系统隐私设置，请在桌面版通天办公中管理权限',
+    '当前运行通道无法打开系统隐私设置，请在桌面版任我行中管理权限',
 
   // ── 对齐整改通道（Hooks / 连接器 / 归档 / 电脑操控） ──
   [ErrorCode.HOOK_INVALID_EVENT]: 'Hook 事件名不在支持清单内，请从下拉列表选择',
@@ -273,7 +274,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   [ErrorCode.TERMINAL_DISABLED]:
     '终端 AI+ 未启用，请先在「设置 → ACP 与终端」中显式开启',
   [ErrorCode.TERMINAL_UNSUPPORTED]:
-    '当前运行通道没有本机 shell 进程，终端 AI+ 仅在桌面版通天办公中可用',
+    '当前运行通道没有本机 shell 进程，终端 AI+ 仅在桌面版任我行中可用',
   [ErrorCode.TERMINAL_CWD_INVALID]: '工作目录不存在或不是目录，请重新选择',
   [ErrorCode.TERMINAL_SESSION_UNKNOWN]:
     '本应用没有这个终端会话，可能已关闭或界面已刷新；请重新打开终端',
@@ -350,7 +351,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   [ErrorCode.MCP_PROTOCOL_ERROR]: 'MCP 连接器响应不符合协议，未能返回可解析的 JSON-RPC 消息',
   [ErrorCode.MCP_TRANSPORT_UNSUPPORTED]: '该传输方式需要常驻事件流，请改用 Streamable HTTP 端点',
   [ErrorCode.MCP_INVALID_CONFIG]: '连接器配置 JSON 无法解析，请检查格式后重新粘贴',
-  [ErrorCode.MCP_UNSUPPORTED]: '当前运行通道无法与 MCP 连接器握手，请在桌面版通天办公中完成连接',
+  [ErrorCode.MCP_UNSUPPORTED]: '当前运行通道无法与 MCP 连接器握手，请在桌面版任我行中完成连接',
   [ErrorCode.MCP_OAUTH_INVALID_CONFIG]: 'OAuth 配置非法：授权地址与 token 地址需为 HTTPS，client_id 不能为空',
   [ErrorCode.MCP_OAUTH_REQUIRED]: '该连接器需要先完成 OAuth 授权才能连接',
   [ErrorCode.MCP_OAUTH_REAUTH_REQUIRED]: 'OAuth 授权已过期或被提供方拒绝，请重新授权',
@@ -364,11 +365,11 @@ const ERROR_MESSAGES: Record<string, string> = {
   [ErrorCode.MCP_OAUTH_INVALID_RESPONSE]: '提供方返回的令牌响应不符合 OAuth 规范，无法完成授权',
   [ErrorCode.MCP_OAUTH_NETWORK]: 'OAuth 授权网络请求失败，请检查网络或代理设置后重试',
   [ErrorCode.MCP_OAUTH_OPEN_FAILED]: '无法打开系统浏览器完成授权，请检查默认浏览器设置',
-  [ErrorCode.MCP_OAUTH_UNSUPPORTED]: '当前运行通道无法发起 OAuth 授权，请在桌面版通天办公中完成授权',
+  [ErrorCode.MCP_OAUTH_UNSUPPORTED]: '当前运行通道无法发起 OAuth 授权，请在桌面版任我行中完成授权',
 
   // ── 项目协作（跨用户 / 跨机器；桌面端 Rust → 账号服务） ──
   [ErrorCode.COLLAB_UNSUPPORTED]:
-    '当前运行通道无法访问协作服务，请在桌面版通天办公中使用项目协作',
+    '当前运行通道无法访问协作服务，请在桌面版任我行中使用项目协作',
   [ErrorCode.COLLAB_LOGIN_REQUIRED]:
     '项目协作需要真实账号登录；当前为 Mock 登录，请关闭 TT_AUTH_MOCK 后重新登录',
   [ErrorCode.COLLAB_AUTH_EXPIRED]: '登录态已失效，请退出后重新登录再使用项目协作',
@@ -396,17 +397,17 @@ const ERROR_MESSAGES: Record<string, string> = {
   // ── 文件与文档预览（file_list / file_read / file_preview 抛出的码不得裸奔） ──
   [ErrorCode.FILE_NOT_FOUND]: '文件不存在或已被移动，请刷新目录后重试',
   [ErrorCode.OPEN_FAILED]: '无法用系统默认应用打开该文件，请检查系统文件关联设置后重试',
-  [ErrorCode.OPEN_EXTERNAL_UNSUPPORTED]: '当前运行通道没有系统默认应用，请在桌面版通天办公中打开',
+  [ErrorCode.OPEN_EXTERNAL_UNSUPPORTED]: '当前运行通道没有系统默认应用，请在桌面版任我行中打开',
   [ErrorCode.FILE_ACCESS_DENIED]: '该路径不在工作区文件白名单内，无法读写',
   [ErrorCode.FILE_WRITE_FAILED]: '文件写入失败，请检查目标目录写入权限',
   [ErrorCode.FILE_READ_FAILED]: '文件读取失败，可能是二进制文件或编码异常',
   [ErrorCode.FILE_CONVERSION_FAILED]: '文档正文提取失败，可尝试用本地应用打开后另存为 docx/xlsx/pptx/pdf',
   [ErrorCode.FILE_TOO_LARGE]: '文件超出大小上限，请拆分后重试',
   [ErrorCode.FILE_BACKUP_FAILED]: '附件暂存失败，请检查运行目录写入权限',
-  [ErrorCode.FILE_UNSUPPORTED]: '当前运行通道无法读取本机文档正文，请在桌面版通天办公中预览',
+  [ErrorCode.FILE_UNSUPPORTED]: '当前运行通道无法读取本机文档正文，请在桌面版任我行中预览',
 
   // ── IM 频道（长连接只跑在引擎进程；引擎不在时如实告知，不显示假清单） ──
-  [ErrorCode.IM_ENGINE_UNAVAILABLE]: 'IM 频道的长连接由本地引擎进程承载，引擎未运行时无法查看或绑定频道，请先启动通天办公',
+  [ErrorCode.IM_ENGINE_UNAVAILABLE]: 'IM 频道的长连接由本地引擎进程承载，引擎未运行时无法查看或绑定频道，请先启动任我行',
   [ErrorCode.IM_ENGINE_UNREACHABLE]: '本地引擎无响应，IM 频道状态暂时问不到，请重启引擎后刷新',
   [ErrorCode.IM_ENGINE_ERROR]: 'IM 频道接口返回错误，请查看下方原因',
   [ErrorCode.IM_BAD_RESPONSE]: 'IM 频道接口响应无法解析，请重启引擎后重试',
@@ -414,7 +415,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   [ErrorCode.IM_CHANNEL_INVALID]: '频道标识非法，已拒绝该请求',
   [ErrorCode.IM_UNSUPPORTED]: '该 IM 的长连接还没接入引擎，暂不能绑定；已接入的频道见清单里的「可绑定」',
   [ErrorCode.IM_DEPENDENCY_MISSING]:
-    '这台机器的引擎运行时缺该频道依赖的官方 SDK，通道不可用（清单里会显示「尚未接入」）；请重新安装通天办公的随包运行时，或按下方原因处理',
+    '这台机器的引擎运行时缺该频道依赖的官方 SDK，通道不可用（清单里会显示「尚未接入」）；请重新安装任我行的随包运行时，或按下方原因处理',
   [ErrorCode.IM_NOT_CONFIGURED]: '还没有登记该频道的凭据，请先完成绑定',
   [ErrorCode.IM_CREDENTIAL_MISSING]: '必填凭据还没填全，缺哪一项已在字段上标出',
   [ErrorCode.IM_CREDENTIAL_INVALID]: '凭据格式不对（前缀或长度不符合该 IM 的要求），请回开发者后台复制完整值',
@@ -423,10 +424,24 @@ const ERROR_MESSAGES: Record<string, string> = {
   [ErrorCode.IM_CONNECTION_CLOSED]: '长连接被 IM 服务端关闭，正在按退避重试',
   [ErrorCode.IM_CONNECTION_FAILED]: '长连接建立失败，请检查本机到 IM 服务端的网络',
   [ErrorCode.IM_CONNECTION_KICKED]:
-    '这个机器人的长连接被另一条新连接顶掉了（企业微信同一个 BotID 只允许一条有效长连接）。引擎已停止自动重连，否则两边会互相踢；请确认只有一个通天办公实例或脚本在用这个 BotID',
+    '这个机器人的长连接被另一条新连接顶掉了（企业微信同一个 BotID 只允许一条有效长连接）。引擎已停止自动重连，否则两边会互相踢；请确认只有一个任我行实例或脚本在用这个 BotID',
   [ErrorCode.IM_CHANNEL_ERROR]: 'IM 频道运行异常，请查看最近错误后重试',
   [ErrorCode.IM_REPLY_FAILED]: '任务已完成，但消息回贴失败，请检查频道凭据的发消息权限',
   [ErrorCode.IM_PREFERENCE_INVALID]: 'IM 频道偏好保存失败：开关值不合法，请重试',
+
+  // ── 品牌外观（system/branding.rs；名称与图标单次自定义） ──
+  BRAND_NAME_EMPTY: '应用名称不能为空',
+  BRAND_NAME_TOO_LONG: '应用名称最多 24 个字符',
+  BRAND_NAME_INVALID: '应用名称不能包含换行或控制字符',
+  BRAND_ALREADY_CUSTOMIZED: '品牌修改机会已使用，应用内不再提供第二次修改',
+  BRAND_NO_CHANGE: '请至少修改名称或选择一张图标',
+  BRAND_UNSUPPORTED: '当前通道没有桌面窗口与托盘，无法修改应用名称或图标',
+  BRAND_ICON_NOT_PNG: '只支持 PNG 图片',
+  BRAND_ICON_TOO_LARGE: '图片不能超过 4 MB',
+  BRAND_ICON_TOO_LARGE_DIM: '图片不能超过 1024×1024 像素',
+  BRAND_ICON_TOO_SMALL: '图片至少 16×16 像素',
+  BRAND_ICON_INVALID: '图片无法解析，请换一张 PNG',
+  BRAND_ICON_SAVE_FAILED: '图标保存失败，请检查运行目录写入权限',
 };
 
 /** `BRIDGE_CHAT_HTTP_{status}` 为动态码，按前缀归一 */

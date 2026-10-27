@@ -52,6 +52,7 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { useWorkbenchStore } from '../../store/workbenchStore';
 import { useImChannelStore, imChannelMeta } from '../../stores/imChannelStore';
 import { useAuthStore } from '../../stores/useAuthStore';
+import { useBrandingStore } from '../../stores/useBrandingStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { useAppSettings } from '../../lib/use-app-settings';
 import { systemAPI } from '../../lib/api';
@@ -59,6 +60,7 @@ import { useShallow } from 'zustand/react/shallow';
 import { errorTextOf } from '../../../shared/error-messages';
 import { navPalette, type NavPaletteKey } from '../../theme/tokens';
 import { useI18n } from '../../i18n';
+import brandLogo from '../../assets/brand-logo.png';
 
 // ── 导航项定义 ──────────────────────────────────────────────────────
 
@@ -113,6 +115,10 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
   const location = useLocation();
   const isMobile = useMediaQuery(theme.breakpoints.down('md'));
   const isCollapsed = open === false;
+
+  // 品牌外观（设置页可单次自定义；拉取前先按默认「任我行」渲染）
+  const brandName = useBrandingStore((s) => s.info.name);
+  const brandIcon = useBrandingStore((s) => s.info.iconDataUrl);
 
   const [extExpanded, setExtExpanded] = useState(true);
   const [userAnchor, setUserAnchor] = useState<null | HTMLElement>(null);
@@ -386,27 +392,44 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
           justifyContent: isCollapsed ? 'center' : 'flex-start',
         }}
       >
-        {/* Logo：多彩渐变方块 */}
-        <Box
-          sx={{
-            width: 28,
-            height: 28,
-            borderRadius: '9px',
-            flexShrink: 0,
-            background: 'linear-gradient(135deg, #6366F1 0%, #8B5CF6 50%, #06B6D4 100%)',
-            boxShadow: '0 3px 10px rgba(99, 102, 241, 0.35)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-          }}
-        >
+        {/* Logo：自定义图标优先，否则默认品牌图（白底圆角块保证浅色侧栏上的对比度） */}
+        {brandIcon ? (
           <Box
-            component="span"
-            sx={{ fontSize: '14px', fontWeight: 800, color: '#fff', lineHeight: 1 }}
+            component="img"
+            src={brandIcon}
+            alt={brandName}
+            sx={{
+              width: 28,
+              height: 28,
+              borderRadius: '9px',
+              flexShrink: 0,
+              objectFit: 'cover',
+              boxShadow: '0 3px 10px rgba(15, 23, 42, 0.18)',
+            }}
+          />
+        ) : (
+          <Box
+            sx={{
+              width: 28,
+              height: 28,
+              borderRadius: '9px',
+              flexShrink: 0,
+              bgcolor: '#fff',
+              border: '1px solid rgba(15, 23, 42, 0.07)',
+              boxShadow: '0 3px 10px rgba(15, 23, 42, 0.12)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+            }}
           >
-            通
+            <Box
+              component="img"
+              src={brandLogo}
+              alt={brandName}
+              sx={{ width: 22, height: 22, objectFit: 'contain', display: 'block' }}
+            />
           </Box>
-        </Box>
+        )}
 
         {!isCollapsed && (
           <>
@@ -415,12 +438,16 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                 fontSize: '16px',
                 fontWeight: 800,
                 letterSpacing: '0.02em',
+                maxWidth: 132,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
                 background: 'linear-gradient(90deg, #4F46E5 0%, #7C3AED 60%, #0EA5E9 100%)',
                 WebkitBackgroundClip: 'text',
                 WebkitTextFillColor: 'transparent',
               }}
             >
-              {tr('通天办公')}
+              {brandName}
             </Typography>
             <Box
               sx={{

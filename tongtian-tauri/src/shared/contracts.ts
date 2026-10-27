@@ -184,6 +184,8 @@ export enum ErrorCode {
   // Rust `bridge/agent.rs` 与 `bridge/python_env.rs` 实际抛出的码（`CODE: 详情`）
   BRIDGE_ERROR = 'BRIDGE_ERROR',
   BRIDGE_START_TIMEOUT = 'BRIDGE_START_TIMEOUT',
+  /** 引擎进程启动后立即退出（带退出码，通常是随包资源缺文件） */
+  BRIDGE_ENGINE_EXITED = 'BRIDGE_ENGINE_EXITED',
   BRIDGE_SCRIPT_NOT_FOUND = 'BRIDGE_SCRIPT_NOT_FOUND',
   BRIDGE_NO_FREE_PORT = 'BRIDGE_NO_FREE_PORT',
   BRIDGE_WORKDIR_FAILED = 'BRIDGE_WORKDIR_FAILED',
@@ -2228,6 +2230,39 @@ export interface AutostartStatus {
 }
 
 /**
+ * 品牌外观（`branding:get` / `branding:customize`）。
+ * 单次自定义：名称与 PNG 图标可在同一次提交里一起改；成功即锁定修改机会。
+ * `applied` 是本次真实作用到的位置（桌面端由 Rust 回填），
+ * 已安装快捷方式与应用文件名由安装包写入，运行期改不了 —— 界面必须如实说明。
+ */
+export interface BrandingInfo {
+  /** 安装包默认名称（任我行） */
+  defaultName: string;
+  /** 署名/开发者（北京通天云计算有限公司） */
+  attribution: string;
+  /** 当前显示名称（默认或自定义） */
+  name: string;
+  /** 自定义图标 data URL；无自定义图标为 null */
+  iconDataUrl: string | null;
+  /** 修改机会是否已使用 */
+  customized: boolean;
+  /** 修改机会使用时间（epoch ms） */
+  customizedAt: number | null;
+  /** desktop=Rust 通道；mock=浏览器 Mock；browser=引擎直连等无桌面能力通道 */
+  platform: 'desktop' | 'mock' | 'browser';
+  /** customize 返回值：本次实际生效的位置 */
+  applied?: { windowTitle: boolean; windowIcon: boolean; trayIcon: boolean };
+  /** customize 返回值：部分目标失败的真实原因（不静默吞掉） */
+  warnings?: string[];
+}
+
+export interface BrandingCustomizeReq {
+  name?: string | null;
+  /** 原始 base64（可带 data URI 前缀） */
+  iconBase64?: string | null;
+}
+
+/**
  * 会话正文行（Rust `chat_messages` 表 / 浏览器本地台账同一形状）。
  * 一行 = 一个会话某一轮某个角色的正文；事件流只留 24h，正文不设 TTL。
  */
@@ -2485,6 +2520,10 @@ export const IPC_CHANNELS = {
   BADGE_SUPPORT: 'badge:support',
   /** 设置/清除任务栏未读角标；count=0 清除 */
   BADGE_SET: 'badge:set',
+  /** 品牌外观：读取当前显示名/图标与是否已用掉修改机会 */
+  BRANDING_GET: 'branding:get',
+  /** 品牌外观：单次自定义名称与 PNG 图标（桌面端才写系统窗口/托盘图标） */
+  BRANDING_CUSTOMIZE: 'branding:customize',
   /** 桌面端打开独立任务窗口（popWindow 实验特性的真实执行面） */
   TASK_OPEN_WINDOW: 'task:openWindow',
   PROXY_STATUS: 'proxy:status',

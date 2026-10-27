@@ -95,13 +95,13 @@ describe('按模式挑选画布产物', () => {
 });
 
 describe('输入框模式胶囊组', () => {
-  it('胶囊组在输入卡片上方，设置页只启用一个模式时不渲染', () => {
+  it('胶囊组只在新任务（非 compact）出现，设置页只启用一个模式时也不渲染', () => {
     const src = chatInput();
     const capsuleIdx = src.indexOf('工作台模式胶囊组');
     const cardIdx = src.indexOf("bgcolor: 'var(--tt-surface)'", capsuleIdx);
     expect(capsuleIdx).toBeGreaterThan(-1);
     expect(cardIdx).toBeGreaterThan(capsuleIdx);
-    expect(src).toContain('{enabledModeDefs.length > 1 && (');
+    expect(src).toContain('{!compact && enabledModeDefs.length > 1 && (');
     expect(src).toContain('data-mode={d.id}');
     expect(src).toContain('aria-pressed={selected}');
     expect(src).toContain('onClick={() => setWorkMode(d.id as WorkMode)}');
@@ -203,5 +203,20 @@ describe('画布内容的诚实性', () => {
     expect(src).toContain('只读预览：画布不提供改写并保存文件的能力');
     expect(src).not.toContain('<textarea');
     expect(src).not.toContain('contentEditable');
+  });
+});
+
+describe('欢迎区推荐案例与任务模板', () => {
+  it('只在设计模式渲染；通用与幻灯片不显示', () => {
+    const src = workbench();
+    const guardIdx = src.indexOf("{mode === 'design' && (");
+    expect(guardIdx).toBeGreaterThan(-1);
+    // 推荐案例、模板入口、全量模板弹窗都在这道条件里
+    expect(src.indexOf('推荐案例（换一换）', guardIdx)).toBeGreaterThan(guardIdx);
+    expect(src.indexOf('浏览全部模板', guardIdx)).toBeGreaterThan(guardIdx);
+    expect(src.indexOf('<Dialog', guardIdx)).toBeGreaterThan(guardIdx);
+    // 模式来自工作台当前选择，而不是再读一份本地状态
+    expect(src).toContain('mode={activeMode}');
+    expect(src).toContain('mode: import(\'../../../shared/types\').WorkMode;');
   });
 });

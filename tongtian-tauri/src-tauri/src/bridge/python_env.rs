@@ -53,13 +53,13 @@ fn parse_python_version(output: &str) -> Option<String> {
 }
 
 async fn python_version(python: &str) -> Option<String> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(5),
-        Command::new(python).arg("--version").output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    let mut cmd = Command::new(python);
+    cmd.arg("--version");
+    crate::win_console::hide_console_async(&mut cmd);
+    let output = tokio::time::timeout(Duration::from_secs(5), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let text = if stdout.trim().is_empty() {
@@ -122,13 +122,10 @@ pub async fn detect_python() -> Option<PythonInfo> {
 
 /// 检测 qwenpaw 是否安装在给定 Python 环境中
 pub async fn detect_agent(python_path: &str) -> AgentInfo {
-    let result = tokio::time::timeout(
-        Duration::from_secs(10),
-        Command::new(python_path)
-            .args(["-m", "pip", "show", "qwenpaw"])
-            .output(),
-    )
-    .await;
+    let mut cmd = Command::new(python_path);
+    cmd.args(["-m", "pip", "show", "qwenpaw"]);
+    crate::win_console::hide_console_async(&mut cmd);
+    let result = tokio::time::timeout(Duration::from_secs(10), cmd.output()).await;
 
     match result {
         Ok(Ok(output)) if output.status.success() => {

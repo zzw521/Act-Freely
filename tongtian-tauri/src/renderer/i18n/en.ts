@@ -9,6 +9,8 @@
 export const EN_DICT: Record<string, string> = {
   // ── 品牌与导航 ──────────────────────────────────────────────
   通天办公: 'Tongtian Office',
+  通通: 'Tongtong',
+  '今天想让通通做什么？': 'What would you like Tongtong to do today?',
   专家套件: 'Expert Suites',
   技能: 'Skills',
   连接器: 'Connectors',
@@ -128,6 +130,7 @@ export const EN_DICT: Record<string, string> = {
   继续执行: 'Resume',
   继续: 'Resume',
   取消任务: 'Cancel task',
+  停止任务: 'Stop task',
   终止: 'Stop',
   展开任务监控: 'Show task monitor',
   把当前任务弹出为独立窗口: 'Open this task in a separate window',
@@ -150,6 +153,7 @@ export const EN_DICT: Record<string, string> = {
   选择模型: 'Select model',
   语音输入: 'Voice input',
   '语音输入（录音与转录）尚未提供': 'Voice input (recording and transcription) is not available yet',
+  发送: 'Send',
   '发送 (Enter)': 'Send (Enter)',
   '生成中…': 'Generating…',
   请输入内容: 'Enter a prompt',
@@ -379,8 +383,61 @@ export const EN_DICT: Record<string, string> = {
   'Enter 提交 · Shift+Enter 换行 · Esc 关闭': 'Enter to submit · Shift+Enter for a new line · Esc to close',
   '描述要完成的任务，直接回车提交': 'Describe the task to complete, then press Enter',
   快速任务目标: 'Quick task goal',
-  '应用内快捷键：仅当通天办公窗口在前台时生效，系统级全局热键尚未提供':
-    'In-app shortcut: works only while the Tongtian Office window is in the foreground. A system-wide hotkey is not provided yet.',
+  '应用内快捷键：仅当任我行窗口在前台时生效，系统级全局热键尚未提供':
+    'In-app shortcut: works only while the Renwoxing window is in the foreground. A system-wide hotkey is not provided yet.',
   '提交中…': 'Submitting…',
   提交任务: 'Submit task',
+
+  // ── 品牌外观（设置页「品牌外观」与侧边栏） ──
+  任我行: 'Renwoxing',
+  品牌外观: 'Branding',
+  '修改应用显示名称与图标；安装后仅有一次修改机会':
+    'Change the app name and icon. This can be done only once after installation.',
+  当前品牌: 'Current branding',
+  已使用自定义品牌: 'Custom branding in use',
+  安装包默认品牌: 'Installer default',
+  署名: 'Attribution',
+  '开发者与版权归属，随安装包发布': 'Developer and copyright holder, shipped with the installer',
+  修改机会: 'Change allowance',
+  '已于 {time} 使用，应用内不再提供第二次修改':
+    'Used at {time}. A second change is not available in the app.',
+  已使用: 'Used',
+  '已生效：{targets}': 'Applied: {targets}',
+  '界面内品牌已更新，系统窗口不在当前通道':
+    'Branding updated in the UI; system windows are unavailable in this channel',
+  修改入口: 'Change entry',
+  '当前通道没有桌面窗口与托盘，请在 Windows 桌面版中修改':
+    'This channel has no desktop window or tray. Change branding in the Windows desktop app.',
+  应用名称: 'App name',
+  '1–24 个字符；留空表示保留当前名称': '1–24 characters. Leave empty to keep the current name.',
+  应用图标: 'App icon',
+  '选择 PNG 图片': 'Choose PNG image',
+  清除: 'Clear',
+  'PNG，16×16 至 1024×1024 像素，不超过 4 MB': 'PNG, 16×16 to 1024×1024 px, up to 4 MB',
+  '保存后立即生效且不可恢复，应用内不再提供第二次修改。':
+    'Takes effect immediately and cannot be undone. No second change is offered in the app.',
+  '生效范围：窗口标题、任务栏/托盘图标与界面内名称；已安装的桌面快捷方式名称与应用文件名不会改变。':
+    'Applies to: window title, taskbar/tray icon and in-app name. Installed shortcut names and the executable filename are not renamed.',
+  'Mock 模式：修改只保存在浏览器内存，不写入窗口标题或系统图标':
+    'Mock mode: the change is kept in browser memory only; no window title or system icon is written.',
+  '正在应用…': 'Applying…',
+  '保存并应用（仅一次）': 'Save and apply (once)',
+  '修改名称或选择图片后可提交': 'Change the name or choose an image to submit',
+  '图标与名称保存在本机运行目录，重启后自动恢复；卸载重装不会重置已使用的修改机会。':
+    'Icon and name are stored in the local runtime folder and restored on restart. Reinstalling does not reset a used change allowance.',
+  '确认使用唯一的修改机会？': 'Use your only change allowance?',
+  '保存后立即生效，且应用内不再提供第二次修改或恢复默认的入口。':
+    'It takes effect immediately, and the app offers no second change or reset.',
+  '新名称：': 'New name: ',
+  '新图标：': 'New icon: ',
+  '已选择 PNG 图片': 'PNG image selected',
+  保持不变: 'Unchanged',
+  确认修改: 'Confirm change',
+  品牌修改失败: 'Branding update failed',
+  '只支持 PNG 图片，其它格式请先转换': 'Only PNG images are supported. Convert other formats first.',
+  '图片不能超过 4 MB': 'Image must be 4 MB or smaller',
+  '文件不是有效的 PNG 图片': 'The file is not a valid PNG image',
+  窗口标题: 'Window title',
+  任务栏图标: 'Taskbar icon',
+  托盘图标: 'Tray icon',
 };

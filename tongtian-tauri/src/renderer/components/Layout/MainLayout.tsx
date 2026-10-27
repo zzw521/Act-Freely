@@ -23,6 +23,7 @@ import ResizeHandle from './ResizeHandle';
 import TaskSearchDialog from '../TaskSearchDialog';
 import QuickPickDialog from '../QuickPickDialog';
 import { useAppStore } from '../../stores/useAppStore';
+import { useBrandingStore } from '../../stores/useBrandingStore';
 import { useAppShortcuts } from '../../lib/use-app-shortcuts';
 import { installBadgeFocusReset } from '../../lib/badge-local';
 
@@ -58,6 +59,12 @@ const MainLayout: React.FC = () => {
 
   // 任务栏未读：窗口回到前台即清零（后台完成的任务不再显示未读）
   useEffect(() => installBadgeFocusReset(), []);
+
+  // 品牌外观：启动即读取上次自定义的名称/图标（未改过则保持默认「任我行」）
+  const loadBranding = useBrandingStore((s) => s.load);
+  useEffect(() => {
+    void loadBranding();
+  }, [loadBranding]);
 
   const handleDrawerToggle = () => {
     if (isMobile) setOpen(!open);

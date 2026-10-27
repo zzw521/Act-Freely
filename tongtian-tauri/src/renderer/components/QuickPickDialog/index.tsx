@@ -131,7 +131,7 @@ const QuickPickDialog: React.FC = () => {
 
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 1.25 }}>
           <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', flexGrow: 1, lineHeight: 1.5 }}>
-            {tr('应用内快捷键：仅当通天办公窗口在前台时生效，系统级全局热键尚未提供')}
+            {tr('应用内快捷键：仅当任我行窗口在前台时生效，系统级全局热键尚未提供')}
           </Typography>
           <Box
             component="button"

@@ -142,7 +142,7 @@ const now = Date.now();
 
 const MOCK_SUITES: CatalogSuite[] = [
   {
-    id: 'finance-suite', name: '金融行业套件', author: '@通天办公官方', category: '财务',
+    id: 'finance-suite', name: '金融行业套件', author: '@任我行官方', category: '财务',
     desc: '风控、研报与合规流程一键接入对话；用套件固化常用模板与数据源。',
     skillCount: 12, commandCount: 6, dataLinkCount: 3, version: 'v2.1.0',
     hot: 980, publishedAt: now - 2 * 86400e3, icon: AccountBalanceIcon, iconColor: '#10B981',
@@ -1213,7 +1213,7 @@ const ExpertSuitePage: React.FC = () => {
           >
             <AddIcon sx={{ fontSize: 15, color: '#059669' }} />
             <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#059669', whiteSpace: 'nowrap' }}>
-              让通天办公帮我创建
+              让任我行帮我创建
             </Typography>
           </Box>
         </Tooltip>

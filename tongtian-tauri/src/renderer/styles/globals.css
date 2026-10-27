@@ -376,3 +376,85 @@ html[data-ui-style] body {
     border-top: 1px solid var(--tt-border);
   }
 }
+
+/* ── 熊猫「通通」动效（组件：components/Panda） ───────────────── */
+@keyframes tt-panda-sway {
+  0%,
+  100% {
+    transform: rotate(-1.1deg);
+  }
+  50% {
+    transform: rotate(1.1deg);
+  }
+}
+
+.tt-panda-sway {
+  transform-box: fill-box;
+  transform-origin: 50% 88%;
+  animation: tt-panda-sway 6s ease-in-out infinite;
+}
+
+@keyframes tt-panda-tilt {
+  0%,
+  100% {
+    transform: rotate(-4deg);
+  }
+  50% {
+    transform: rotate(-2deg);
+  }
+}
+
+.tt-panda-tilt {
+  transform-box: fill-box;
+  transform-origin: 50% 88%;
+  animation: tt-panda-tilt 2.6s ease-in-out infinite;
+}
+
+@keyframes tt-panda-shake {
+  0%,
+  100% {
+    transform: rotate(0deg);
+  }
+  25% {
+    transform: rotate(-3deg);
+  }
+  75% {
+    transform: rotate(3deg);
+  }
+}
+
+.tt-panda-shake {
+  transform-box: fill-box;
+  transform-origin: 50% 88%;
+  animation: tt-panda-shake 0.5s ease-in-out 2;
+}
+
+@keyframes tt-panda-pop {
+  0% {
+    transform: scale(0.6);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.08);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.tt-panda-pop {
+  transform-box: fill-box;
+  transform-origin: 50% 90%;
+  animation: tt-panda-pop 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tt-panda-sway,
+  .tt-panda-tilt,
+  .tt-panda-shake,
+  .tt-panda-pop {
+    animation: none !important;
+  }
+}

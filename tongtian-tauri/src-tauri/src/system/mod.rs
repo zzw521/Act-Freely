@@ -9,6 +9,7 @@
 
 pub mod autostart;
 pub mod badge;
+pub mod branding;
 pub mod task_window;
 
 use std::sync::Arc;

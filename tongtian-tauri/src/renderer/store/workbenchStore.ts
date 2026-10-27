@@ -42,6 +42,7 @@ import { api } from '../lib/api';
 import { chatModelSelectionOf, modelBaseUrl } from '../lib/chat-models';
 import { browserPptxTemplates } from '../../shared/pptx-templates';
 import { getActiveWorkspaceId } from './workspaceStore';
+import { useAppStore } from '../stores/useAppStore';
 import {
   claimNoticeKey,
   noticeKindFor,
@@ -366,6 +367,53 @@ let routerRegistered = false;
 const hydrating = new Set<string>();
 
 /**
+ * 自动批准（免审阅）的时序保护：同一任务只批准一次。
+ * 计划事件比 Rust 把任务写成 pending_review 更早到达，立刻批准会被状态校验拒绝，
+ * 所以对「还没到待审阅」做短退避重试；其他错误直接上报，不静默失败。
+ */
+const autoApproveTasks = new Set<string>();
+
+/** 自动批准最终失败时回写会话；applyEvent 在 store 闭包外，由 store 创建后注入 */
+let reportAutoApproveFailure: (convId: string, message: string) => void = (_convId, message) => {
+  useAppStore.getState().showNotification(message, 'error');
+};
+
+/** Rust 拒绝批准的唯一时序原因：任务还没被写成 pending_review */
+const APPROVE_NOT_READY = /仅 pending_review 可批准/;
+/** 已经到终态的任务不再重试（取消/失败后迟到的批准没有意义） */
+const APPROVE_TASK_SETTLED = /当前 (cancelled|failed|done)/;
+
+/**
+ * 免审阅自动批准：计划生成完就自动批准进入执行。
+ * Rust 的 chat_review 只接受 pending_review，而计划事件先于该状态到达，
+ * 这里用有限次退避重试抹平这段时序差，保证任务真的进入执行并产出回复。
+ */
+export async function approvePlanWhenReady(
+  taskId: string,
+  onFailure: (message: string) => void,
+  review: (id: string) => Promise<unknown> = (id) =>
+    api.chat.review(id, { planId: '', action: 'approve' }),
+): Promise<void> {
+  if (autoApproveTasks.has(taskId)) return;
+  autoApproveTasks.add(taskId);
+  const maxAttempts = 20;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await review(taskId);
+      return;
+    } catch (err) {
+      const raw = typeof err === 'string' ? err : err instanceof Error ? err.message : '';
+      const retriable = APPROVE_NOT_READY.test(raw) && !APPROVE_TASK_SETTLED.test(raw);
+      if (!retriable || attempt === maxAttempts) {
+        onFailure(errorTextOf(err, '自动批准失败'));
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+  }
+}
+
+/**
  * 以隐私模式提交的任务 id。
  * 隐私模式在提交时生效、对本轮整个生命周期有效：即使用户在任务运行中关掉开关，
  * 本轮回复也不会补写进正文库（避免「关掉开关才落盘」这种半隐私状态）。
@@ -390,7 +438,12 @@ async function notifyForEvent(kind: NoticeKind, title: string, taskId: string | 
   });
 }
 
-function applyEvent(conv: ConversationState, event: ChatEvent, turnIdx: number): Partial<ConversationState> | null {
+function applyEvent(
+  conv: ConversationState,
+  event: ChatEvent,
+  turnIdx: number,
+  eventTaskId?: string | null,
+): Partial<ConversationState> | null {
   // 事件归档到指定轮次分组（越界时夹取到合法范围）
   const idx = Math.max(0, Math.min(turnIdx, conv.turnEvents.length - 1));
   const base: Partial<ConversationState> = {
@@ -403,15 +456,22 @@ function applyEvent(conv: ConversationState, event: ChatEvent, turnIdx: number):
 
   switch (event.type) {
     case 'plan': {
-      // 免审阅：计划产出后自动批准直接进入执行
-      const plan = buildPlanFromEvent(event.planId, event.steps, conv.taskId ?? '');
-      const approved: Plan = { ...plan, status: PlanStatus.APPROVED, reviewed: true };
-      if (conv.taskId) {
-        api.chat
-          .review(conv.taskId, { planId: plan.id, action: 'approve' })
-          .catch(() => undefined);
+      // 取消/失败后仍可能收到迟到的计划事件：只归档事件，不把任务复活成执行中
+      if (conv.taskStatus === TaskStatus.CANCELLED || conv.taskStatus === TaskStatus.FAILED) {
+        return base;
       }
-      return { ...base, plan: approved, isLoading: true, taskStatus: TaskStatus.EXECUTING };
+      // 事件自带 taskId 时优先：提交响应还没回填会话时，不能拿上一轮的任务去批准
+      const taskId = eventTaskId ?? conv.taskId;
+      const plan = buildPlanFromEvent(event.planId, event.steps, taskId ?? '');
+      const approved: Plan = { ...plan, status: PlanStatus.APPROVED, reviewed: true };
+      if (taskId) {
+        // 免审阅：计划一产出就尝试批准；Rust 要等计划流收尾才落 pending_review，
+        // 这段时序差由 approvePlanWhenReady 的重试兜住（失败会写回会话，不静默）
+        void approvePlanWhenReady(taskId, (message) => reportAutoApproveFailure(conv.id, message));
+      }
+      // 计划流自己的 done 紧跟其后：状态必须停在待审阅，
+      // 否则 done 会把「已开始执行」误判成任务收尾，停止键和回复都会丢
+      return { ...base, plan: approved, isLoading: true, taskStatus: TaskStatus.PENDING_REVIEW };
     }
 
     case 'step_done': {
@@ -451,21 +511,45 @@ function applyEvent(conv: ConversationState, event: ChatEvent, turnIdx: number):
     case 'done': {
       // 重新生成中的轮次完成时清除标记
       const regenPatch = conv.regeneratingTurn != null ? { regeneratingTurn: null } : {};
-      return { ...base, ...regenPatch, isLoading: false, taskStatus: TaskStatus.DONE };
+      // 引擎的 done 只是「本次事件流结束」：计划流结束时任务还要进入待审阅/执行，
+      // 此时按终态收尾会把主按钮一直留在停止态（点了只会得到「任务已结束」）
+      const preExecution =
+        conv.taskStatus === TaskStatus.QUEUED ||
+        conv.taskStatus === TaskStatus.PLANNING ||
+        conv.taskStatus === TaskStatus.PENDING_REVIEW;
+      // 取消/失败后收尾仍可能补发 done：终态不能被改写成「已完成」
+      const terminal =
+        conv.taskStatus === TaskStatus.CANCELLED || conv.taskStatus === TaskStatus.FAILED;
+      return {
+        ...base,
+        ...regenPatch,
+        isLoading: preExecution ? conv.isLoading : false,
+        taskStatus: terminal || preExecution ? conv.taskStatus : TaskStatus.DONE,
+      };
     }
 
     case 'status_change': {
-      const status = toTaskStatus(event.status);
+      const incoming = toTaskStatus(event.status);
+      // 失败/取消后 Rust 仍可能按「流已消费完」补发 pending_review/done：
+      // 终态不能被覆盖，否则错误被显示成「已完成」，停止键也会重新出现
+      const settled =
+        conv.taskStatus === TaskStatus.CANCELLED || conv.taskStatus === TaskStatus.FAILED;
+      const status = settled ? conv.taskStatus : incoming;
       const meta: TaskMetaView = {
         waitReason: event.waitReason ?? undefined,
         queuePosition: event.queuePosition,
         statusReasonCode: event.statusReasonCode,
       };
       const releaseLoading =
-        status === TaskStatus.BUDGET_PAUSED ||
-        status === TaskStatus.CANCELLED ||
-        status === TaskStatus.FAILED ||
-        status === TaskStatus.DONE;
+        incoming === TaskStatus.BUDGET_PAUSED ||
+        incoming === TaskStatus.CANCELLED ||
+        incoming === TaskStatus.FAILED ||
+        incoming === TaskStatus.DONE;
+      // 计划流收尾后任务才真正进入待审阅：这是批准能被接受的时机
+      const taskId = eventTaskId ?? conv.taskId;
+      if (!settled && incoming === TaskStatus.PENDING_REVIEW && taskId) {
+        void approvePlanWhenReady(taskId, (message) => reportAutoApproveFailure(conv.id, message));
+      }
       return {
         ...base,
         taskStatus: status ?? conv.taskStatus,
@@ -495,9 +579,12 @@ function applyEvent(conv: ConversationState, event: ChatEvent, turnIdx: number):
 
     case 'error':
       // 引擎事件带 message（多为 `错误码: 详情`）时优先展示详情，否则按 code 映射
+      // 错误即本轮执行终止：不落到 failed 会让停止键一直可见，点了也没有任务可取消
       return {
         ...base,
         isLoading: false,
+        taskStatus:
+          conv.taskStatus === TaskStatus.CANCELLED ? conv.taskStatus : TaskStatus.FAILED,
         error: event.message ? errorTextOf(event.message) : errorMessageOf(event.code),
       };
 
@@ -517,6 +604,19 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
       const convs = { ...s.convs, [convId]: { ...conv, ...patch } };
       const mirrors = convId === s.activeId ? mirrorOf(convs[convId]) : {};
       return { convs, ...mirrors, conversations: summariesOf(convs, s.convOrder) };
+    });
+  };
+
+  // 自动批准重试耗尽：把失败原因写回本轮，不能让界面停在停止键上等一个不会来的回复；
+  // 已经取消/失败的任务保持原终态，不被迟到的批准错误覆盖
+  reportAutoApproveFailure = (convId, message) => {
+    const conv = get().convs[convId];
+    if (!conv) return;
+    if (conv.taskStatus === TaskStatus.CANCELLED || conv.taskStatus === TaskStatus.FAILED) return;
+    patchConv(convId, {
+      isLoading: false,
+      taskStatus: TaskStatus.FAILED,
+      error: message,
     });
   };
 
@@ -561,7 +661,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
           deliver.artifacts ?? [],
         );
       }
-      const patch = applyEvent(target, event, turnIdx);
+      const patch = applyEvent(target, event, turnIdx, evTaskId);
       if (patch) patchConv(target.id, patch);
       // 协作任务出错：本轮不回报成功（失败/取消也会收到 done，不能只看 done）
       if (event.type === 'error') captureCollabFailure(target.id);
@@ -744,6 +844,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
         fileOps: [],
         taskMeta: {},
         checkpoint: null,
+        // 新任务从干净状态开始：上一轮的 failed/cancelled 不能带进这一轮
+        taskStatus: null,
         isLoading: true,
         error: null,
         workMode: mode ?? 'general',
@@ -1034,7 +1136,16 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
             taskStatus: TaskStatus.CANCELLED,
             taskMeta: { statusReasonCode: 'USER_CANCELLED' },
           });
+          return;
         }
+        // 后端判定任务已终态，不会改写状态：界面必须自己退出停止态，
+        // 否则按钮一直可点、点下去只是再收到一次 cancelled=false（看起来就是「没反应」）
+        const settled = result.status ? toTaskStatus(result.status) : null;
+        patchConv(conv.id, {
+          isLoading: false,
+          ...(settled ? { taskStatus: settled } : {}),
+        });
+        useAppStore.getState().showNotification('任务已经结束，无需终止', 'info');
       } catch (err: unknown) {
         patchConv(conv.id, { error: errorTextOf(err, '取消任务失败') });
       }

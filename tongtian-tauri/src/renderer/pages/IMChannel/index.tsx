@@ -189,7 +189,7 @@ const IMChannel: React.FC = () => {
     <Box sx={{ maxWidth: 860, mx: 'auto' }}>
       <Typography variant="h5" sx={{ fontWeight: 700, color: 'var(--tt-text-1)' }}>IM 频道</Typography>
       <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-3, #6B7280)', mt: 0.5, mb: 2 }}>
-        把通天办公接进 IM：机器人收到消息后在本地发起任务，结果回到原会话。
+        把任我行接进 IM：机器人收到消息后在本地发起任务，结果回到原会话。
         凭据与会话台账只存在本机引擎数据目录，长连接由本地引擎进程持有，不上传云端。
       </Typography>
 

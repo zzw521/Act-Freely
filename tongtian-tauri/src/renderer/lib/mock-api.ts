@@ -17,6 +17,7 @@ import { declaredBuiltinToolList } from '../../shared/builtin-tools';
 import { isTauri, tauriAPI, createProxiedAPI } from './tauri-api';
 import { engineAPI, ENGINE_DIRECT_URL } from './engine-api';
 import type { QuotaSnapshot } from '../../shared/contracts';
+import type { BrandingCustomizeReq } from '../../shared/contracts';
 import { handleLocalSecurityChannel } from './security-local';
 import { handleLocalScheduleChannel } from './schedule-local';
 import { handleLocalAlignmentChannel } from './alignment-local';
@@ -182,9 +183,11 @@ function schedulePlanFlow(task: MockTaskState) {
       task.status = 'pending_review';
       emit(seqEvent(task.taskId, { type: 'status_change', status: 'pending_review' }));
     }],
-    [820, () => emit(seqEvent(task.taskId, { type: 'done' }))],
+    // 不发 done：真实引擎的 done 只是计划流结束，任务随后由 approve 进入执行，
+    // 在这里补 done 会让界面把待审阅/执行中的任务误收尾成已完成
   ];
-  timeline.forEach(([delay, fire]) => setTimeout(fire, delay));
+  // 取消后不再派发后续事件，避免 Mock 里「点了停止却继续跑完」
+  timeline.forEach(([delay, fire]) => setTimeout(() => { if (!task.cancelled) fire(); }, delay));
 }
 
 /** 阶段二：执行流（approve 后：executing → steps → deliver → done） */
@@ -247,7 +250,8 @@ function scheduleExecutionFlow(task: MockTaskState) {
       activeMockTask = null;
     }],
   ];
-  timeline.forEach(([delay, fire]) => setTimeout(fire, delay));
+  // 取消后不再派发后续事件，避免 Mock 里「点了停止却继续跑完」
+  timeline.forEach(([delay, fire]) => setTimeout(() => { if (!task.cancelled) fire(); }, delay));
 }
 
 // ── ModelHub Mock（内存 CRUD，模拟 SQLite 持久化语义） ──────
@@ -514,6 +518,64 @@ const mockSettings: Record<string, unknown> = {
   ...readMockSettingsSnapshot(),
 };
 
+// ── 品牌外观 Mock ───────────────────────────────────────────
+// 只保存在本次会话内存：大图 data URL 不能塞进 localStorage（5MB 配额），
+// 且 Mock 通道没有真实窗口/托盘，`applied` 一律 false 并在 warnings 里说明。
+
+let mockBranding: {
+  name: string;
+  iconDataUrl: string | null;
+  customizedAt: number | null;
+} = { name: '任我行', iconDataUrl: null, customizedAt: null };
+
+function mockBrandingView(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    defaultName: '任我行',
+    attribution: '北京通天云计算有限公司',
+    name: mockBranding.name,
+    iconDataUrl: mockBranding.iconDataUrl,
+    customized: mockBranding.customizedAt !== null,
+    customizedAt: mockBranding.customizedAt,
+    platform: 'mock',
+    ...extra,
+  };
+}
+
+function handleMockBranding(channel: string, args: unknown[]): unknown {
+  if (channel === 'branding:get') return mockBrandingView();
+  if (channel !== 'branding:customize') {
+    throw new Error(`IPC_CHANNEL_UNHANDLED: Mock 通道未实现 ${channel}`);
+  }
+  if (mockBranding.customizedAt !== null) {
+    throw new Error('BRAND_ALREADY_CUSTOMIZED: 品牌修改机会已使用（Mock 通道）');
+  }
+  const req = (args[0] ?? {}) as BrandingCustomizeReq;
+  const name = typeof req.name === 'string' ? req.name.trim() : '';
+  const icon = typeof req.iconBase64 === 'string' && req.iconBase64.trim() ? req.iconBase64 : null;
+  if (!name && !icon) {
+    throw new Error('BRAND_NO_CHANGE: 请至少修改名称或选择一张图片');
+  }
+  if (name) {
+    if ([...name].length > 24) throw new Error('BRAND_NAME_TOO_LONG: 名称最多 24 个字符');
+    if (/[\u0000-\u001f\u007f]/.test(name)) {
+      throw new Error('BRAND_NAME_INVALID: 名称不能包含换行或控制字符');
+    }
+  }
+  mockBranding = {
+    name: name || mockBranding.name,
+    iconDataUrl: icon
+      ? icon.startsWith('data:')
+        ? icon
+        : `data:image/png;base64,${icon}`
+      : mockBranding.iconDataUrl,
+    customizedAt: Date.now(),
+  };
+  return mockBrandingView({
+    applied: { windowTitle: false, windowIcon: false, trayIcon: false },
+    warnings: ['Mock 模式：修改只保存在浏览器内存，未写入窗口标题或系统图标'],
+  });
+}
+
 // ── 账号登录态 Mock（与 Rust 侧 TT_AUTH_MOCK 语义一致） ──────
 
 /** Mock 账号资料（与 Rust service::mock_profile 同步） */
@@ -602,7 +664,7 @@ function handleFileChannel(channel: string, args: unknown[]): unknown {
         content: '',
         mimeType: MIME_BY_EXT[lower.slice(lower.lastIndexOf('.'))] ?? 'application/octet-stream',
         supported: false,
-        note: 'FILE_UNSUPPORTED: 当前运行通道无法读取本机文档正文，请在桌面版通天办公中预览',
+        note: 'FILE_UNSUPPORTED: 当前运行通道无法读取本机文档正文，请在桌面版任我行中预览',
       };
     });
   }
@@ -725,6 +787,7 @@ const mockAPI = {
       }));
     }
     if (channel === 'settings:get') return { ...mockSettings };
+    if (channel.startsWith('branding:')) return handleMockBranding(channel, args);
     if (channel === 'proxy:status') return localProxyStatus(mockSettings);
     // 内置工具：演示通道给声明清单（与引擎注册表同源，契约测试锁定），不另编一份
     if (channel === 'agent:builtinTools') return declaredBuiltinToolList('mock');
@@ -869,9 +932,11 @@ const mockAPI = {
       emit(seqEvent(taskId, { type: 'done' }));
       mockHistory.unshift(activeMockTask);
       activeMockTask = null;
-      return { taskId, cancelled: true };
+      return { taskId, cancelled: true, status: 'cancelled' };
     }
-    return { taskId, cancelled: false };
+    // 已收尾的任务：把终态带回去，界面据此退出停止态而不是停在原地
+    const settled = mockHistory.find((t) => t.taskId === taskId);
+    return { taskId, cancelled: false, status: settled?.status };
   },
   /** 重放 Mock：无持久化，返回空窗口（windowExpired 语义） */
   eventReplay: async (taskId: string) => ({ taskId, events: [] }),

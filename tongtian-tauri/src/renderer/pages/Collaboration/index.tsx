@@ -511,7 +511,7 @@ const Collaboration: React.FC = () => {
       <PageShell title="项目协作" onRefresh={refreshAll} busy={false}>
         <Alert severity="info" sx={{ borderRadius: '12px' }}>
           当前运行通道无法访问协作服务（需要桌面端系统凭据库与账号服务直连）。
-          请在桌面版通天办公中使用项目协作；浏览器/Mock 通道不会伪造项目与任务数据。
+          请在桌面版任我行中使用项目协作；浏览器/Mock 通道不会伪造项目与任务数据。
         </Alert>
       </PageShell>
     );

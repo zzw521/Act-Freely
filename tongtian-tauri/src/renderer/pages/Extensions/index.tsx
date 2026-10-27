@@ -43,7 +43,7 @@ import MarketBrowser from '../../components/MarketBrowser';
 function skillCreatePrompt(skillsRoot: string | null): string {
   const target = skillsRoot
     ? `将技能保存到 ${skillsRoot}/（每个技能一个子目录，内含 SKILL.md）`
-    : '将技能保存到通天办公运行目录下的 skills/ 子目录（每个技能一个子目录，内含 SKILL.md）';
+    : '将技能保存到任我行运行目录下的 skills/ 子目录（每个技能一个子目录，内含 SKILL.md）';
   return `帮我使用 create-skill 创建技能。请检测当前运行环境，${target}。首先问我技能应该做什么。`;
 }
 
@@ -714,11 +714,11 @@ const ExtensionsPage: React.FC = () => {
                   · 技能标识取自来源目录名，重名技能需先卸载（安装不会覆盖既有技能）
                 </Typography>
                 <Typography sx={{ fontSize: '12px', color: '#9CA3AF', lineHeight: 1.7 }}>
-                  · 安装目录：{skillRoot?.skillsRoot ?? '（桌面版通天办公运行目录下的 skills/）'}
+                  · 安装目录：{skillRoot?.skillsRoot ?? '（桌面版任我行运行目录下的 skills/）'}
                 </Typography>
                 {!isTauri() && (
                   <Typography sx={{ fontSize: '12px', color: '#B45309', lineHeight: 1.7, mt: 0.5 }}>
-                    浏览器预览通道不支持技能增删，请在桌面版通天办公中管理技能
+                    浏览器预览通道不支持技能增删，请在桌面版任我行中管理技能
                   </Typography>
                 )}
               </Box>
@@ -1558,7 +1558,7 @@ const ExtensionsPage: React.FC = () => {
                   )}
                   {s.auth && !desktopChannel && (
                     <Typography sx={{ fontSize: '11px', color: '#B45309', lineHeight: 1.6 }}>
-                      浏览器通道无法保存 OAuth 令牌，授权与连接请在桌面版通天办公中完成。
+                      浏览器通道无法保存 OAuth 令牌，授权与连接请在桌面版任我行中完成。
                     </Typography>
                   )}
                   <Box sx={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 1, mt: 0.5, flexWrap: 'wrap' }}>

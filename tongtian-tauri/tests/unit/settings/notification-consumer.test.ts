@@ -279,7 +279,7 @@ describe('任务栏角标的平台边界', () => {
     expect(comp).toContain("if (p !== 'granted')");
     expect(comp).toContain('updateAppSettings({ desktopNotify: true });');
     expect(comp).toContain('checked={notify && granted}');
-    expect(comp).toContain('系统未授权通知，请在系统设置中允许通天办公发送通知后再开');
+    expect(comp).toContain('系统未授权通知，请在系统设置中允许任我行发送通知后再开');
   });
 
   it('旧的三行假开关（只落库不生效）已从页面消失', () => {

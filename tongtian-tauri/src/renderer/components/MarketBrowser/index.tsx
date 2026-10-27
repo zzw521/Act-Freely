@@ -237,7 +237,7 @@ const MarketBrowser: React.FC<MarketBrowserProps> = ({ open, kind, onClose, onIn
             </Box>
           ) : unsupported ? (
             <Alert severity="warning" sx={{ fontSize: '13px' }}>
-              当前运行通道没有市场下载与落盘能力，请在桌面版通天办公中使用在线市场。
+              当前运行通道没有市场下载与落盘能力，请在桌面版任我行中使用在线市场。
             </Alert>
           ) : (
             <Box>

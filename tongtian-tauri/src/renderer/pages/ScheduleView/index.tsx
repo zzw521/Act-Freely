@@ -1012,7 +1012,7 @@ const ScheduleView: React.FC = () => {
 
           {/* 任务描述 */}
           <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>
-            让通天办公帮你做什么...
+            让任我行帮你做什么...
           </Typography>
           <TextField
             value={taskDesc}
@@ -1020,7 +1020,7 @@ const ScheduleView: React.FC = () => {
             fullWidth
             multiline
             minRows={4}
-            placeholder="让通天办公帮你做什么..."
+            placeholder="让任我行帮你做什么..."
             inputProps={{ 'aria-label': '任务描述' }}
             sx={{ mb: 1.5, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
           />

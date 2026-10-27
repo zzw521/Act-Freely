@@ -23,7 +23,10 @@ export interface TransportProvider {
   readonly kind: 'tauri' | 'mock' | 'bff';
 
   chatSubmit(req: ChatSubmitReq): Promise<{ taskId: string; workspaceId?: string; quota?: QuotaSnapshot }>;
-  chatCancel(taskId: string, workspaceId?: string): Promise<{ taskId: string; cancelled: boolean }>;
+  chatCancel(
+    taskId: string,
+    workspaceId?: string,
+  ): Promise<{ taskId: string; cancelled: boolean; status?: string }>;
 
   /** 事件重放（24h 持久化，seq > fromSeq） */
   eventReplay(taskId: string, fromSeq?: number): Promise<{ taskId: string; events: EventReplayItem[] }>;

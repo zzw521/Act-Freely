@@ -187,7 +187,7 @@ async function fetchEngineFile(path: string): Promise<EngineFileContent> {
  */
 async function handleEngineFileChannel(channel: string, args: unknown[]): Promise<unknown> {
   if (channel === 'file:browse') {
-    throw new Error('FILE_UNSUPPORTED: 引擎侧未提供目录浏览接口，请在桌面版通天办公中查看文件');
+    throw new Error('FILE_UNSUPPORTED: 引擎侧未提供目录浏览接口，请在桌面版任我行中查看文件');
   }
   if (channel === 'file:openExternal') {
     // 浏览器直连/网页宿主没有系统默认应用通道，不能假装打开成功
@@ -212,7 +212,7 @@ async function handleEngineFileChannel(channel: string, args: unknown[]): Promis
         const reason =
           data.message && !data.message.includes('二进制')
             ? data.message
-            : '引擎直连通道不解析 Office/PDF 正文，请在桌面版通天办公中预览';
+            : '引擎直连通道不解析 Office/PDF 正文，请在桌面版任我行中预览';
         return {
           path: filePath,
           content: '',
@@ -442,7 +442,7 @@ export const engineAPI = {
   /** 取消任务 */
   chatCancel: async (taskId: string) => {
     const resp = await postSSE('/api/chat/cancel', { task_id: taskId });
-    return (await resp.json()) as { taskId: string; cancelled: boolean };
+    return (await resp.json()) as { taskId: string; cancelled: boolean; status?: string };
   },
 
   /** 事件重放：引擎侧按 seq 返回会话窗口内的原始事件（窗口外 events 为空） */

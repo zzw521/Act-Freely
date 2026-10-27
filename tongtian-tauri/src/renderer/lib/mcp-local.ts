@@ -388,7 +388,7 @@ export function disconnectLocalServer(serverId: unknown, nowMs: number = Date.no
 export function connectLocalServer(serverId: unknown): McpServer {
   const row = findRow(serverId);
   throw new Error(
-    `MCP_UNSUPPORTED: 当前通道未与「${row.name}」握手，请在桌面版通天办公中连接`,
+    `MCP_UNSUPPORTED: 当前通道未与「${row.name}」握手，请在桌面版任我行中连接`,
   );
 }
 
@@ -484,12 +484,12 @@ export function handleLocalMcpChannel(channel: string, args: unknown[]): LocalMc
     case 'mcp:oauthAuthorize':
       findRow(serverId);
       throw new Error(
-        'MCP_OAUTH_UNSUPPORTED: 浏览器通道无法发起 OAuth 授权与保存令牌，请在桌面版通天办公中完成',
+        'MCP_OAUTH_UNSUPPORTED: 浏览器通道无法发起 OAuth 授权与保存令牌，请在桌面版任我行中完成',
       );
     case 'mcp:oauthRevoke':
       findRow(serverId);
       throw new Error(
-        'MCP_OAUTH_UNSUPPORTED: 浏览器通道不持有访问令牌，无需撤销；请在桌面版通天办公中管理授权',
+        'MCP_OAUTH_UNSUPPORTED: 浏览器通道不持有访问令牌，无需撤销；请在桌面版任我行中管理授权',
       );
     default:
       return { handled: false };

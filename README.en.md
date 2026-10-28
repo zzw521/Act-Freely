@@ -84,7 +84,7 @@ What makes it different from a plain chat client:
 └── README.md / README.en.md
 ```
 
-Docs start at [docs/README.md](docs/README.md): the current [PRD](docs/PRD-任我行.md) and [defect & implementation plan](docs/缺陷与实现计划-任我行.md); historical material is archived under `docs/archive/`.
+Docs start at [docs/README.md](docs/README.md): the current [PRD](docs/PRD-任我行.md) and [defect & implementation plan](docs/缺陷与实现计划-任我行.md); historical material is archived under `docs/archive/` and stays local, it is not distributed with the repository.
 
 ## Getting started
 

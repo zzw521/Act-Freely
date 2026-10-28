@@ -85,7 +85,7 @@
 └── README.md / README.en.md
 ```
 
-文档入口见 [docs/README.md](docs/README.md)：现行 [PRD](docs/PRD-任我行.md) 与 [缺陷与实现计划](docs/缺陷与实现计划-任我行.md)，历史资料归档在 `docs/archive/`。
+文档入口见 [docs/README.md](docs/README.md)：现行 [PRD](docs/PRD-任我行.md) 与 [缺陷与实现计划](docs/缺陷与实现计划-任我行.md)，历史资料归档在 `docs/archive/`，只保留在本机、不随仓库分发。
 
 ## 快速开始
 

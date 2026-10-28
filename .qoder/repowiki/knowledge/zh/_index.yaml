@@ -1,0 +1,53 @@
+# 知识卡导出索引文件
+schema_version: 1
+locale: zh-CN
+branch: Q0DeR-MaG1C-BrAnCh-Fo2-NoN-GiT-Or-No-C0MmIt
+nodes_managed: true
+exported_at: "2026-08-07T02:26:12Z"
+modules:
+    "":
+        dir_name: 通天办公 MVP 项目根（Tauri + Rust 本地 AI 工作助手）
+        title: 通天办公 MVP 项目根（Tauri + Rust 本地 AI 工作助手）
+        scope:
+            - tongtian-office-mvp-design.md
+            - 通天办公-PRD.html
+        source_files: []
+        children:
+            - dev_tools
+            - documentation
+            - tongtian_tauri_app
+        depends_on: []
+        related_to: []
+    dev_tools:
+        dir_name: 开发环境搭建与本地构建脚本集
+        title: 开发环境搭建与本地构建脚本集
+        scope:
+            - .tools/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to:
+            - path: documentation
+            - path: tongtian_tauri_app
+    documentation:
+        dir_name: 通天办公项目文档与规格（SPEC、变更方案与实施任务清单）
+        title: 通天办公项目文档与规格（SPEC、变更方案与实施任务清单）
+        scope:
+            - docs/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to:
+            - path: dev_tools
+            - path: tongtian_tauri_app
+    tongtian_tauri_app:
+        dir_name: 通天办公 Tauri 桌面应用（前端 + Rust 后端 + Python Agent 引擎）
+        title: 通天办公 Tauri 桌面应用（前端 + Rust 后端 + Python Agent 引擎）
+        scope:
+            - tongtian-tauri/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to:
+            - path: dev_tools
+            - path: documentation

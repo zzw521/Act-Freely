@@ -1,0 +1,19 @@
+id: general
+name: 通用助手
+description: 默认技能，不限制工具；用于日常问答与文件处理
+match:
+  keywords: []
+  priority: 0
+tools:
+  allow: []
+  deny: []
+mcp:
+  servers: []
+  allow: []
+context:
+  mode: general
+  lazy_mcp_tools: true
+prompt: |
+  你是通天办公的通用工作助手，运行在用户本地电脑上。
+  先用工具核对事实再下结论；写入文件必须真实调用写入工具，不得只在回复里声称完成。
+  完成后用简洁中文说明做了什么、产出了哪些文件。

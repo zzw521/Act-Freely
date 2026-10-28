@@ -280,6 +280,13 @@ pub async fn start_workspace(
         .envs(proxy_spec.env_vars())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // 系统级沙箱：把启动器与网络授权下发给引擎，终端 / MCP / ACP 的真实子进程据此套壳。
+    // 配置在任务开始时已经写入进程内快照；这里只负责传递。
+    if let Some(cfg) = crate::sandbox::active() {
+        if let Some(envs) = crate::sandbox::engine_env(&cfg) {
+            command.envs(envs);
+        }
+    }
     // 引擎是常驻进程：不抑制控制台，安装版会一直挂着一个黑色窗口
     crate::win_console::hide_console_async(&mut command);
     let mut child = command
@@ -695,6 +702,31 @@ fn spawn_emitter(
             }
         }
     })
+}
+
+/// 本地 harness 的事件通道：与引擎链路同一 emit 通道，返回发送端与转发任务句柄。
+pub fn harness_channel(
+    app: &AppHandle,
+) -> (
+    tokio::sync::mpsc::Sender<Value>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Value>(EMIT_CHANNEL_CAPACITY);
+    (tx, spawn_emitter(app.clone(), rx))
+}
+
+/// 本地 harness 的单条事件入口：持久化 → 计量 → 适配 → 推送，
+/// 与引擎事件的消费链路一致，前端无需区分事件来源。
+pub async fn ingest_event(
+    ev: &super::sse::AgentEvent,
+    task_id: &str,
+    p0: &P0Context,
+    tx: &tokio::sync::mpsc::Sender<Value>,
+) {
+    persist_and_meter(ev, task_id, p0, tx).await;
+    if let Some(chat) = adapt_to_chat_event(ev, task_id) {
+        let _ = tx.send(chat).await;
+    }
 }
 
 /// 从引擎重放端点拉取 seq > from_seq 的事件（断线补齐/gap 修复）
@@ -1138,36 +1170,6 @@ pub async fn query_checkpoints(
     resp.json::<Value>()
         .await
         .map_err(|e| format!("BRIDGE_CHAT_PARSE: {e}"))
-}
-
-/// 任务控制转发（pause/resume/rollback_to，引擎返回 JSON）
-pub async fn control_task(
-    bridge: &BridgeState,
-    workspace_id: &str,
-    task_id: &str,
-    action: &str,
-    step_id: Option<&str>,
-) -> Result<Value, String> {
-    let port = {
-        let b = bridge.lock().await;
-        b.instances
-            .get(workspace_id)
-            .map(|i| i.port)
-            .ok_or_else(|| format!("workspace 未启动: {workspace_id}"))?
-    };
-    let resp = http_client()
-        .post(format!("http://127.0.0.1:{port}/api/chat/control"))
-        .json(&json!({
-            "task_id": task_id,
-            "action": action,
-            "step_id": step_id.unwrap_or(""),
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("BRIDGE_COMM_FAILED: {e}"))?;
-    resp.json::<Value>()
-        .await
-        .map_err(|e| format!("BRIDGE_CONTROL_PARSE: {e}"))
 }
 
 /// 通用 SSE POST 消费管道：独立 emit 任务 + seq 去重/gap 重放 + 断线补齐

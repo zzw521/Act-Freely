@@ -20,23 +20,24 @@ import {
   Tooltip,
   Snackbar,
   Alert,
+  Button,
+  TextField,
 } from '@mui/material';
 import BuildIcon from '@mui/icons-material/Build';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
-import Inventory2Icon from '@mui/icons-material/Inventory2';
 import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
 import ThumbUpOutlinedIcon from '@mui/icons-material/ThumbUpOutlined';
 import ThumbDownOutlinedIcon from '@mui/icons-material/ThumbDownOutlined';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import ShareIcon from '@mui/icons-material/Share';
 import RefreshIcon from '@mui/icons-material/Refresh';
+import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
 import Markdown from 'react-markdown';
 import { Message, Role, ChatEvent, StepType } from '../../../shared/types';
-import FilePreview from '../FilePreview';
+import ArtifactCard from '../ArtifactCard';
 import Panda, { type PandaState } from '../Panda';
 import { useAppSettings } from '../../lib/use-app-settings';
-import { openArtifact } from '../../lib/artifact-open';
 import { useI18n } from '../../i18n';
 
 // re-export for external usage of event types
@@ -99,6 +100,10 @@ interface ChatStreamProps {
   regeneratingTurn?: number | null;
   /** 重新生成回调（真实重跑原目标） */
   onRegenerate?: (turnIdx: number) => void;
+  /** 任务运行中（含排队/待审阅）：此时不允许改写提问，避免同一轮并存两个任务 */
+  busy?: boolean;
+  /** 改写某一轮提问并重新执行（该轮回复与之后轮次随之作废） */
+  onEditTurn?: (turnIdx: number, text: string) => void;
   /**
    * 轮次 → 回复评价（会话状态提供，组件不再本地记账）：
    * 切会话不串轮，刷新/重启后按正文库恢复。
@@ -108,22 +113,24 @@ interface ChatStreamProps {
   onFeedback?: (turnIdx: number, kind: 'up' | 'down' | null) => Promise<void>;
   /** Ctrl+F 会话内查找当前定位到的轮次（0 基，与 data-turn 一致） */
   highlightTurn?: number | null;
+  /** 产物点击：由工作台统一接管（展开右侧任务栏并在面板内预览） */
+  onArtifactOpen: (path: string) => void;
 }
 
-const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, isLoading, regeneratingTurn, onRegenerate, feedback = EMPTY_FEEDBACK, onFeedback, highlightTurn }) => {
+const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, isLoading, regeneratingTurn, onRegenerate, busy, onEditTurn, feedback = EMPTY_FEEDBACK, onFeedback, highlightTurn, onArtifactOpen }) => {
   const { t: tr, locale } = useI18n();
   const messagesEndRef = useRef<HTMLDivElement>(null);
   // 每轮执行过程默认折叠，点击展开查看详情
   const [openTurns, setOpenTurns] = useState<Record<number, boolean>>({});
   const [copiedTurn, setCopiedTurn] = useState<number | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
-  // 产物文件预览
-  const [previewPath, setPreviewPath] = useState<string | null>(null);
+  // 正在改写的轮次与草稿（同一时刻只编辑一轮）
+  const [editingTurn, setEditingTurn] = useState<number | null>(null);
+  const [editText, setEditText] = useState('');
 
-  // 对话字号、字体与产物打开方式（偏好设置真实生效）
+  // 对话字号与字体（偏好设置真实生效）
   const [appSettings] = useAppSettings();
   const chatFontSize = (appSettings.chatFontSize as number) ?? 14;
-  const previewMode = (appSettings.previewMode as string) ?? '应用内预览';
   // 默认展开工具调用：只影响「初始是否展开」，逐轮手动切换仍然优先
   const expandToolCalls = Boolean(appSettings.expandToolCalls);
 
@@ -166,13 +173,6 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
   /** 逐轮手动切换：以当前实际展开态取反，兼容「默认展开工具调用」的初始值 */
   const toggleTurn = (turnIdx: number, currentOpen: boolean) => {
     setOpenTurns((prev) => ({ ...prev, [turnIdx]: !currentOpen }));
-  };
-
-  /** 产物点击：按「预览方式」分流；系统打开失败时提示并回退应用内 */
-  const handleOpenArtifact = async (path: string) => {
-    const result = await openArtifact(path, previewMode);
-    if (result.error) setActionMsg(result.error);
-    if (result.previewPath) setPreviewPath(result.previewPath);
   };
 
   // ── 回复操作栏 ─────────────────────────────────────────
@@ -225,6 +225,30 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
     } else {
       setActionMsg(tr('当前环境不支持剪贴板复制'));
     }
+  };
+
+  // ── 改写提问 ───────────────────────────────────────────
+
+  /** 任务运行中不让改：同一轮并存两个任务会让事件流互相覆盖 */
+  const canEditTurn = Boolean(onEditTurn) && !busy && regeneratingTurn == null;
+
+  const beginEdit = (turnIdx: number, content: string) => {
+    setEditingTurn(turnIdx);
+    setEditText(content);
+  };
+
+  const closeEdit = () => {
+    setEditingTurn(null);
+    setEditText('');
+  };
+
+  const saveEdit = (turnIdx: number, content: string) => {
+    if (!canEditTurn) return;
+    const next = editText.trim();
+    if (!onEditTurn || !next || next === content.trim()) return;
+    // 先收起编辑态：提交后本轮会进入重新执行，气泡显示的是新提问
+    closeEdit();
+    onEditTurn(turnIdx, next);
   };
 
   // ── 执行过程明细渲染 ──────────────────────────────────────
@@ -435,32 +459,14 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                       {renderMarkdown(finalText)}
                     </Box>
                   )}
-                  <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+                  <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))', gap: 1, maxWidth: 560 }}>
                     {arts.map((artifact, artIdx) => (
-                      <Tooltip
+                      <ArtifactCard
                         key={`${artifact}-${artIdx}`}
-                        title={`${artifact} · ${tr(previewMode === '系统默认程序' ? '点击用系统默认程序打开' : '点击在应用内预览')}`}
-                        placement="top"
-                      >
-                        <Chip
-                          icon={<Inventory2Icon sx={{ fontSize: 14 }} />}
-                          label={artifact.split(/[\\/]/).filter(Boolean).pop() ?? artifact}
-                          size="small"
-                          clickable
-                          onClick={() => void handleOpenArtifact(artifact)}
-                          sx={{
-                            fontSize: '12px',
-                            height: 26,
-                            bgcolor: 'var(--tt-surface-2)',
-                            color: 'var(--tt-text-2)',
-                            border: '1px solid var(--tt-border)',
-                            fontWeight: 500,
-                            maxWidth: '100%',
-                            '& .MuiChip-icon': { color: '#16A34A' },
-                            '&:hover': { bgcolor: 'var(--tt-surface)', borderColor: '#86EFAC', color: '#15803D' },
-                          }}
-                        />
-                      </Tooltip>
+                        path={artifact}
+                        onClick={onArtifactOpen}
+                        hint={tr('在右侧预览')}
+                      />
                     ))}
                   </Box>
                 </Box>
@@ -588,26 +594,107 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                 : {}),
             }}
           >
-            <Box sx={{ maxWidth: '72%', display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
-              <Box
-                title={new Date(msg.ts).toLocaleString(locale)}
-                sx={{
-                  px: 1.75,
-                  py: 1.1,
-                  borderRadius: '16px 16px 4px 16px',
-                  // 半透明中性底：亮色主题下是浅灰，暗色主题下是微亮，不再写死一块亮色
-                  bgcolor: 'rgba(100, 116, 139, 0.10)',
-                  color: 'var(--tt-text-1)',
-                  border: '1px solid var(--tt-border-soft)',
-                  fontSize: chatFontSize,
-                  fontFamily: 'var(--tt-chat-font)',
-                  lineHeight: 1.65,
-                  whiteSpace: 'pre-wrap',
-                  wordBreak: 'break-word',
-                }}
-              >
-                {msg.content as string}
-              </Box>
+            <Box
+              sx={{
+                maxWidth: '72%',
+                width: editingTurn === currentTurn ? '72%' : undefined,
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: editingTurn === currentTurn ? 'stretch' : 'flex-end',
+              }}
+            >
+              {editingTurn === currentTurn ? (
+                <>
+                  <TextField
+                    value={editText}
+                    onChange={(e) => setEditText(e.target.value)}
+                    multiline
+                    minRows={2}
+                    maxRows={10}
+                    fullWidth
+                    size="small"
+                    autoFocus
+                    sx={{
+                      bgcolor: 'var(--tt-surface-1)',
+                      borderRadius: '12px',
+                      '& .MuiOutlinedInput-root': {
+                        fontSize: chatFontSize,
+                        fontFamily: 'var(--tt-chat-font)',
+                      },
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') closeEdit();
+                      // Ctrl/Cmd+Enter 直接保存，与输入框发送同一习惯
+                      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) saveEdit(currentTurn, String(msg.content ?? ''));
+                    }}
+                  />
+                  {userMessages.length - currentTurn - 1 > 0 && (
+                    <Typography sx={{ fontSize: '11.5px', color: '#B45309', mt: 0.5 }}>
+                      {tr('提交后将删除这轮之后的 {n} 轮对话，并重新执行本轮', {
+                        n: userMessages.length - currentTurn - 1,
+                      })}
+                    </Typography>
+                  )}
+                  <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 0.5, mt: 0.75 }}>
+                    <Button size="small" onClick={closeEdit} sx={{ color: 'var(--tt-text-3)' }}>
+                      {tr('取消编辑')}
+                    </Button>
+                    <Button
+                      size="small"
+                      variant="contained"
+                      disabled={
+                        !canEditTurn ||
+                        !editText.trim() ||
+                        editText.trim() === String(msg.content ?? '').trim()
+                      }
+                      onClick={() => saveEdit(currentTurn, String(msg.content ?? ''))}
+                      sx={{ bgcolor: '#0D9488', '&:hover': { bgcolor: '#0F766E' } }}
+                    >
+                      {tr('保存并重新执行')}
+                    </Button>
+                  </Box>
+                </>
+              ) : (
+                <>
+                  <Box
+                    title={new Date(msg.ts).toLocaleString(locale)}
+                    sx={{
+                      px: 1.75,
+                      py: 1.1,
+                      borderRadius: '16px 16px 4px 16px',
+                      // 半透明中性底：亮色主题下是浅灰，暗色主题下是微亮，不再写死一块亮色
+                      bgcolor: 'rgba(100, 116, 139, 0.10)',
+                      color: 'var(--tt-text-1)',
+                      border: '1px solid var(--tt-border-soft)',
+                      fontSize: chatFontSize,
+                      fontFamily: 'var(--tt-chat-font)',
+                      lineHeight: 1.65,
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-word',
+                    }}
+                  >
+                    {msg.content as string}
+                  </Box>
+                  {canEditTurn && editingTurn == null && (
+                    <Tooltip title={tr('编辑提问')}>
+                      <IconButton
+                        size="small"
+                        onClick={() => beginEdit(currentTurn, String(msg.content ?? ''))}
+                        sx={{
+                          width: 24,
+                          height: 24,
+                          mt: 0.25,
+                          opacity: 0.45,
+                          transition: 'opacity 0.15s ease',
+                          '&:hover': { opacity: 1 },
+                        }}
+                      >
+                        <EditOutlinedIcon sx={{ fontSize: 14, color: 'var(--tt-text-4)' }} />
+                      </IconButton>
+                    </Tooltip>
+                  )}
+                </>
+              )}
             </Box>
           </Box>,
         );
@@ -746,9 +833,6 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
 
       {/* 自动滚动锚点 */}
       <div ref={messagesEndRef} />
-
-      {/* 产物文件预览弹窗 */}
-      <FilePreview path={previewPath} onClose={() => setPreviewPath(null)} />
     </Box>
   );
 };

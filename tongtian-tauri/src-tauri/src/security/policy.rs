@@ -333,6 +333,42 @@ pub fn set_sandbox(store: &Store, policy: &SandboxPolicy) -> Result<SandboxPolic
     Ok(stored)
 }
 
+// ── 系统级沙箱 ──────────────────────────────────────────────────
+
+pub const SYSTEM_SANDBOX_KEY: &str = "system_sandbox";
+
+/// 读取系统级沙箱设置；未保存过按关闭处理
+pub fn get_system_sandbox(
+    store: &Store,
+) -> Result<crate::sandbox::SystemSandboxConfig, String> {
+    let Some(raw) = get_json(store, SYSTEM_SANDBOX_KEY)? else {
+        return Ok(crate::sandbox::SystemSandboxConfig::default());
+    };
+    serde_json::from_str(&raw)
+        .map_err(|e| format!("POLICY_CORRUPT: system_sandbox 解析失败（{e}）"))
+}
+
+/// 保存系统级沙箱设置：平台没有实现时拒绝「启用」，不落一份永远不生效的已开启状态
+pub fn set_system_sandbox(
+    store: &Store,
+    config: &crate::sandbox::SystemSandboxConfig,
+) -> Result<crate::sandbox::SystemSandboxConfig, String> {
+    if config.enabled && !crate::sandbox::platform_supported() {
+        return Err(format!(
+            "POLICY_UNSUPPORTED: 当前平台（{}）没有系统级沙箱实现，无法启用",
+            std::env::consts::OS
+        ));
+    }
+    let stored = crate::sandbox::SystemSandboxConfig {
+        enabled: config.enabled,
+        network: config.network,
+        updated_at_ms: now_ms(),
+    };
+    let json = serde_json::to_string(&stored).map_err(|e| format!("POLICY_SAVE_FAILED: {e}"))?;
+    put_json(store, SYSTEM_SANDBOX_KEY, &json)?;
+    Ok(stored)
+}
+
 // ── 路径规则（沙箱文件白/黑名单） ──────────────────────────────
 
 /// 路径文本归一化：统一为 `/`、去掉尾部斜杠；Windows 下转小写（文件系统不区分大小写）。
@@ -697,5 +733,45 @@ mod tests {
         assert_eq!(normalize_domain(""), None);
         assert_eq!(normalize_domain("   "), None);
         assert_eq!(normalize_domain("has space.com"), None);
+    }
+
+    #[test]
+    fn test_system_sandbox_defaults_off_then_roundtrip() {
+        let (store, dir) = temp_store("system-sandbox");
+        let default = get_system_sandbox(&store).unwrap();
+        assert!(!default.enabled, "从未保存过时必须按关闭处理");
+
+        let saved = set_system_sandbox(
+            &store,
+            &crate::sandbox::SystemSandboxConfig {
+                enabled: false,
+                network: true,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        assert!(saved.updated_at_ms > 0, "保存时应写入时间戳");
+        assert_eq!(get_system_sandbox(&store).unwrap(), saved);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_system_sandbox_rejects_enable_on_unsupported_platform() {
+        if crate::sandbox::platform_supported() {
+            return;
+        }
+        let (store, dir) = temp_store("system-sandbox-unsupported");
+        let err = set_system_sandbox(
+            &store,
+            &crate::sandbox::SystemSandboxConfig {
+                enabled: true,
+                network: false,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(err.starts_with("POLICY_UNSUPPORTED"), "{err}");
+        assert!(!get_system_sandbox(&store).unwrap().enabled);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

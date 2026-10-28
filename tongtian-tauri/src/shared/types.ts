@@ -1,6 +1,6 @@
 // src/shared/types.ts - 扩展类型定义
 
-/** 任务状态（14 态：原 9 态 + 云端演进增量 5 态，见 docs/changes/agent-platform-evolution/experts/03-business.md §2.1） */
+/** 任务状态（14 态：原 9 态 + 云端演进增量 5 态，见 docs/archive/2026-10/docs/changes/agent-platform-evolution/experts/03-business.md §2.1） */
 export enum TaskStatus {
   IDLE = 'idle',
   PLANNING = 'planning',
@@ -436,12 +436,6 @@ export interface ChatReviewReq {
   planId?: string;
   action: 'approve' | 'reject' | 'modify' | 'resume';
   patch?: Partial<Step>[];
-}
-
-export interface ChatControlReq {
-  taskId: string;
-  action: 'pause' | 'resume' | 'rollback_to';
-  stepId?: string;
 }
 
 // === 安全相关 ===

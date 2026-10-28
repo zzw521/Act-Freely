@@ -13,9 +13,14 @@
 用法: python tests/integration/engine_service_cli_selftest.py
 """
 
+import base64
+import hashlib
+import hmac
+import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 try:
@@ -44,8 +49,173 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         FAILURES.append(name)
 
 
-def main() -> int:
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def make_jwt(secret: str, **overrides) -> str:
+    now = int(time.time())
+    claims = {
+        "sub": "u-1",
+        "sid": "sess-1",
+        "role": "user",
+        "org": "acme",
+        "quota": {"monthlyTokens": 100000, "concurrentTasks": 2},
+        "iss": "tongtian-auth",
+        "aud": "tongtian-engine",
+        "type": "access",
+        "iat": now,
+        "exp": now + 300,
+    }
+    claims.update(overrides)
+    header = _b64url(b'{"alg":"HS256","typ":"JWT"}')
+    body = _b64url(json.dumps(claims, separators=(",", ":")).encode("utf-8"))
+    sig = hmac.new(secret.encode("utf-8"), f"{header}.{body}".encode("ascii"), hashlib.sha256).digest()
+    return f"{header}.{body}.{_b64url(sig)}"
+
+
+def _bearer(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _auth_env_clear() -> None:
+    for name in (
+        "TT_ENGINE_TOKEN",
+        "TT_ENGINE_JWT_SECRET",
+        "TT_AUTH_JWT_SECRET",
+        "TT_ENGINE_JWT_ISSUER",
+        "TT_ENGINE_JWT_AUDIENCE",
+        "TT_ENGINE_ALLOWED_USERS",
+        "TT_ENGINE_AUDIT_LOG",
+    ):
+        os.environ.pop(name, None)
+
+
+def check_jwt_and_audit(client) -> None:
+    print("\n[引擎 JWT 校验、审计与用量归属]")
+    secret = "engine-jwt-selftest-secret"
+    _auth_env_clear()
+    os.environ["TT_ENGINE_JWT_SECRET"] = secret
+
+    good = make_jwt(secret)
+    ok = client.get("/api/models", headers=_bearer(good))
+    check("合法 JWT 可通过", ok.status_code == 200, f"{ok.status_code} {ok.text[:120]}")
+
+    bad_tokens = [
+        ("签名错误", make_jwt("wrong-secret")),
+        ("已过期", make_jwt(secret, exp=int(time.time()) - 1)),
+        ("aud 不匹配", make_jwt(secret, aud="other-engine")),
+        ("iss 不匹配", make_jwt(secret, iss="other-auth")),
+        ("refresh 令牌", make_jwt(secret, type="refresh")),
+        ("缺少 sid", make_jwt(secret, sid="")),
+        ("缺少 sub", make_jwt(secret, sub="")),
+        ("畸形令牌", "not-a-jwt"),
+    ]
+    for name, token in bad_tokens:
+        res = client.get("/api/models", headers=_bearer(token))
+        check(
+            f"JWT {name} → 401 ENGINE_UNAUTHORIZED",
+            res.status_code == 401 and res.json().get("code") == "ENGINE_UNAUTHORIZED",
+            f"{res.status_code} {res.text[:120]}",
+        )
+
+    os.environ["TT_ENGINE_ALLOWED_USERS"] = "u-1"
+    denied = client.get("/api/models", headers=_bearer(make_jwt(secret, sub="u-2", sid="sess-2")))
+    check(
+        "白名单外用户 → 403 ENGINE_USER_NOT_ALLOWED",
+        denied.status_code == 403 and denied.json().get("code") == "ENGINE_USER_NOT_ALLOWED",
+        f"{denied.status_code} {denied.text[:120]}",
+    )
+    check(
+        "白名单内用户放行",
+        client.get("/api/models", headers=_bearer(good)).status_code == 200,
+    )
+    os.environ.pop("TT_ENGINE_ALLOWED_USERS", None)
+
+    os.environ["TT_ENGINE_TOKEN"] = "static-selftest-token"
+    check(
+        "静态令牌与 JWT 并存（静态）",
+        client.get("/api/models", headers=_bearer("static-selftest-token")).status_code == 200,
+    )
+    check(
+        "静态令牌与 JWT 并存（JWT）",
+        client.get("/api/models", headers=_bearer(good)).status_code == 200,
+    )
     os.environ.pop("TT_ENGINE_TOKEN", None)
+
+    u1 = make_jwt(secret)
+    u2 = make_jwt(secret, sub="u-2", sid="sess-2")
+    admin = make_jwt(secret, sub="admin-1", sid="sess-admin", role="admin")
+    client.get("/api/models", headers=_bearer(u1))
+    client.get("/api/tools", headers=_bearer(u2))
+
+    own = client.get("/api/audit?limit=200", headers=_bearer(u1)).json()
+    own_entries = own.get("entries") or []
+    check("审计记录调用主体", any(e.get("sub") == "u-1" and e.get("path") == "/api/models" for e in own_entries))
+    check(
+        "普通用户审计只见自己",
+        bool(own_entries) and all(e.get("sub") == "u-1" for e in own_entries),
+    )
+    forced = client.get("/api/audit?sub=u-2", headers=_bearer(u1)).json().get("entries") or []
+    check(
+        "普通用户无法指定他人审计",
+        bool(forced) and all(e.get("sub") == "u-1" for e in forced),
+    )
+
+    all_entries = client.get("/api/audit?limit=500", headers=_bearer(admin)).json().get("entries") or []
+    subjects = {e.get("sub") for e in all_entries}
+    check("管理员审计可见多个用户", {"u-1", "u-2"} <= subjects, str(subjects))
+    by_user = client.get("/api/audit?sub=u-2", headers=_bearer(admin)).json().get("entries") or []
+    check("管理员可按用户过滤审计", bool(by_user) and all(e.get("sub") == "u-2" for e in by_user))
+    failed = [e for e in all_entries if e.get("reason")]
+    check("失败请求也进入审计", any(e.get("reason") == "expired" for e in failed), str(failed[:2]))
+
+    with tempfile.TemporaryDirectory() as audit_dir:
+        log_path = Path(audit_dir) / "audit.jsonl"
+        os.environ["TT_ENGINE_AUDIT_LOG"] = str(log_path)
+        client.get("/api/models", headers=_bearer(u1))
+        lines = log_path.read_text(encoding="utf-8").splitlines() if log_path.exists() else []
+        persisted = json.loads(lines[-1]) if lines else {}
+        check("审计可追加落盘", persisted.get("sub") == "u-1" and persisted.get("path") == "/api/models")
+        os.environ.pop("TT_ENGINE_AUDIT_LOG", None)
+
+    engine_server.USAGE_LEDGER.add("audit-model", 10, 5, sub="u-1", org="acme")
+    engine_server.USAGE_LEDGER.add("audit-model", 20, 7, sub="u-2", org="acme")
+    all_rows = engine_server.USAGE_LEDGER.aggregate("total")
+    merged = next((r for r in all_rows if r["modelName"] == "audit-model"), {})
+    check("用量默认汇总全部用户", merged.get("tokensUsed") == 42, str(merged))
+    u1_rows = engine_server.USAGE_LEDGER.aggregate("total", "u-1")
+    u1_merged = next((r for r in u1_rows if r["modelName"] == "audit-model"), {})
+    check("用量可按用户过滤", u1_merged.get("tokensUsed") == 15, str(u1_merged))
+    users = engine_server.USAGE_LEDGER.users("total")
+    order = [row["sub"] for row in users]
+    check("用户汇总按 token 降序", order[:2] == ["u-2", "u-1"], str(users))
+    check("用户汇总带组织", next(r for r in users if r["sub"] == "u-1").get("org") == "acme")
+
+    u1_usage = client.get("/api/usage?period=total&sub=u-2", headers=_bearer(u1)).json()
+    u1_row = next((r for r in u1_usage.get("rows") or [] if r["modelName"] == "audit-model"), {})
+    check(
+        "普通用户查询用量被强制收窄到自己",
+        u1_usage.get("subject") == "u-1" and u1_row.get("tokensUsed") == 15,
+        str(u1_usage)[:200],
+    )
+    admin_usage = client.get("/api/usage?period=total&sub=u-2", headers=_bearer(admin)).json()
+    admin_row = next((r for r in admin_usage.get("rows") or [] if r["modelName"] == "audit-model"), {})
+    check(
+        "管理员可按用户查询用量",
+        admin_usage.get("subject") == "u-2" and admin_row.get("tokensUsed") == 27,
+        str(admin_usage)[:200],
+    )
+    report = client.get("/api/usage/report?period=total", headers=_bearer(admin)).json()
+    subjects = {row.get("sub") for row in report.get("users") or []}
+    check("用量报表含用户汇总", {"u-1", "u-2"} <= subjects, str(subjects))
+
+    _auth_env_clear()
+    check("清理凭据后回到无鉴权桌面模式", client.get("/api/models").status_code == 200)
+
+
+def main() -> int:
+    _auth_env_clear()
     os.environ.pop("TT_ALLOW_REMOTE_BIND", None)
 
     with tempfile.TemporaryDirectory() as td:
@@ -89,6 +259,8 @@ def main() -> int:
         check("静态页不受令牌守卫影响", client.get("/").status_code == 200)
         os.environ.pop("TT_ENGINE_TOKEN", None)
 
+        check_jwt_and_audit(client)
+
         # 目录不可用必须失败，不能静默退化成只起 API
         try:
             engine_server.mount_web(engine_server.app, str(root / "missing"))
@@ -96,7 +268,7 @@ def main() -> int:
         except RuntimeError as exc:
             check("缺失目录明确报错并指向构建产物", "index.html" in str(exc))
 
-    # 绑定准入：纯函数覆盖四象限
+    # 绑定准入：纯函数覆盖各象限
     check("回环地址无需令牌", engine_server.service_bind_error("127.0.0.1", "", "") == "")
     check(
         "非回环但未确认 → 拒绝",
@@ -109,6 +281,14 @@ def main() -> int:
     check(
         "非回环 + 确认 + 令牌 → 允许",
         engine_server.service_bind_error("0.0.0.0", "1", "tok") == "",
+    )
+    check(
+        "非回环 + 确认 + 仅 JWT 密钥 → 允许",
+        engine_server.service_bind_error("0.0.0.0", "1", "", "jwt-secret") == "",
+    )
+    check(
+        "非回环 + 确认 + 无任何凭据 → 拒绝",
+        "TT_ENGINE_JWT_SECRET" in engine_server.service_bind_error("0.0.0.0", "1", "", ""),
     )
 
     print()

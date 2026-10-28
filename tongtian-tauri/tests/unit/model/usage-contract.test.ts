@@ -215,9 +215,9 @@ describe('契约与三通道接入', () => {
     // 引擎侧确实提供报表端点与按日/汇总算法（不是前端凭空拼）
     const py = engineServer();
     expect(py).toContain('@app.get("/api/usage/report")');
-    expect(py).toContain('def days(self, period: str)');
+    expect(py).toContain('def days(self, period: str, subject: str | None = None)');
     expect(py).toContain('def totals(self, period: str');
-    expect(py).toContain('USAGE_LEDGER.days(p)');
+    expect(py).toContain('"days": USAGE_LEDGER.days(p, subject)');
   });
 
   it('开发 Mock：两条通道由本地台账接管（Mock 开关规范）', () => {

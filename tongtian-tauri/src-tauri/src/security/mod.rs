@@ -153,6 +153,56 @@ pub async fn sandbox_policy_set(
     Ok(serde_json::to_value(stored).unwrap_or(Value::Null))
 }
 
+/// 系统级沙箱读取：设置意图与真实生效状态分开返回（`requested` / `supported` / `effective`）
+#[tauri::command]
+pub async fn sandbox_system_get(p0: State<'_, Arc<P0Services>>) -> Result<Value, String> {
+    let config = policy::get_system_sandbox(&p0.store)?;
+    Ok(system_sandbox_view(&config, crate::sandbox::status(&config)))
+}
+
+/// 系统级沙箱保存：启用前真实创建 AppContainer profile，失败就不落库
+#[tauri::command]
+pub async fn sandbox_system_set(
+    p0: State<'_, Arc<P0Services>>,
+    enabled: bool,
+    network: bool,
+) -> Result<Value, String> {
+    if enabled {
+        crate::sandbox::prepare(network)?;
+    }
+    let stored = policy::set_system_sandbox(
+        &p0.store,
+        &crate::sandbox::SystemSandboxConfig {
+            enabled,
+            network,
+            updated_at_ms: 0,
+        },
+    )?;
+    crate::sandbox::set_active(Some(stored.clone()).filter(|c| c.enabled));
+    let status = crate::sandbox::status(&stored);
+    audit::record_quiet(
+        &p0.store,
+        audit::ACTION_CONFIG_CHANGE,
+        if stored.enabled { audit::SEV_WARNING } else { audit::SEV_INFO },
+        "sandbox:system",
+        &format!(
+            "系统级沙箱{}：网络={} 实际生效={}（平台 {}）",
+            if stored.enabled { "已启用" } else { "已关闭" },
+            if stored.network { "允许" } else { "阻断" },
+            if status.effective { "是" } else { "否" },
+            status.platform
+        ),
+    );
+    Ok(system_sandbox_view(&stored, status))
+}
+
+fn system_sandbox_view(
+    config: &crate::sandbox::SystemSandboxConfig,
+    status: crate::sandbox::SystemSandboxStatus,
+) -> Value {
+    json!({ "config": config, "status": status })
+}
+
 /// 工作环境文件用量：磁盘实测 `{data_home}/workspaces/*/environment`，无目录即 0
 #[tauri::command]
 pub async fn sandbox_env_usage() -> Result<Value, String> {

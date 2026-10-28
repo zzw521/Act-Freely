@@ -888,31 +888,6 @@ const mockAPI = {
     return { ok: true, status: 'pending_review' };
   },
 
-  /** 控制（pause/resume/rollback_to） */
-  chatControl: async (req: { taskId: string; action: string; stepId?: string }) => {
-    const task = activeMockTask;
-    if (!task || task.taskId !== req.taskId) return { ok: false, status: 'TASK_NOT_FOUND' };
-    if (req.action === 'pause') {
-      task.status = 'paused';
-      emit(seqEvent(req.taskId, { type: 'status_change', status: 'paused', waitReason: 'user_pause' }));
-      return { ok: true, status: 'paused' };
-    }
-    if (req.action === 'resume') {
-      task.status = 'executing';
-      emit(seqEvent(req.taskId, { type: 'status_change', status: 'executing' }));
-      return { ok: true, status: 'executing' };
-    }
-    if (req.action === 'rollback_to') {
-      task.status = 'rolled_back';
-      emit(seqEvent(req.taskId, { type: 'status_change', status: 'rolled_back', statusReasonCode: `ROLLBACK_TO:${req.stepId ?? ''}` }));
-      emit(seqEvent(req.taskId, { type: 'done' }));
-      mockHistory.unshift(task);
-      activeMockTask = null;
-      return { ok: true, status: 'rolled_back' };
-    }
-    return { ok: false, status: 'VALIDATION_ERROR' };
-  },
-
   chatHistory: async () =>
     mockHistory.map((t) => ({
       id: t.taskId,

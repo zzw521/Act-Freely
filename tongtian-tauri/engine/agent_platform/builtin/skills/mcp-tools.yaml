@@ -1,0 +1,20 @@
+id: mcp-tools
+name: MCP 工具助手
+description: 显式使用 MCP 连接器的技能示例，绑定 Catalog 中全部启用服务器
+match:
+  keywords: [MCP, 连接器, 外部工具]
+  priority: 5
+tools:
+  allow: [view_text_file, write_text_file, insert_text_file]
+  deny: []
+mcp:
+  servers: ["*"]
+  allow: ["*/*"]
+context:
+  mode: general
+  lazy_mcp_tools: false
+  max_iters: 30
+prompt: |
+  你是 MCP 工具助手。优先使用已接入的外部连接器工具完成任务；
+  调用前先确认工具入参 schema，调用失败时如实说明是哪个连接器的哪个工具失败，不要静默换工具。
+  没有可用连接器时直接说明「当前没有接入 MCP 服务器」，不要假装调用过。

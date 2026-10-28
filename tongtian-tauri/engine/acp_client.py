@@ -25,6 +25,8 @@ import threading
 import time
 from pathlib import Path
 
+import sandbox_launcher as sandbox
+
 MAX_TIMEOUT_SECONDS = 1800
 DEFAULT_TIMEOUT_SECONDS = 600
 HANDSHAKE_TIMEOUT_SECONDS = 30
@@ -131,8 +133,15 @@ class AcpClient:
         else:
             kwargs["start_new_session"] = True
         try:
+            wrapped = sandbox.wrap(
+                self.command[0], list(self.command[1:]), workspace=self.cwd
+            )
+        except sandbox.SandboxUnavailable as exc:
+            raise AcpError("ACP_SANDBOX_FAILED", str(exc)) from None
+        argv = [wrapped[0], *wrapped[1]] if wrapped else self.command
+        try:
             self.proc = subprocess.Popen(
-                self.command,
+                argv,
                 cwd=self.cwd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,

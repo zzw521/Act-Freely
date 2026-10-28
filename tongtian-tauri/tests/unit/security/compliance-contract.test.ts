@@ -248,11 +248,15 @@ describe('UI 消费与假状态清理', () => {
     expect(src).toContain('closeNotification');
   });
 
-  it('Workbench 提交与重新生成前都过合规闸门', () => {
+  it('Workbench 提交、重新生成与改写提问前都过合规闸门', () => {
     const src = workbenchStore();
-    expect(src.match(/await api\.compliance\.check\(/g)?.length).toBe(2);
+    // 三条出站路径：新任务、重新生成、改写提问后重跑
+    expect(src.match(/await api\.compliance\.check\(/g)?.length).toBe(3);
     // 端点按所选模型 id 从权威清单解析（渲染层不再持有模型配置对象）
     expect(src).toContain('await api.compliance.check(goal, await modelBaseUrl(modelId));');
+    expect(src).toContain(
+      'await api.compliance.check(trimmed, await modelBaseUrl(conv.turnModels[turnIdx]?.modelId));'
+    );
   });
 });
 

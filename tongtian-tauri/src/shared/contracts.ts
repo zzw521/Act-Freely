@@ -137,6 +137,8 @@ export enum ErrorCode {
   MCP_PROTOCOL_ERROR = 'MCP_PROTOCOL_ERROR',
   MCP_TRANSPORT_UNSUPPORTED = 'MCP_TRANSPORT_UNSUPPORTED',
   MCP_INVALID_CONFIG = 'MCP_INVALID_CONFIG',
+  /** 系统级沙箱启动连接器子进程失败（沙箱开关打开时） */
+  MCP_SANDBOX_FAILED = 'MCP_SANDBOX_FAILED',
   /** 仅浏览器直连通道使用：网页侧无法拉起子进程或持有连接器凭据 */
   MCP_UNSUPPORTED = 'MCP_UNSUPPORTED',
 
@@ -307,6 +309,8 @@ export enum ErrorCode {
   POLICY_DOMAIN_BLOCKED = 'POLICY_DOMAIN_BLOCKED',
   /** 无法解析出目标域名 */
   POLICY_INVALID_URL = 'POLICY_INVALID_URL',
+  /** 当前平台没有系统级沙箱实现（如非 Windows），无法启用该级别 */
+  POLICY_UNSUPPORTED = 'POLICY_UNSUPPORTED',
   /** 审计日志查询失败 */
   AUDIT_QUERY_FAILED = 'AUDIT_QUERY_FAILED',
   /** 审计日志写入失败 */
@@ -604,12 +608,6 @@ export interface ChatReviewReq {
   planId?: string;
   action: 'approve' | 'reject' | 'modify' | 'resume';
   patch?: Record<string, unknown>;
-}
-
-export interface ChatControlReq {
-  taskId: string;
-  action: 'pause' | 'resume' | 'rollback_to';
-  stepId?: string;
 }
 
 /**
@@ -1663,6 +1661,32 @@ export interface SandboxEnvClearResult {
   failed: Array<{ workspaceId?: string; path?: string; error: string }>;
 }
 
+/** 系统级沙箱设置：`enabled` 是用户意图，不等于已生效 */
+export interface SystemSandboxConfig {
+  enabled: boolean;
+  network: boolean;
+  updatedAtMs: number;
+}
+
+/** 系统级沙箱状态：请求 / 平台支持 / 实际生效三栏分开 */
+export interface SystemSandboxStatus {
+  requested: boolean;
+  supported: boolean;
+  effective: boolean;
+  platform: string;
+  profile: string;
+  network: boolean;
+  profileReady: boolean;
+  /** 未生效原因（平台不支持、profile 创建失败等），由界面如实显示 */
+  error: string | null;
+}
+
+/** sandbox:systemGet / systemSet 响应 */
+export interface SystemSandboxView {
+  config: SystemSandboxConfig;
+  status: SystemSandboxStatus;
+}
+
 // ── File System ──────────────────────────────────────────────
 
 export interface TaskSummary {
@@ -2416,7 +2440,6 @@ export const IPC_CHANNELS = {
   // Chat / Task
   CHAT_SUBMIT: 'chat:submit',
   CHAT_REVIEW: 'chat:review',
-  CHAT_CONTROL: 'chat:control',
   CHAT_HISTORY: 'chat:history',
   /** 会话列表（正文聚合，重启后重建侧边栏任务） */
   CHAT_CONVERSATIONS: 'chat:conversations',
@@ -2424,6 +2447,8 @@ export const IPC_CHANNELS = {
   CHAT_MESSAGES: 'chat:messages',
   /** 一轮回复的点赞/点踩（按 (会话, 轮次) 归属，null 为取消） */
   CHAT_FEEDBACK: 'chat:feedback',
+  /** 改写某一轮提问（本轮回复与之后轮次作废，随后重新执行） */
+  CHAT_EDIT_TURN: 'chat:editTurn',
 
   // Model
   MODEL_LIST: 'model:list',
@@ -2493,6 +2518,8 @@ export const IPC_CHANNELS = {
   SANDBOX_UPDATE_POLICY: 'sandbox:updatePolicy',
   SANDBOX_ENV_USAGE: 'sandbox:envUsage',
   SANDBOX_ENV_CLEAR: 'sandbox:envClear',
+  SANDBOX_SYSTEM_GET: 'sandbox:systemGet',
+  SANDBOX_SYSTEM_SET: 'sandbox:systemSet',
 
   // Audit
   AUDIT_QUERY: 'audit:query',

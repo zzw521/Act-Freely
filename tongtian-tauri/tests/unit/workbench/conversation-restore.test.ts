@@ -439,6 +439,133 @@ describe('恢复组装：评价随正文一起恢复', () => {
   });
 });
 
+// ── 改写提问（截断本轮回复与之后轮次） ────────────────────────
+
+describe('conversation-store：改写某一轮提问', () => {
+  const seedThree = () => {
+    store.recordConversationMessage(row('conv-1', 0, 'user', '首轮提问', 'task-0', { tsMs: 1000 }));
+    store.recordConversationMessage(row('conv-1', 0, 'assistant', '首轮回复', 'task-0', { tsMs: 2000 }));
+    store.recordConversationMessage(row('conv-1', 1, 'user', '第二轮提问', 'task-1', { tsMs: 3000 }));
+    store.recordConversationMessage(row('conv-1', 1, 'assistant', '第二轮回复', 'task-1', { tsMs: 4000 }));
+    store.recordConversationMessage(row('conv-1', 2, 'user', '第三轮提问', 'task-2', { tsMs: 5000 }));
+    store.recordConversationMessage(row('conv-1', 2, 'assistant', '第三轮回复', 'task-2', { tsMs: 6000 }));
+  };
+
+  it('改第 1 轮：前面的轮次原样保留，本轮回复与之后轮次全部作废', async () => {
+    seedThree();
+    await store.editConversationTurn('conv-1', 1, '第二轮改过的提问');
+    expect(
+      store.localMessages('conv-1').map((r) => [r.turnIndex, r.role, r.content])
+    ).toEqual([
+      [0, 'user', '首轮提问'],
+      [0, 'assistant', '首轮回复'],
+      [1, 'user', '第二轮改过的提问'],
+    ]);
+    // 新任务提交前不挂旧任务 id（避免事件被路由到已作废的轮次）
+    expect(store.localMessages('conv-1')[2].taskId).toBe('');
+    // 会话摘要仍按首轮提问、轮次数量按现存轮次
+    const convs = store.localConversations();
+    expect(convs[0].firstGoal).toBe('首轮提问');
+    expect(convs[0].turnCount).toBe(2);
+  });
+
+  it('评价跟着作废的轮次清掉，前面轮次的评价保留', async () => {
+    seedThree();
+    store.setLocalFeedback('conv-1', 0, 'up');
+    store.setLocalFeedback('conv-1', 1, 'down');
+    await store.editConversationTurn('conv-1', 1, '第二轮改过的提问');
+    const rows = store.localMessages('conv-1');
+    expect(rows.find((r) => r.turnIndex === 0 && r.role === 'assistant')?.feedback).toBe('up');
+    expect(rows.some((r) => r.turnIndex >= 1 && r.role === 'assistant')).toBe(false);
+  });
+
+  it('空正文与空会话键直接拒绝（与 Rust 同错误码），不改动台账', async () => {
+    seedThree();
+    await expect(store.editConversationTurn('conv-1', 1, '   ')).rejects.toThrow(
+      /CHAT_EDIT_EMPTY_CONTENT/
+    );
+    await expect(store.editConversationTurn('', 1, '新提问')).rejects.toThrow(
+      /CHAT_INVALID_CONVERSATION/
+    );
+    expect(store.localMessages('conv-1')).toHaveLength(6);
+  });
+
+  it('桌面通道以 Rust 为权威，参数为会话键 + 轮次 + 新正文', async () => {
+    const invoke = vi.fn(async () => ({ ok: true }));
+    (globalThis as Record<string, unknown>).window = {
+      __TAURI_INTERNALS__: {},
+      tongtianAPI: { invoke },
+    };
+    await store.editConversationTurn('conv-1', 1, '新提问');
+    expect(invoke).toHaveBeenCalledWith('chat:editTurn', 'conv-1', 1, '新提问');
+  });
+
+  it('桌面落库失败如实抛出，供界面保持原样并提示', async () => {
+    (globalThis as Record<string, unknown>).window = {
+      __TAURI_INTERNALS__: {},
+      tongtianAPI: {
+        invoke: vi.fn(async () => {
+          throw new Error('CHAT_EDIT_TRUNCATE_FAILED: locked');
+        }),
+      },
+    };
+    await expect(store.editConversationTurn('conv-1', 1, '新提问')).rejects.toThrow(
+      /CHAT_EDIT_TRUNCATE_FAILED/
+    );
+  });
+});
+
+describe('改写提问接线：IPC 通道 + Rust command + 界面入口', () => {
+  it('契约常量与桌面通道映射', () => {
+    expect(read('shared/contracts.ts')).toContain("CHAT_EDIT_TURN: 'chat:editTurn'");
+    const tauri = read('renderer/lib/tauri-api.ts');
+    expect(tauri).toContain("if (channel === 'chat:editTurn') {");
+    expect(tauri).toContain("return invoke('chat_edit_turn', {");
+    expect(tauri).toContain('content: args[2] as string,');
+  });
+
+  it('Rust 侧 command 存在、走事务截断并注册进 invoke_handler', () => {
+    const rs = readFileSync(resolve(__dirname, '../../../src-tauri/src/lib.rs'), 'utf8').replace(/\r\n/g, '\n');
+    expect(rs).toContain('async fn chat_edit_turn(');
+    expect(rs).toContain('store::messages::edit_turn(');
+    expect(rs).toMatch(/\n\s+chat_feedback,\n\s+chat_edit_turn,\n/);
+    const storeRs = readFileSync(
+      resolve(__dirname, '../../../src-tauri/src/store/messages.rs'),
+      'utf8'
+    ).replace(/\r\n/g, '\n');
+    expect(storeRs).toContain('pub fn edit_turn(');
+    expect(storeRs).toContain('unchecked_transaction()');
+    // 只作废本轮回复与之后的轮次，用户行覆盖而不是先删后插
+    expect(storeRs).toContain('OR (turn_index = ?2 AND role = ?3)');
+  });
+
+  it('store：编辑走正文库再提交，运行中不允许并发改写', () => {
+    const wb = read('renderer/store/workbenchStore.ts');
+    expect(wb).toContain('editTurn: async (turnIdx, text) => {');
+    // 不先注册事件路由时，重跑的事件没人接收，界面会一直停在「进行中」
+    const edit = wb.split('editTurn: async (turnIdx, text) => {')[1].split('// ── 回复评价')[0];
+    expect(edit).toContain('ensureRouter();');
+    expect(edit).toContain('await editConversationTurn(conv.id, turnIdx, trimmed);');
+    expect(wb).toContain('if (conv.regeneratingTurn != null || conv.isLoading) return;');
+    // 提交沿用原会话模式与当轮模型，并从第 0 轮起保留历史
+    expect(wb).toContain('mode: conv.workMode ?? \'general\',');
+    expect(wb).toContain('conversationId: conv.id,');
+    expect(wb).toContain('turnIndex: turnIdx,');
+  });
+
+  it('界面：用户气泡带编辑入口，运行中与重新生成时禁用', () => {
+    const stream = read('renderer/components/ChatStream/index.tsx');
+    expect(stream).toContain('onEditTurn?: (turnIdx: number, text: string) => void;');
+    expect(stream).toContain('const canEditTurn = Boolean(onEditTurn) && !busy && regeneratingTurn == null;');
+    expect(stream).toContain("tr('编辑提问')");
+    expect(stream).toContain("tr('保存并重新执行')");
+    expect(stream).toContain("tr('取消编辑')");
+    const page = read('renderer/pages/Workbench/index.tsx');
+    expect(page).toContain('busy={runningTask}');
+    expect(page).toContain('onEditTurn={(turnIdx, text) => void editTurn(turnIdx, text)}');
+  });
+});
+
 // ── 三通道接线（源码契约断言） ───────────────────────────────
 
 describe('会话恢复接线：三条通道 + 提交/落库参数', () => {

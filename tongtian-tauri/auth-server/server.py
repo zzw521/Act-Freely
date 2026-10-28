@@ -7,7 +7,7 @@
 - 网页端登录/注册/退出页面（浏览器打开，登录成功回跳桌面端 loopback 回调）
 - REST API：register / login / exchange（code 换 token）/ refresh / logout
 - JWT HS256 手写实现（标准库 hmac/hashlib/base64，不引 PyJWT）：
-  access 15min + refresh 30d 轮换（对齐 spec-通天办公-云端与账号体系）
+  access 15min + refresh 30d 轮换（对齐 docs/PRD-任我行.md §4.1）
 - SQLite 持久化 users / sessions（云端切换时仅改客户端 TT_AUTH_SERVER_URL）
 
 用法:

@@ -33,6 +33,8 @@ class Settings:
     db_path: Path
     packages_dir: Path
     jwt_secret: str
+    jwt_issuer: str
+    jwt_audience: str
     access_ttl_seconds: int
     refresh_ttl_seconds: int
     allow_registration: bool
@@ -71,6 +73,9 @@ def load_settings() -> Settings:
         db_path=data_dir / "market.db",
         packages_dir=data_dir / "packages",
         jwt_secret=jwt_secret,
+        jwt_issuer=os.environ.get("TT_AUTH_ISSUER", "tongtian-auth").strip() or "tongtian-auth",
+        jwt_audience=os.environ.get("TT_AUTH_AUDIENCE", "tongtian-engine").strip()
+        or "tongtian-engine",
         access_ttl_seconds=_env_int("TT_ACCESS_TTL_SECONDS", 15 * 60),
         refresh_ttl_seconds=_env_int("TT_REFRESH_TTL_SECONDS", 30 * 24 * 3600),
         allow_registration=_env_bool("TT_ALLOW_REGISTRATION", True),

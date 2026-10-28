@@ -429,16 +429,6 @@ export const engineAPI = {
     return { ok: true, status: action === 'approve' ? 'executing' : 'done' };
   },
 
-  /** 任务控制：pause/resume/rollback_to */
-  chatControl: async (req: { taskId: string; action: string; stepId?: string }) => {
-    const resp = await postSSE('/api/chat/control', {
-      task_id: req.taskId,
-      action: req.action,
-      step_id: req.stepId,
-    });
-    return (await resp.json()) as { ok: boolean; status?: string };
-  },
-
   /** 取消任务 */
   chatCancel: async (taskId: string) => {
     const resp = await postSSE('/api/chat/cancel', { task_id: taskId });

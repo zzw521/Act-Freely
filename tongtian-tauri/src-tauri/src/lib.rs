@@ -43,6 +43,7 @@ mod collab;
 mod computer;
 mod expert;
 mod file;
+mod harness;
 mod knowledge;
 mod market;
 mod mcp;
@@ -51,6 +52,7 @@ mod plugin;
 mod pptx;
 mod proxy;
 mod remote;
+pub mod sandbox;
 mod security;
 mod skill;
 mod store;
@@ -197,6 +199,121 @@ fn validate_work_dir(raw: Option<&str>) -> Result<Option<std::path::PathBuf>, St
     Ok(Some(buf))
 }
 
+/// 本地 harness 的工作目录：用户自选优先，否则与引擎同用 workspace 目录
+fn harness_work_dir(
+    chosen: Option<&std::path::Path>,
+    ws: &str,
+) -> Result<std::path::PathBuf, String> {
+    match chosen {
+        Some(path) => Ok(path.to_path_buf()),
+        None => bridge::python_env::ensure_workspace_dir(ws)
+            .map_err(|e| format!("WORK_DIR_UNAVAILABLE: 无法创建 workspace 工作目录：{e}")),
+    }
+}
+
+/// 取（或按磁盘检查点重建）本地 harness 任务；`None` 表示该任务不归 harness。
+async fn harness_slot_for(
+    hub: &harness::Hub,
+    task_id: &str,
+    ws: &str,
+    store: &Arc<Store>,
+    model_id: Option<&str>,
+    privacy: bool,
+) -> Result<Option<Arc<harness::Slot>>, String> {
+    if let Some(slot) = hub.get(task_id) {
+        return Ok(Some(slot));
+    }
+    if harness::checkpoint::load(task_id).is_none() {
+        return Ok(None);
+    }
+    // 磁盘检查点不保存密钥：重启后按任务记住的模型 id 重新解析端点与密钥
+    let cfg_store = Arc::clone(store);
+    let cfg_model = model_id.map(str::to_string);
+    let model_config = tauri::async_runtime::spawn_blocking(move || {
+        model::service::runtime_config(&cfg_store, cfg_model.as_deref())
+    })
+    .await
+    .map_err(|e| format!("CHECKPOINT_MODEL_UNAVAILABLE: 模型配置解析线程异常：{e}"))??;
+    let rt_store = Arc::clone(store);
+    let rt_ws = ws.to_string();
+    let runtime = tauri::async_runtime::spawn_blocking(move || {
+        bridge::runtime::build(Some(&rt_store), &rt_ws, &[]).runtime
+    })
+    .await
+    .map_err(|e| format!("RUNTIME_BUNDLE_PANIC: 执行面输入装配线程异常：{e}"))?;
+    let slot = harness::runner::slot_from_checkpoint(
+        task_id,
+        model_config.unwrap_or(Value::Null),
+        runtime,
+        privacy,
+    )?;
+    hub.insert(slot.clone());
+    Ok(Some(slot))
+}
+
+/// harness 任务收尾：状态回写、正文同步与租约释放（与引擎路径同一状态机）
+fn finish_harness_task(
+    app: &AppHandle,
+    services: &Arc<P0Services>,
+    task_id: &str,
+    result: Result<(), String>,
+    restore: Option<(String, Option<String>)>,
+    privacy: bool,
+) {
+    let cancel_requested = services
+        .registry
+        .get(task_id)
+        .map(|r| r.cancel_requested)
+        .unwrap_or(false);
+    match result {
+        Ok(()) => {
+            let next = if cancel_requested {
+                status::CANCELLED
+            } else {
+                status::DONE
+            };
+            if let Some(r) = services.registry.update_status(task_id, next, None) {
+                emit_status_change(app, &r);
+            }
+        }
+        Err(err) => {
+            // 恢复没有真正跑起来：回到之前的状态，不能把可重试的中断误标成 failed
+            if let Some((previous, reason)) = restore {
+                eprintln!("[harness] resume failed: {err}");
+                if let Some(r) =
+                    services
+                        .registry
+                        .update_status(task_id, &previous, reason.as_deref())
+                {
+                    emit_status_change(app, &r);
+                }
+                let _ = app.emit(
+                    agent::EVENT_CHAT,
+                    json!({ "type": "error", "code": "CHECKPOINT_RESUME_FAILED", "message": err }),
+                );
+                let _ = app.emit(
+                    agent::EVENT_CHAT,
+                    json!({ "type": "done", "taskId": task_id }),
+                );
+            } else {
+                eprintln!("[harness] task failed: {err}");
+                let code = harness::runner::error_code(&err);
+                if let Some(r) =
+                    services
+                        .registry
+                        .update_status(task_id, status::FAILED, Some(&code))
+                {
+                    emit_status_change(app, &r);
+                }
+            }
+        }
+    }
+    if !privacy {
+        sync_task_to_db(services, task_id, "");
+    }
+    services.leases.release(task_id);
+}
+
 /// 提交任务：注册表受理（queued→planning）→ 配额闸门 → 租约 → 两阶段计划生成。
 /// 计划流结束后任务进入 pending_review 待审阅（approve 后经 chat_review 执行）。
 #[tauri::command]
@@ -204,6 +321,7 @@ async fn chat_submit(
     app: AppHandle,
     state: State<'_, BridgeState>,
     p0: State<'_, Arc<P0Services>>,
+    hub: State<'_, harness::Hub>,
     workspace_id: Option<String>,
     goal: String,
     // 工作台模式：只接受白名单值，未知值显式失败而不是静默按通用模式跑
@@ -246,6 +364,8 @@ async fn chat_submit(
     // 模型选择在受理阶段就解析：模型不存在/缺密钥时直接拒绝提交，
     // 不留下一个跑起来才发现调用不了的幽灵任务（Auto 且有默认模型时也在此绑定）
     let model_config = model::service::runtime_config(&p0.store, model_id.as_deref())?;
+    // 本地 harness 的计划与执行同样需要这份配置；引擎路径继续用 override 下发
+    let slot_model_config = model_config.clone();
     // 负责人专家在受理阶段校验：不存在/绑定模型不可用直接拒绝，不留下必然失败的任务
     let expert_id = match expert_id
         .as_deref()
@@ -262,6 +382,30 @@ async fn chat_submit(
         }
         None => None,
     };
+    let work_dir_path = work_dir.clone();
+
+    let attachments = attachments.unwrap_or_default();
+    // 执行面输入只装配一次：门控与真正执行的引擎共用同一份 runtime
+    let (runtime, hydrated) = {
+        let store = Some(Arc::clone(&p0.store));
+        let ws_for_runtime = ws.clone();
+        let raw = attachments.clone();
+        let bundle = tauri::async_runtime::spawn_blocking(move || {
+            bridge::runtime::build(store.as_deref(), &ws_for_runtime, &raw)
+        })
+        .await
+        .map_err(|e| format!("RUNTIME_BUNDLE_PANIC: 执行面输入装配线程异常：{e}"))?;
+        (bundle.runtime, bundle.attachments)
+    };
+    // 默认由客户端内嵌 harness 承接；只有它确实做不到的能力才交给引擎。
+    // 图片识别与正文抽取只在装配后成立：门控与 harness 都看装配结果
+    let harness_reason = harness::engine_required(&harness::GateRequest {
+        mode: mode.as_deref().unwrap_or(""),
+        expert_id: expert_id.as_deref(),
+        attachments: &hydrated,
+        runtime: &runtime,
+        secure_env: secure_env_enabled(&p0.store),
+    });
     let overrides = agent::SubmitOverrides {
         mode,
         model_binding: model_binding.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
@@ -269,6 +413,7 @@ async fn chat_submit(
         expert_id,
         work_dir: work_dir.map(|p| p.display().to_string()),
         history: history.unwrap_or_default(),
+        runtime: Some(runtime.clone()),
         // 执行面输入（意识/技能）由桥接层装配，这里不替它决定内容
         ..agent::SubmitOverrides::default()
     };
@@ -323,74 +468,150 @@ async fn chat_submit(
         }
     }
 
-    // 确保实例已启动（首次自动拉起）
-    agent::start_workspace(&app, &state.inner(), &ws).await?;
-
-    // 后台执行计划生成流（两阶段 stage=plan），事件经 chat-event 推送前端
-    let bridge = state.inner().clone();
-    let app2 = app.clone();
-    let ws2 = ws.clone();
-    let tid = task_id.clone();
-    let services = p0.inner().clone();
-    let attachments = attachments;
-    tauri::async_runtime::spawn(async move {
-        let ctx = P0Context {
-            events: Some(Arc::clone(&services.events)),
-            quota: Some(Arc::clone(&services.quota)),
-            registry: Some(Arc::clone(&services.registry)),
-            store: Some(Arc::clone(&services.store)),
-            secure_env: secure_env_enabled(&services.store),
-            privacy,
-        };
-        let result = agent::send_message_with_attachments(
-            &app2,
-            &bridge,
-            &ws2,
-            &tid,
+    if harness_reason.is_none() {
+        // 本地 harness：计划在本机进程内生成，不拉起 Python 引擎
+        let work_dir = harness_work_dir(work_dir_path.as_deref(), &ws)?;
+        let mode_value = overrides.mode.clone().unwrap_or_default();
+        let history = overrides.history.clone();
+        let slot = harness::Slot::new(
+            &task_id,
             &goal,
-            attachments.unwrap_or_default(),
-            overrides,
-            ctx,
-        )
-        .await;
-        let cancel_requested = services
-            .registry
-            .get(&tid)
-            .map(|r| r.cancel_requested)
-            .unwrap_or(false);
-        match result {
-            Ok(()) => {
-                // 两阶段协议：计划流结束 → pending_review 待审阅（非任务终态）
-                let next = if cancel_requested {
-                    status::CANCELLED
-                } else {
-                    status::PENDING_REVIEW
-                };
-                if let Some(r) = services.registry.update_status(&tid, next, None) {
-                    emit_status_change(&app2, &r);
+            &mode_value,
+            work_dir,
+            slot_model_config.unwrap_or(Value::Null),
+            runtime.clone(),
+            history,
+            hydrated,
+            privacy,
+        );
+        hub.insert(slot.clone());
+        let app2 = app.clone();
+        let services = p0.inner().clone();
+        let tid = task_id.clone();
+        tauri::async_runtime::spawn(async move {
+            let result = harness::runner::plan(&app2, &services, &slot).await;
+            match result {
+                Ok(()) => {
+                    let cancel_requested = services
+                        .registry
+                        .get(&tid)
+                        .map(|r| r.cancel_requested)
+                        .unwrap_or(false);
+                    // 两阶段协议：计划流结束 → pending_review 待审阅（非任务终态）
+                    let next = if cancel_requested {
+                        status::CANCELLED
+                    } else {
+                        status::PENDING_REVIEW
+                    };
+                    if let Some(r) = services.registry.update_status(&tid, next, None) {
+                        emit_status_change(&app2, &r);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[harness] plan failed: {err}");
+                    // 错误事件已由 runner 发出；这里只落状态，不重复播报
+                    let code = harness::runner::error_code(&err);
+                    if let Some(r) = services
+                        .registry
+                        .update_status(&tid, status::FAILED, Some(&code))
+                    {
+                        emit_status_change(&app2, &r);
+                    }
                 }
             }
-            Err(err) => {
-                eprintln!("[bridge] chat failed: {err}");
-                if let Some(r) = services
-                    .registry
-                    .update_status(&tid, status::FAILED, Some("BRIDGE_ERROR"))
-                {
-                    emit_status_change(&app2, &r);
-                }
-                let _ = app2.emit(
-                    agent::EVENT_CHAT,
-                    json!({ "type": "error", "code": "BRIDGE_ERROR", "message": err }),
-                );
-                let _ = app2.emit(agent::EVENT_CHAT, json!({ "type": "done", "taskId": tid }));
+            if !privacy {
+                sync_task_to_db(&services, &tid, "");
             }
-        }
-        if !privacy {
-            sync_task_to_db(&services, &tid, "");
-        }
-        // 计划阶段结束释放租约；approve 执行阶段重新签发
-        services.leases.release(&tid);
-    });
+            // 计划阶段结束释放租约；approve 执行阶段重新签发
+            services.leases.release(&tid);
+        });
+    } else {
+        // 门控命中：把「为什么交给引擎」摊成可见步骤，避免用户以为本地能力失效
+        let reason = harness_reason.unwrap_or_default();
+        let _ = app.emit(
+            agent::EVENT_CHAT,
+            json!({
+                "type": "step_start",
+                "stepId": "gate-note",
+                "stepType": "context",
+                "description": format!("本轮由引擎执行：{reason}"),
+            }),
+        );
+        let _ = app.emit(
+            agent::EVENT_CHAT,
+            json!({ "type": "step_done", "stepId": "gate-note", "output": reason }),
+        );
+
+        // 确保实例已启动（首次自动拉起）
+        agent::start_workspace(&app, &state.inner(), &ws).await?;
+
+        // 后台执行计划生成流（两阶段 stage=plan），事件经 chat-event 推送前端
+        let bridge = state.inner().clone();
+        let app2 = app.clone();
+        let ws2 = ws.clone();
+        let tid = task_id.clone();
+        let services = p0.inner().clone();
+        let attachments = attachments.clone();
+        tauri::async_runtime::spawn(async move {
+            let ctx = P0Context {
+                events: Some(Arc::clone(&services.events)),
+                quota: Some(Arc::clone(&services.quota)),
+                registry: Some(Arc::clone(&services.registry)),
+                store: Some(Arc::clone(&services.store)),
+                secure_env: secure_env_enabled(&services.store),
+                privacy,
+            };
+            let result = agent::send_message_with_attachments(
+                &app2,
+                &bridge,
+                &ws2,
+                &tid,
+                &goal,
+                attachments,
+                overrides,
+                ctx,
+            )
+            .await;
+            let cancel_requested = services
+                .registry
+                .get(&tid)
+                .map(|r| r.cancel_requested)
+                .unwrap_or(false);
+            match result {
+                Ok(()) => {
+                    // 两阶段协议：计划流结束 → pending_review 待审阅（非任务终态）
+                    let next = if cancel_requested {
+                        status::CANCELLED
+                    } else {
+                        status::PENDING_REVIEW
+                    };
+                    if let Some(r) = services.registry.update_status(&tid, next, None) {
+                        emit_status_change(&app2, &r);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[bridge] chat failed: {err}");
+                    if let Some(r) = services
+                        .registry
+                        .update_status(&tid, status::FAILED, Some("BRIDGE_ERROR"))
+                    {
+                        emit_status_change(&app2, &r);
+                    }
+                    let _ = app2.emit(
+                        agent::EVENT_CHAT,
+                        json!({ "type": "error", "code": "BRIDGE_ERROR", "message": err }),
+                    );
+                    let _ = app2
+                        .emit(agent::EVENT_CHAT, json!({ "type": "done", "taskId": tid }));
+                }
+            }
+            if !privacy {
+                sync_task_to_db(&services, &tid, "");
+            }
+            // 计划阶段结束释放租约；approve 执行阶段重新签发
+            services.leases.release(&tid);
+        });
+    }
 
     // 任务受理留痕（PRD §4.7.4）：目标文本入库前经 audit 统一脱敏。
     // 隐私模式下只记录「发生过一次提交」，不写目标摘要。
@@ -421,6 +642,7 @@ async fn chat_review(
     app: AppHandle,
     state: State<'_, BridgeState>,
     p0: State<'_, Arc<P0Services>>,
+    hub: State<'_, harness::Hub>,
     task_id: String,
     action: String,
     patch: Option<Value>,
@@ -445,6 +667,17 @@ async fn chat_review(
             }
             // 执行阶段沿用提交时的隐私开关：期间用户可能已改设置，以当前值为准
             let privacy = privacy_enabled(&p0.store);
+            // 本地 harness 计划（进程内或留盘检查点）优先由本机执行；
+            // 重建失败时明确报错，不把 harness 的计划交给引擎
+            let harness_slot = harness_slot_for(
+                &hub,
+                &task_id,
+                &ws,
+                &p0.store,
+                record.model_id.as_deref(),
+                privacy,
+            )
+            .await?;
             // 转移 #9：pending_review→executing；重新签发执行租约
             let lease = p0
                 .leases
@@ -458,66 +691,76 @@ async fn chat_review(
                 sync_task_to_db(&p0, &task_id, "");
             }
 
-            // 后台消费执行流（step_*/deliver/done 事件）
-            let bridge = state.inner().clone();
-            let app2 = app.clone();
-            let ws2 = ws.clone();
-            let tid = task_id.clone();
-            let services = p0.inner().clone();
-            tauri::async_runtime::spawn(async move {
-                let ctx = P0Context {
-                    events: Some(Arc::clone(&services.events)),
-                    quota: Some(Arc::clone(&services.quota)),
-                    registry: Some(Arc::clone(&services.registry)),
-                    store: Some(Arc::clone(&services.store)),
-                    secure_env: secure_env_enabled(&services.store),
-                    privacy,
-                };
-                let result = agent::review_task(
-                    &app2, &bridge, &ws2, &tid, "approve", patch, ctx,
-                )
-                .await;
-                let cancel_requested = services
-                    .registry
-                    .get(&tid)
-                    .map(|r| r.cancel_requested)
-                    .unwrap_or(false);
-                match result {
-                    Ok(()) => {
-                        let next = if cancel_requested {
-                            status::CANCELLED
-                        } else {
-                            status::DONE
-                        };
-                        if let Some(r) = services.registry.update_status(&tid, next, None) {
-                            emit_status_change(&app2, &r);
+            if let Some(slot) = harness_slot {
+                let app2 = app.clone();
+                let services = p0.inner().clone();
+                let tid = task_id.clone();
+                tauri::async_runtime::spawn(async move {
+                    let result = harness::runner::execute(&app2, &services, &slot, false).await;
+                    finish_harness_task(&app2, &services, &tid, result, None, privacy);
+                });
+            } else {
+                // 后台消费执行流（step_*/deliver/done 事件）
+                let bridge = state.inner().clone();
+                let app2 = app.clone();
+                let ws2 = ws.clone();
+                let tid = task_id.clone();
+                let services = p0.inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    let ctx = P0Context {
+                        events: Some(Arc::clone(&services.events)),
+                        quota: Some(Arc::clone(&services.quota)),
+                        registry: Some(Arc::clone(&services.registry)),
+                        store: Some(Arc::clone(&services.store)),
+                        secure_env: secure_env_enabled(&services.store),
+                        privacy,
+                    };
+                    let result = agent::review_task(
+                        &app2, &bridge, &ws2, &tid, "approve", patch, ctx,
+                    )
+                    .await;
+                    let cancel_requested = services
+                        .registry
+                        .get(&tid)
+                        .map(|r| r.cancel_requested)
+                        .unwrap_or(false);
+                    match result {
+                        Ok(()) => {
+                            let next = if cancel_requested {
+                                status::CANCELLED
+                            } else {
+                                status::DONE
+                            };
+                            if let Some(r) = services.registry.update_status(&tid, next, None) {
+                                emit_status_change(&app2, &r);
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("[bridge] review approve failed: {err}");
+                            if let Some(r) = services
+                                .registry
+                                .update_status(&tid, status::FAILED, Some("BRIDGE_ERROR"))
+                            {
+                                emit_status_change(&app2, &r);
+                            }
+                            let _ = app2.emit(
+                                agent::EVENT_CHAT,
+                                json!({ "type": "error", "code": "BRIDGE_ERROR", "message": err }),
+                            );
+                            let _ = app2
+                                .emit(agent::EVENT_CHAT, json!({ "type": "done", "taskId": tid }));
                         }
                     }
-                    Err(err) => {
-                        eprintln!("[bridge] review approve failed: {err}");
-                        if let Some(r) = services
-                            .registry
-                            .update_status(&tid, status::FAILED, Some("BRIDGE_ERROR"))
-                        {
-                            emit_status_change(&app2, &r);
-                        }
-                        let _ = app2.emit(
-                            agent::EVENT_CHAT,
-                            json!({ "type": "error", "code": "BRIDGE_ERROR", "message": err }),
-                        );
-                        let _ = app2
-                            .emit(agent::EVENT_CHAT, json!({ "type": "done", "taskId": tid }));
+                    if !privacy {
+                        sync_task_to_db(&services, &tid, "");
                     }
-                }
-                if !privacy {
-                    sync_task_to_db(&services, &tid, "");
-                }
-                services.leases.release(&tid);
-            });
+                    services.leases.release(&tid);
+                });
+            }
             Ok(json!({ "ok": true, "taskId": task_id, "status": status::EXECUTING }))
         }
         "resume" => {
-            // 断点续跑：引擎进程内检查点决定能否恢复，Rust 只做状态与租约编排。
+            // 断点续跑：检查点决定能否恢复，Rust 只做状态与租约编排。
             // 已结束的任务（done/failed/cancelled）才有检查点；执行中请走 control pause/resume。
             let resumable_status = matches!(
                 record.status.as_str(),
@@ -529,28 +772,21 @@ async fn chat_review(
                     record.status
                 ));
             }
-            // 磁盘检查点不保存密钥：resume 时重新解析模型配置、重新装配执行面输入
-            // （Hook 网关令牌/MCP 凭据只在本机内存与请求体里，不落检查点文件）
-            let model_config = model::service::runtime_config(&p0.store, record.model_id.as_deref())
-                .map_err(|err| {
-                    format!("CHECKPOINT_MODEL_UNAVAILABLE: 断点续跑需要重新解析模型配置，但{err}")
-                })?;
-            let runtime_bundle = {
-                let store = p0.store.clone();
-                let ws_for_runtime = ws.clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    bridge::runtime::build(Some(&store), &ws_for_runtime, &[])
-                })
-                .await
-                .map_err(|e| format!("RUNTIME_BUNDLE_PANIC: 执行面输入装配线程异常：{e}"))?
-            };
-            let resume_context = json!({
-                "modelConfig": model_config,
-                "runtime": runtime_bundle.runtime,
-            });
+            let privacy = privacy_enabled(&p0.store);
             let previous_status = record.status.clone();
             let previous_reason = record.status_reason_code.clone();
-            let privacy = privacy_enabled(&p0.store);
+            // 磁盘检查点不保存密钥：恢复时重新解析模型配置、重新装配执行面输入
+            // （本地 harness 与引擎各自从自己的检查点目录取，互不串读）
+            let harness_slot = harness_slot_for(
+                &hub,
+                &task_id,
+                &ws,
+                &p0.store,
+                record.model_id.as_deref(),
+                privacy,
+            )
+            .await
+            .map_err(|err| format!("CHECKPOINT_RESUME_FAILED: 无法恢复本地执行上下文：{err}"))?;
             let lease = p0
                 .leases
                 .acquire(&task_id, now_ms_u64())
@@ -563,67 +799,105 @@ async fn chat_review(
                 sync_task_to_db(&p0, &task_id, "");
             }
 
-            let bridge = state.inner().clone();
-            let app2 = app.clone();
-            let ws2 = ws.clone();
-            let tid = task_id.clone();
-            let services = p0.inner().clone();
-            tauri::async_runtime::spawn(async move {
-                let ctx = P0Context {
-                    events: Some(Arc::clone(&services.events)),
-                    quota: Some(Arc::clone(&services.quota)),
-                    registry: Some(Arc::clone(&services.registry)),
-                    store: Some(Arc::clone(&services.store)),
-                    secure_env: secure_env_enabled(&services.store),
-                    privacy,
+            if let Some(slot) = harness_slot {
+                let app2 = app.clone();
+                let services = p0.inner().clone();
+                let tid = task_id.clone();
+                tauri::async_runtime::spawn(async move {
+                    let result = harness::runner::execute(&app2, &services, &slot, true).await;
+                    finish_harness_task(
+                        &app2,
+                        &services,
+                        &tid,
+                        result,
+                        Some((previous_status, previous_reason)),
+                        privacy,
+                    );
+                });
+            } else {
+                // 引擎路径：重新下发 modelConfig 与 runtime（磁盘里不存密钥）
+                let model_config =
+                    model::service::runtime_config(&p0.store, record.model_id.as_deref()).map_err(
+                        |err| {
+                            format!("CHECKPOINT_MODEL_UNAVAILABLE: 断点续跑需要重新解析模型配置，但{err}")
+                        },
+                    )?;
+                let runtime_bundle = {
+                    let store = p0.store.clone();
+                    let ws_for_runtime = ws.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        bridge::runtime::build(Some(&store), &ws_for_runtime, &[])
+                    })
+                    .await
+                    .map_err(|e| format!("RUNTIME_BUNDLE_PANIC: 执行面输入装配线程异常：{e}"))?
                 };
-                let result = agent::review_task_with(
-                    &app2, &bridge, &ws2, &tid, "resume", patch, ctx,
-                    Some(resume_context),
-                )
-                .await;
-                let cancel_requested = services
-                    .registry
-                    .get(&tid)
-                    .map(|r| r.cancel_requested)
-                    .unwrap_or(false);
-                match result {
-                    Ok(()) => {
-                        let next = if cancel_requested {
-                            status::CANCELLED
-                        } else {
-                            status::DONE
-                        };
-                        if let Some(r) = services.registry.update_status(&tid, next, None) {
-                            emit_status_change(&app2, &r);
+                let resume_context = json!({
+                    "modelConfig": model_config,
+                    "runtime": runtime_bundle.runtime,
+                });
+
+                let bridge = state.inner().clone();
+                let app2 = app.clone();
+                let ws2 = ws.clone();
+                let tid = task_id.clone();
+                let services = p0.inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    let ctx = P0Context {
+                        events: Some(Arc::clone(&services.events)),
+                        quota: Some(Arc::clone(&services.quota)),
+                        registry: Some(Arc::clone(&services.registry)),
+                        store: Some(Arc::clone(&services.store)),
+                        secure_env: secure_env_enabled(&services.store),
+                        privacy,
+                    };
+                    let result = agent::review_task_with(
+                        &app2, &bridge, &ws2, &tid, "resume", patch, ctx,
+                        Some(resume_context),
+                    )
+                    .await;
+                    let cancel_requested = services
+                        .registry
+                        .get(&tid)
+                        .map(|r| r.cancel_requested)
+                        .unwrap_or(false);
+                    match result {
+                        Ok(()) => {
+                            let next = if cancel_requested {
+                                status::CANCELLED
+                            } else {
+                                status::DONE
+                            };
+                            if let Some(r) = services.registry.update_status(&tid, next, None) {
+                                emit_status_change(&app2, &r);
+                            }
+                        }
+                        Err(err) => {
+                            // 恢复没有真正开始（检查点不可用/引擎已重启）：回到之前的状态，
+                            // 不能把一个可重试的中断误标成 failed。
+                            eprintln!("[bridge] review resume failed: {err}");
+                            if let Some(r) = services.registry.update_status(
+                                &tid,
+                                &previous_status,
+                                previous_reason.as_deref(),
+                            ) {
+                                emit_status_change(&app2, &r);
+                            }
+                            let _ = app2.emit(
+                                agent::EVENT_CHAT,
+                                json!({ "type": "error", "code": "CHECKPOINT_RESUME_FAILED", "message": err }),
+                            );
+                            let _ = app2.emit(
+                                agent::EVENT_CHAT,
+                                json!({ "type": "done", "taskId": tid }),
+                            );
                         }
                     }
-                    Err(err) => {
-                        // 恢复没有真正开始（检查点不可用/引擎已重启）：回到之前的状态，
-                        // 不能把一个可重试的中断误标成 failed。
-                        eprintln!("[bridge] review resume failed: {err}");
-                        if let Some(r) = services.registry.update_status(
-                            &tid,
-                            &previous_status,
-                            previous_reason.as_deref(),
-                        ) {
-                            emit_status_change(&app2, &r);
-                        }
-                        let _ = app2.emit(
-                            agent::EVENT_CHAT,
-                            json!({ "type": "error", "code": "CHECKPOINT_RESUME_FAILED", "message": err }),
-                        );
-                        let _ = app2.emit(
-                            agent::EVENT_CHAT,
-                            json!({ "type": "done", "taskId": tid }),
-                        );
+                    if !privacy {
+                        sync_task_to_db(&services, &tid, "");
                     }
-                }
-                if !privacy {
-                    sync_task_to_db(&services, &tid, "");
-                }
-                services.leases.release(&tid);
-            });
+                    services.leases.release(&tid);
+                });
+            }
             Ok(json!({ "ok": true, "taskId": task_id, "status": status::EXECUTING }))
         }
         "reject" => {
@@ -635,27 +909,78 @@ async fn chat_review(
             }
             // 转移 #10：pending_review→done(REJECTED)；短流消费后落终态
             let privacy = privacy_enabled(&p0.store);
-            let bridge = state.inner().clone();
-            let app2 = app.clone();
-            let ws2 = ws.clone();
-            let tid = task_id.clone();
-            let services = p0.inner().clone();
-            tauri::async_runtime::spawn(async move {
-                let ctx = P0Context { privacy, ..P0Context::default() };
-                let _ = agent::review_task(&app2, &bridge, &ws2, &tid, "reject", patch, ctx)
-                    .await
-                    .map_err(|e| eprintln!("[bridge] review reject failed: {e}"));
-                if let Some(r) = services
-                    .registry
-                    .update_status(&tid, status::DONE, Some("REJECTED"))
-                {
-                    emit_status_change(&app2, &r);
+            // harness 计划：进程内直接收尾；重启后只剩留盘计划时按文件清理
+            let harness_owned = harness::checkpoint::load(&task_id).is_some();
+            if let Some(slot) = hub.remove(&task_id) {
+                let app2 = app.clone();
+                let services = p0.inner().clone();
+                let tid = task_id.clone();
+                tauri::async_runtime::spawn(async move {
+                    harness::runner::reject(&app2, &slot).await;
+                    if let Some(r) = services
+                        .registry
+                        .update_status(&tid, status::DONE, Some("REJECTED"))
+                    {
+                        emit_status_change(&app2, &r);
+                    }
+                    if !privacy {
+                        sync_task_to_db(&services, &tid, "");
+                    }
+                    services.leases.release(&tid);
+                });
+            } else if harness_owned {
+                if let Some(cp) = harness::checkpoint::load(&task_id) {
+                    cp.delete();
                 }
-                if !privacy {
-                    sync_task_to_db(&services, &tid, "");
-                }
-                services.leases.release(&tid);
-            });
+                let app2 = app.clone();
+                let services = p0.inner().clone();
+                let tid = task_id.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = app2.emit(
+                        agent::EVENT_CHAT,
+                        json!({
+                            "type": "status_change",
+                            "taskId": tid,
+                            "status": "done",
+                            "statusReasonCode": "REJECTED",
+                        }),
+                    );
+                    let _ = app2
+                        .emit(agent::EVENT_CHAT, json!({ "type": "done", "taskId": tid }));
+                    if let Some(r) = services
+                        .registry
+                        .update_status(&tid, status::DONE, Some("REJECTED"))
+                    {
+                        emit_status_change(&app2, &r);
+                    }
+                    if !privacy {
+                        sync_task_to_db(&services, &tid, "");
+                    }
+                    services.leases.release(&tid);
+                });
+            } else {
+                let bridge = state.inner().clone();
+                let app2 = app.clone();
+                let ws2 = ws.clone();
+                let tid = task_id.clone();
+                let services = p0.inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    let ctx = P0Context { privacy, ..P0Context::default() };
+                    let _ = agent::review_task(&app2, &bridge, &ws2, &tid, "reject", patch, ctx)
+                        .await
+                        .map_err(|e| eprintln!("[bridge] review reject failed: {e}"));
+                    if let Some(r) = services
+                        .registry
+                        .update_status(&tid, status::DONE, Some("REJECTED"))
+                    {
+                        emit_status_change(&app2, &r);
+                    }
+                    if !privacy {
+                        sync_task_to_db(&services, &tid, "");
+                    }
+                    services.leases.release(&tid);
+                });
+            }
             Ok(json!({ "ok": true, "taskId": task_id, "status": status::DONE }))
         }
         "modify" => {
@@ -667,26 +992,54 @@ async fn chat_review(
             }
             // 转移 #11：携带 patch 重新生成 plan（状态保持 pending_review）
             let privacy = privacy_enabled(&p0.store);
-            let bridge = state.inner().clone();
-            let app2 = app.clone();
-            let ws2 = ws.clone();
-            let tid = task_id.clone();
-            let services = p0.inner().clone();
-            tauri::async_runtime::spawn(async move {
-                let ctx = P0Context { privacy, ..P0Context::default() };
-                let result =
-                    agent::review_task(&app2, &bridge, &ws2, &tid, "modify", patch, ctx).await;
-                if let Err(e) = result {
-                    eprintln!("[bridge] review modify failed: {e}");
-                    let _ = app2.emit(
-                        agent::EVENT_CHAT,
-                        json!({ "type": "error", "code": "BRIDGE_ERROR", "message": e }),
-                    );
-                }
-                if !privacy {
-                    sync_task_to_db(&services, &tid, "");
-                }
-            });
+            let harness_slot = harness_slot_for(
+                &hub,
+                &task_id,
+                &ws,
+                &p0.store,
+                record.model_id.as_deref(),
+                privacy,
+            )
+            .await?;
+            if let Some(slot) = harness_slot {
+                let app2 = app.clone();
+                let services = p0.inner().clone();
+                let tid = task_id.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = harness::runner::modify_plan(&app2, &slot, &patch).await {
+                        eprintln!("[harness] modify failed: {e}");
+                        let code = harness::runner::error_code(&e);
+                        let _ = app2.emit(
+                            agent::EVENT_CHAT,
+                            json!({ "type": "error", "code": code, "message": e }),
+                        );
+                    }
+                    if !privacy {
+                        sync_task_to_db(&services, &tid, "");
+                    }
+                });
+            } else {
+                let bridge = state.inner().clone();
+                let app2 = app.clone();
+                let ws2 = ws.clone();
+                let tid = task_id.clone();
+                let services = p0.inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    let ctx = P0Context { privacy, ..P0Context::default() };
+                    let result =
+                        agent::review_task(&app2, &bridge, &ws2, &tid, "modify", patch, ctx).await;
+                    if let Err(e) = result {
+                        eprintln!("[bridge] review modify failed: {e}");
+                        let _ = app2.emit(
+                            agent::EVENT_CHAT,
+                            json!({ "type": "error", "code": "BRIDGE_ERROR", "message": e }),
+                        );
+                    }
+                    if !privacy {
+                        sync_task_to_db(&services, &tid, "");
+                    }
+                });
+            }
             Ok(json!({ "ok": true, "taskId": task_id, "status": status::PENDING_REVIEW }))
         }
         _ => Err(format!("VALIDATION_ERROR: 未知审阅动作 {action}")),
@@ -698,6 +1051,7 @@ async fn chat_review(
 #[tauri::command]
 async fn chat_checkpoint_query(
     state: State<'_, BridgeState>,
+    hub: State<'_, harness::Hub>,
     task_ids: Vec<String>,
     workspace_id: Option<String>,
 ) -> Result<Value, String> {
@@ -714,100 +1068,33 @@ async fn chat_checkpoint_query(
     if ids.is_empty() {
         return Ok(serde_json::json!({ "checkpoints": {} }));
     }
-    agent::query_checkpoints(state.inner(), workspace_id.as_deref(), ids).await
-}
-
-/// 任务控制（转移 #14/#21/#22）：pause(executing→paused) / resume(paused→executing) /
-/// rollback_to(paused→rolled_back)
-#[tauri::command]
-async fn chat_control(
-    app: AppHandle,
-    state: State<'_, BridgeState>,
-    p0: State<'_, Arc<P0Services>>,
-    task_id: String,
-    action: String,
-    step_id: Option<String>,
-    workspace_id: Option<String>,
-) -> Result<Value, String> {
-    let record = p0
-        .registry
-        .get(&task_id)
-        .ok_or_else(|| format!("TASK_NOT_FOUND: {task_id}"))?;
-    let ws = workspace_id
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| record.workspace_id.clone());
-
-    match action.as_str() {
-        "pause" => {
-            if record.status != status::EXECUTING {
-                return Err(format!(
-                    "VALIDATION_ERROR: 仅 executing 可暂停（当前 {}）",
-                    record.status
-                ));
-            }
-            let resp = agent::control_task(&state.inner(), &ws, &task_id, "pause", None).await?;
-            if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-                return Err(format!("BRIDGE_CONTROL_FAILED: {resp}"));
-            }
-            if let Some(r) = p0.registry.update_status(&task_id, status::PAUSED, None) {
-                emit_status_change(&app, &r);
-            }
-            sync_task_to_db(&p0, &task_id, "");
-            Ok(json!({ "ok": true, "taskId": task_id, "status": status::PAUSED }))
+    // 本地 harness 的检查点先查（进程内 → harness 专属目录），其余交给引擎
+    let mut merged = serde_json::Map::new();
+    let mut remaining = Vec::new();
+    for id in ids {
+        if let Some(slot) = hub.get(&id) {
+            merged.insert(id, slot.snapshot().checkpoint.public_info());
+        } else if let Some(cp) = harness::checkpoint::load(&id) {
+            merged.insert(id, cp.public_info());
+        } else {
+            remaining.push(id);
         }
-        "resume" => {
-            if record.status != status::PAUSED {
-                return Err(format!(
-                    "VALIDATION_ERROR: 仅 paused 可继续（当前 {}）",
-                    record.status
-                ));
-            }
-            let resp = agent::control_task(&state.inner(), &ws, &task_id, "resume", None).await?;
-            if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-                return Err(format!("BRIDGE_CONTROL_FAILED: {resp}"));
-            }
-            if let Some(r) = p0.registry.update_status(&task_id, status::EXECUTING, None) {
-                emit_status_change(&app, &r);
-            }
-            sync_task_to_db(&p0, &task_id, "");
-            Ok(json!({ "ok": true, "taskId": task_id, "status": status::EXECUTING }))
-        }
-        "rollback_to" => {
-            if record.status != status::PAUSED {
-                return Err(format!(
-                    "VALIDATION_ERROR: 仅 paused 可回滚（当前 {}）",
-                    record.status
-                ));
-            }
-            let sid = step_id.clone().unwrap_or_default();
-            if sid.is_empty() {
-                return Err("VALIDATION_ERROR: rollback_to 需指定 stepId".into());
-            }
-            let resp = agent::control_task(
-                &state.inner(),
-                &ws,
-                &task_id,
-                "rollback_to",
-                Some(&sid),
-            )
-            .await?;
-            if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-                return Err(format!("BRIDGE_CONTROL_FAILED: {resp}"));
-            }
-            // 转移 #22：paused→rolled_back（文件级恢复随备份模块下批落地）
-            if let Some(r) = p0.registry.update_status(
-                &task_id,
-                status::ROLLED_BACK,
-                Some(&format!("ROLLBACK_TO:{sid}")),
-            ) {
-                emit_status_change(&app, &r);
-            }
-            sync_task_to_db(&p0, &task_id, "");
-            p0.leases.release(&task_id);
-            Ok(json!({ "ok": true, "taskId": task_id, "status": status::ROLLED_BACK }))
-        }
-        _ => Err(format!("VALIDATION_ERROR: 未知控制动作 {action}")),
     }
+    if !remaining.is_empty() {
+        match agent::query_checkpoints(state.inner(), workspace_id.as_deref(), remaining).await {
+            Ok(value) => {
+                if let Some(map) = value.get("checkpoints").and_then(Value::as_object) {
+                    for (key, info) in map {
+                        merged.insert(key.clone(), info.clone());
+                    }
+                }
+            }
+            // 引擎未启动时不影响 harness 检查点；一个都没有才如实报错
+            Err(err) if merged.is_empty() => return Err(err),
+            Err(_) => {}
+        }
+    }
+    Ok(serde_json::json!({ "checkpoints": merged }))
 }
 
 /// 取消任务（转移 #3/#8/#19/#23/#28：非终态 → cancelled）
@@ -816,6 +1103,7 @@ async fn chat_cancel(
     app: AppHandle,
     state: State<'_, BridgeState>,
     p0: State<'_, Arc<P0Services>>,
+    hub: State<'_, harness::Hub>,
     task_id: String,
     workspace_id: Option<String>,
 ) -> Result<Value, String> {
@@ -827,9 +1115,13 @@ async fn chat_cancel(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| record.workspace_id.clone());
 
-    // 标记取消请求（幂等），并通知引擎终止执行
+    // 标记取消请求（幂等）：本地 harness 任务置进程内取消标记，其余通知引擎终止
     p0.registry.request_cancel(&task_id);
-    let engine_resp = agent::cancel_task(&state.inner(), &ws, &task_id).await;
+    let engine_resp = if hub.cancel(&task_id) {
+        Ok(Value::Null)
+    } else {
+        agent::cancel_task(&state.inner(), &ws, &task_id).await
+    };
 
     let cancellable = !matches!(
         record.status.as_str(),
@@ -931,6 +1223,31 @@ async fn chat_feedback(
     }
     let value = feedback.as_deref().map(str::trim).filter(|v| !v.is_empty());
     store::messages::set_feedback(&p0.store, id, turn_index, value, crate::bridge::event_store::now_ms() as i64)?;
+    Ok(Value::Object(serde_json::Map::from_iter([(
+        "ok".to_string(),
+        Value::Bool(true),
+    )])))
+}
+
+/// 改写某一轮的提问（本轮回复与之后的所有轮次随之作废，等重新执行）
+#[tauri::command]
+async fn chat_edit_turn(
+    p0: State<'_, Arc<P0Services>>,
+    conversation_id: String,
+    turn_index: i64,
+    content: String,
+) -> Result<Value, String> {
+    let id = conversation_id.trim();
+    if id.is_empty() {
+        return Err("CHAT_INVALID_CONVERSATION: 会话标识不能为空".to_string());
+    }
+    store::messages::edit_turn(
+        &p0.store,
+        id,
+        turn_index,
+        &content,
+        crate::bridge::event_store::now_ms() as i64,
+    )?;
     Ok(Value::Object(serde_json::Map::from_iter([(
         "ok".to_string(),
         Value::Bool(true),
@@ -1709,6 +2026,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(agent::new_bridge_state())
+        .manage(harness::Hub::new())
         .manage(remote::new_state())
         .manage(background::new_state())
         .setup(|app| {
@@ -1765,6 +2083,14 @@ pub fn run() {
             // 网络代理：启动即发布生效配置，后续 Rust 出网与引擎子进程都读这一份
             proxy::publish(proxy::spec_or_system(&services.store));
 
+            // 系统级沙箱：恢复上次设置；平台不支持时不写快照，避免引擎收到无效授权
+            match security::policy::get_system_sandbox(&services.store) {
+                Ok(cfg) => sandbox::set_active(
+                    Some(cfg).filter(|c| c.enabled && sandbox::platform_supported()),
+                ),
+                Err(e) => eprintln!("[sandbox] 系统隔离设置读取失败，按未启用处理: {e}"),
+            }
+
             // Hook 网关：引擎执行链路在触发点回到这里，由 Rust 拉起用户放行过的脚本
             // （配了脚本 ≠ 会执行：未放行的命令网关只如实回报「未执行」）
             bridge::hook_gate::start(Arc::clone(&services));
@@ -1806,12 +2132,12 @@ pub fn run() {
             chat_submit,
             chat_review,
             chat_checkpoint_query,
-            chat_control,
             chat_cancel,
             chat_history,
             chat_conversations,
             chat_messages,
             chat_feedback,
+            chat_edit_turn,
             event_replay,
             model_list,
             model_add,
@@ -1882,6 +2208,8 @@ pub fn run() {
             security::compliance_check,
             security::sandbox_policy_get,
             security::sandbox_policy_set,
+            security::sandbox_system_get,
+            security::sandbox_system_set,
             security::sandbox_env_usage,
             security::sandbox_env_clear,
             security::system_permission_status,

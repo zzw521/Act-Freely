@@ -51,7 +51,12 @@ def jwt_encode(payload: dict) -> str:
     return f"{body}.{claims}.{_b64url_encode(sig)}"
 
 
-def jwt_decode(token: str) -> dict | None:
+def jwt_decode(
+    token: str,
+    *,
+    issuer: str | None = None,
+    audience: str | None = None,
+) -> dict | None:
     try:
         body, claims, sig = token.split(".")
         signing_input = f"{body}.{claims}".encode("ascii")
@@ -61,8 +66,19 @@ def jwt_decode(token: str) -> dict | None:
         if not hmac.compare_digest(expected, _b64url_decode(sig)):
             return None
         payload = json.loads(_b64url_decode(claims))
+        if not isinstance(payload, dict):
+            return None
         if int(payload.get("exp", 0)) < int(time.time()):
             return None
+        if issuer is not None and payload.get("iss") != issuer:
+            return None
+        if audience is not None:
+            aud = payload.get("aud")
+            if isinstance(aud, list):
+                if audience not in aud:
+                    return None
+            elif aud != audience:
+                return None
         return payload
     except Exception:
         return None

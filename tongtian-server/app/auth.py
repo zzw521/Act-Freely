@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
 import re
 import sqlite3
@@ -38,6 +39,11 @@ router = APIRouter()
 CODE_TTL_SECONDS = 5 * 60
 MAX_PENDING_CODES = 10_000
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+ORG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+USER_QUOTA = {"monthlyTokens": 100_000, "concurrentTasks": 2}
+ADMIN_QUOTA = {"monthlyTokens": 2_000_000, "concurrentTasks": 8}
+QUOTA_LIMITS = {"monthlyTokens": (0, 1_000_000_000), "concurrentTasks": (1, 100)}
 
 _login_limiter = RateLimiter()
 
@@ -71,7 +77,72 @@ class LogoutIn(BaseModel):
     refreshToken: str = ""
 
 
+class QuotaIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    monthlyTokens: int | None = None
+    concurrentTasks: int | None = None
+
+
+class UserClaimsIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    org: str | None = None
+    quota: QuotaIn | None = None
+
+
 # ── 用户与会话 ───────────────────────────────────────────────
+
+
+def _user_value(user: sqlite3.Row | dict, key: str, default: Any = None) -> Any:
+    if isinstance(user, sqlite3.Row):
+        return user[key] if key in user.keys() else default
+    return user.get(key, default)
+
+
+def effective_org(user: sqlite3.Row | dict) -> str:
+    org = str(_user_value(user, "org_id", "") or "").strip().lower()
+    uid = str(_user_value(user, "uid", "") or "")
+    return org or f"personal-{uid}"
+
+
+def _default_quota(user: sqlite3.Row | dict) -> dict:
+    role = _user_value(user, "role", "user") or "user"
+    return dict(ADMIN_QUOTA if role == "admin" else USER_QUOTA)
+
+
+def effective_quota(user: sqlite3.Row | dict) -> dict:
+    quota = _default_quota(user)
+    try:
+        override = json.loads(_user_value(user, "quota_json", "{}") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return quota
+    if not isinstance(override, dict):
+        return quota
+    for key, (low, high) in QUOTA_LIMITS.items():
+        value = override.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high:
+            quota[key] = value
+    return quota
+
+
+def _normalize_org(raw: str | None) -> str:
+    org = (raw or "").strip().lower()
+    if not org:
+        return ""
+    if not ORG_RE.match(org):
+        raise ApiError(400, "INVALID_ORG", "组织标识需为 1~64 位小写字母、数字、下划线或连字符")
+    return org
+
+
+def _validate_quota(model: QuotaIn) -> dict:
+    quota: dict[str, int] = {}
+    for key, (low, high) in QUOTA_LIMITS.items():
+        value = getattr(model, key)
+        if value is None:
+            continue
+        if not low <= value <= high:
+            raise ApiError(400, "INVALID_QUOTA", f"{key} 需在 {low}~{high} 之间")
+        quota[key] = value
+    return quota
 
 
 def profile_of(user: sqlite3.Row | dict) -> dict:
@@ -84,6 +155,8 @@ def profile_of(user: sqlite3.Row | dict) -> dict:
         "email": get("email"),
         "plan": get("plan") or "个人免费版",
         "role": get("role") or "user",
+        "org": effective_org(user),
+        "quota": effective_quota(user),
         "mock": False,
     }
 
@@ -143,24 +216,27 @@ def _create_user(email: str, password: str, nickname: str, role: str = "user") -
 
 def _issue_tokens(conn: sqlite3.Connection, user: sqlite3.Row | dict) -> dict:
     now = int(time.time())
-    uid = user["uid"] if isinstance(user, sqlite3.Row) else user["uid"]
-    role = (user["role"] if isinstance(user, sqlite3.Row) else user.get("role")) or "user"
+    uid = str(_user_value(user, "uid", "") or "")
+    role = _user_value(user, "role", "user") or "user"
+    session_id = new_session_id()
+    claims = {
+        "sub": uid,
+        "sid": session_id,
+        "role": role,
+        "org": effective_org(user),
+        "quota": effective_quota(user),
+        "iss": settings.jwt_issuer,
+        "aud": settings.jwt_audience,
+        "iat": now,
+    }
     access = jwt_encode(
-        {
-            "sub": uid,
-            "type": "access",
-            "role": role,
-            "iat": now,
-            "exp": now + settings.access_ttl_seconds,
-        }
+        {**claims, "type": "access", "exp": now + settings.access_ttl_seconds}
     )
     refresh = jwt_encode(
         {
-            "sub": uid,
+            **claims,
             "type": "refresh",
-            "role": role,
             "jti": new_session_id(),
-            "iat": now,
             "exp": now + settings.refresh_ttl_seconds,
         }
     )
@@ -168,7 +244,7 @@ def _issue_tokens(conn: sqlite3.Connection, user: sqlite3.Row | dict) -> dict:
         "INSERT INTO sessions (id, uid, refresh_hash, expires_at_ms, revoked, created_at_ms) "
         "VALUES (?1, ?2, ?3, ?4, 0, ?5)",
         (
-            new_session_id(),
+            session_id,
             uid,
             token_hash(refresh),
             (now + settings.refresh_ttl_seconds) * 1000,
@@ -189,18 +265,26 @@ def issue_tokens(user: sqlite3.Row | dict) -> dict:
 
 
 def refresh_tokens(refresh_token: str) -> dict:
-    payload = jwt_decode(refresh_token)
+    payload = jwt_decode(
+        refresh_token,
+        issuer=settings.jwt_issuer,
+        audience=settings.jwt_audience,
+    )
     if payload is None or payload.get("type") != "refresh":
         raise ApiError(401, "INVALID_REFRESH", "refresh token 无效或已过期")
+    sid = str(payload.get("sid") or "")
+    uid = str(payload.get("sub") or "")
+    if not sid or not uid:
+        raise ApiError(401, "INVALID_REFRESH", "refresh token 缺少会话绑定，请重新登录")
     with tx() as conn:
         cur = conn.execute(
             "UPDATE sessions SET revoked = 1 "
-            "WHERE refresh_hash = ?1 AND revoked = 0 AND expires_at_ms > ?2",
-            (token_hash(refresh_token), now_ms()),
+            "WHERE id = ?1 AND uid = ?2 AND refresh_hash = ?3 AND revoked = 0 AND expires_at_ms > ?4",
+            (sid, uid, token_hash(refresh_token), now_ms()),
         )
         if cur.rowcount != 1:
             raise ApiError(401, "INVALID_REFRESH", "refresh token 无效或已吊销")
-        user = conn.execute("SELECT * FROM users WHERE uid = ?1", (payload.get("sub", ""),)).fetchone()
+        user = conn.execute("SELECT * FROM users WHERE uid = ?1", (uid,)).fetchone()
         if user is None:
             raise ApiError(401, "INVALID_REFRESH", "账号不存在")
         return _issue_tokens(conn, user)
@@ -217,15 +301,42 @@ def revoke_refresh(refresh_token: str) -> bool:
         return cur.rowcount > 0
 
 
+def find_user_by_session(session_id: str, uid: str) -> sqlite3.Row | None:
+    if not session_id or not uid:
+        return None
+    with tx() as conn:
+        return conn.execute(
+            "SELECT u.*, s.revoked AS session_revoked, s.expires_at_ms AS session_expires_at_ms "
+            "FROM sessions s JOIN users u ON u.uid = s.uid "
+            "WHERE s.id = ?1 AND s.uid = ?2",
+            (session_id, uid),
+        ).fetchone()
+
+
 def bearer_user(request: Request) -> dict | None:
     header = request.headers.get("authorization", "")
     if not header.lower().startswith("bearer "):
         return None
-    payload = jwt_decode(header[7:].strip())
+    payload = jwt_decode(
+        header[7:].strip(),
+        issuer=settings.jwt_issuer,
+        audience=settings.jwt_audience,
+    )
     if payload is None or payload.get("type") != "access":
         return None
-    user = find_user_by_uid(str(payload.get("sub", "")))
+    uid = str(payload.get("sub") or "")
+    sid = str(payload.get("sid") or "")
+    if not uid or not sid:
+        # 升级前签发的无 sid 令牌无法按会话吊销，直接要求重新登录
+        return None
+    user = find_user_by_session(sid, uid)
     if user is None:
+        return None
+    if int(user["session_revoked"] or 0) or int(user["session_expires_at_ms"] or 0) <= now_ms():
+        return None
+    if (payload.get("role") or "user") != (user["role"] or "user"):
+        return None
+    if str(payload.get("org") or "") != effective_org(user):
         return None
     return dict(user)
 
@@ -391,6 +502,58 @@ def api_v1_logout(payload: LogoutIn):
 @router.get("/api/v1/auth/me")
 def api_v1_me(user: dict = Depends(require_user)):
     return {"ok": True, "profile": profile_of(user)}
+
+
+@router.patch("/api/v1/admin/users/{uid}")
+def api_admin_patch_user(
+    uid: str,
+    payload: UserClaimsIn,
+    _admin: dict = Depends(require_admin),
+):
+    if not payload.model_fields_set:
+        raise ApiError(400, "NOTHING_TO_UPDATE", "请至少提供 org 或 quota")
+    with tx() as conn:
+        row = conn.execute("SELECT * FROM users WHERE uid = ?1", (uid,)).fetchone()
+        if row is None:
+            raise ApiError(404, "USER_NOT_FOUND", "用户不存在")
+        org = row["org_id"]
+        if "org" in payload.model_fields_set:
+            org = _normalize_org(payload.org)
+        quota_json = row["quota_json"]
+        if "quota" in payload.model_fields_set:
+            quota_json = (
+                "{}"
+                if payload.quota is None
+                else json.dumps(_validate_quota(payload.quota), separators=(",", ":"))
+            )
+        conn.execute(
+            "UPDATE users SET org_id = ?1, quota_json = ?2 WHERE uid = ?3",
+            (org, quota_json, uid),
+        )
+        # 声明是签发时刻的快照：改组织/配额后必须让旧令牌立即失效，否则旧声明继续生效
+        cur = conn.execute(
+            "UPDATE sessions SET revoked = 1 WHERE uid = ?1 AND revoked = 0 AND expires_at_ms > ?2",
+            (uid, now_ms()),
+        )
+        updated = conn.execute("SELECT * FROM users WHERE uid = ?1", (uid,)).fetchone()
+        return {
+            "ok": True,
+            "profile": profile_of(updated),
+            "sessionsRevoked": cur.rowcount,
+        }
+
+
+@router.post("/api/v1/admin/users/{uid}/revoke-sessions")
+def api_admin_revoke_sessions(uid: str, _admin: dict = Depends(require_admin)):
+    with tx() as conn:
+        row = conn.execute("SELECT uid FROM users WHERE uid = ?1", (uid,)).fetchone()
+        if row is None:
+            raise ApiError(404, "USER_NOT_FOUND", "用户不存在")
+        cur = conn.execute(
+            "UPDATE sessions SET revoked = 1 WHERE uid = ?1 AND revoked = 0 AND expires_at_ms > ?2",
+            (uid, now_ms()),
+        )
+        return {"ok": True, "revoked": cur.rowcount}
 
 
 # ── 网页登录/注册（loopback 回跳） ──────────────────────────

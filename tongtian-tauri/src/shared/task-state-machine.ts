@@ -1,6 +1,6 @@
 // src/shared/task-state-machine.ts — 14 态任务状态机（流 B1）
 //
-// 依据：docs/changes/agent-platform-evolution/experts/03-business.md §2.1
+// 任务状态定义见 docs/archive/2026-10/docs/changes/agent-platform-evolution/experts/03-business.md §2.1
 // （14 态 + wait_reason 子态 + 35 条合法转移，需求分析报告 P0：先于 Phase B 冻结）
 //
 // 设计原则：

@@ -10,13 +10,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import secrets
 import sqlite3
+import time
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
@@ -49,6 +52,14 @@ MAX_MACHINE = 60
 INVITE_TTL_MS = 7 * 24 * 3600 * 1000
 MAX_INVITE_TOKEN = 256
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+# 事件流：单次补拉上限与轮询节奏。协作验收要求 1 秒内可见，500ms 轮询
+# 留出一半余量；心跳 15 秒，避免反代把空闲连接当作僵死连接掐断。
+EVENT_PAGE_LIMIT = 500
+EVENT_DEFAULT_LIMIT = 100
+EVENT_STREAM_BATCH = 200
+EVENT_STREAM_POLL_SECONDS = 0.5
+EVENT_STREAM_PING_SECONDS = 15.0
 
 _limits = RateLimiter()
 
@@ -210,6 +221,42 @@ def _emit(
         (ts, project_id),
     )
     return int(seq)
+
+
+def _event_view(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        payload = json.loads(row["payload_json"] or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    return {
+        "seq": row["seq"],
+        "kind": row["kind"],
+        "actorUid": row["actor_uid"],
+        "payload": payload,
+        "createdAtMs": row["created_at_ms"],
+    }
+
+
+def _event_rows(
+    conn: sqlite3.Connection, project_id: str, since: int, limit: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT seq, actor_uid, kind, payload_json, created_at_ms FROM project_events "
+        "WHERE project_id = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
+        (project_id, since, limit),
+    ).fetchall()
+
+
+def _read_events(
+    project_id: str, uid: str, since: int, limit: int
+) -> list[dict[str, Any]] | None:
+    """读取游标之后的事件；返回 None 表示已不是项目成员，流应关闭。"""
+    try:
+        with tx() as conn:
+            _require_project(conn, project_id, uid)
+            return [_event_view(row) for row in _event_rows(conn, project_id, since, limit)]
+    except ApiError:
+        return None
 
 
 # ── 视图 ──────────────────────────────────────────────────────
@@ -868,3 +915,83 @@ def api_report_result(
             conn, project["id"], user["uid"], "task.result", {"task": _task_view(updated)}
         )
         return {"ok": True, "task": _task_view(updated), "seq": seq}
+
+
+# ── 事件增量拉取与实时流 ─────────────────────────────────────
+
+
+@router.get("/api/v1/projects/{project_id}/events")
+def list_project_events(
+    project_id: str,
+    since: int = Query(0, ge=0),
+    limit: int = Query(EVENT_DEFAULT_LIMIT, ge=1, le=EVENT_PAGE_LIMIT),
+    user: dict = Depends(require_user),
+):
+    """按游标补拉项目事件；客户端断线重连或降级轮询都用它。"""
+    with tx() as conn:
+        project = _require_project(conn, project_id, user["uid"], ROLE_VIEWER)
+        events = [_event_view(row) for row in _event_rows(conn, project["id"], since, limit)]
+    next_cursor = events[-1]["seq"] if events else since
+    return {
+        "ok": True,
+        "events": events,
+        "cursor": next_cursor,
+        "hasMore": len(events) == limit,
+    }
+
+
+@router.get("/api/v1/projects/{project_id}/events/stream")
+async def stream_project_events(
+    project_id: str,
+    request: Request,
+    since: int = Query(0, ge=0),
+    user: dict = Depends(require_user),
+):
+    """订阅项目事件（SSE）。
+
+    鉴权走 Bearer 头；浏览器 EventSource 不能自定义请求头时，客户端应使用
+    fetch 流式读取，或先走增量接口降级。游标来自 `since` 或 `Last-Event-ID`。
+    """
+    project_id = _check_project_id(project_id)
+    with tx() as conn:
+        _require_project(conn, project_id, user["uid"], ROLE_VIEWER)
+
+    header_cursor = request.headers.get("last-event-id", "").strip()
+    cursor = since
+    if header_cursor.isdigit():
+        cursor = max(cursor, int(header_cursor))
+
+    async def generate():
+        nonlocal cursor
+        last_ping = time.monotonic()
+        yield (
+            "event: ready\n"
+            f"data: {json.dumps({'cursor': cursor}, ensure_ascii=False)}\n\n"
+        )
+        while True:
+            if await request.is_disconnected():
+                return
+            batch = await asyncio.to_thread(
+                _read_events, project_id, user["uid"], cursor, EVENT_STREAM_BATCH
+            )
+            if batch is None:
+                # 被移出项目或项目已删除：明确结束，客户端不再重连
+                yield 'event: closed\ndata: {"reason":"membership"}\n\n'
+                return
+            if batch:
+                for event in batch:
+                    cursor = event["seq"]
+                    data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+                    yield f"id: {cursor}\nevent: message\ndata: {data}\n\n"
+                last_ping = time.monotonic()
+                continue
+            if time.monotonic() - last_ping >= EVENT_STREAM_PING_SECONDS:
+                yield ": ping\n\n"
+                last_ping = time.monotonic()
+            await asyncio.sleep(EVENT_STREAM_POLL_SECONDS)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )

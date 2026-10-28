@@ -83,7 +83,7 @@ import { resolveEngineBaseUrl } from '../../lib/engine-endpoint';
 import { engineFetch } from '../../lib/engine-http';
 import { useI18n } from '../../i18n';
 import brandLogo from '../../assets/brand-logo.png';
-import type { AppSettingsData, AcpConfigState, AcpServerStatus, AutostartStatus, AwarenessView, AwarenessPatch, AwarenessFileEntry, AwarenessFileName, AwarenessProfile, AwarenessStyleId, BrandingInfo, ImPreferences, MemoryEntry, PermissionState, PiiOutboundMode, ProxyStatus, SandboxEnvUsage, SystemCapability, SystemPermissionStatus, TerminalCapabilities, ToolApprovalMode } from '../../../shared/contracts';
+import type { AppSettingsData, AcpConfigState, AcpServerStatus, AutostartStatus, AwarenessView, AwarenessPatch, AwarenessFileEntry, AwarenessFileName, AwarenessProfile, AwarenessStyleId, BrandingInfo, ImPreferences, MemoryEntry, PermissionState, PiiOutboundMode, ProxyStatus, SandboxEnvUsage, SystemCapability, SystemPermissionStatus, SystemSandboxView, TerminalCapabilities, ToolApprovalMode } from '../../../shared/contracts';
 
 // ── 三分组分区定义 ─────────────────────────────────────────────────
 
@@ -3019,6 +3019,9 @@ const SandboxPanel: React.FC = () => {
 
   /** 工作环境文件用量：Rust/引擎实测磁盘，未落地时为 0，不是估算值 */
   const [usage, setUsage] = useState<SandboxEnvUsage | null>(null);
+  /** 系统级隔离（AppContainer）：配置意图与真实生效状态分开保存 */
+  const [systemSandbox, setSystemSandbox] = useState<SystemSandboxView | null>(null);
+  const [systemSaving, setSystemSaving] = useState(false);
   const [envMessage, setEnvMessage] = useState('');
   const [envError, setEnvError] = useState('');
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -3033,9 +3036,31 @@ const SandboxPanel: React.FC = () => {
     }
   }, []);
 
+  const loadSystem = React.useCallback(async () => {
+    try {
+      setSystemSandbox(await sandboxAPI.systemGet());
+    } catch (e) {
+      setEnvError(errorTextOf(e, '系统隔离状态读取失败'));
+    }
+  }, []);
+
   useEffect(() => {
     void loadUsage();
-  }, [loadUsage]);
+    void loadSystem();
+  }, [loadUsage, loadSystem]);
+
+  const applySystem = async (enabled: boolean, network: boolean) => {
+    setSystemSaving(true);
+    try {
+      setSystemSandbox(await sandboxAPI.systemSet(enabled, network));
+      setEnvMessage(enabled ? '系统隔离已启用，新启动的引擎进程会带上隔离' : '系统隔离已关闭，新启动的引擎进程不再带隔离');
+      setEnvError('');
+    } catch (e) {
+      setEnvError(errorTextOf(e, '系统隔离设置保存失败'));
+    } finally {
+      setSystemSaving(false);
+    }
+  };
 
   const handleClear = async () => {
     setClearing(true);
@@ -3065,9 +3090,41 @@ const SandboxPanel: React.FC = () => {
   // 按钮不能是个点了只弹假回执的装饰
   const canClear = Boolean(usage?.supported) && usedBytes > 0 && !clearing;
 
+  const sysStatus = systemSandbox?.status;
+  const sysEnabled = Boolean(systemSandbox?.config.enabled);
+  const sysNetwork = Boolean(systemSandbox?.config.network);
+  const systemSub = !sysStatus
+    ? '正在读取系统隔离状态…'
+    : !sysStatus.supported
+      ? `${sysStatus.platform} 不支持操作系统级隔离，当前只有策略沙箱：工具调用受工作区边界与白名单约束，进程不受限制`
+      : sysEnabled
+        ? sysStatus.effective
+          ? `已生效（AppContainer · ${sysStatus.profile}）：终端、MCP stdio 与 ACP 子进程以容器令牌运行，写操作限制在工作区，读不到数据根里的会话库与密钥文件${sysNetwork ? '；允许出网' : '；阻断出网（回环与局域网同样不可达）'}`
+          : `已请求但未生效：${sysStatus.error ?? 'AppContainer profile 未就绪'}`
+        : '未启用：子进程以当前用户权限运行，只有策略沙箱拦截越界工具调用。启用后需重新启动任务才会作用于新引擎进程';
+
   return (
     <Box sx={{ maxWidth: 860 }}>
-      <PanelTitle title="安全工作环境" desc="在本机为任务单独开辟工作目录，工具读写限制在该目录内；它不是操作系统级沙箱，模型调用仍会把任务内容发送给所选模型服务商" />
+      <PanelTitle title="安全工作环境" desc="两层隔离：策略沙箱按工作区限制可用工具与路径；系统隔离让真实子进程以 Windows AppContainer 令牌运行。开启前请注意：模型调用仍会把任务内容发送给所选模型服务商" />
+      <Box
+        sx={{
+          display: 'flex',
+          gap: 2,
+          flexWrap: 'wrap',
+          mb: 1.5,
+          px: 2,
+          py: 1.25,
+          borderRadius: '10px',
+          bgcolor: 'rgba(15,23,42,0.04)',
+        }}
+      >
+        <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-2)' }}>
+          策略沙箱：L0 只读 / L1 受限 / L2 可执行，按工作区策略限制工具与路径
+        </Typography>
+        <Typography sx={{ fontSize: '12px', color: sysEnabled && sysStatus?.effective ? '#0D9488' : 'var(--tt-text-3)' }}>
+          系统隔离：{sysStatus?.supported ? (sysEnabled && sysStatus.effective ? '已生效' : sysEnabled ? '未生效' : '未启用') : '平台不支持'}
+        </Typography>
+      </Box>
       {(envError || envMessage) && (
         <Box
           sx={{
@@ -3088,6 +3145,36 @@ const SandboxPanel: React.FC = () => {
         label="启用安全工作环境"
         sub="开启且未自选工作目录时，任务文件落在当前工作区的 environment 子目录，并由工作区沙箱策略限制可用工具；已选择工作目录时以所选目录为准。本机应用无法阻止模型出网"
         control={<Switch checked={enabled} onChange={(e) => updateAppSettings({ secureEnv: e.target.checked })} sx={tealSwitch} />}
+      />
+      <SettingRow
+        label="系统隔离（Windows AppContainer）"
+        sub={systemSub}
+        control={
+          <Switch
+            checked={sysEnabled}
+            disabled={!sysStatus?.supported || systemSaving}
+            onChange={(e) => void applySystem(e.target.checked, sysNetwork)}
+            sx={tealSwitch}
+          />
+        }
+      />
+      <SettingRow
+        label="允许沙箱内命令出网"
+        sub={
+          sysEnabled
+            ? sysNetwork
+              ? '已允许：容器内的终端、MCP 与 ACP 进程可以访问外网；回环与局域网仍被 AppContainer 网络隔离阻断'
+              : '已阻断：容器内进程无法访问外网。需要联网安装依赖或调用在线服务时临时开启'
+            : '系统隔离未启用时此项无效'
+        }
+        control={
+          <Switch
+            checked={sysNetwork}
+            disabled={!sysEnabled || systemSaving}
+            onChange={(e) => void applySystem(true, e.target.checked)}
+            sx={tealSwitch}
+          />
+        }
       />
       <SettingRow
         label="清理工作环境文件"

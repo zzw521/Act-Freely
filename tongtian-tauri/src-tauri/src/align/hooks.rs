@@ -244,6 +244,8 @@ pub fn run_command(event: &str, command: &str, timeout_sec: u64, input: &Value) 
         };
     }
 
+    // Hook 命令是用户逐条放行的本机自动化，进程沿用应用权限；
+    // 系统级隔离只覆盖终端、MCP stdio 与 ACP（见 docs/缺陷与实现计划-任我行.md 的 D-03）。
     #[cfg(windows)]
     let mut spec = {
         use std::os::windows::process::CommandExt;

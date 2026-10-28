@@ -278,7 +278,7 @@ describe.skipIf(!hasPython)('Mock Agent SSE 集成（黄金 fixture）', () => {
     expect(statuses).toContain('pending_review');
   });
 
-  it('控制端点：pause/resume/rollback_to 返回 ok，未知任务拒绝', async () => {
+  it('控制端点已移除：pause/rollback_to 不再提供（只有取消）', async () => {
     const taskId = `integ-ctrl-${Date.now()}`;
     await fetch(`${BASE}/api/chat`, {
       method: 'POST',
@@ -286,26 +286,13 @@ describe.skipIf(!hasPython)('Mock Agent SSE 集成（黄金 fixture）', () => {
       body: JSON.stringify({ message: '任务', task_id: taskId, stage: 'plan' }),
     }).then((r) => r.text());
 
-    for (const action of ['pause', 'resume']) {
+    for (const action of ['pause', 'resume', 'rollback_to']) {
       const resp = await fetch(`${BASE}/api/chat/control`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ task_id: taskId, action }),
+        body: JSON.stringify({ task_id: taskId, action, step_id: 'step-1' }),
       });
-      expect(((await resp.json()) as { ok: boolean }).ok).toBe(true);
+      expect(resp.status).toBe(404);
     }
-    const rb = await fetch(`${BASE}/api/chat/control`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ task_id: taskId, action: 'rollback_to', step_id: 'step-1' }),
-    });
-    expect(((await rb.json()) as { ok: boolean }).ok).toBe(true);
-
-    const miss = await fetch(`${BASE}/api/chat/control`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ task_id: 'no-such', action: 'pause' }),
-    });
-    expect(((await miss.json()) as { ok: boolean }).ok).toBe(false);
   });
 });

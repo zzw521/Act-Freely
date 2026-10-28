@@ -24,6 +24,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import sandbox_launcher as sandbox
+
 MAX_SESSIONS = 5
 MAX_BUFFER_CHARS = 200_000
 IDLE_TIMEOUT_SECONDS = 30 * 60
@@ -149,8 +151,15 @@ class TerminalManager:
         if os.name == "nt":
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
+            spawn = (argv[0], list(argv[1:]))
+            wrapped = sandbox.wrap(spawn[0], spawn[1], workspace=str(path))
+            if wrapped:
+                spawn = wrapped
+        except sandbox.SandboxUnavailable as exc:
+            raise TerminalError("TERMINAL_SANDBOX_FAILED", str(exc)) from None
+        try:
             proc = subprocess.Popen(
-                argv,
+                [spawn[0], *spawn[1]],
                 cwd=str(path),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,

@@ -204,9 +204,11 @@ SELECT i.item_type, i.item_id, i.name, i.summary, i.description, i.category,
           WHERE v.item_type = i.item_type AND v.item_id = i.item_id) AS version_count,
        (SELECT v.version FROM item_versions v
           WHERE v.item_type = i.item_type AND v.item_id = i.item_id
+            AND v.revoked_at_ms = 0
           ORDER BY v.published_at_ms DESC, v.rowid DESC LIMIT 1) AS latest_version,
        (SELECT v.published_at_ms FROM item_versions v
           WHERE v.item_type = i.item_type AND v.item_id = i.item_id
+            AND v.revoked_at_ms = 0
           ORDER BY v.published_at_ms DESC, v.rowid DESC LIMIT 1) AS latest_published_at_ms,
        EXISTS(SELECT 1 FROM stars s2
           WHERE s2.uid = ?1 AND s2.item_type = i.item_type AND s2.item_id = i.item_id
@@ -219,6 +221,7 @@ JOIN users u ON u.uid = i.author_uid
 def _summary_of(row: sqlite3.Row, item_type: str) -> dict:
     plural = TYPE_SPECS[item_type]["plural"]
     latest = row["latest_version"]
+    revoked = bool(row["version_count"]) and latest is None
     download_url = None
     if item_type != "mcp" and latest:
         download_url = f"/api/v1/{plural}/{row['item_id']}/download?version={urllib.parse.quote(latest)}"
@@ -232,6 +235,7 @@ def _summary_of(row: sqlite3.Row, item_type: str) -> dict:
         "icon": row["icon"] or TYPE_SPECS[item_type]["default_icon"],
         "author": {"uid": row["author_uid"], "nickname": row["author_nickname"]},
         "featured": bool(row["featured"]),
+        "revoked": revoked,
         "latestVersion": latest,
         "versionCount": row["version_count"],
         "downloads": row["downloads"],
@@ -246,7 +250,8 @@ def _summary_of(row: sqlite3.Row, item_type: str) -> dict:
 
 def _version_view(row: sqlite3.Row, item_type: str, item_id: str) -> dict:
     plural = TYPE_SPECS[item_type]["plural"]
-    has_package = bool(row["package_path"])
+    revoked = bool(row["revoked_at_ms"])
+    has_package = bool(row["package_path"]) and not revoked
     download_url = None
     if item_type != "mcp" and has_package:
         download_url = (
@@ -259,6 +264,9 @@ def _version_view(row: sqlite3.Row, item_type: str, item_id: str) -> dict:
         "sizeBytes": row["package_size"] or 0,
         "downloads": row["download_count"],
         "publishedAtMs": row["published_at_ms"],
+        "revoked": revoked,
+        "revokedAtMs": row["revoked_at_ms"] or None,
+        "revokedReason": row["revoked_reason"] or None,
         "downloadUrl": download_url,
     }
 
@@ -295,14 +303,15 @@ def get_item_detail(item_type: str, item_id: str, requester_uid: str | None = No
             raise ApiError(404, "ITEM_NOT_FOUND", f"未找到条目：{item_id}")
         versions = conn.execute(
             "SELECT version, readme, changelog, manifest_json, package_path, package_size, "
-            "package_sha256, published_at_ms, download_count "
+            "package_sha256, published_at_ms, download_count, "
+            "revoked_at_ms, revoked_reason "
             "FROM item_versions WHERE item_type = ?1 AND item_id = ?2 "
             "ORDER BY published_at_ms DESC, rowid DESC",
             (item_type, item_id),
         ).fetchall()
 
     item = _summary_of(row, item_type)
-    latest = versions[0] if versions else None
+    latest = next((version for version in versions if not version["revoked_at_ms"]), None)
     manifest: dict = {}
     if latest is not None:
         try:
@@ -852,6 +861,7 @@ def publish_mcp(
         if existing is not None:
             row = conn.execute(
                 "SELECT readme FROM item_versions WHERE item_type = 'mcp' AND item_id = ?1 "
+                "AND revoked_at_ms = 0 "
                 "ORDER BY published_at_ms DESC, rowid DESC LIMIT 1",
                 (item_id,),
             ).fetchone()
@@ -992,6 +1002,7 @@ def api_mcp_config(item_id: str, version: str | None = Query(None)):
         requested = normalize_version(version)
         if requested is None:
             raise ApiError(400, "INVALID_VERSION", "版本号需形如 1.0.0")
+    all_revoked = False
     with tx() as conn:
         item = conn.execute(
             "SELECT name FROM items WHERE item_type = 'mcp' AND item_id = ?1", (item_id,)
@@ -1000,19 +1011,28 @@ def api_mcp_config(item_id: str, version: str | None = Query(None)):
             raise ApiError(404, "ITEM_NOT_FOUND", f"未找到条目：{item_id}")
         if requested:
             row = conn.execute(
-                "SELECT version, manifest_json FROM item_versions "
+                "SELECT version, manifest_json, revoked_at_ms FROM item_versions "
                 "WHERE item_type = 'mcp' AND item_id = ?1 AND version = ?2",
                 (item_id, requested),
             ).fetchone()
         else:
             row = conn.execute(
-                "SELECT version, manifest_json FROM item_versions "
-                "WHERE item_type = 'mcp' AND item_id = ?1 "
+                "SELECT version, manifest_json, revoked_at_ms FROM item_versions "
+                "WHERE item_type = 'mcp' AND item_id = ?1 AND revoked_at_ms = 0 "
                 "ORDER BY published_at_ms DESC, rowid DESC LIMIT 1",
                 (item_id,),
             ).fetchone()
+            if row is None:
+                all_revoked = conn.execute(
+                    "SELECT 1 FROM item_versions WHERE item_type = 'mcp' AND item_id = ?1 LIMIT 1",
+                    (item_id,),
+                ).fetchone() is not None
     if row is None:
+        if all_revoked:
+            raise ApiError(410, "ITEM_REVOKED", "该条目的所有版本已被撤销")
         raise ApiError(404, "VERSION_NOT_FOUND", "指定版本不存在")
+    if row["revoked_at_ms"]:
+        raise ApiError(410, "ITEM_REVOKED", "该版本已被撤销")
     try:
         config = json.loads(row["manifest_json"] or "{}")
     except json.JSONDecodeError:
@@ -1023,6 +1043,53 @@ def api_mcp_config(item_id: str, version: str | None = Query(None)):
         "name": item["name"],
         "version": row["version"],
         "mcp": config,
+    }
+
+
+@router.get("/api/v1/revoked")
+def api_revoked(
+    type: str | None = Query(None),
+    page: int = Query(1),
+    pageSize: int = Query(20),
+):
+    item_type = _require_item_type(type) if type else None
+    page = max(1, page)
+    page_size = min(100, max(1, pageSize))
+    conditions = ["v.revoked_at_ms > 0"]
+    params: list[Any] = []
+    if item_type:
+        conditions.append("v.item_type = ?")
+        params.append(item_type)
+    where_sql = " WHERE " + " AND ".join(conditions)
+    with tx() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) AS n FROM item_versions v" + where_sql, params
+        ).fetchone()["n"]
+        rows = conn.execute(
+            "SELECT v.item_type, v.item_id, v.version, v.revoked_reason, v.revoked_at_ms, i.name "
+            "FROM item_versions v "
+            "JOIN items i ON i.item_type = v.item_type AND i.item_id = v.item_id"
+            + where_sql
+            + " ORDER BY v.revoked_at_ms DESC, v.rowid DESC LIMIT ? OFFSET ?",
+            [*params, page_size, (page - 1) * page_size],
+        ).fetchall()
+    return {
+        "ok": True,
+        "items": [
+            {
+                "type": row["item_type"],
+                "id": row["item_id"],
+                "name": row["name"],
+                "version": row["version"],
+                "reason": row["revoked_reason"],
+                "revokedAtMs": row["revoked_at_ms"],
+            }
+            for row in rows
+        ],
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
+        "hasMore": page * page_size < total,
     }
 
 
@@ -1063,6 +1130,7 @@ def api_download(plural: str, item_id: str, version: str | None = Query(None)):
         if requested is None:
             raise ApiError(400, "INVALID_VERSION", "版本号需形如 1.0.0")
 
+    all_revoked = False
     with tx() as conn:
         item = conn.execute(
             "SELECT name FROM items WHERE item_type = ?1 AND item_id = ?2",
@@ -1072,19 +1140,30 @@ def api_download(plural: str, item_id: str, version: str | None = Query(None)):
             raise ApiError(404, "ITEM_NOT_FOUND", f"未找到条目：{item_id}")
         if requested:
             row = conn.execute(
-                "SELECT version, package_path, package_sha256, package_size FROM item_versions "
+                "SELECT version, package_path, package_sha256, package_size, revoked_at_ms "
+                "FROM item_versions "
                 "WHERE item_type = ?1 AND item_id = ?2 AND version = ?3",
                 (item_type, item_id, requested),
             ).fetchone()
         else:
             row = conn.execute(
-                "SELECT version, package_path, package_sha256, package_size FROM item_versions "
-                "WHERE item_type = ?1 AND item_id = ?2 "
+                "SELECT version, package_path, package_sha256, package_size, revoked_at_ms "
+                "FROM item_versions "
+                "WHERE item_type = ?1 AND item_id = ?2 AND revoked_at_ms = 0 "
                 "ORDER BY published_at_ms DESC, rowid DESC LIMIT 1",
                 (item_type, item_id),
             ).fetchone()
+            if row is None:
+                all_revoked = conn.execute(
+                    "SELECT 1 FROM item_versions WHERE item_type = ?1 AND item_id = ?2 LIMIT 1",
+                    (item_type, item_id),
+                ).fetchone() is not None
         if row is None:
+            if all_revoked:
+                raise ApiError(410, "ITEM_REVOKED", "该条目的所有版本已被撤销")
             raise ApiError(404, "VERSION_NOT_FOUND", "指定版本不存在")
+        if row["revoked_at_ms"]:
+            raise ApiError(410, "ITEM_REVOKED", "该版本已被撤销")
         if not row["package_path"]:
             raise ApiError(404, "NO_PACKAGE", "该版本没有可下载的压缩包")
         full_path = (settings.data_dir / row["package_path"]).resolve()
@@ -1311,9 +1390,63 @@ def api_publish_mcp_version(
 # ── 管理员 ───────────────────────────────────────────────────
 
 
+MAX_REVOKE_REASON = 500
+
+
 class FeatureIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
     featured: bool
+
+
+class RevokeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str
+
+
+def _set_version_revoked(
+    item_type: str,
+    item_id: str,
+    version: str,
+    *,
+    revoked: bool,
+    reason: str,
+    admin_uid: str,
+) -> dict:
+    with _publish_lock, tx() as conn:
+        if conn.execute(
+            "SELECT 1 FROM items WHERE item_type = ?1 AND item_id = ?2", (item_type, item_id)
+        ).fetchone() is None:
+            raise ApiError(404, "ITEM_NOT_FOUND", f"未找到条目：{item_id}")
+        row = conn.execute(
+            "SELECT revoked_at_ms FROM item_versions "
+            "WHERE item_type = ?1 AND item_id = ?2 AND version = ?3",
+            (item_type, item_id, version),
+        ).fetchone()
+        if row is None:
+            raise ApiError(404, "VERSION_NOT_FOUND", "指定版本不存在")
+        changed = bool(row["revoked_at_ms"]) != revoked
+        if changed and revoked:
+            conn.execute(
+                "UPDATE item_versions SET revoked_at_ms = ?4, revoked_reason = ?5, revoked_by = ?6 "
+                "WHERE item_type = ?1 AND item_id = ?2 AND version = ?3",
+                (item_type, item_id, version, now_ms(), reason, admin_uid),
+            )
+        elif changed:
+            conn.execute(
+                "UPDATE item_versions SET revoked_at_ms = 0, revoked_reason = '', revoked_by = '' "
+                "WHERE item_type = ?1 AND item_id = ?2 AND version = ?3",
+                (item_type, item_id, version),
+            )
+        state = conn.execute(
+            "SELECT revoked_at_ms, revoked_reason FROM item_versions "
+            "WHERE item_type = ?1 AND item_id = ?2 AND version = ?3",
+            (item_type, item_id, version),
+        ).fetchone()
+    return {
+        "changed": changed,
+        "revokedAtMs": state["revoked_at_ms"],
+        "reason": state["revoked_reason"],
+    }
 
 
 @router.post("/api/v1/admin/items/{item_type}/{item_id}/feature")
@@ -1331,3 +1464,50 @@ def api_feature(
         if cur.rowcount == 0:
             raise ApiError(404, "ITEM_NOT_FOUND", f"未找到条目：{item_id}")
     return {"ok": True, "item": get_item_detail(item_type, item_id, user["uid"])}
+
+
+@router.post("/api/v1/admin/items/{item_type}/{item_id}/versions/{version}/revoke")
+def api_revoke_version(
+    item_type: str,
+    item_id: str,
+    version: str,
+    payload: RevokeIn,
+    user: dict = Depends(require_admin),
+):
+    item_type = _require_item_type(item_type)
+    item_id = _validate_item_id(item_id)
+    normalized = normalize_version(version)
+    if normalized is None:
+        raise ApiError(400, "INVALID_VERSION", "版本号需形如 1.0.0")
+    reason = _clean_text(payload.reason, "撤销原因", MAX_REVOKE_REASON, required=True)
+    state = _set_version_revoked(
+        item_type, item_id, normalized, revoked=True, reason=reason, admin_uid=user["uid"]
+    )
+    return {
+        "ok": True,
+        "changed": state["changed"],
+        "revokedAtMs": state["revokedAtMs"],
+        "item": get_item_detail(item_type, item_id, user["uid"]),
+    }
+
+
+@router.post("/api/v1/admin/items/{item_type}/{item_id}/versions/{version}/unrevoke")
+def api_unrevoke_version(
+    item_type: str,
+    item_id: str,
+    version: str,
+    user: dict = Depends(require_admin),
+):
+    item_type = _require_item_type(item_type)
+    item_id = _validate_item_id(item_id)
+    normalized = normalize_version(version)
+    if normalized is None:
+        raise ApiError(400, "INVALID_VERSION", "版本号需形如 1.0.0")
+    state = _set_version_revoked(
+        item_type, item_id, normalized, revoked=False, reason="", admin_uid=user["uid"]
+    )
+    return {
+        "ok": True,
+        "changed": state["changed"],
+        "item": get_item_detail(item_type, item_id, user["uid"]),
+    }

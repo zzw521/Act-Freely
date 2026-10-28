@@ -419,6 +419,30 @@ export function handleLocalSecurityChannel(channel: string, args: unknown[]): Lo
     return { handled: true, value: mockEnvUsage() };
   }
 
+  if (channel === 'sandbox:systemGet') {
+    // 浏览器预览没有系统级隔离：如实返回「平台不支持」，不做一个能点亮但毫无作用的开关
+    return {
+      handled: true,
+      value: {
+        config: { enabled: false, network: false, updatedAtMs: 0 },
+        status: {
+          requested: false,
+          supported: false,
+          effective: false,
+          platform: 'browser',
+          profile: '',
+          network: false,
+          profileReady: false,
+          error: '浏览器预览环境没有操作系统级沙箱，请在桌面版查看',
+        },
+      },
+    };
+  }
+
+  if (channel === 'sandbox:systemSet') {
+    throw new Error('SANDBOX_SYSTEM_UNSUPPORTED: 浏览器预览环境无法开启系统级隔离，请在桌面版操作');
+  }
+
   if (channel === 'sandbox:envClear') {
     // 本地通道删不了真实文件，报不支持而不是返回一份「释放了 N 字节」的假回执
     throw new Error('SANDBOX_ENV_UNSUPPORTED: 浏览器预览环境无法清理工作环境文件，请在桌面版操作');

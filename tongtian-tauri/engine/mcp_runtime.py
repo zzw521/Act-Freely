@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 
+import sandbox_launcher as sandbox
 import tool_search as ts
 
 # 一轮最多接入的连接器数量：再多通常是配置出错，不该让提交卡在串行握手上
@@ -92,6 +93,16 @@ def build_client(spec: dict):
             for k, v in (spec.get("env") if isinstance(spec.get("env"), dict) else {}).items()
             if str(k).strip()
         }
+        # 系统隔离开启时，MCP 服务进程也要进 AppContainer；用户为连接器显式配置的
+        # 变量（如 GITHUB_TOKEN）由启动器保留，其余敏感变量仍被过滤。
+        try:
+            wrapped = sandbox.wrap(command, args, keep_env=tuple(env))
+        except sandbox.SandboxUnavailable as exc:
+            raise ValueError(
+                f"系统隔离已开启，连接器「{name}」无法在沙箱中启动：{exc}"
+            ) from None
+        if wrapped:
+            command, args = wrapped
         return StdIOStatefulClient(
             name=name,
             command=command,

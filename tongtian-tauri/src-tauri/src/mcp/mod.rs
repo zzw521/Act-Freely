@@ -699,6 +699,14 @@ async fn stdio_handshake(job: ProbeTarget) -> Result<Vec<ToolRow>, String> {
     use tokio::io::AsyncBufReadExt;
 
     let (program, args) = spawn_plan(&job.command, &job.args);
+    // 系统隔离开启时，探测进程与真实会话走同一个启动器；套壳失败直接拒绝，不静默降级
+    let keep_env: Vec<String> = job.env.keys().cloned().collect();
+    let (program, args) = match crate::sandbox::wrap_for_spawn(&program, &args, &keep_env)
+        .map_err(|e| format!("MCP_SANDBOX_FAILED: {e}"))?
+    {
+        Some((exe, argv)) => (exe.to_string_lossy().into_owned(), argv),
+        None => (program, args),
+    };
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args)
         .stdin(std::process::Stdio::piped())

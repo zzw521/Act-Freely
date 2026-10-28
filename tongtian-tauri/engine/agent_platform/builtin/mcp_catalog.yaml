@@ -1,0 +1,23 @@
+# MCP Catalog 内置示例（默认不启用任何服务器）
+#
+# 用户目录 {TT_PLATFORM_HOME}/mcp_catalog.yaml 会覆盖同名 id。
+# stdio 与 http 两种传输统一在这里声明；技能通过 mcp.servers 绑定。
+servers: []
+
+# servers:
+#   - id: filesystem
+#     name: 本地文件系统
+#     transport: stdio
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+#     env: {}
+#     enabled: true
+#
+#   - id: remote-search
+#     name: 远程搜索
+#     transport: http
+#     url: http://127.0.0.1:9000/mcp
+#     headers:
+#       Authorization: "Bearer <token>"
+#     timeoutSecs: 30
+#     enabled: true

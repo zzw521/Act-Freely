@@ -199,4 +199,15 @@ describe('接线契约：引擎请求不得绕过统一入口', () => {
     expect(server).toContain('x-tt-engine-token');
     expect(server).toContain('def mount_web');
   });
+
+  it('账号 JWT、请求审计与用量归属在引擎侧真实接线', () => {
+    const server = read('../../../engine/server.py');
+    expect(server).toContain('def verify_engine_jwt');
+    expect(server).toContain('def _authenticate_engine_request');
+    expect(server).toContain('TT_ENGINE_JWT_SECRET');
+    expect(server).toContain('TT_ENGINE_ALLOWED_USERS');
+    expect(server).toContain('@app.get("/api/audit")');
+    expect(server).toContain('def _usage_scope');
+    expect(server).toMatch(/service_bind_error\(\s*args\.host[\s\S]{0,200}?_engine_jwt_secret\(\)/);
+  });
 });

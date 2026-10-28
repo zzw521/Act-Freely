@@ -87,7 +87,9 @@ describe('熊猫接入点', () => {
 
   it('空态主视觉换成熊猫，不再是渐变方块字', () => {
     const src = workbench();
-    expect(src).toContain('<Panda state="idle" size={112} variant="full" ground ariaLabel={tr(\'通通\')} />');
+    // 熊猫坐在输入卡上沿（下半身被卡片遮住），由 ChatInput 的 mascot 插槽承载
+    expect(src).toContain('mascot={<Panda state="idle" size={128} variant="full" ariaLabel={tr(\'通通\')} />}');
+    expect(input()).toContain('{mascot}');
     expect(src).not.toContain("background: 'linear-gradient(135deg, #34D399 0%, #06B6D4 100%)'");
   });
 

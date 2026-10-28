@@ -26,6 +26,7 @@ import { errorMessageOf, errorTextOf } from '../../shared/error-messages';
 import { archiveTask, getSettings, listArchived } from '../lib/alignment-api';
 import {
   feedbackOfTurns,
+  editConversationTurn,
   fetchConversationMessages,
   fetchConversations,
   groupTurns,
@@ -190,6 +191,11 @@ interface WorkbenchState {
   /** 重新生成指定轮次的回复（重置该轮事件流后重新提交原目标） */
   regenerateTurn: (turnIdx: number) => Promise<void>;
   /**
+   * 改写某一轮提问并重新执行。该轮回复与之后所有轮次随之作废（与截断式分支一致），
+   * 正文库同步截断后再按新提问提交；失败时不改界面并给出中文错误。
+   */
+  editTurn: (turnIdx: number, text: string) => Promise<void>;
+  /**
    * 给某轮回复点赞/点踩（kind 为 null 时取消评价）。
    * 评价按 (会话, 轮次) 落库：桌面端写 SQLite chat_feedback，Mock/浏览器写本地台账。
    * 落库失败时抛错，由调用方提示（界面不留下一个没存住的选中态）。
@@ -198,7 +204,6 @@ interface WorkbenchState {
   reviewPlan: (action: 'approve' | 'reject' | 'modify', patch?: Partial<Step>[]) => Promise<void>;
   /** 从中断前最近一次模型调用前的检查点继续（同一 taskId，不新增对话轮次） */
   resumeTask: () => Promise<void>;
-  controlTask: (action: 'pause' | 'resume' | 'rollback_to', stepId?: string) => Promise<void>;
   cancelTask: () => Promise<void>;
   loadHistory: () => Promise<void>;
   /** 按正文库重建会话显示（设置页「运行修复」的真实动作），返回各分类条数 */
@@ -227,7 +232,6 @@ const WAIT_REASON_TEXT: Record<string, string> = {
   quota_wait: '配额排队中',
   budget_wait: '预算暂停，恢复后自动继续',
   lease_wait: '等待执行租约',
-  user_pause: '用户暂停',
   pending_review_ttl: '审阅超期',
 };
 
@@ -1023,6 +1027,129 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
       }
     },
 
+    // ── 改写某一轮提问并重新执行 ────────────────────────
+
+    editTurn: async (turnIdx, text) => {
+      // 与提交/重新生成一致：先确保全局事件路由已注册，否则重跑的事件没人接收
+      ensureRouter();
+      const trimmed = text.trim();
+      const s = get();
+      const conv = s.activeId ? s.convs[s.activeId] : undefined;
+      if (!conv) return;
+      // 运行中/正在重新生成时不允许改写：同一轮并存两个任务会让事件流互相覆盖
+      if (conv.regeneratingTurn != null || conv.isLoading) return;
+      if (turnIdx < 0 || turnIdx >= conv.turnEvents.length) return;
+      const userMsgs = conv.messages.filter((m) => m.role === Role.USER);
+      const current = ((userMsgs[turnIdx]?.content as string | undefined) ?? '').trim();
+      if (!trimmed || trimmed === current) return;
+
+      const settings = await getSettings().catch(() => null);
+      const privacy = Boolean(settings?.privacyMode);
+      // 先落库再改界面：写不进去就保持原样并给出中文错误，避免刷新后「改了一半」
+      if (!privacy) {
+        try {
+          await editConversationTurn(conv.id, turnIdx, trimmed);
+        } catch (err: unknown) {
+          patchConv(conv.id, { error: errorTextOf(err, '改写提问失败') });
+          return;
+        }
+      }
+
+      // 本轮之后的所有轮次作废：正文库已截断，界面同步截断
+      const keptUsers = userMsgs.slice(0, turnIdx);
+      const existing = userMsgs[turnIdx];
+      const nextUserMsg: Message = existing
+        ? { ...existing, content: trimmed, ts: new Date() }
+        : { id: `msg-${Date.now()}-user`, taskId: '', role: Role.USER, content: trimmed, ts: new Date() };
+      const keepTurn = <T,>(table: Record<number, T>, limit: number): Record<number, T> =>
+        Object.fromEntries(Object.entries(table).filter(([k]) => Number(k) <= limit)) as Record<number, T>;
+      const keptMap = Object.fromEntries(
+        Object.entries(conv.taskTurnMap).filter(([, turn]) => turn < turnIdx)
+      );
+
+      // 沿用此前轮次的上下文（与 regenerateTurn 同口径：用户原文 + 上一轮最终回复）
+      const history: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+      keptUsers.forEach((m, i) => {
+        const content = typeof m.content === 'string' ? m.content : '';
+        if (content) history.push({ role: 'user', content });
+        const deliver = [...(conv.turnEvents[i] ?? [])].reverse().find((e) => e.type === 'deliver');
+        const finalText = deliver ? (deliver as { final_text?: string }).final_text : undefined;
+        if (finalText) history.push({ role: 'assistant', content: finalText });
+      });
+
+      patchConv(conv.id, {
+        messages: [...keptUsers, nextUserMsg],
+        events: [],
+        turnEvents: [...conv.turnEvents.slice(0, turnIdx), []],
+        taskTurnMap: keptMap,
+        turnModels: keepTurn(conv.turnModels, turnIdx),
+        turnExperts: keepTurn(conv.turnExperts, turnIdx),
+        feedbackByTurn: keepTurn(conv.feedbackByTurn, turnIdx - 1),
+        plan: null,
+        fileOps: [],
+        taskMeta: {},
+        checkpoint: null,
+        taskStatus: null,
+        taskId: null,
+        regeneratingTurn: turnIdx,
+        isLoading: true,
+        error: null,
+        ...(turnIdx === 0 ? { title: trimmed.slice(0, 20) } : {}),
+      });
+
+      try {
+        // 改写后的提问同样过合规闸门：被策略拒绝时不发起任务
+        await api.compliance.check(trimmed, await modelBaseUrl(conv.turnModels[turnIdx]?.modelId));
+        const secureEnv = settings?.secureEnv;
+        const model = conv.turnModels[turnIdx] ?? chatModelSelectionOf(get().chatModelId);
+        const { taskId } = await api.chat.submit({
+          goal: trimmed,
+          // 沿用原会话模式：幻灯片任务不该在通用模式下重跑成 Markdown
+          mode: conv.workMode ?? 'general',
+          workspaceId: getActiveWorkspaceId(),
+          secureEnv,
+          piiOutboundMode: settings?.piiOutboundMode,
+          agentPolicy: {
+            maxIters: settings?.agentMaxIters,
+            autoCompress: settings?.agentAutoCompress,
+            lazyMcpTools: settings?.agentLazyMcpTools,
+          },
+          pptxTemplates:
+            conv.workMode === 'slides'
+              ? browserPptxTemplates(settings?.pptxTemplateId)
+              : undefined,
+          modelBinding: model.modelBinding,
+          modelId: model.modelId,
+          expertId: conv.turnExperts[turnIdx] || undefined,
+          history: history.length > 0 ? history : undefined,
+          conversationId: conv.id,
+          turnIndex: turnIdx,
+        });
+        patchConv(conv.id, {
+          taskId,
+          taskTurnMap: { ...get().convs[conv.id].taskTurnMap, [taskId]: turnIdx },
+        });
+        if (privacy) privacyTasks.add(taskId);
+        if (!privacy) {
+          recordConversationMessage({
+            convId: conv.id,
+            turnIndex: turnIdx,
+            role: 'user',
+            taskId,
+            content: trimmed,
+            artifacts: [],
+            tsMs: Date.now(),
+          });
+        }
+      } catch (err: unknown) {
+        patchConv(conv.id, {
+          regeneratingTurn: null,
+          isLoading: false,
+          error: errorTextOf(err, '改写提问后重新执行失败'),
+        });
+      }
+    },
+
     // ── 回复评价（点赞/点踩） ──────────────────────────────
 
     setTurnFeedback: async (convId: string, turnIdx: number, kind: 'up' | 'down' | null) => {
@@ -1095,28 +1222,6 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
       } catch (err: unknown) {
         // 恢复没启动成功：保留检查点与入口，把不可恢复的真实原因显示出来
         patchConv(conv.id, { isLoading: false, error: errorTextOf(err, '从检查点恢复失败') });
-      }
-    },
-
-    // ── 控制任务 ──────────────────────────────────────────────
-
-    controlTask: async (action, stepId) => {
-      const s = get();
-      const conv = s.activeId ? s.convs[s.activeId] : undefined;
-      const taskId = conv?.taskId;
-      if (!taskId || !conv) return;
-
-      try {
-        await api.chat.control({ taskId, action, stepId });
-        if (action === 'pause') {
-          patchConv(conv.id, { taskStatus: TaskStatus.PAUSED, taskMeta: { waitReason: 'user_pause' } });
-        } else if (action === 'resume') {
-          patchConv(conv.id, { taskStatus: TaskStatus.EXECUTING, taskMeta: {}, isLoading: true });
-        } else if (action === 'rollback_to') {
-          patchConv(conv.id, { taskStatus: TaskStatus.ROLLED_BACK, isLoading: false });
-        }
-      } catch (err: unknown) {
-        patchConv(conv.id, { error: errorTextOf(err, '控制任务失败') });
       }
     },
 

@@ -106,11 +106,14 @@ describe('预览方式', () => {
     expect(src).toContain("已改为应用内预览");
   });
 
-  it('对话流按设置分流，预览弹窗也能用系统应用打开', () => {
-    const stream = chatStream();
-    expect(stream).toContain("const previewMode = (appSettings.previewMode as string) ?? '应用内预览';");
-    expect(stream).toContain('await openArtifact(path, previewMode)');
-    expect(stream).toContain("previewMode === '系统默认程序' ? '点击用系统默认程序打开' : '点击在应用内预览'");
+  it('对话流与任务栏的产物都按设置分流，系统应用失败时回退应用内预览', () => {
+    const wb = workbench();
+    expect(wb).toContain("const previewMode = (appSettings.previewMode as string) ?? '应用内预览';");
+    expect(wb).toContain('await openArtifact(path, previewMode)');
+    // 消息流与任务栏点击产物都回到工作台同一份预览状态（面板内预览，不再各挂一个弹窗）
+    expect(chatStream()).toContain('onArtifactOpen');
+    expect(wb).toContain('setArtifactPreview(result.previewPath)');
+    expect(wb).toContain('setMonitorOpen(true)');
     expect(filePreview()).toContain('fileAPI.openExternal(path)');
   });
 });

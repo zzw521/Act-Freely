@@ -9,7 +9,9 @@
 
 - `engine/server.py --web-dir <dist>`：前端构建产物与 `/api/*` 同端口托管，API 不被静态站点覆盖。
 - `TT_ENGINE_TOKEN`：`/api/*` 缺失或错误令牌返回 401 `ENGINE_UNAUTHORIZED`；`Authorization: Bearer` 与 `x-tt-engine-token` 两种头都可用；`/health` 与静态文件不要求令牌。
-- 非回环绑定准入：`--host 0.0.0.0` 必须同时设置 `TT_ALLOW_REMOTE_BIND=1` 与非空 `TT_ENGINE_TOKEN`，否则进程拒绝启动。
+- 账号 JWT（`TT_ENGINE_JWT_SECRET`）：校验 HS256 签名、`exp`、`iss`、`aud`、`type=access`、`sub`、`sid`；与静态令牌并存；可选 `TT_ENGINE_ALLOWED_USERS` 白名单。
+- 请求审计与用量归属：`GET /api/audit` 按调用主体查询；`/api/usage` 与 `/api/usage/report` 支持按用户过滤，JWT 非管理员强制只看自己。
+- 非回环绑定准入：`--host 0.0.0.0` 必须同时设置 `TT_ALLOW_REMOTE_BIND=1` 与非空 `TT_ENGINE_TOKEN` 或 `TT_ENGINE_JWT_SECRET`，否则进程拒绝启动。
 - `scripts/tt-cli.mjs` 的 `health` / `chat` / `doctor`：真实 HTTP/SSE、令牌只读环境变量、拒绝 `--token`。
 - 网页令牌输入框：401 时提示输入，令牌只写当前标签页 `sessionStorage`。
 - 以上由 `tests/integration/engine_service_cli_selftest.py`、`tests/unit/deploy/tt-cli.test.ts`、`tests/unit/deploy/engine-service-auth.test.ts` 覆盖。
@@ -56,9 +58,29 @@ python engine/server.py --host 0.0.0.0 --port 18000 \
 若由反向代理统一注入 `x-tt-engine-token`，页面不会看到 401，也就不需要输入；此时
 必须保证代理不会把该头透传给未授权调用方，并在代理层终止 TLS。
 
+### 接入账号服务 JWT（可选）
+
+```bash
+# 与账号服务 TT_SERVER_JWT_SECRET 相同的密钥；也可沿用旧变量 TT_AUTH_JWT_SECRET
+export TT_ENGINE_JWT_SECRET='<与账号服务一致的 HS256 密钥>'
+export TT_ALLOW_REMOTE_BIND=1
+# 可选：只允许名单内的 uid（逗号分隔）；静态令牌始终保留为应急通道
+export TT_ENGINE_ALLOWED_USERS='tt-xxxxxxxx,tt-yyyyyyyy'
+
+python engine/server.py --host 0.0.0.0 --port 18000 \
+  --work-dir /data/work --web-dir ./dist
+```
+
+- 引擎校验 HS256 签名、`exp`、`iss`（默认 `tongtian-auth`，可用 `TT_ENGINE_JWT_ISSUER` 覆盖）、`aud`（默认 `tongtian-engine`，可用 `TT_ENGINE_JWT_AUDIENCE` 覆盖）、`type=access`，并要求 `sub` 与 `sid` 非空；refresh token 与升级前无 `sid` 的旧令牌一律拒绝。
+- 调用方把账号服务的 access token 放进 `Authorization: Bearer`；CLI 可把同一令牌放进 `TT_ENGINE_TOKEN`（变量名只是“引擎凭据”的存放位置）。
+- 每个 `/api/*` 请求写入审计：`sub/org/role/sid/method/path/status/durationMs/ip`，`GET /api/audit` 查询；默认内存保留 2000 条，设置 `TT_ENGINE_AUDIT_LOG=/data/audit.jsonl` 后追加 JSONL。
+- 模型用量按 `sub` 归集：`GET /api/usage?sub=<uid>` 与 `GET /api/usage/report` 的 `users` 字段；JWT 非管理员只能看到自己的审计与用量，管理员（`role=admin`）可查全部。
+- **边界**：引擎不连接账号库，也**不做**组织数据隔离或配额硬停。`quota` 声明只随令牌传入，留待后续计费/限额实现；账号侧强制下线后，引擎仍会接受未过期的 access token（最长 `TT_ACCESS_TTL_SECONDS`，默认 15 分钟）。需要更短窗口时收紧该 TTL。
+
 **安全边界**
 
-- 这里没有用户体系：一个令牌就是全部权限。任何持有令牌的人都能读写 `/data/work`、调用已启用的工具。只应在可信网络内使用，不要直接暴露到公网。
+- 未设置任何凭据时没有用户体系：回环桌面模式下，能访问本机端口的进程都可调用 `/api/*`。设置 `TT_ENGINE_JWT_SECRET` 后每个请求都有 `sub` 审计，但工作目录、会话与产物仍是共享的，**尚未按用户隔离**；不要把多租户隔离当作已实现。
+- 静态令牌仍是全权限应急通道：任何持有者都能读写 `/data/work`、调用已启用的工具。只应在可信网络内使用，不要直接暴露到公网。
 - 服务化模式没有桌面专属能力：终端 AI+、电脑操控、浏览器 AI+、远程桌面、应用内 Hook 与审计视图、Tauri 文件对话框/系统应用打开、任务栏角标、独立任务窗口都依赖桌面壳，页面会如实标注不可用。
 - 引擎不是操作系统级沙箱；模型调用会把任务内容发送给所选模型服务商。`run_command` / `fetch_url` 仍受工作区沙箱显式授权与白名单约束，未授权时不注册。
 - `/health` 与静态资源不需要令牌；不要在这些路径上放敏感内容。
@@ -78,18 +100,22 @@ node scripts/tt-cli.mjs chat "汇总本周待办并写入 report.md" --work-dir 
 `chat` 会流式打印 plan / step / step_done / deliver / done；引擎报错或流提前结束时
 以非 0 退出，不把半截结果当成功。CLI 不提供终端、电脑操控、远程桌面等桌面能力。
 
+设置 `TT_ENGINE_JWT_SECRET` 时，`TT_ENGINE_TOKEN` 也可以放账号服务签发的 access token，引擎会按 JWT 校验并记录调用主体。
+
 ## 四、Docker（模板，未验证）
 
 ```bash
 cd tongtian-tauri
 docker build -f deploy/Dockerfile -t tongtian-office:dev .
 
-# TT_ENGINE_TOKEN 必须提供；缺令牌时引擎会拒绝绑定 0.0.0.0 并退出
+# TT_ENGINE_TOKEN 或 TT_ENGINE_JWT_SECRET 至少设置一个；否则引擎会拒绝绑定 0.0.0.0 并退出
 docker run --rm -p 18000:18000 \
   -e TT_ENGINE_TOKEN='<令牌>' \
   -v tt-data:/data \
   tongtian-office:dev
 ```
+
+- 接入账号服务 JWT 时，把 `TT_ENGINE_TOKEN` 换成 `-e TT_ENGINE_JWT_SECRET=<与账号服务一致的密钥>`；审计落盘可再加 `-e TT_ENGINE_AUDIT_LOG=/data/audit.jsonl`。
 
 - 镜像内以非 root 用户运行，`/data` 是唯一需要持久化的目录：`models.json`、意识文件、IM 凭据、检查点、`work/`。
 - 镜像使用 `engine/requirements.txt`（跨平台直接依赖），**不是** `engine/requirements.lock.txt`；后者是 Windows 3.12 embeddable 运行时的随包锁表，Linux 容器不能照用。

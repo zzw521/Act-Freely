@@ -5,7 +5,6 @@
 import type {
   ChatSubmitReq,
   ChatReviewReq,
-  ChatControlReq,
   ChatEvent,
   ModelTestReq,
   ModelTestResp,
@@ -67,8 +66,6 @@ interface TongtianAPI {
   chatSubmit(req: ChatSubmitReq): Promise<{ taskId: string; workspaceId?: string; status?: string }>;
   /** 审阅计划（approve/reject/modify/resume；resume 走检查点续跑） */
   chatReview(taskId: string, action: 'approve' | 'reject' | 'modify' | 'resume', patch?: unknown[]): Promise<{ ok: boolean; status: string }>;
-  /** 任务控制（pause/resume/rollback_to，转移 #14/#21/#22） */
-  chatControl(req: ChatControlReq): Promise<{ ok: boolean; status: string }>;
   /** 历史任务（tasks 表，含 14 态 meta） */
   chatHistory(limit?: number): Promise<unknown[]>;
   /** 批量查询检查点摘要（刷新/重启后恢复续跑入口；不含会话正文与密钥） */

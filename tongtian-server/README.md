@@ -64,6 +64,8 @@ bash init.sh
 | `TT_SERVER_DATA_DIR` | `tongtian-server/storage` | SQLite 与包文件目录 |
 | `TT_SERVER_JWT_SECRET` | 开发默认值 | JWT HS256 密钥；生产环境必须设置 |
 | `TT_AUTH_JWT_SECRET` | 空 | 兼容旧版 Auth 服务的密钥变量，优先级低于上一项 |
+| `TT_AUTH_ISSUER` | `tongtian-auth` | JWT `iss`；校验端必须一致 |
+| `TT_AUTH_AUDIENCE` | `tongtian-engine` | JWT `aud`；引擎侧按此值校验 |
 | `TT_ACCESS_TTL_SECONDS` | `900` | access token 有效期（15 分钟） |
 | `TT_REFRESH_TTL_SECONDS` | `2592000` | refresh token 有效期（30 天） |
 | `TT_ALLOW_REGISTRATION` | `true` | 关闭后注册接口返回 403 |
@@ -119,6 +121,8 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/auth/register \
     "email": "me@example.com",
     "plan": "个人免费版",
     "role": "user",
+    "org": "personal-tt-...",
+    "quota": {"monthlyTokens": 100000, "concurrentTasks": 2},
     "mock": false
   }
 }
@@ -130,7 +134,11 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/auth/register \
 - 昵称最长 24 字符，缺省取邮箱前缀；
 - 邮箱统一小写；
 - 注册与登录均有限流（返回 `429` 与 `Retry-After`）；
-- access token 无状态，退出登录只吊销 refresh token；access token 到期后自然失效。
+- access token 绑定会话（`sid` 对应 `sessions.id`）：退出、刷新轮换或管理员强制下线后，旧 access token 立即失效，不再等待 15 分钟自然过期；
+- access/refresh token 均携带 `iss`/`aud`/`org`/`quota`/`sid`；`org` 与 `quota` 是签发时刻的快照，管理员修改后需重新登录才能拿到新值；
+- 升级前签发的、没有 `sid` 的旧 access token 会被拒绝，用户重新登录即可。
+
+多用户共享同一引擎时，引擎侧设置与 `TT_SERVER_JWT_SECRET` 相同的 `TT_ENGINE_JWT_SECRET`，并把 `TT_AUTH_ISSUER`/`TT_AUTH_AUDIENCE` 同步为引擎的 `TT_ENGINE_JWT_ISSUER`/`TT_ENGINE_JWT_AUDIENCE`（默认值一致）。引擎只校验签名与过期，不内省本服务，因此在本服务吊销后旧 access token 仍可用到 `exp`（最长 15 分钟）。
 
 ### 3.2 桌面端兼容：网页验证登录
 
@@ -200,6 +208,7 @@ TT_AUTH_SERVER_URL=https://auth.example.com bash init.sh
 | `GET` | `/api/v1/{plural}/{id}` | 详情（含 readme、版本列表） |
 | `GET` | `/api/v1/{plural}/{id}/download?version=` | 下载 ZIP；缺省为最新版 |
 | `GET` | `/api/v1/mcp/{id}/config?version=` | 获取 MCP 配置；缺省为最新版 |
+| `GET` | `/api/v1/revoked?type=&page=&pageSize=` | 已撤销版本的下架公告，按撤销时间倒序 |
 | `POST` | `/api/v1/{plural}/{id}/star` | 收藏/取消收藏（需登录，幂等切换） |
 | `GET` | `/api/v1/me/items` | 我发布的条目（需登录） |
 
@@ -229,6 +238,7 @@ TT_AUTH_SERVER_URL=https://auth.example.com bash init.sh
       "icon": "🧠",
       "author": {"uid": "tt-...", "nickname": "发布者"},
       "featured": false,
+      "revoked": false,
       "latestVersion": "1.1.0",
       "versionCount": 2,
       "downloads": 3,
@@ -249,11 +259,15 @@ TT_AUTH_SERVER_URL=https://auth.example.com bash init.sh
 
 详情额外返回 `description`、`readme`、`versions`、`install`；套件额外返回 `commands` 与 `packageInfo`，技能返回 `packageInfo`，MCP 返回 `mcp` 配置。
 
+每个版本视图带 `revoked` / `revokedAtMs` / `revokedReason`；撤销版本的 `downloadUrl` 为 `null`，且 `readme` 取最近一个未撤销版本。条目摘要的 `revoked` 仅在全部版本都被撤销时为 `true`，此时 `latestVersion` 与 `downloadUrl` 均为 `null`，`versionCount` 仍保留历史总数。
+
 下载响应带：
 
 - `X-Checksum-Sha256`：包文件 SHA-256；
 - `X-Item-Version`：版本号；
 - `ETag` 与不可变缓存头。
+
+指定版本被撤销时返回 `410 ITEM_REVOKED`；缺省下载会跳过撤销版本，全部版本都被撤销时同样返回 `410`。
 
 ### 4.3 发布技能包
 
@@ -433,6 +447,8 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/mcp \
 | `PATCH` | `/api/v1/projects/{id}/tasks/{taskId}` | 按字段判断 | 修改标题/说明/负责人需管理员或创建者；状态可由管理员、创建者或负责人修改 |
 | `POST` | `/api/v1/projects/{id}/tasks/{taskId}/comments` | 成员及以上 | 追加评论 |
 | `POST` | `/api/v1/projects/{id}/tasks/{taskId}/result` | 负责人 | 回报结果摘要（`review` / `done`）与产物文件名 |
+| `GET` | `/api/v1/projects/{id}/events?since=0&limit=100` | 成员 | 按游标补拉项目事件（成员变更、任务、评论、结果回报），返回 `events` / `cursor` / `hasMore` |
+| `GET` | `/api/v1/projects/{id}/events/stream?since=0` | 成员 | SSE 事件流；支持 `Last-Event-ID` 续传，500ms 轮询、15 秒心跳，成员被移除时发送 `closed` 后结束 |
 
 约束：
 
@@ -442,7 +458,8 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/mcp \
 - 邀请码只存 SHA-256 摘要，一次性使用且绑定被邀请邮箱；转发给其他账号会被拒绝。
 - 成员视图不返回邮箱；邀请列表仅管理员/所有者可见。
 - 结果中的产物只保留文件名（服务端会剥离本地绝对路径），不同步文件内容。
-- 所有查询都是快照 + `seq`；桌面端轮询刷新，不做 WebSocket 推送。
+- 所有查询都是快照 + `seq`；实时更新走 SSE（`events/stream`），断线后按 `since` / `Last-Event-ID` 补拉，可回退到 10 秒轮询。
+- SSE 需要 `Authorization: Bearer` 头；浏览器 `EventSource` 不能自定义请求头时，客户端应使用 fetch 流式读取，或改用增量事件接口。
 
 ## 5. 管理员
 
@@ -464,6 +481,51 @@ Content-Type: application/json
 ```
 
 普通用户返回 403。
+
+版本撤销与恢复（管理员）：
+
+```http
+POST /api/v1/admin/items/{skill|suite|mcp}/{id}/versions/{version}/revoke
+Authorization: Bearer <admin access token>
+Content-Type: application/json
+
+{"reason": "存在越权读取，禁止安装"}
+```
+
+```http
+POST /api/v1/admin/items/{skill|suite|mcp}/{id}/versions/{version}/unrevoke
+Authorization: Bearer <admin access token>
+```
+
+- `reason` 必填，去除首尾空白后 1~500 字；返回 `changed` 与 `revokedAtMs`；
+- 重复撤销或重复恢复均为幂等：返回 `200` 且 `changed=false`，不覆盖首次撤销时间与原因；
+- 撤销只影响版本分发，不删除包文件与历史行；恢复后版本重新可下载；
+- 忘记版本号时可用 `GET /api/v1/revoked` 查询当前下架公告。
+
+用户组织与配额（管理员）：
+
+```http
+PATCH /api/v1/admin/users/{uid}
+Authorization: Bearer <admin access token>
+Content-Type: application/json
+
+{"org": "acme", "quota": {"monthlyTokens": 500000, "concurrentTasks": 4}}
+```
+
+- `org` 为 1~64 位小写字母、数字、下划线或连字符；传 `null` 或空串表示回到个人组织 `personal-<uid>`；
+- `quota` 支持 `monthlyTokens`（0~10 亿）与 `concurrentTasks`（1~100），未提供的键沿用默认值；传 `null` 表示清空覆盖、回到角色默认；
+- 普通用户默认 `{monthlyTokens: 100000, concurrentTasks: 2}`，管理员默认 `{monthlyTokens: 2000000, concurrentTasks: 8}`；
+- 至少提供 `org` 或 `quota` 之一，否则返回 `400 NOTHING_TO_UPDATE`；
+- 修改成功后吊销该用户全部活跃会话，响应返回 `sessionsRevoked`；旧令牌立即失效，重新登录后携带新声明。
+
+强制下线（管理员）：
+
+```http
+POST /api/v1/admin/users/{uid}/revoke-sessions
+Authorization: Bearer <admin access token>
+```
+
+返回 `{"ok": true, "revoked": <吊销会话数>}`；`uid` 不存在返回 `404 USER_NOT_FOUND`。
 
 ---
 
@@ -501,6 +563,11 @@ Content-Type: application/json
 | `PAYLOAD_TOO_LARGE` | 413 | 非 multipart 请求体超过 2MB |
 | `PACKAGE_MISSING` | 410 | 包文件不存在 |
 | `PACKAGE_CORRUPTED` | 410 | 包文件大小与登记不一致 |
+| `ITEM_REVOKED` | 410 | 版本已被撤销，禁止下载该版本或获取其 MCP 配置 |
+| `USER_NOT_FOUND` | 404 | 管理员操作的用户不存在 |
+| `INVALID_ORG` | 400 | 组织标识不合法 |
+| `INVALID_QUOTA` | 400 | 配额超出允许范围 |
+| `NOTHING_TO_UPDATE` | 400 | 管理员更新请求未提供任何字段 |
 
 ---
 
@@ -520,6 +587,7 @@ storage/
 - 表结构只做增量变更（`CREATE TABLE IF NOT EXISTS` + 必要的 `ALTER TABLE ADD COLUMN`）；
 - 版本包写入采用临时文件 + 原子替换，文件名为不可变版本文件；
 - 取消收藏采用 `active` 软删除，不物理删除行；
+- 版本撤销写入 `item_versions.revoked_at_ms/revoked_reason/revoked_by`，只做字段更新，不删除版本、包文件与下载计数；
 - 过期会话保留为审计记录，不做运行时批量删除；如需归档，建议独立迁移任务并先备份；
 - 市场包文件只落本地磁盘，不执行包内任何代码；MCP 命令仅登记，不在服务端启动。
 
@@ -530,13 +598,14 @@ storage/
 ```bash
 cd tongtian-server
 python tests/test_units.py     # 71 项单元断言
-python tests/test_server.py    # 136 项全链路断言
+python tests/test_server.py    # 267 项全链路断言
 ```
 
 覆盖范围：
 
 - JWT 签名/过期、PBKDF2、标识归一、ZIP 路径穿越/软链接/条目上限、frontmatter、套件命令解析、限流、增量补列；
 - 注册/登录/刷新轮换/退出、v1 与 legacy 接口、loopback 网页登录、授权码一次性；
+- 令牌声明（`iss`/`aud`/`sid`/`org`/`quota`）、会话绑定吊销、管理员改声明与强制下线；
 - 技能/套件发布、版本、检索、分类、下载与 SHA-256；
 - 包文件被篡改（体积不一致）时下载返回 `PACKAGE_CORRUPTED`；
 - MCP 配置校验与密钥值拒绝；
@@ -563,6 +632,8 @@ export TT_SERVER_ENV=production
 export TT_SERVER_HOST=0.0.0.0
 export TT_SERVER_PORT=8000
 export TT_SERVER_JWT_SECRET="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+export TT_AUTH_ISSUER=tongtian-auth
+export TT_AUTH_AUDIENCE=tongtian-engine
 export TT_CORS_ORIGINS="https://your-app.example.com"
 export TT_ALLOW_REGISTRATION=true
 export TT_ADMIN_EMAIL=admin@example.com

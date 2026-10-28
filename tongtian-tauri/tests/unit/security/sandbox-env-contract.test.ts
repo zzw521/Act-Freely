@@ -271,13 +271,13 @@ describe('设置页 SandboxPanel 真实化', () => {
     expect(src).toContain('usage.note ?? ');
   });
 
-  it('Workbench 提交与重新生成都把 secureEnv 随请求下发（引擎直连口径）', () => {
+  it('Workbench 提交、重新生成与改写提问都把 secureEnv 随请求下发（引擎直连口径）', () => {
     const src = workbenchStore();
-    // 两条路径共用同一份 settings 快照：secureEnv 与 privacyMode 一起读取
-    expect(src.match(/const secureEnv = settings\?\.secureEnv;/g)?.length).toBe(2);
-    expect(src.match(/^\s+secureEnv,$/gm)?.length).toBe(2);
-    // 两条提交路径都带上当前工作空间：不同 workspace 有独立引擎实例
-    expect(src.match(/^\s+workspaceId: getActiveWorkspaceId\(\),$/gm)?.length).toBe(2);
+    // 三条提交路径共用同一份 settings 快照：secureEnv 与 privacyMode 一起读取
+    expect(src.match(/const secureEnv = settings\?\.secureEnv;/g)?.length).toBe(3);
+    expect(src.match(/^\s+secureEnv,$/gm)?.length).toBe(3);
+    // 三条提交路径都带上当前工作空间：不同 workspace 有独立引擎实例
+    expect(src.match(/^\s+workspaceId: getActiveWorkspaceId\(\),$/gm)?.length).toBe(3);
   });
 });
 

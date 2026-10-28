@@ -82,6 +82,8 @@ interface ChatInputProps {
   onSelectWorkDir?: (dir: string) => void;
   /** 对话态紧凑模式：收起提示词建议，避免和消息流争夺空间 */
   compact?: boolean;
+  /** 空态主视觉：坐在输入卡上沿、下半身被卡片遮住的吉祥物（不参与点击） */
+  mascot?: React.ReactNode;
 }
 
 // 附件约束（交互补设计 §3.3；含图片格式，原「插入图片」已合并到添加文件）
@@ -143,6 +145,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
   workDir,
   onSelectWorkDir,
   compact = false,
+  mascot,
 }) => {
   const { t: tr } = useI18n();
   const [value, setValue] = useState(initialText ?? '');
@@ -510,7 +513,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
       <Box
         role="group"
         aria-label={tr('工作台模式')}
-        sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, mb: 1, px: 0.25 }}
+        sx={{ position: 'relative', zIndex: 2, display: 'flex', flexWrap: 'wrap', gap: 0.75, mb: 1, px: 0.25 }}
       >
         {enabledModeDefs.map((d) => {
           const selected = d.id === activeMode;
@@ -544,8 +547,28 @@ const ChatInput: React.FC<ChatInputProps> = ({
       </Box>
     )}
     {/* 幻灯片模式模板选择已移到输入框下方的目录行之后 */}
+    <Box sx={{ position: 'relative' }}>
+    {/* 吉祥物：露出头部与上半身，下半身被不透明输入卡遮住 */}
+    {mascot && (
+      <Box
+        aria-hidden="true"
+        sx={{
+          position: 'absolute',
+          left: '50%',
+          bottom: 'calc(100% - 62px)',
+          transform: 'translateX(-50%)',
+          zIndex: 0,
+          pointerEvents: 'none',
+          userSelect: 'none',
+        }}
+      >
+        {mascot}
+      </Box>
+    )}
     <Box
       sx={{
+        position: 'relative',
+        zIndex: 1,
         bgcolor: 'var(--tt-surface)',
         borderRadius: '24px',
         border: `1px solid ${focused ? '#14B8A6' : '#E5E7EB'}`,
@@ -1295,6 +1318,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
           </MenuItem>
         ))}
       </Menu>
+    </Box>
     </Box>
 
           {/* 输入框下方：选择工作目录（真实目录） + 免责提示 */}

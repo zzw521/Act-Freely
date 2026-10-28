@@ -148,19 +148,7 @@ def main() -> None:
     resp = client.post("/api/chat/review", json={"task_id": "no-such", "action": "approve"})
     check("审阅未知任务 404", resp.status_code == 404)
 
-    # ── 7. 控制：pause/resume/rollback_to ──
-    resp = client.post("/api/chat/control", json={"task_id": plan_task, "action": "pause"})
-    check("pause 返回 ok", resp.json().get("ok") is True)
-    resp = client.post("/api/chat/control", json={"task_id": plan_task, "action": "resume"})
-    check("resume 返回 ok", resp.json().get("ok") is True)
-    resp = client.post("/api/chat/control", json={"task_id": plan_task, "action": "rollback_to", "step_id": "step-1"})
-    check("rollback_to 返回 ok", resp.json().get("ok") is True)
-    resp = client.post("/api/chat/control", json={"task_id": "no-such", "action": "pause"})
-    check("控制未知任务 TASK_NOT_FOUND", resp.json().get("code") == "TASK_NOT_FOUND")
-    resp = client.post("/api/chat/control", json={"task_id": plan_task, "action": "fly"})
-    check("未知 action VALIDATION_ERROR", resp.json().get("code") == "VALIDATION_ERROR")
-
-    # ── 8. 模型用量采集（离线：假模型驱动真实 ReActAgent 循环） ──
+    # ── 7. 模型用量采集（离线：假模型驱动真实 ReActAgent 循环） ──
     check_usage_tracking(client)
 
     # ── 汇总 ──

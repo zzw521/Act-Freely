@@ -8,7 +8,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { ChatEvent, CheckpointInfo, ChatControlReq, ChatSubmitReq } from '../../shared/types';
+import type { ChatEvent, CheckpointInfo, ChatSubmitReq } from '../../shared/types';
 import type {
   AuthLoginResp,
   AuthProfile,
@@ -71,6 +71,13 @@ export const tauriAPI = {
         turnIndex: args[1] as number,
         // null 表示取消评价（Rust 侧删除该行评价，正文不动）
         feedback: (args[2] as string | null | undefined) ?? null,
+      });
+    }
+    if (channel === 'chat:editTurn') {
+      return invoke('chat_edit_turn', {
+        conversationId: args[0] as string,
+        turnIndex: args[1] as number,
+        content: args[2] as string,
       });
     }
     if (channel === 'file:browse') {
@@ -271,6 +278,17 @@ export const tauriAPI = {
     }
     if (channel === 'sandbox:envClear') {
       return invoke('sandbox_env_clear');
+    }
+    if (channel === 'sandbox:systemGet') {
+      return invoke('sandbox_system_get');
+    }
+    if (channel === 'sandbox:systemSet') {
+      // 入参是 { enabled, network } 对象：按位置读会把对象当成 true，关不掉开关
+      const req = (args[0] ?? {}) as { enabled?: boolean; network?: boolean };
+      return invoke('sandbox_system_set', {
+        enabled: Boolean(req.enabled),
+        network: Boolean(req.network),
+      });
     }
     if (channel === 'audit:query') {
       return invoke('audit_log_query', { filters: args[0] ?? null });
@@ -639,18 +657,10 @@ export const tauriAPI = {
     }) as Promise<{ taskId: string }>;
   },
 
-  // review/control/history 已接入 Rust 两阶段协议（核心闭环补齐）
+  // review/history 已接入 Rust 两阶段协议（核心闭环补齐）
   /** 审阅计划：approve/reject/modify（转移 #9/#10/#11） */
   chatReview: (taskId: string, action: 'approve' | 'reject' | 'modify' | 'resume', patch?: unknown[]): Promise<{ ok: boolean; status: string }> =>
     invoke('chat_review', { taskId, action, patch: patch ?? [] }) as Promise<{ ok: boolean; status: string }>,
-
-  /** 任务控制：pause/resume/rollback_to（转移 #14/#21/#22） */
-  chatControl: (req: ChatControlReq): Promise<{ ok: boolean; status: string }> =>
-    invoke('chat_control', {
-      taskId: req.taskId,
-      action: req.action,
-      stepId: req.stepId,
-    }) as Promise<{ ok: boolean; status: string }>,
 
   /** 历史任务（tasks 表，含 14 态 meta） */
   chatHistory: (limit?: number): Promise<unknown[]> =>

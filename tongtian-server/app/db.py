@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS users (
     nickname       TEXT NOT NULL,
     role           TEXT NOT NULL DEFAULT 'user',
     plan           TEXT NOT NULL DEFAULT '个人免费版',
+    org_id         TEXT NOT NULL DEFAULT '',
+    quota_json     TEXT NOT NULL DEFAULT '{}',
     created_at_ms  INTEGER NOT NULL
 );
 
@@ -69,6 +71,9 @@ CREATE TABLE IF NOT EXISTS item_versions (
     package_sha256  TEXT NOT NULL DEFAULT '',
     published_at_ms INTEGER NOT NULL,
     download_count  INTEGER NOT NULL DEFAULT 0,
+    revoked_at_ms   INTEGER NOT NULL DEFAULT 0,
+    revoked_reason  TEXT NOT NULL DEFAULT '',
+    revoked_by      TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (item_type, item_id, version),
     FOREIGN KEY (item_type, item_id) REFERENCES items(item_type, item_id) ON DELETE CASCADE
 );
@@ -211,5 +216,29 @@ def init_db() -> None:
                 columns = {row["name"] for row in conn.execute("PRAGMA table_info(stars)")}
                 if "active" not in columns:
                     conn.execute("ALTER TABLE stars ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+                # 增量补列：组织归属与配额覆盖；存量用户保持个人空间与默认配额
+                user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+                for name, ddl in (
+                    ("org_id", "TEXT NOT NULL DEFAULT ''"),
+                    ("quota_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ):
+                    if name not in user_columns:
+                        conn.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_users_org ON users(org_id)")
+                # 增量补列：版本撤销；已有版本默认未撤销
+                version_columns = {
+                    row["name"] for row in conn.execute("PRAGMA table_info(item_versions)")
+                }
+                for name, ddl in (
+                    ("revoked_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+                    ("revoked_reason", "TEXT NOT NULL DEFAULT ''"),
+                    ("revoked_by", "TEXT NOT NULL DEFAULT ''"),
+                ):
+                    if name not in version_columns:
+                        conn.execute(f"ALTER TABLE item_versions ADD COLUMN {name} {ddl}")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_versions_revoked "
+                    "ON item_versions(revoked_at_ms DESC)"
+                )
         finally:
             conn.close()

@@ -8,6 +8,7 @@
                              attachments（已抽取正文的附件）、runtime（意识 + 启用技能 + 已连接连接器 + Hooks）
 - GET  /api/events/replay → 事件重放（三层架构演进 P0：seq + 重放窗口 ≥10min）
 - POST /api/chat/cancel   → 取消任务（cancelled 事件 + done）
+- GET  /api/audit         → 请求审计（服务化 JWT 模式下按调用主体记录与过滤）
 - GET  /api/sandbox/environment/usage → 工作环境文件磁盘用量
 - POST /api/sandbox/environment/clear → 清理工作环境文件（保留对话记录与工作产物）
 
@@ -25,6 +26,8 @@
 import argparse
 import asyncio
 import base64
+import contextvars
+import hashlib
 import hmac
 import inspect
 import math
@@ -33,6 +36,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -117,13 +121,8 @@ class TaskSession:
         # ── 两阶段协议（plan → review → execute） ──
         self.goal: str = ""
         self.plan: list | None = None
-        # set=运行中；clear=已暂停（control pause/resume 门控）
-        self.pause_event = asyncio.Event()
-        self.pause_event.set()
-        # 执行期间的活动队列（rollback 事件注入点）
+        # 执行期间的活动队列（事件按 seq 写入窗口）
         self.exec_queue: "RecordingQueue | None" = None
-        # rollback_to 目标（非 None 时 CancelledError 走 rolled_back 语义）
-        self.rolled_back: str | None = None
         # 会话子目录（工作目录下按对话时间创建，存会话内容与产出物）
         self.session_dir: Path | None = None
         # 对话内模型档位绑定（approve 重新执行时沿用）
@@ -427,6 +426,17 @@ def _restore_session_from_disk(
 # 权威持久化在 Rust 侧 model_usage 表（按 usage 事件记账，见 bridge/agent.rs）；
 # 本台账服务于浏览器直连模式（无 Rust）与计划阶段用量展示，进程重启即清零。
 
+# 当前请求的调用主体（JWT 模式为账号 uid；桌面/无令牌模式为 None）。
+# 模型调用链较深，用 contextvar 传递，避免把 principal 穿过每一层函数。
+_CURRENT_PRINCIPAL: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "tt_engine_principal", default=None
+)
+
+
+def current_principal() -> dict | None:
+    return _CURRENT_PRINCIPAL.get()
+
+
 def _utc_day(ms: int | None = None) -> str:
     """UTC 日期 yyyy-mm-dd（与 Rust 台账同口径：跨日按 UTC 分桶）"""
     ts = time.time() if ms is None else ms / 1000
@@ -451,12 +461,16 @@ class UsageLedger:
 
     def add(self, model_name: str, prompt_tokens: int, completion_tokens: int,
             latency_ms: int | None = None, cost_micros: int | None = None,
-            currency: str | None = None, priced: bool = False) -> dict:
+            currency: str | None = None, priced: bool = False,
+            sub: str | None = None, org: str | None = None) -> dict:
         name = (model_name or "").strip() or "unknown"
+        subject = (sub or "").strip() or "local"
         day = _utc_day()
-        row = self.rows.get((name, day))
+        row = self.rows.get((subject, name, day))
         if row is None:
             row = {
+                "sub": subject,
+                "org": (org or "").strip(),
                 "modelName": name,
                 "day": day,
                 "promptTokens": 0,
@@ -469,7 +483,7 @@ class UsageLedger:
                 "pricedCalls": 0,
                 "unpricedCalls": 0,
             }
-            self.rows[(name, day)] = row
+            self.rows[(subject, name, day)] = row
         row["promptTokens"] += max(0, int(prompt_tokens))
         row["completionTokens"] += max(0, int(completion_tokens))
         row["calls"] += 1
@@ -485,8 +499,11 @@ class UsageLedger:
             row["unpricedCalls"] += 1
         return row
 
-    def aggregate(self, period: str) -> list[dict]:
-        """按周期聚合为「模型一行」（daily=今日 / monthly=本月 / total=全部）"""
+    def aggregate(self, period: str, subject: str | None = None) -> list[dict]:
+        """按周期聚合为「模型一行」（daily=今日 / monthly=本月 / total=全部）
+
+        subject 为 None 时汇总全部用户；传入具体 uid 时只看该用户。
+        """
         if period == "daily":
             match = lambda day: day == _utc_day()  # noqa: E731
         elif period == "monthly":
@@ -496,7 +513,9 @@ class UsageLedger:
             match = lambda day: True  # noqa: E731
 
         agg: dict[str, dict] = {}
-        for (name, day), row in self.rows.items():
+        for (row_subject, name, day), row in self.rows.items():
+            if subject is not None and row_subject != subject:
+                continue
             if not match(day):
                 continue
             cur = agg.get(name)
@@ -540,11 +559,13 @@ class UsageLedger:
             return lambda d: d.startswith(month)
         return lambda d: True
 
-    def days(self, period: str) -> list[dict]:
+    def days(self, period: str, subject: str | None = None) -> list[dict]:
         """按 UTC 日分桶的趋势点（升序），口径与 aggregate 同一周期过滤"""
         match = self._match(period)
         buckets: dict[str, dict] = {}
-        for (name, day), row in self.rows.items():
+        for (row_subject, name, day), row in self.rows.items():
+            if subject is not None and row_subject != subject:
+                continue
             if not match(day):
                 continue
             cur = buckets.get(day)
@@ -571,6 +592,54 @@ class UsageLedger:
             _finalize_usage_row(point)
             out.append(point)
         return out
+
+    def users(self, period: str, subject: str | None = None) -> list[dict]:
+        """按用户聚合：谁用了多少 token、调用了多少次、涉及哪些模型"""
+        match = self._match(period)
+        agg: dict[str, dict] = {}
+        for (row_subject, name, day), row in self.rows.items():
+            if subject is not None and row_subject != subject:
+                continue
+            if not match(day):
+                continue
+            cur = agg.get(row_subject)
+            if cur is None:
+                cur = {
+                    "sub": row_subject,
+                    "org": row.get("org") or "",
+                    "promptTokens": 0,
+                    "completionTokens": 0,
+                    "tokensUsed": 0,
+                    "calls": 0,
+                    "lastUsedAtMs": 0,
+                    "models": 0,
+                    "_names": set(),
+                    "latencyMsTotal": 0,
+                    "latencySamples": 0,
+                    "costs": {},
+                    "pricedCalls": 0,
+                    "unpricedCalls": 0,
+                }
+                agg[row_subject] = cur
+            cur["promptTokens"] += row["promptTokens"]
+            cur["completionTokens"] += row["completionTokens"]
+            cur["tokensUsed"] += row["promptTokens"] + row["completionTokens"]
+            cur["calls"] += row["calls"]
+            cur["lastUsedAtMs"] = max(cur["lastUsedAtMs"], row["lastUsedAtMs"])
+            cur["latencyMsTotal"] += row["latencyMsTotal"]
+            cur["latencySamples"] += row["latencySamples"]
+            cur["pricedCalls"] += row["pricedCalls"]
+            cur["unpricedCalls"] += row["unpricedCalls"]
+            cur["_names"].add(name)
+            if row.get("org"):
+                cur["org"] = row["org"]
+            for code, micros in row["costs"].items():
+                cur["costs"][code] = cur["costs"].get(code, 0) + micros
+        rows = sorted(agg.values(), key=lambda r: r["tokensUsed"], reverse=True)
+        for row in rows:
+            row["models"] = len(row.pop("_names"))
+            _finalize_usage_row(row)
+        return rows
 
     def totals(self, period: str, models: list[dict] | None = None) -> dict:
         """周期汇总（延迟按调用数加权；成本按币种分开，未配单价不按 0 元计）"""
@@ -1155,7 +1224,7 @@ def _diff_files(base: Path, before: dict, after: dict, exclude_dir: "Path | None
 
 async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay_from: list, model_binding: str | None = None, work_dir: "Path | None" = None, history: list | None = None, model_config: dict | None = None, resume: bool = False):
     """阶段二：执行流（status_change(executing) → Agent 事件 → deliver/done）。
-    支持 pause/resume 门控与 rollback_to 语义；model_binding 为对话内选中的模型档位；
+    model_binding 为对话内选中的模型档位；
     work_dir 为前端选择的工作目录（工具操作与产物落盘均限定其中）；
     history 为此前轮次对话历史（保障连续对话上下文）。
     启用安全工作环境且未自选目录时，执行落在 environment/{taskId} 隔离目录。
@@ -1373,8 +1442,6 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
     yield sse("status_change", {"taskId": task_id, "status": "executing"})
 
     session.exec_queue = queue
-    session.pause_event.set()
-    session.rolled_back = None
     # 副作用幂等门禁必须最先注册（洋葱最内层）：沙箱/Hooks 在外层，
     # 被拒绝的调用不会进入台账；恢复时装不上必须中止，避免重复写盘/外发。
     ckpt_err = ckpt.install(agent.toolkit, checkpoint)
@@ -1696,26 +1763,14 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
             # Stop：脚本可以 exit 2 表达「别停，继续」；能否续跑由下面的说明如实交代
             await hook_runner.fire("Stop", payload={"reason": "completed"})
         except asyncio.CancelledError:
-            end_reason = "rolled_back" if session.rolled_back is not None else "cancelled"
-            end_note = (
-                "任务已回滚，不提供续跑"
-                if session.rolled_back is not None
-                else "用户取消了任务，可从最近一次模型调用前的检查点继续"
-            )
-            if session.rolled_back is not None:
-                # 回滚路径（control rollback_to）：rolled_back 语义（转移 #22）
-                _safe_put(queue, "status_change", {
-                    "taskId": task_id,
-                    "status": "rolled_back",
-                    "statusReasonCode": f"ROLLBACK_TO:{session.rolled_back}",
-                })
-            else:
-                # 取消路径（POST /api/chat/cancel）：cancelled 状态事件后正常收尾
-                _safe_put(queue, "status_change", {
-                    "taskId": task_id,
-                    "status": "cancelled",
-                    "statusReasonCode": "USER_CANCELLED",
-                })
+            end_reason = "cancelled"
+            end_note = "用户取消了任务，可从最近一次模型调用前的检查点继续"
+            # 取消路径（POST /api/chat/cancel）：cancelled 状态事件后正常收尾
+            _safe_put(queue, "status_change", {
+                "taskId": task_id,
+                "status": "cancelled",
+                "statusReasonCode": "USER_CANCELLED",
+            })
         except pg.PrivacyBlocked as exc:
             # 出站脱敏档位为 block：命中后不再发下一次模型调用，直接中止本轮
             end_reason = "privacy_blocked"
@@ -1737,11 +1792,9 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
                 await hook_runner.fire("SessionEnd", payload={"reason": end_reason})
             except BaseException:  # noqa: BLE001
                 pass
-            # 收尾判定检查点：正常完成/回滚不保留，可重试的中断保留并如实说明
+            # 收尾判定检查点：正常完成不保留，可重试的中断保留并如实说明
             if end_reason == "completed":
                 checkpoint.mark_final(False, "任务已正常完成，无需续跑")
-            elif end_reason == "rolled_back":
-                checkpoint.mark_final(False, "任务已回滚，不提供续跑")
             elif end_reason == "cancelled":
                 checkpoint.mark_final(
                     True, end_note or "用户取消了任务，可从最近一次模型调用前的检查点继续"
@@ -1753,7 +1806,7 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
                 checkpoint.mark_final(
                     True, end_note or "执行中断，可从最近一次模型调用前的检查点继续"
                 )
-            # 可续跑收尾写盘（正常完成/回滚删除旧文件）；写盘失败只降级为进程内，
+            # 可续跑收尾写盘（正常完成删除旧文件）；写盘失败只降级为进程内，
             # final_event 的 scope 与原因会如实反映，不让界面承诺刷新后还能继续。
             try:
                 await asyncio.shield(asyncio.to_thread(_persist_checkpoint, session))
@@ -1770,12 +1823,6 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
     last_output = time.monotonic()
     try:
         while True:
-            # 暂停门控：paused 期间不再产出事件（事件在队列中积压），保活心跳
-            while not session.pause_event.is_set():
-                if time.monotonic() - last_output >= KEEPALIVE_INTERVAL_SECONDS:
-                    yield ": keepalive\n\n"
-                    last_output = time.monotonic()
-                await asyncio.sleep(0.3)
             try:
                 # 批量 drain：取到一条后一次性清空队列，降低高吞吐下循环开销
                 event, data = await asyncio.wait_for(queue.queue.get(), timeout=0.5)
@@ -2031,10 +2078,12 @@ class UsageTrackingModel(ChatModelBase):
         prompt, completion = usage
         cost_micros, currency = cost_micros_of(self._prices, prompt, completion)
         priced = cost_micros is not None
+        principal = current_principal() or {}
         row = USAGE_LEDGER.add(
             self.model_name, prompt, completion,
             latency_ms=latency_ms, cost_micros=cost_micros,
             currency=currency, priced=priced,
+            sub=principal.get("sub"), org=principal.get("org"),
         )
         if self._on_usage is not None:
             try:
@@ -3143,43 +3192,286 @@ except Exception:
 # 服务化模式（容器/内网）必须显式设置令牌，CLI 与前置反代携带 Authorization: Bearer。
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+DEFAULT_JWT_ISSUER = "tongtian-auth"
+DEFAULT_JWT_AUDIENCE = "tongtian-engine"
+JWT_ALG = "HS256"
+AUDIT_MAX_ENTRIES = 2000
+
+JWT_UNAUTHORIZED_MESSAGE = (
+    "服务化模式需要携带有效的引擎令牌"
+    "（Authorization: Bearer <TT_ENGINE_TOKEN 或账号服务 access token>）"
+)
 
 
-def service_bind_error(host: str, allow_remote: str, token: str) -> str:
+def _engine_jwt_secret() -> str:
+    return (
+        str(os.environ.get("TT_ENGINE_JWT_SECRET") or "").strip()
+        or str(os.environ.get("TT_AUTH_JWT_SECRET") or "").strip()
+    )
+
+
+def _engine_jwt_issuer() -> str:
+    return str(os.environ.get("TT_ENGINE_JWT_ISSUER") or "").strip() or DEFAULT_JWT_ISSUER
+
+
+def _engine_jwt_audience() -> str:
+    return str(os.environ.get("TT_ENGINE_JWT_AUDIENCE") or "").strip() or DEFAULT_JWT_AUDIENCE
+
+
+def _engine_allowed_users() -> set[str]:
+    raw = str(os.environ.get("TT_ENGINE_ALLOWED_USERS") or "")
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _b64url_decode(raw: str) -> bytes:
+    return base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+
+
+def verify_engine_jwt(
+    token: str, secret: str, issuer: str, audience: str
+) -> tuple[dict | None, str]:
+    """校验账号服务签发的 HS256 access token。
+
+    返回 (claims, reason)；reason 只用于审计，不回显给客户端。
+    """
+    try:
+        header_raw, claims_raw, sig = token.split(".")
+        header = json.loads(_b64url_decode(header_raw))
+        if not isinstance(header, dict) or header.get("alg") != JWT_ALG:
+            return None, "unsupported_alg"
+        expected = hmac.new(
+            secret.encode("utf-8"),
+            f"{header_raw}.{claims_raw}".encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(expected, _b64url_decode(sig)):
+            return None, "bad_signature"
+        claims = json.loads(_b64url_decode(claims_raw))
+    except Exception:
+        return None, "malformed"
+    if not isinstance(claims, dict):
+        return None, "malformed"
+    if claims.get("type") != "access":
+        return None, "not_access_token"
+    try:
+        expired = int(claims.get("exp") or 0) < int(time.time())
+    except (TypeError, ValueError):
+        return None, "malformed"
+    if expired:
+        return None, "expired"
+    if claims.get("iss") != issuer:
+        return None, "bad_issuer"
+    aud = claims.get("aud")
+    aud_ok = audience in aud if isinstance(aud, list) else aud == audience
+    if not aud_ok:
+        return None, "bad_audience"
+    if not str(claims.get("sub") or "").strip():
+        return None, "missing_sub"
+    if not str(claims.get("sid") or "").strip():
+        # 没有会话绑定的令牌无法被账号服务吊销，不接受
+        return None, "missing_sid"
+    return claims, ""
+
+
+def principal_from_claims(claims: dict) -> dict:
+    quota = claims.get("quota")
+    return {
+        "sub": str(claims.get("sub") or "").strip(),
+        "sid": str(claims.get("sid") or "").strip(),
+        "org": str(claims.get("org") or "").strip(),
+        "role": str(claims.get("role") or "user").strip() or "user",
+        "quota": quota if isinstance(quota, dict) else {},
+        "auth": "jwt",
+    }
+
+
+STATIC_PRINCIPAL = {
+    "sub": "static",
+    "sid": "",
+    "org": "",
+    "role": "service",
+    "quota": {},
+    "auth": "static",
+}
+
+
+def _authenticate_engine_request(request: Request) -> tuple[dict | None, str]:
+    """解析服务化请求的调用主体。
+
+    未配置任何凭据时返回 (None, "")，即桌面/回环模式，行为保持不变。
+    配置后静态令牌与账号 JWT 都接受（静态令牌保留为应急通道）。
+    """
+    static_token = str(os.environ.get("TT_ENGINE_TOKEN") or "").strip()
+    jwt_secret = _engine_jwt_secret()
+    if not static_token and not jwt_secret:
+        return None, ""
+    auth = request.headers.get("authorization") or ""
+    got = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if not got:
+        got = (request.headers.get("x-tt-engine-token") or "").strip()
+    if not got:
+        return None, "missing_token"
+    if static_token and hmac.compare_digest(static_token, got):
+        return dict(STATIC_PRINCIPAL), ""
+    if not jwt_secret:
+        return None, "invalid_token"
+    claims, reason = verify_engine_jwt(
+        got, jwt_secret, _engine_jwt_issuer(), _engine_jwt_audience()
+    )
+    if not claims:
+        return None, reason or "invalid_token"
+    principal = principal_from_claims(claims)
+    allowed = _engine_allowed_users()
+    if allowed and principal["sub"] not in allowed:
+        return None, "user_not_allowed"
+    return principal, ""
+
+
+class AuditLog:
+    """请求审计台账：内存环形缓冲；设置 TT_ENGINE_AUDIT_LOG 时同步追加 JSONL。"""
+
+    def __init__(self, maxlen: int = AUDIT_MAX_ENTRIES) -> None:
+        self._entries: deque[dict] = deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+
+    def record(self, entry: dict) -> None:
+        entry = {"atMs": int(time.time() * 1000), **entry}
+        with self._lock:
+            self._entries.append(entry)
+            path = str(os.environ.get("TT_ENGINE_AUDIT_LOG") or "").strip()
+            if not path:
+                return
+            try:
+                with open(path, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except OSError as exc:
+                print(f"[engine] 审计日志写入失败：{exc}", flush=True)
+
+    def query(self, limit: int = 100, subject: str | None = None) -> list[dict]:
+        try:
+            limit = max(1, min(int(limit), AUDIT_MAX_ENTRIES))
+        except (TypeError, ValueError):
+            limit = 100
+        with self._lock:
+            rows = list(self._entries)
+        if subject is not None:
+            rows = [row for row in rows if row.get("sub") == subject]
+        rows = rows[-limit:]
+        rows.reverse()  # 新 → 旧
+        return rows
+
+
+AUDIT_LOG = AuditLog()
+
+
+def _client_host(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _is_jwt_admin(principal: dict | None) -> bool:
+    return bool(principal) and principal.get("auth") == "jwt" and principal.get("role") == "admin"
+
+
+def _usage_scope(sub: str) -> str | None:
+    """JWT 非管理员强制只看自己的用量；其他模式按请求参数过滤。"""
+    principal = current_principal()
+    if principal and principal.get("auth") == "jwt" and not _is_jwt_admin(principal):
+        return principal.get("sub") or ""
+    return (sub or "").strip() or None
+
+
+def service_bind_error(
+    host: str, allow_remote: str, token: str, jwt_secret: str | None = None
+) -> str:
     """绑定非回环地址的准入判断（纯函数，便于离线测试）。
 
-    引擎没有用户体系；把无鉴权的执行面挂到 0.0.0.0 等于把本机工具能力开放给
-    整个网络。因此要求同时满足：显式确认 + 非空令牌。
+    服务化会暴露可执行面；没有桌面壳时更依赖显式凭据。因此要求同时满足：
+    显式确认 + 非空静态令牌或 JWT 密钥。
     """
     if host in LOOPBACK_HOSTS:
         return ""
     if allow_remote.strip() != "1":
         return "拒绝绑定非回环地址：服务化会暴露无用户体系的执行面；如确需，请设置 TT_ALLOW_REMOTE_BIND=1"
-    if not token.strip():
-        return "拒绝绑定非回环地址：必须设置 TT_ENGINE_TOKEN（所有 /api 请求需携带 Bearer 令牌）"
+    secret = _engine_jwt_secret() if jwt_secret is None else jwt_secret.strip()
+    if not token.strip() and not secret:
+        return (
+            "拒绝绑定非回环地址：必须设置 TT_ENGINE_TOKEN 或 TT_ENGINE_JWT_SECRET"
+            "（所有 /api 请求需携带 Bearer 令牌）"
+        )
     return ""
 
 
 @app.middleware("http")
 async def _engine_token_guard(request: Request, call_next):
-    expected = str(os.environ.get("TT_ENGINE_TOKEN") or "").strip()
     path = request.url.path
-    if not expected or not path.startswith("/api/") or request.method == "OPTIONS":
+    if not path.startswith("/api/") or request.method == "OPTIONS":
         return await call_next(request)
-    auth = request.headers.get("authorization") or ""
-    got = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-    if not got:
-        got = (request.headers.get("x-tt-engine-token") or "").strip()
-    if not hmac.compare_digest(expected, got):
+    principal, error = _authenticate_engine_request(request)
+    if error:
+        status = 403 if error == "user_not_allowed" else 401
+        AUDIT_LOG.record(
+            {
+                "sub": "",
+                "org": "",
+                "role": "",
+                "sid": "",
+                "auth": "",
+                "method": request.method,
+                "path": path,
+                "status": status,
+                "durationMs": 0,
+                "ip": _client_host(request),
+                "reason": error,
+            }
+        )
         return JSONResponse(
             {
                 "ok": False,
-                "code": "ENGINE_UNAUTHORIZED",
-                "message": "服务化模式需要携带有效的引擎令牌（Authorization: Bearer <TT_ENGINE_TOKEN>）",
+                "code": "ENGINE_USER_NOT_ALLOWED" if status == 403 else "ENGINE_UNAUTHORIZED",
+                "message": (
+                    "当前账号不在引擎允许的用户名单内"
+                    if status == 403
+                    else JWT_UNAUTHORIZED_MESSAGE
+                ),
             },
-            status_code=401,
+            status_code=status,
         )
-    return await call_next(request)
+    token = _CURRENT_PRINCIPAL.set(principal)
+    request.state.principal = principal
+    started = time.monotonic()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        if principal is not None:
+            AUDIT_LOG.record(
+                {
+                    "sub": principal.get("sub") or "",
+                    "org": principal.get("org") or "",
+                    "role": principal.get("role") or "",
+                    "sid": principal.get("sid") or "",
+                    "auth": principal.get("auth") or "",
+                    "method": request.method,
+                    "path": path,
+                    "status": status,
+                    "durationMs": int((time.monotonic() - started) * 1000),
+                    "ip": _client_host(request),
+                }
+            )
+        _CURRENT_PRINCIPAL.reset(token)
+
+
+@app.get("/api/audit")
+async def audit_get(limit: int = 100, sub: str = ""):
+    """请求审计：管理员可查全部或指定用户，普通用户只能查到自己的记录。"""
+    principal = current_principal()
+    subject = (sub or "").strip() or None
+    if principal and principal.get("auth") == "jwt" and not _is_jwt_admin(principal):
+        subject = principal.get("sub") or ""
+    entries = AUDIT_LOG.query(limit, subject)
+    return JSONResponse({"ok": True, "count": len(entries), "entries": entries})
 
 
 def mount_web(app_: FastAPI, directory: str | Path) -> Path:
@@ -3683,8 +3975,6 @@ async def chat_review(request: Request):
                 status_code=409,
             )
         session.cancelled = False
-        session.rolled_back = None
-        session.pause_event.set()
         return StreamingResponse(
             _run_execution(
                 session, task_id, session.goal or "", [],
@@ -3768,36 +4058,6 @@ async def chat_checkpoint_query(request: Request):
         if info:
             out[task_id] = info
     return JSONResponse({"checkpoints": out})
-
-
-@app.post("/api/chat/control")
-async def chat_control(request: Request):
-    """任务控制（转移 #14/#21/#22）：pause/resume 门控执行流；
-    rollback_to 终止执行并发 rolled_back 事件（文件级恢复由 Rust 备份模块承接）"""
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-    task_id = (payload.get("task_id") or "").strip()
-    action = (payload.get("action") or "").strip()
-    step_id = (payload.get("step_id") or "").strip()
-    session = _TASK_SESSIONS.get(task_id)
-    if session is None:
-        return JSONResponse({"ok": False, "code": "TASK_NOT_FOUND", "taskId": task_id})
-
-    if action == "pause":
-        session.pause_event.clear()
-        return JSONResponse({"ok": True, "taskId": task_id, "action": "pause"})
-    if action == "resume":
-        session.pause_event.set()
-        return JSONResponse({"ok": True, "taskId": task_id, "action": "resume"})
-    if action == "rollback_to":
-        # 标记回滚目标后取消执行；run_agent 的 CancelledError 分支发 rolled_back 事件
-        session.rolled_back = step_id or "unknown"
-        if session.agent_task is not None and not session.agent_task.done():
-            session.agent_task.cancel()
-        return JSONResponse({"ok": True, "taskId": task_id, "action": "rollback_to", "stepId": step_id})
-    return JSONResponse({"ok": False, "code": "VALIDATION_ERROR", "message": f"未知 action: {action}"})
 
 
 @app.get("/api/events/replay")
@@ -4758,28 +5018,34 @@ def _probe_ollama_root(root: str) -> dict:
 
 
 @app.get("/api/usage")
-async def usage_get(period: str = "monthly"):
+async def usage_get(period: str = "monthly", sub: str = ""):
     """模型用量（真实 token 台账）：daily=今日 / monthly=本月 / total=全部。
 
     仅供浏览器直连模式读取（无 Rust 后端时的联调通道）；
     Tauri 模式的权威数据在 Rust model_usage 表（按 usage 事件持久化）。
-    台账为进程内累计，引擎重启清零。"""
+    台账为进程内累计，引擎重启清零。JWT 非管理员只能看到自己的用量。"""
     p = period if period in ("daily", "monthly", "total") else "total"
-    return JSONResponse({"ok": True, "period": p, "rows": USAGE_LEDGER.aggregate(p)})
+    subject = _usage_scope(sub)
+    return JSONResponse(
+        {"ok": True, "period": p, "subject": subject, "rows": USAGE_LEDGER.aggregate(p, subject)}
+    )
 
 
 @app.get("/api/usage/report")
-async def usage_report_get(period: str = "monthly"):
-    """用量报表（按日趋势 + 明细 + 汇总）：与 Rust `usage_report` 同一返回体。"""
+async def usage_report_get(period: str = "monthly", sub: str = ""):
+    """用量报表（按日趋势 + 明细 + 用户汇总 + 总计）：与 Rust `usage_report` 同一口径。"""
     p = period if period in ("daily", "monthly", "total") else "total"
-    models = USAGE_LEDGER.aggregate(p)
+    subject = _usage_scope(sub)
+    models = USAGE_LEDGER.aggregate(p, subject)
     return JSONResponse(
         {
             "ok": True,
             "period": p,
+            "subject": subject,
             "generatedAtMs": int(time.time() * 1000),
-            "days": USAGE_LEDGER.days(p),
+            "days": USAGE_LEDGER.days(p, subject),
             "models": models,
+            "users": USAGE_LEDGER.users(p, subject),
             "totals": USAGE_LEDGER.totals(p, models),
         }
     )
@@ -5570,7 +5836,10 @@ def main():
         "--host",
         type=str,
         default="127.0.0.1",
-        help="绑定地址；非回环地址需同时设置 TT_ALLOW_REMOTE_BIND=1 与 TT_ENGINE_TOKEN",
+        help=(
+            "绑定地址；非回环地址需同时设置 TT_ALLOW_REMOTE_BIND=1 与 "
+            "TT_ENGINE_TOKEN 或 TT_ENGINE_JWT_SECRET"
+        ),
     )
     parser.add_argument(
         "--web-dir",
@@ -5590,6 +5859,7 @@ def main():
         args.host,
         os.environ.get("TT_ALLOW_REMOTE_BIND", ""),
         os.environ.get("TT_ENGINE_TOKEN", ""),
+        _engine_jwt_secret(),
     )
     if bind_error:
         parser.error(bind_error)
@@ -5609,7 +5879,9 @@ def main():
         f"key={'yes' if os.environ.get('TT_API_KEY') else 'NO'}, "
         f"work-dir={WORK_DIR}, "
         f"web={web_root or 'off'}, "
-        f"service-token={'yes' if os.environ.get('TT_ENGINE_TOKEN') else 'NO'})",
+        f"service-token={'yes' if os.environ.get('TT_ENGINE_TOKEN') else 'NO'}, "
+        f"jwt={'yes' if _engine_jwt_secret() else 'NO'}, "
+        f"audit-log={'yes' if os.environ.get('TT_ENGINE_AUDIT_LOG') else 'memory'})",
         flush=True,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

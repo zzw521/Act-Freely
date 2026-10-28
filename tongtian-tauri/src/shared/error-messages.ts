@@ -146,6 +146,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   [ErrorCode.POLICY_DOMAIN_NOT_ALLOWED]: '该域名不在出域白名单内，请求已被拦截',
   [ErrorCode.POLICY_DOMAIN_BLOCKED]: '该域名命中出域黑名单，请求已被拦截',
   [ErrorCode.POLICY_INVALID_URL]: '无法解析目标地址，请检查 URL 配置',
+  [ErrorCode.POLICY_UNSUPPORTED]: '当前系统没有可用的系统级沙箱，无法启用该执行级别',
   [ErrorCode.COMPLIANCE_DATA_LEAK]:
     '内容含机密或个人信息，按合规策略已阻止发往外部模型；请改用本地模型，或在安全合规页调整机密本地化设置',
   [ErrorCode.AUDIT_QUERY_FAILED]: '审计日志查询失败',
@@ -351,6 +352,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   [ErrorCode.MCP_PROTOCOL_ERROR]: 'MCP 连接器响应不符合协议，未能返回可解析的 JSON-RPC 消息',
   [ErrorCode.MCP_TRANSPORT_UNSUPPORTED]: '该传输方式需要常驻事件流，请改用 Streamable HTTP 端点',
   [ErrorCode.MCP_INVALID_CONFIG]: '连接器配置 JSON 无法解析，请检查格式后重新粘贴',
+  [ErrorCode.MCP_SANDBOX_FAILED]: '在系统沙箱内启动连接器失败，请检查沙箱设置或临时关闭沙箱后重试',
   [ErrorCode.MCP_UNSUPPORTED]: '当前运行通道无法与 MCP 连接器握手，请在桌面版任我行中完成连接',
   [ErrorCode.MCP_OAUTH_INVALID_CONFIG]: 'OAuth 配置非法：授权地址与 token 地址需为 HTTPS，client_id 不能为空',
   [ErrorCode.MCP_OAUTH_REQUIRED]: '该连接器需要先完成 OAuth 授权才能连接',

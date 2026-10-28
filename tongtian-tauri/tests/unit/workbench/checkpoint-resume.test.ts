@@ -230,7 +230,7 @@ describe('刷新恢复：从磁盘查询检查点入口', () => {
 
   it('Rust 命令批量去重并限制 200 条，查询失败不编造入口', () => {
     const src = rustLib();
-    const cmd = src.split('async fn chat_checkpoint_query(')[1].split('async fn chat_control(')[0];
+    const cmd = src.split('async fn chat_checkpoint_query(')[1].split('async fn chat_cancel(')[0];
     expect(cmd).toContain('task_ids: Vec<String>');
     expect(cmd).toContain('!ids.contains(&id)');
     expect(cmd).toContain('ids.len() >= 200');
@@ -261,9 +261,9 @@ describe('通道接线：Mock 不伪造恢复成功', () => {
   });
 
   it('Rust 只允许已结束任务从检查点恢复，启动失败回到原状态', () => {
-    const review = rustLib().split('async fn chat_review(')[1].split('async fn chat_control(')[0];
+    const review = rustLib().split('async fn chat_review(')[1].split('async fn chat_cancel(')[0];
     expect(review).toContain('"resume" => {');
-    // 执行中/待审阅等状态不能从检查点恢复（执行中走 control pause/resume）
+    // 执行中/待审阅等状态不能从检查点恢复（运行中的任务只能终止）
     expect(review).toContain('status::DONE | status::FAILED | status::CANCELLED');
     expect(review).toContain('let previous_status = record.status.clone();');
     expect(review).toContain('&previous_status,');

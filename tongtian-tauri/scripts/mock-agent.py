@@ -128,8 +128,6 @@ class MockAgentHandler(BaseHTTPRequestHandler):
             self._handle_chat()
         elif parsed.path == "/api/chat/review":
             self._handle_review()
-        elif parsed.path == "/api/chat/control":
-            self._handle_control()
         elif parsed.path == "/api/chat/cancel":
             self._handle_cancel()
         elif parsed.path == "/api/config":
@@ -273,30 +271,6 @@ class MockAgentHandler(BaseHTTPRequestHandler):
                 self._send_sse(session, task_id, "done", {})
         except (BrokenPipeError, ConnectionResetError):
             print("[mock-agent] client disconnected", flush=True)
-
-    def _handle_control(self):
-        """任务控制：pause/resume/rollback_to（状态语义，文件恢复随备份模块）"""
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length) if length else b"{}"
-        try:
-            payload = json.loads(raw)
-        except Exception:
-            payload = {}
-        task_id = (payload.get("task_id") or "").strip()
-        action = (payload.get("action") or "").strip()
-        step_id = (payload.get("step_id") or "").strip()
-        session = _SESSIONS.get(task_id)
-        if session is None:
-            self._send_json(200, {"ok": False, "code": "TASK_NOT_FOUND", "taskId": task_id})
-            return
-        if action in ("pause", "resume"):
-            self._send_json(200, {"ok": True, "taskId": task_id, "action": action})
-            return
-        if action == "rollback_to":
-            session["cancelled"] = True  # 终止进行中的执行流
-            self._send_json(200, {"ok": True, "taskId": task_id, "action": action, "stepId": step_id})
-            return
-        self._send_json(200, {"ok": False, "code": "VALIDATION_ERROR", "message": f"未知 action: {action}"})
 
     # ── 聊天流（两阶段协议 + 兼容全流程） ──────────────────
 

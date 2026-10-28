@@ -398,7 +398,6 @@ def test_legacy_web_login():
     exchanged = payload(body)
     check("授权码换 token", status == 200 and exchanged.get("ok") is True)
     check("返回桌面端 profile", exchanged["profile"].get("email") == email_b)
-    access_b = exchanged["accessToken"]
     status, _, body = http(
         "POST", "/api/auth/exchange", json_body={"code": code, "state": state}
     )
@@ -429,10 +428,18 @@ def test_legacy_web_login():
         },
     )
     check("网页登录 302", status == 302)
+    location = headers.get("Location", "")
     check(
         "登录回跳带新 code",
-        "code=" in headers.get("Location", "") and "state=state-login" in headers.get("Location", ""),
+        "code=" in location and "state=state-login" in location,
     )
+    # refresh 轮换会吊销旧会话（含旧 access token），这里换刚拿到的 code 获取可用令牌
+    fresh_code = urllib.parse.parse_qs(urllib.parse.urlsplit(location).query)["code"][0]
+    status, _, body = http(
+        "POST", "/api/auth/exchange", json_body={"code": fresh_code, "state": "state-login"}
+    )
+    check("网页登录授权码可换 token", status == 200 and payload(body).get("ok") is True)
+    access_b = payload(body)["accessToken"]
 
     status, _, body = http(
         "POST",
@@ -453,6 +460,153 @@ def test_legacy_web_login():
     check("非法授权码被拒", status == 400 and payload(body).get("code") == "INVALID_CODE")
 
     return {"email_b": email_b, "access_b": access_b}
+
+
+def test_auth_claims(ctx):
+    print("\n[令牌声明与吊销]")
+    stamp = int(time.time())
+    admin = ctx["admin_access"]
+    email = f"claims{stamp}@test.local"
+    status, _, body = http(
+        "POST",
+        "/api/v1/auth/register",
+        json_body={"email": email, "password": "secret123", "nickname": "声明用户"},
+    )
+    data = payload(body)
+    uid = data["profile"]["uid"]
+    access, refresh = data["accessToken"], data["refreshToken"]
+    check("注册成功", status == 201)
+    check("默认个人组织", data["profile"].get("org") == f"personal-{uid}")
+    check(
+        "默认免费配额",
+        data["profile"].get("quota") == {"monthlyTokens": 100_000, "concurrentTasks": 2},
+    )
+
+    claims = security.jwt_decode(access)
+    refresh_claims = security.jwt_decode(refresh)
+    check(
+        "access 声明齐全",
+        claims.get("iss") == "tongtian-auth"
+        and claims.get("aud") == "tongtian-engine"
+        and claims.get("sub") == uid
+        and bool(claims.get("sid"))
+        and claims.get("org") == f"personal-{uid}"
+        and claims.get("iat", 0) > 0
+        and claims.get("exp", 0) > claims.get("iat", 0),
+    )
+    check("refresh 与 access 同会话", refresh_claims.get("sid") == claims.get("sid"))
+
+    forged = security.jwt_encode(
+        {
+            "sub": uid,
+            "sid": claims["sid"],
+            "role": "user",
+            "org": claims["org"],
+            "quota": claims["quota"],
+            "iss": "tongtian-auth",
+            "aud": "someone-else",
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 60,
+            "type": "access",
+        }
+    )
+    status, _, body = http("GET", "/api/v1/auth/me", token=forged)
+    check("aud 不匹配被拒", status == 401 and payload(body).get("code") == "AUTH_REQUIRED")
+
+    legacy = security.jwt_encode(
+        {
+            "sub": uid,
+            "type": "access",
+            "role": "user",
+            "iss": "tongtian-auth",
+            "aud": "tongtian-engine",
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 60,
+        }
+    )
+    status, _, body = http("GET", "/api/v1/auth/me", token=legacy)
+    check("无 sid 旧令牌被拒", status == 401)
+
+    status, _, body = http(
+        "PATCH",
+        f"/api/v1/admin/users/{uid}",
+        json_body={"org": "acme", "quota": {"monthlyTokens": 5000, "concurrentTasks": 3}},
+        token=admin,
+    )
+    patched = payload(body)
+    check("管理员改声明成功", status == 200 and patched.get("sessionsRevoked") == 1)
+    check("返回新组织", patched["profile"].get("org") == "acme")
+    check(
+        "返回新配额",
+        patched["profile"].get("quota") == {"monthlyTokens": 5000, "concurrentTasks": 3},
+    )
+
+    status, _, _ = http("GET", "/api/v1/auth/me", token=access)
+    check("旧 access 立即失效", status == 401)
+    status, _, body = http("POST", "/api/v1/auth/refresh", json_body={"refreshToken": refresh})
+    check("旧 refresh 同步失效", status == 401 and payload(body).get("code") == "INVALID_REFRESH")
+
+    status, _, body = http(
+        "POST", "/api/v1/auth/login", json_body={"email": email, "password": "secret123"}
+    )
+    relogin = payload(body)
+    new_access = relogin["accessToken"]
+    new_claims = security.jwt_decode(new_access)
+    check("重新登录带新组织", status == 200 and new_claims.get("org") == "acme")
+    check("重新登录带新配额", new_claims.get("quota") == {"monthlyTokens": 5000, "concurrentTasks": 3})
+    status, _, _ = http("GET", "/api/v1/auth/me", token=new_access)
+    check("新令牌可正常访问", status == 200)
+
+    status, _, body = http(
+        "PATCH", f"/api/v1/admin/users/{uid}", json_body={"org": "other"}, token=new_access
+    )
+    check("非管理员被拒", status == 403 and payload(body).get("code") == "FORBIDDEN")
+    status, _, body = http(
+        "PATCH", f"/api/v1/admin/users/{uid}", json_body={"org": "Bad Org"}, token=admin
+    )
+    check("非法组织 400", status == 400 and payload(body).get("code") == "INVALID_ORG")
+    status, _, body = http(
+        "PATCH", f"/api/v1/admin/users/{uid}", json_body={"quota": {"monthlyTokens": -1}}, token=admin
+    )
+    check("非法配额 400", status == 400 and payload(body).get("code") == "INVALID_QUOTA")
+    status, _, body = http(
+        "PATCH", f"/api/v1/admin/users/{uid}", json_body={"extra": 1}, token=admin
+    )
+    check("声明多余字段 422", status == 422 and payload(body).get("code") == "VALIDATION_ERROR")
+    status, _, body = http("PATCH", f"/api/v1/admin/users/{uid}", json_body={}, token=admin)
+    check("空更新 400", status == 400 and payload(body).get("code") == "NOTHING_TO_UPDATE")
+    status, _, body = http(
+        "PATCH", "/api/v1/admin/users/tt-missing", json_body={"org": "x"}, token=admin
+    )
+    check("未知用户 404", status == 404 and payload(body).get("code") == "USER_NOT_FOUND")
+
+    status, _, body = http(
+        "POST", f"/api/v1/admin/users/{uid}/revoke-sessions", token=admin
+    )
+    check("管理员强制下线", status == 200 and payload(body).get("revoked") == 1)
+    status, _, _ = http("GET", "/api/v1/auth/me", token=new_access)
+    check("强制下线后令牌失效", status == 401)
+    status, _, body = http("POST", "/api/v1/admin/users/tt-missing/revoke-sessions", token=admin)
+    check("未知用户强制下线 404", status == 404)
+
+    status, _, body = http(
+        "POST", "/api/v1/auth/login", json_body={"email": email, "password": "secret123"}
+    )
+    last_access = payload(body)["accessToken"]
+    status, _, body = http(
+        "PATCH",
+        f"/api/v1/admin/users/{uid}",
+        json_body={"org": None, "quota": None},
+        token=admin,
+    )
+    cleared = payload(body)
+    check("清空组织回到个人", status == 200 and cleared["profile"].get("org") == f"personal-{uid}")
+    check(
+        "清空配额回到默认",
+        cleared["profile"].get("quota") == {"monthlyTokens": 100_000, "concurrentTasks": 2},
+    )
+    status, _, _ = http("GET", "/api/v1/auth/me", token=last_access)
+    check("清空后旧令牌失效", status == 401)
 
 
 def test_skill_market(ctx):
@@ -818,6 +972,149 @@ def test_seed(ctx):
     check("分页第二页", status == 200 and len(second_page["items"]) == 1 and second_page["hasMore"] is False)
 
 
+def test_market_revoke(ctx):
+    print("\n[市场撤销与下架]")
+    access_a = ctx["access_a"]
+    admin = ctx["admin_access"]
+
+    data_v1 = skill_zip("revoke-target", "1.0.0", "撤销测试用技能")
+    status, _, body = publish_skill(
+        access_a, "revoke-target", data_v1, summary="撤销测试用技能"
+    )
+    check("撤销样本发布", status == 201, payload(body).get("message", ""))
+    item = payload(body)["item"]
+    check("新条目未撤销", item.get("revoked") is False)
+    data_v2 = skill_zip("revoke-target", "1.1.0", "撤销测试用技能第二版")
+    status, _, body = publish_skill_version(access_a, "revoke-target", data_v2)
+    check("撤销样本新版本", status == 201 and payload(body)["item"].get("latestVersion") == "1.1.0")
+
+    revoke_path = "/api/v1/admin/items/skill/revoke-target/versions/1.1.0/revoke"
+    status, _, body = http("POST", revoke_path, json_body={"reason": "存在越权读取"}, token=access_a)
+    check("普通用户不能撤销", status == 403 and payload(body).get("code") == "FORBIDDEN")
+    status, _, body = http("POST", revoke_path, json_body={"reason": "   "}, token=admin)
+    check("撤销原因不能为空", status == 400 and payload(body).get("code") == "INVALID_FIELD")
+    status, _, body = http("POST", revoke_path, json_body={"reason": "x" * 501}, token=admin)
+    check("撤销原因超长被拒", status == 400 and payload(body).get("code") == "INVALID_FIELD")
+    status, _, body = http(
+        "POST",
+        "/api/v1/admin/items/skill/revoke-target/versions/9.9.9/revoke",
+        json_body={"reason": "不存在"},
+        token=admin,
+    )
+    check("撤销未知版本 404", status == 404 and payload(body).get("code") == "VERSION_NOT_FOUND")
+    status, _, body = http(
+        "POST",
+        "/api/v1/admin/items/skill/missing-item/versions/1.0.0/revoke",
+        json_body={"reason": "不存在"},
+        token=admin,
+    )
+    check("撤销未知条目 404", status == 404 and payload(body).get("code") == "ITEM_NOT_FOUND")
+    status, _, body = http(
+        "POST",
+        "/api/v1/admin/items/skill/revoke-target/versions/1.0/revoke",
+        json_body={"reason": "坏版本"},
+        token=admin,
+    )
+    check("撤销非法版本号 400", status == 400 and payload(body).get("code") == "INVALID_VERSION")
+
+    status, _, body = http("POST", revoke_path, json_body={"reason": "存在越权读取"}, token=admin)
+    data = payload(body)
+    item = data.get("item", {})
+    check("管理员撤销版本", status == 200 and data.get("changed") is True and data.get("revokedAtMs", 0) > 0)
+    check("最新版本回落到未撤销版本", item.get("latestVersion") == "1.0.0")
+    revoked_at = data["revokedAtMs"]
+    target = next(v for v in item.get("versions", []) if v["version"] == "1.1.0")
+    check("版本视图标记撤销", target.get("revoked") is True and target.get("revokedReason") == "存在越权读取")
+    check("撤销版本无下载地址", target.get("downloadUrl") is None)
+    status, _, body = http("GET", "/api/v1/skills/revoke-target/download?version=1.1.0")
+    check("撤销版本禁止下载", status == 410 and payload(body).get("code") == "ITEM_REVOKED")
+    status, headers, _ = http("GET", "/api/v1/skills/revoke-target/download")
+    check("默认下载回落到未撤销版本", status == 200 and headers.get("X-Item-Version") == "1.0.0")
+    status, _, body = http("POST", revoke_path, json_body={"reason": "重复撤销"}, token=admin)
+    check(
+        "重复撤销幂等",
+        status == 200 and payload(body).get("changed") is False
+        and payload(body).get("revokedAtMs") == revoked_at,
+    )
+
+    status, _, body = http("GET", "/api/v1/revoked")
+    data = payload(body)
+    entry = next((row for row in data.get("items", []) if row["id"] == "revoke-target"), None)
+    check("下架列表返回撤销版本", status == 200 and data.get("total") == 1 and entry is not None)
+    check(
+        "下架条目字段",
+        entry is not None and entry.get("version") == "1.1.0"
+        and entry.get("reason") == "存在越权读取" and entry.get("type") == "skill"
+        and entry.get("name") == "revoke-target",
+    )
+    status, _, body = http("GET", "/api/v1/revoked?type=mcp")
+    check("下架列表按类型筛选", status == 200 and payload(body).get("total") == 0)
+    status, _, body = http("GET", "/api/v1/revoked?type=unknown")
+    check("下架列表类型校验", status == 400 and payload(body).get("code") == "INVALID_TYPE")
+
+    status, _, body = http(
+        "POST",
+        "/api/v1/admin/items/skill/revoke-target/versions/1.0.0/revoke",
+        json_body={"reason": "全部下架"},
+        token=admin,
+    )
+    item = payload(body).get("item", {})
+    check("全部版本撤销后条目下架", status == 200 and item.get("revoked") is True and item.get("latestVersion") is None)
+    check("下架条目无下载地址", item.get("downloadUrl") is None)
+    check("版本数仍保留历史", item.get("versionCount") == 2)
+    check("下架详情不再返回 readme", item.get("readme") == "")
+    status, _, body = http("GET", "/api/v1/skills/revoke-target/download")
+    check("全部下架后默认下载 410", status == 410 and payload(body).get("code") == "ITEM_REVOKED")
+    status, _, body = http("GET", "/api/v1/skills?q=revoke-target")
+    rows = [row for row in payload(body).get("items", []) if row["id"] == "revoke-target"]
+    check("列表标记下架条目", len(rows) == 1 and rows[0].get("revoked") is True)
+    status, _, body = http("GET", "/api/v1/revoked")
+    check("下架列表包含两个版本", payload(body).get("total") == 2)
+
+    status, _, body = http(
+        "POST",
+        "/api/v1/admin/items/mcp/repo-insights-mcp/versions/1.1.0/revoke",
+        json_body={"reason": "配置注入风险"},
+        token=admin,
+    )
+    check("撤销 MCP 版本", status == 200 and payload(body)["item"].get("latestVersion") == "1.0.0")
+    status, _, body = http("GET", "/api/v1/mcp/repo-insights-mcp/config")
+    check("MCP 默认配置回落到未撤销版本", status == 200 and payload(body).get("version") == "1.0.0")
+    status, _, body = http("GET", "/api/v1/mcp/repo-insights-mcp/config?version=1.1.0")
+    check("撤销 MCP 版本配置被拒", status == 410 and payload(body).get("code") == "ITEM_REVOKED")
+    status, _, body = http(
+        "POST",
+        "/api/v1/admin/items/mcp/repo-insights-mcp/versions/1.0.0/revoke",
+        json_body={"reason": "全部下架"},
+        token=admin,
+    )
+    check("撤销 MCP 最后一个版本", status == 200)
+    prefix = "/api/v1/admin/items/mcp/repo-insights-mcp/versions/"
+    status, _, body = http("GET", "/api/v1/mcp/repo-insights-mcp/config")
+    check("MCP 全部撤销后配置 410", status == 410 and payload(body).get("code") == "ITEM_REVOKED")
+    http("POST", prefix + "1.0.0/unrevoke", token=admin)
+    http("POST", prefix + "1.1.0/unrevoke", token=admin)
+
+    unrevoke_1 = "/api/v1/admin/items/skill/revoke-target/versions/1.1.0/unrevoke"
+    status, _, body = http("POST", unrevoke_1, token=admin)
+    check(
+        "恢复撤销版本",
+        status == 200 and payload(body).get("changed") is True
+        and payload(body)["item"].get("latestVersion") == "1.1.0",
+    )
+    status, _, body = http("POST", unrevoke_1, token=admin)
+    check("重复恢复幂等", status == 200 and payload(body).get("changed") is False)
+    status, headers, _ = http("GET", "/api/v1/skills/revoke-target/download?version=1.1.0")
+    check("恢复后可下载", status == 200 and headers.get("X-Item-Version") == "1.1.0")
+    http(
+        "POST",
+        "/api/v1/admin/items/skill/revoke-target/versions/1.0.0/unrevoke",
+        token=admin,
+    )
+    status, _, body = http("GET", "/api/v1/revoked")
+    check("全部恢复后下架列表为空", status == 200 and payload(body).get("total") == 0)
+
+
 def register_user(email: str, nickname: str, password: str = "secret123") -> dict:
     status, _, body = http(
         "POST",
@@ -1053,6 +1350,114 @@ def test_projects(ctx):
     check("未登录不能访问项目", status == 401 and payload(body).get("code") == "AUTH_REQUIRED")
 
 
+def open_sse(path: str, token: str, timeout: float = 8.0):
+    request = urllib.request.Request(
+        BASE + path, headers={"Authorization": f"Bearer {token}"}
+    )
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+def read_sse_event(resp, timeout_seconds: float = 8.0):
+    """读取下一条命名事件；跳过注释心跳与空行，超时返回 None。"""
+    deadline = time.time() + timeout_seconds
+    event = ""
+    while time.time() < deadline:
+        try:
+            raw = resp.readline()
+        except (TimeoutError, socket.timeout):
+            return None
+        if not raw:
+            return None
+        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+        if line.startswith("event: "):
+            event = line[7:]
+        elif line.startswith("data: "):
+            try:
+                data = json.loads(line[6:])
+            except ValueError:
+                data = None
+            if event:
+                return event, data
+    return None
+
+
+def test_project_events(ctx):
+    print("\n[项目事件流]")
+    stamp = int(time.time() * 1000)
+    owner = register_user(f"evt-owner-{stamp}@test.local", "事件所有者")
+    outsider = register_user(f"evt-out-{stamp}@test.local", "事件局外人")
+    owner_access = owner["accessToken"]
+    outsider_access = outsider["accessToken"]
+
+    status, _, body = http(
+        "POST", "/api/v1/projects", json_body={"name": "事件测试"}, token=owner_access
+    )
+    project_id = payload(body).get("project", {}).get("id", "")
+    check("事件：创建项目", status == 201 and project_id.startswith("prj-"))
+
+    status, _, body = http(
+        "GET", f"/api/v1/projects/{project_id}/events", token=owner_access
+    )
+    data = payload(body)
+    seqs = [event["seq"] for event in data.get("events", [])]
+    check("事件列表可读", status == 200 and data["events"][0]["kind"] == "project.created")
+    check("事件按 seq 升序", seqs == sorted(seqs))
+    check("游标等于最后一条 seq", data.get("cursor") == seqs[-1])
+
+    first_cursor = data["cursor"]
+    status, _, body = http(
+        "POST", f"/api/v1/projects/{project_id}/tasks",
+        json_body={"title": "事件任务"}, token=owner_access,
+    )
+    check("事件：创建任务", status == 201)
+    status, _, body = http(
+        "GET", f"/api/v1/projects/{project_id}/events?since={first_cursor}",
+        token=owner_access,
+    )
+    data = payload(body)
+    check("增量只返回新事件", [event["kind"] for event in data["events"]] == ["task.created"])
+    check("增量游标前进", data["cursor"] > first_cursor)
+    cursor = data["cursor"]
+
+    status, _, body = http(
+        "GET", f"/api/v1/projects/{project_id}/events", token=outsider_access
+    )
+    check("非成员不能读事件", status == 404 and payload(body).get("code") == "PROJECT_NOT_FOUND")
+    status, _, body = http(
+        "GET", f"/api/v1/projects/{project_id}/events?since=-1", token=owner_access
+    )
+    check("非法游标被拒绝", status in (400, 422))
+    status, _, body = http(
+        "GET", f"/api/v1/projects/{project_id}/events/stream", token=outsider_access
+    )
+    check("非成员不能订阅事件流", status == 404)
+
+    resp = open_sse(
+        f"/api/v1/projects/{project_id}/events/stream?since={cursor}", owner_access
+    )
+    try:
+        ready = read_sse_event(resp)
+        check(
+            "SSE 首包为 ready",
+            ready is not None and ready[0] == "ready" and ready[1].get("cursor") == cursor,
+        )
+        status, _, body = http(
+            "POST", f"/api/v1/projects/{project_id}/tasks",
+            json_body={"title": "实时推送任务"}, token=owner_access,
+        )
+        check("事件：实时任务创建", status == 201)
+        pushed = read_sse_event(resp)
+        check(
+            "SSE 推送新事件",
+            pushed is not None
+            and pushed[0] == "message"
+            and pushed[1].get("kind") == "task.created",
+        )
+        check("SSE 事件游标前进", pushed is not None and pushed[1].get("seq", 0) > cursor)
+    finally:
+        resp.close()
+
+
 def test_rate_limit():
     print("\n[登录限流]")
     email = f"ghost{int(time.time())}@test.local"
@@ -1076,6 +1481,7 @@ def run():
         test_public()
         ctx = test_auth()
         ctx.update(test_legacy_web_login())
+        test_auth_claims(ctx)
         test_skill_market(ctx)
         ctx["skill_id"] = "weekly-digest"
         ctx.update(test_suite_market(ctx))
@@ -1083,7 +1489,9 @@ def run():
         test_interactions(ctx)
         test_my_items(ctx)
         test_projects(ctx)
+        test_project_events(ctx)
         test_seed(ctx)
+        test_market_revoke(ctx)
         test_rate_limit()
         print(f"\n全部通过：{_passed} 项断言")
     finally:

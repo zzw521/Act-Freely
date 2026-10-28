@@ -194,6 +194,44 @@ export async function saveFeedback(
   setLocalFeedback(convId, turnIndex, kind);
 }
 
+/**
+ * 改写某一轮提问（本轮回复与之后所有轮次随之作废，由调用方随后重新提交）。
+ * 桌面端以 Rust `chat_edit_turn` 为权威并把失败暴露给调用方，
+ * 其余通道同样截断本地台账后覆盖本轮提问，保持三通道同一语义。
+ */
+export async function editConversationTurn(
+  convId: string,
+  turnIndex: number,
+  content: string
+): Promise<void> {
+  if (!convId) throw new Error('CHAT_INVALID_CONVERSATION: 会话标识不能为空');
+  if (!content.trim()) throw new Error('CHAT_EDIT_EMPTY_CONTENT: 提问内容不能为空');
+  if (isDesktopRuntime()) {
+    const api = getAPI();
+    if (!api) throw new Error('CHAT_EDIT_UNAVAILABLE: tongtianAPI 未注入，提问无法改写');
+    await api.invoke(IPC_CHANNELS.CHAT_EDIT_TURN, convId, turnIndex, content);
+    return;
+  }
+  const rows = ledgerRows().filter(
+    (r) =>
+      !(
+        r.convId === convId &&
+        (r.turnIndex > turnIndex || (r.turnIndex === turnIndex && r.role === 'assistant'))
+      )
+  );
+  cache = rows;
+  writeLedger(rows);
+  recordConversationMessage({
+    convId,
+    turnIndex,
+    role: 'user',
+    taskId: '',
+    content,
+    artifacts: [],
+    tsMs: Date.now(),
+  });
+}
+
 /** 清空本地台账（测试用；只动本地 Mock 台账，不触碰 Rust 库内数据） */
 export function resetConversationLedger(): void {
   cache = [];

@@ -208,6 +208,71 @@ pub fn set_feedback(
     })
 }
 
+/// 改写某一轮的用户提问（并作废这轮回复与之后的所有轮次）
+///
+/// 语义与界面一致：编辑第 N 轮等于从这里「另起一路」——本轮回复和第 N 轮之后的
+/// 对话都会作废，随后按新提问重新执行。因此这里删的是「已被新提问取代的内容」，
+/// 只作用于该会话这一轮及以后，其他会话与其他表不受影响。
+/// 用户行本身不用删除再插入，直接覆盖正文并清空任务绑定，等新任务提交后回填。
+pub fn edit_turn(
+    store: &Store,
+    conv_id: &str,
+    turn_index: i64,
+    content: &str,
+    ts_ms: i64,
+) -> Result<(), String> {
+    if conv_id.trim().is_empty() {
+        return Err("CHAT_EDIT_INVALID_CONV: 会话 id 不能为空".to_string());
+    }
+    if content.trim().is_empty() {
+        return Err("CHAT_EDIT_EMPTY_CONTENT: 提问内容不能为空".to_string());
+    }
+    if turn_index < 0 {
+        return Err("CHAT_EDIT_INVALID_TURN: 轮次不能为负".to_string());
+    }
+    store.with_conn(|c| {
+        let exists: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM chat_messages WHERE conv_id = ?1 AND turn_index = ?2 AND role = ?3",
+                rusqlite::params![conv_id, turn_index, ROLE_USER],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("CHAT_EDIT_CHECK_FAILED: {e}"))?;
+        if exists == 0 {
+            return Err(format!(
+                "CHAT_EDIT_TURN_MISSING: 会话 {conv_id} 第 {turn_index} 轮没有提问记录"
+            ));
+        }
+        let tx = c
+            .unchecked_transaction()
+            .map_err(|e| format!("CHAT_EDIT_BEGIN_FAILED: {e}"))?;
+        tx.execute(
+            "DELETE FROM chat_messages
+              WHERE conv_id = ?1
+                AND (turn_index > ?2 OR (turn_index = ?2 AND role = ?3))",
+            rusqlite::params![conv_id, turn_index, ROLE_ASSISTANT],
+        )
+        .map_err(|e| format!("CHAT_EDIT_TRUNCATE_FAILED: {e}"))?;
+        tx.execute(
+            "DELETE FROM chat_feedback WHERE conv_id = ?1 AND turn_index >= ?2",
+            rusqlite::params![conv_id, turn_index],
+        )
+        .map_err(|e| format!("CHAT_EDIT_FEEDBACK_FAILED: {e}"))?;
+        tx.execute(
+            "INSERT INTO chat_messages (conv_id, turn_index, role, task_id, content, artifacts_json, ts_ms)
+             VALUES (?1, ?2, ?3, '', ?4, '[]', ?5)
+             ON CONFLICT(conv_id, turn_index, role) DO UPDATE SET
+                task_id = '',
+                content = excluded.content,
+                artifacts_json = '[]',
+                ts_ms = excluded.ts_ms",
+            rusqlite::params![conv_id, turn_index, ROLE_USER, content, ts_ms],
+        )
+        .map_err(|e| format!("CHAT_EDIT_SAVE_FAILED: {e}"))?;
+        tx.commit().map_err(|e| format!("CHAT_EDIT_COMMIT_FAILED: {e}"))
+    })
+}
+
 /// 按会话读取正文（轮次升序，同轮内 user 先于 assistant）
 pub fn list_by_conv(
     store: &Store,
@@ -521,6 +586,83 @@ mod tests {
         let rows = list_by_conv(&store, "conv-b", None).unwrap();
         assert_eq!(rows[1].content, "B 的第二版回复");
         assert_eq!(rows[1].feedback, FEEDBACK_UP);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_edit_turn_truncates_later_turns() {
+        let (store, dir) = temp_store("edit-truncate");
+        record_user_goal(&store, "conv-1", 0, "task-0", "首轮提问", 1000).unwrap();
+        record_assistant_reply(&store, "task-0", "首轮回复", "", &["a.md".into()], 2000).unwrap();
+        record_user_goal(&store, "conv-1", 1, "task-1", "第二轮提问", 3000).unwrap();
+        record_assistant_reply(&store, "task-1", "第二轮回复", "", &[], 4000).unwrap();
+        record_user_goal(&store, "conv-1", 2, "task-2", "第三轮提问", 5000).unwrap();
+        record_assistant_reply(&store, "task-2", "第三轮回复", "", &[], 6000).unwrap();
+        set_feedback(&store, "conv-1", 0, Some(FEEDBACK_UP), 7000).unwrap();
+        set_feedback(&store, "conv-1", 1, Some(FEEDBACK_DOWN), 7000).unwrap();
+        set_feedback(&store, "conv-1", 2, Some(FEEDBACK_DOWN), 7000).unwrap();
+
+        edit_turn(&store, "conv-1", 1, "第二轮改过的提问", 8000).unwrap();
+
+        let rows = list_by_conv(&store, "conv-1", None).unwrap();
+        // 第 0 轮原样保留（含交付物与评价）；第 1 轮只剩新提问；第 2 轮整轮作废
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.turn_index, r.role.as_str(), r.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "user", "首轮提问"),
+                (0, "assistant", "首轮回复"),
+                (1, "user", "第二轮改过的提问"),
+            ]
+        );
+        assert_eq!(rows[1].feedback, FEEDBACK_UP, "改后面的轮次不得动前面轮次的评价");
+        assert_eq!(rows[2].feedback, "", "本轮回复已作废，评价随之作废");
+        assert_eq!(rows[2].task_id, "", "改后的提问等新任务提交再回填任务 id");
+        // 会话摘要仍按首轮提问、轮次数量按现存轮次
+        let convs = list_conversations(&store, None).unwrap();
+        assert_eq!(convs[0].first_goal, "首轮提问");
+        assert_eq!(convs[0].turn_count, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_edit_turn_rejects_bad_input_and_missing_turn() {
+        let (store, dir) = temp_store("edit-bad");
+        record_user_goal(&store, "conv-1", 0, "task-0", "提问", 1000).unwrap();
+        let err = edit_turn(&store, "conv-1", 0, "   ", 2000).unwrap_err();
+        assert!(err.starts_with("CHAT_EDIT_EMPTY_CONTENT"), "实际错误：{err}");
+        let err = edit_turn(&store, "  ", 0, "新提问", 2000).unwrap_err();
+        assert!(err.starts_with("CHAT_EDIT_INVALID_CONV"), "实际错误：{err}");
+        let err = edit_turn(&store, "conv-1", -1, "新提问", 2000).unwrap_err();
+        assert!(err.starts_with("CHAT_EDIT_INVALID_TURN"), "实际错误：{err}");
+        // 没有这一轮的提问就拒绝，避免凭空造出一轮
+        let err = edit_turn(&store, "conv-1", 5, "新提问", 2000).unwrap_err();
+        assert!(err.starts_with("CHAT_EDIT_TURN_MISSING"), "实际错误：{err}");
+        // 失败不改动任何正文
+        let rows = list_by_conv(&store, "conv-1", None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].content, "提问");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_edit_turn_isolated_between_conversations() {
+        let (store, dir) = temp_store("edit-isolate");
+        record_user_goal(&store, "conv-a", 0, "task-a", "A 的提问", 1000).unwrap();
+        record_assistant_reply(&store, "task-a", "A 的回复", "", &[], 2000).unwrap();
+        record_user_goal(&store, "conv-b", 0, "task-b", "B 的提问", 3000).unwrap();
+        record_assistant_reply(&store, "task-b", "B 的回复", "", &[], 4000).unwrap();
+
+        edit_turn(&store, "conv-a", 0, "A 改过的提问", 5000).unwrap();
+
+        let a = list_by_conv(&store, "conv-a", None).unwrap();
+        assert_eq!(a.len(), 1, "同轮回复被作废，等重新执行");
+        assert_eq!(a[0].content, "A 改过的提问");
+        let b = list_by_conv(&store, "conv-b", None).unwrap();
+        assert_eq!(b.len(), 2, "别的会话不受影响");
+        assert_eq!(b[0].content, "B 的提问");
+        assert_eq!(b[1].content, "B 的回复");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

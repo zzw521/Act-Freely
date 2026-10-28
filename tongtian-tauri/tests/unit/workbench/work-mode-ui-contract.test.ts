@@ -149,7 +149,7 @@ describe('右侧画布接入', () => {
     expect(src).toContain("if (hasCanvas) {");
     expect(src).toContain("setTab('canvas');");
     expect(src).toContain("tab === 'canvas' && canvasLabel ? tr(canvasLabel) : tr('任务监控')");
-    expect(src).toContain('{tab === \'canvas\' && canvas ? (');
+    expect(src).toContain("tab === 'canvas' && canvas ? (");
   });
 
   it('待审阅时自动回到任务页，批准按钮不会被画布挡住', () => {

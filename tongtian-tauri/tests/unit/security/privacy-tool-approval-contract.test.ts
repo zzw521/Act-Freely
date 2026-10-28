@@ -106,9 +106,10 @@ describe('浏览器直连提交链路', () => {
     expect(body).toContain('piiOutboundMode: req.piiOutboundMode,');
   });
 
-  it('首次提交与重新生成都从设置读取，不在 store 里写死 off', () => {
+  it('首次提交、重新生成与改写提问都从设置读取，不在 store 里写死 off', () => {
     const src = workbenchStore();
-    expect(src.split('piiOutboundMode: settings?.piiOutboundMode,').length).toBe(3);
+    // 三条提交路径：新任务、重新生成、改写提问后重跑
+    expect(src.split('piiOutboundMode: settings?.piiOutboundMode,').length).toBe(4);
     const regen = src.split('regenerateTurn: async (')[1].split('resumeTask: async (')[0];
     expect(regen).toContain('const settings = await getSettings()');
     expect(regen).toContain('piiOutboundMode: settings?.piiOutboundMode,');

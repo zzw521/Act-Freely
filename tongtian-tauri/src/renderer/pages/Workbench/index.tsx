@@ -13,7 +13,6 @@ import { useSearchParams, useNavigate } from 'react-router-dom';
 import { Box, Chip, Snackbar, Alert, Tooltip, Typography, Dialog, DialogTitle, DialogContent, IconButton, Select, MenuItem } from '@mui/material';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import HourglassEmptyIcon from '@mui/icons-material/HourglassEmpty';
-import PauseCircleOutlineIcon from '@mui/icons-material/PauseCircleOutline';
 import CancelOutlinedIcon from '@mui/icons-material/CancelOutlined';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import OpenInNewIcon from '@mui/icons-material/OpenInNew';
@@ -27,6 +26,7 @@ import ViewSidebarIcon from '@mui/icons-material/ViewSidebar';
 import { useWorkbenchStore } from '../../store/workbenchStore';
 import { useAppSettings } from '../../lib/use-app-settings';
 import { useWorkMode } from '../../lib/use-work-mode';
+import { openArtifact } from '../../lib/artifact-open';
 import { MODE_CANVAS_LABELS } from '../../lib/mode-canvas';
 import { systemAPI } from '../../lib/api';
 import { isTauri } from '../../lib/tauri-api';
@@ -75,15 +75,6 @@ const StatusBadge: React.FC<{
   switch (taskStatus) {
     case TaskStatus.PENDING_REVIEW:
       return <Chip size="small" label={tr('待审阅')} sx={{ bgcolor: '#E0F2FE', color: '#0369A1', fontSize: '12px' }} />;
-    case TaskStatus.PAUSED:
-      return (
-        <Chip
-          size="small"
-          icon={<PauseCircleOutlineIcon sx={{ fontSize: 14 }} />}
-          label={tr('已暂停')}
-          sx={{ bgcolor: '#F3F4F6', color: 'var(--tt-text-3)', fontSize: '12px', '& .MuiChip-icon': { color: 'var(--tt-text-3)' } }}
-        />
-      );
     case TaskStatus.BUDGET_PAUSED:
       return <Chip size="small" label={tr('预算暂停')} sx={{ bgcolor: '#FEE2E2', color: '#B91C1C', fontSize: '12px' }} />;
     case TaskStatus.CANCELLED:
@@ -234,22 +225,30 @@ const WelcomeView: React.FC<{
     navigate(`/?prompt=${encodeURIComponent(prompt)}`);
   };
   return (
-    <Box sx={{ maxWidth: chatMaxWidth, mx: 'auto', mt: '4vh', px: 2 }}>
-      {/* 吉祥物 + 问候 */}
-      <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', mb: 3 }}>
-        <Box sx={{ mb: 1.25, mt: 0.5 }}>
-          <Panda state="idle" size={112} variant="full" ground ariaLabel={tr('通通')} />
-        </Box>
-        <Typography sx={{ fontSize: '26px', fontWeight: 700, color: 'var(--tt-text-1)', letterSpacing: '-0.01em' }}>
+    <Box sx={{ maxWidth: chatMaxWidth, mx: 'auto', mt: '8vh', px: 2 }}>
+      {/* 问候语：紧接其下是坐在输入卡上沿的吉祥物，中间不留整块空白 */}
+      <Box sx={{ textAlign: 'center' }}>
+        <Typography sx={{ fontSize: '28px', fontWeight: 700, color: 'var(--tt-text-1)', letterSpacing: '-0.01em' }}>
           {tr(getGreeting())}
           {nickname ? tr('，{name}', { name: nickname }) : ''}
         </Typography>
-        <Typography sx={{ fontSize: '15px', color: 'var(--tt-text-3)', mt: 0.75, mb: 3 }}>{tr('今天想让通通做什么？')}</Typography>
+        <Typography sx={{ fontSize: '14.5px', color: 'var(--tt-text-3)', mt: 0.75 }}>
+          {tr('今天想让通通做什么？')}
+        </Typography>
+      </Box>
 
-        {/* 输入框（紧跟问候区，设计图对齐） */}
-        <Box sx={{ width: '100%' }}>
-          <ChatInput onSend={onSend} loading={loading} stoppable={stoppable} onStop={onStop} initialText={initialText} workDir={workDir} onSelectWorkDir={onSelectWorkDir} />
-        </Box>
+      {/* 输入框：吉祥物探出问候语下方，只有下半身藏在输入卡里 */}
+      <Box sx={{ width: '100%', mt: '54px' }}>
+        <ChatInput
+          onSend={onSend}
+          loading={loading}
+          stoppable={stoppable}
+          onStop={onStop}
+          initialText={initialText}
+          workDir={workDir}
+          onSelectWorkDir={onSelectWorkDir}
+          mascot={<Panda state="idle" size={128} variant="full" ariaLabel={tr('通通')} />}
+        />
       </Box>
 
       {/* 推荐案例与任务模板只在「设计」模式出现；通用 / 幻灯片不展示 */}
@@ -487,6 +486,20 @@ const Workbench: React.FC = () => {
   // 右侧面板显隐：状态放在 app store，Ctrl + / 快捷键与头部按钮共用同一份
   const monitorOpen = useAppStore((s) => s.taskMonitorOpen);
   const setMonitorOpen = useAppStore((s) => s.setTaskMonitorOpen);
+  // 产物预览：路径放在工作台，消息流与右侧面板共用；点击产物展开面板并在面板内预览
+  const [artifactPreview, setArtifactPreview] = React.useState<string | null>(null);
+  const previewMode = (appSettings.previewMode as string) ?? '应用内预览';
+  const handleArtifactOpen = useCallback(
+    async (path: string) => {
+      const result = await openArtifact(path, previewMode);
+      if (result.error) showNotification(result.error, 'warning');
+      if (result.previewPath) {
+        setArtifactPreview(result.previewPath);
+        setMonitorOpen(true);
+      }
+    },
+    [previewMode, showNotification, setMonitorOpen],
+  );
   // 会话内查找条（Ctrl + F）：显隐由 store 提供，快捷键与查找条共用；高亮轮次由查找条回报
   const findBarOpen = useAppStore((s) => s.findBarOpen);
   const setFindBarOpen = useAppStore((s) => s.setFindBarOpen);
@@ -508,9 +521,9 @@ const Workbench: React.FC = () => {
     taskId,
     checkpoint,
     submitGoal,
+    editTurn,
     reviewPlan,
     resumeTask,
-    controlTask,
     cancelTask,
     loadHistory,
     clearError,
@@ -532,9 +545,9 @@ const Workbench: React.FC = () => {
       taskId: s.taskId,
       checkpoint: s.checkpoint,
       submitGoal: s.submitGoal,
+      editTurn: s.editTurn,
       reviewPlan: s.reviewPlan,
       resumeTask: s.resumeTask,
-      controlTask: s.controlTask,
       cancelTask: s.cancelTask,
       loadHistory: s.loadHistory,
       clearError: s.clearError,
@@ -564,6 +577,11 @@ const Workbench: React.FC = () => {
       setSearchParams(searchParams, { replace: true });
     }
   }, [searchParams, setSearchParams]);
+
+  // 切换会话时收起上一会话的产物预览，避免面板重开时还停在旧文件上
+  useEffect(() => {
+    setArtifactPreview(null);
+  }, [activeId]);
 
   const hasConversation = messages.length > 0 || events.length > 0 || isLoading;
 
@@ -602,23 +620,18 @@ const Workbench: React.FC = () => {
   const now = new Date();
   const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
 
-  // 控制按钮可见性（14 态）
-  const canPause = taskStatus === TaskStatus.EXECUTING;
-  const canResume = taskStatus === TaskStatus.PAUSED;
-  // 断点续跑：只看检查点收尾状态（失败/取消/中断后为 true），与 14 态里的「继续」互不影响
+  // 控制按钮可见性（14 态）：运行中只有输入框主按钮的「停止」，非运行态才显示「终止」
+  // 断点续跑：只看检查点收尾状态（失败/取消/中断后为 true），与任务是否运行无关
   const canResumeCheckpoint = Boolean(
     checkpoint?.resumable && taskId && checkpoint.taskId === taskId,
   ) && !isLoading;
-  const canCancel =
-    isLoading ||
-    [
-      TaskStatus.QUEUED,
-      TaskStatus.PLANNING,
-      TaskStatus.PENDING_REVIEW,
-      TaskStatus.EXECUTING,
-      TaskStatus.BUDGET_PAUSED,
-      TaskStatus.PAUSED,
-    ].includes(taskStatus as TaskStatus);
+  const canCancel = [
+    TaskStatus.QUEUED,
+    TaskStatus.PLANNING,
+    TaskStatus.PENDING_REVIEW,
+    TaskStatus.EXECUTING,
+    TaskStatus.BUDGET_PAUSED,
+  ].includes(taskStatus as TaskStatus);
   // 「运行中」以任务状态为准：引擎的 done 只代表一次事件流结束，
   // 计划流收尾后任务仍在待审阅/执行中，不能因为 plan 还挂着就一直显示停止键
   const runningTask =
@@ -645,10 +658,24 @@ const Workbench: React.FC = () => {
             borderBottom: '1px solid #F3F4F6',
           }}
         >
-          <Typography sx={{ fontSize: '15px', fontWeight: 600, color: 'var(--tt-text-1)' }}>{taskTitle}</Typography>
+          <Tooltip title={taskTitle}>
+            <Typography
+              sx={{
+                fontSize: '15px',
+                fontWeight: 600,
+                color: 'var(--tt-text-1)',
+                minWidth: 0,
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              }}
+            >
+              {taskTitle}
+            </Typography>
+          </Tooltip>
           <StatusBadge taskStatus={taskStatus} isLoading={isLoading} stepCount={steps.length} doneSteps={doneSteps} />
           {hasConversation && (
-            <Typography sx={{ fontSize: '12px', color: '#C0C4CA' }}>{timeStr}</Typography>
+            <Typography sx={{ fontSize: '12px', color: '#C0C4CA', display: { xs: 'none', lg: 'block' } }}>{timeStr}</Typography>
           )}
           <Box sx={{ flexGrow: 1 }} />
 
@@ -703,45 +730,7 @@ const Workbench: React.FC = () => {
             </Tooltip>
           )}
 
-          {/* 任务控制：暂停/继续/终止 */}
-          {canPause && (
-            <Tooltip title={tr('暂停任务')}>
-              <Box
-                component="button"
-                onClick={() => controlTask('pause')}
-                style={{
-                  border: '1px solid #FCD34D',
-                  background: '#FFFBEB',
-                  color: '#B45309',
-                  borderRadius: 999,
-                  fontSize: 12,
-                  padding: '3px 12px',
-                  cursor: 'pointer',
-                }}
-              >
-                {tr('暂停')}
-              </Box>
-            </Tooltip>
-          )}
-          {canResume && (
-            <Tooltip title={tr('继续执行')}>
-              <Box
-                component="button"
-                onClick={() => controlTask('resume')}
-                style={{
-                  border: '1px solid #6EE7B7',
-                  background: '#ECFDF5',
-                  color: '#047857',
-                  borderRadius: 999,
-                  fontSize: 12,
-                  padding: '3px 12px',
-                  cursor: 'pointer',
-                }}
-              >
-                {tr('继续')}
-              </Box>
-            </Tooltip>
-          )}
+          {/* 任务控制：只保留「终止」；运行中由输入框主按钮停止，不再提供暂停/继续 */}
           {canResumeCheckpoint && (
             <Tooltip
               title={
@@ -780,7 +769,7 @@ const Workbench: React.FC = () => {
               </Box>
             </Tooltip>
           )}
-          {/* 运行中由输入框主按钮停止；这里只兜住暂停/待审阅等非运行但可取消的状态 */}
+          {/* 运行中由输入框主按钮停止；这里只兜住待审阅/预算暂停等非运行但可取消的状态 */}
           {canCancel && !runningTask && (
             <Tooltip title={tr('取消任务')}>
               <Box
@@ -841,12 +830,15 @@ const Workbench: React.FC = () => {
                   isLoading={isLoading}
                   regeneratingTurn={regeneratingTurn}
                   onRegenerate={regenerateTurn}
+                  busy={runningTask}
+                  onEditTurn={(turnIdx, text) => void editTurn(turnIdx, text)}
                   feedback={feedbackByTurn}
                   onFeedback={async (turnIdx, kind) => {
                     if (!activeId) return;
                     await setTurnFeedback(activeId, turnIdx, kind);
                   }}
                   highlightTurn={highlightTurn}
+                  onArtifactOpen={(path) => void handleArtifactOpen(path)}
                 />
               </Box>
             ) : (
@@ -872,10 +864,16 @@ const Workbench: React.FC = () => {
           fileOps={fileOps}
           onReview={handlePlanReview}
           workDir={workDir}
-          onHide={() => setMonitorOpen(false)}
+          onHide={() => {
+            setMonitorOpen(false);
+            setArtifactPreview(null);
+          }}
           mode={activeMode}
           canvas={activeMode === 'general' ? undefined : <ModeCanvas mode={activeMode} fileOps={fileOps} />}
           canvasLabel={activeMode === 'general' ? undefined : tr(MODE_CANVAS_LABELS[activeMode])}
+          previewPath={artifactPreview}
+          onPreviewClose={() => setArtifactPreview(null)}
+          onArtifactOpen={(path) => void handleArtifactOpen(path)}
         />
       )}
 

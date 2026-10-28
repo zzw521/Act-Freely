@@ -9,7 +9,6 @@ import { IPC_CHANNELS } from '../../shared/contracts';
 import type {
   ChatSubmitReq,
   ChatReviewReq,
-  ChatControlReq,
   ChatEvent,
   CheckpointInfo,
   ModelConfig,
@@ -61,6 +60,7 @@ import type {
   ModelUsageView,
   SandboxEnvClearResult,
   SandboxEnvUsage,
+  SystemSandboxView,
   SkillInstallReq,
   SkillRootInfo,
   PluginTemplate,
@@ -97,11 +97,6 @@ export const chatAPI = {
   /** 审阅 Plan（approve → 执行流 / reject → done(REJECTED) / modify → 重新计划 / resume → 从检查点续跑） */
   review(taskId: string, req: ChatReviewReq): Promise<{ ok: boolean; status: string }> {
     return getAPI().chatReview(taskId, req.action, req.patch as unknown[]);
-  },
-
-  /** 控制任务（暂停 / 继续 / 回滚） */
-  control(req: ChatControlReq): Promise<{ ok: boolean; status: string }> {
-    return getAPI().chatControl(req);
   },
 
   /** 取消任务（转移 #3/#8/#19/#23/#28） */
@@ -623,6 +618,16 @@ export const sandboxAPI = {
   /** 清理工作环境文件，仅删除 workspaces/{id}/environment 内的条目 */
   envClear(): Promise<SandboxEnvClearResult> {
     return getAPI().invoke(IPC_CHANNELS.SANDBOX_ENV_CLEAR) as Promise<SandboxEnvClearResult>;
+  },
+
+  /** 系统级沙箱设置与真实生效状态（Windows AppContainer） */
+  systemGet(): Promise<SystemSandboxView> {
+    return getAPI().invoke(IPC_CHANNELS.SANDBOX_SYSTEM_GET) as Promise<SystemSandboxView>;
+  },
+
+  /** 保存系统级隔离：启用前会真实创建 AppContainer profile，失败即报错 */
+  systemSet(enabled: boolean, network: boolean): Promise<SystemSandboxView> {
+    return getAPI().invoke(IPC_CHANNELS.SANDBOX_SYSTEM_SET, { enabled, network }) as Promise<SystemSandboxView>;
   },
 };
 

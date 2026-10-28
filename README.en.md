@@ -1,7 +1,7 @@
 <div align="center">
   <img src="image/logo-square-1024.png" width="112" alt="Act-Freely" />
   <h1>Act-Freely</h1>
-  <p>A local-first AI office workbench — General / Design / Slides modes, from conversation to execution to deliverable</p>
+  <p>A local-first AI office workbench — General / Design / Slides default modes (Writing optional), from conversation to execution to deliverable</p>
   <p>English · <a href="README.md">简体中文</a></p>
 </div>
 
@@ -13,7 +13,7 @@ Act-Freely is an AI office workbench that runs on the desktop. It keeps a single
 
 What makes it different from a plain chat client:
 
-- **Deliverable-oriented**: tasks can produce real files — single-file HTML prototypes, `.xlsx` dashboards, `.docx` reports, `.pptx` decks — not just a paragraph of text.
+- **Deliverable-oriented**: tasks can produce real files — single-file HTML prototypes, `.pptx` decks and Markdown documents — not just a paragraph of text. `.xlsx` / `.docx` generation is not implemented yet and never faked by renaming a file.
 - **Local-first**: conversations, knowledge bases, memory and artifacts stay in local data directories by default; model keys go to the OS keychain and never into the repository.
 - **Inspectable execution surface**: terminal, browser, computer use and remote desktop run under explicit grants; high-risk actions require approval, and tool grants and hooks can be revoked at any time.
 
@@ -21,14 +21,14 @@ What makes it different from a plain chat client:
 
 ## Highlights
 
-- **Three work modes**: General, Design and Slides, each with its own canvas and artifact handling. Design mode ships 9 curated showcases and task templates (real cover images + directly runnable prompts); they are hidden in General and Slides.
+- **Three default work modes**: General, Design and Slides (Writing can be enabled in Settings), each with its own canvas and artifact handling. Design mode ships 9 curated showcases and task templates (real cover images + directly runnable prompts); they are hidden in General and Slides.
 - **Task execution and replay**: the agent streams plan / step / deliver events; SSE events carry a monotonic `seq` and support reconnection replay. Task monitor and canvas are paginated, and send/stop is a single button.
 - **Experts, skills and marketplace**: expert suites, skill packs and MCP connectors can be searched, downloaded and bookmarked from the online marketplace; installs are statically scanned for risk and publisher signatures can be verified.
 - **Knowledge, memory and awareness**: the local knowledge base supports ranking and title recall; `SOUL.md` / `WORK_MANUAL.md` / `USER_PROFILE.md` / `MEMORY.md` define collaboration style and long-term memory.
-- **Execution surface**: terminal (including ACP), browser use, computer use, remote desktop, scheduled tasks and hooks — all constrained by a sandbox.
+- **Execution surface**: terminal (including ACP), browser use, computer use, remote desktop, scheduled tasks and hooks — tool and file access are constrained by workspace sandbox policies. On Windows you can additionally turn on system isolation, which runs terminal, MCP stdio and ACP child processes inside an AppContainer so that out-of-bounds writes and data-root secret reads are refused by the OS; hooks and macOS / Linux remain inside the policy sandbox.
 - **Model hub**: multiple model profiles, per-task routing and failover, cost / latency ledger; zero-config detection of a local Ollama installation.
 - **Accounts and security**: loopback web-verified login, OS keychain for secrets, tool grants and approvals, privacy guard, static risk scanning.
-- **IM channels**: Slack, DingTalk, WeCom and Feishu long connections (real enterprise app credentials required).
+- **IM channels**: Slack, DingTalk, WeCom and Feishu long connections; validated only against local fake servers so far — real enterprise credentials and online behavior are unverified.
 - **Bilingual UI**: switch between 中文 and English in Settings; dates and copy follow the selected language.
 
 ## Architecture
@@ -78,11 +78,13 @@ What makes it different from a plain chat client:
 │   ├── app/                   # Routes, storage, auth and marketplace logic
 │   ├── tests/                 # End-to-end and unit tests
 │   └── init.sh                # Server setup and launch script
-├── docs/                      # Specs, change records, capability ledger, gap list
+├── docs/                      # PRD, defect & implementation plan, archive
 ├── image/                     # Brand assets
 ├── LICENSE / NOTICE
 └── README.md / README.en.md
 ```
+
+Docs start at [docs/README.md](docs/README.md): the current [PRD](docs/PRD-任我行.md) and [defect & implementation plan](docs/缺陷与实现计划-任我行.md); historical material is archived under `docs/archive/`.
 
 ## Getting started
 
@@ -206,8 +208,10 @@ This project is under active development. The following are not delivered capabi
 
 - **Service deployment**: engine + static frontend + token flow is verified locally; `deploy/Dockerfile`, real reverse proxies, TLS and public SSE long connections are unverified. See [tongtian-tauri/deploy/README.md](tongtian-tauri/deploy/README.md).
 - **IM channels**: Slack / DingTalk / WeCom / Feishu have only been verified against local fake servers; real enterprise credentials and production behavior are not accepted yet.
-- **Cross-platform**: the desktop app is primarily developed and verified on Windows; macOS / Linux builds, bundled Python and installers are unverified.
-- **Full gap list**: see the [capability ledger](docs/changes/project-gap-analysis/能力台账-2026-10-19.md) and [unimplemented list](docs/changes/project-gap-analysis/未实现清单-2026-10-20.md); this README does not duplicate them.
+- **Office artifacts**: HTML, PPTX and Markdown are generated as real files; `.xlsx` / `.docx` are not implemented and are never faked by renaming.
+- **Cross-platform**: the desktop app is primarily developed and verified on Windows; macOS / Linux builds, bundled Python and installers are unverified, and system-level isolation is Windows-only.
+- **System isolation**: covers terminal, MCP stdio and ACP child processes only; hooks still run with app privileges. With networking off, container processes cannot reach loopback or LAN either — reaching local services requires an administrator-configured loopback exemption.
+- **Full gap list**: see the status column in the [PRD](docs/PRD-任我行.md) and the [defect & implementation plan](docs/缺陷与实现计划-任我行.md); this README does not duplicate them.
 
 ## Security notes
 

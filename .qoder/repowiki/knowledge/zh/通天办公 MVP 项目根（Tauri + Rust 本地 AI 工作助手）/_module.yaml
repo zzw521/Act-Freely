@@ -1,9 +1,0 @@
-schema_version: 1
-module_path: ""
-title: 通天办公 MVP 项目根（Tauri + Rust 本地 AI 工作助手）
-scope:
-    - tongtian-office-mvp-design.md
-    - 通天办公-PRD.html
-source_files: []
-depends_on: []
-related_to: []

@@ -29,8 +29,14 @@ auth.db
 tongtian-tauri/sessions/
 tongtian-tauri/.tools/
 
-# Qoder hooks 的运行时审计日志
+# Qoder 本机配置与运行时产物（规则、技能、canvas、hooks 审计日志），不随仓库分发
+.qoder/
 .qoder/hooks/logs/
+
+# 仅本机参考的调研报告与 PRD（不随仓库分发）
+/tongtian-tauri/千问办公调研报告.html
+/通天办公-PRD.html
+
 
 # 根目录临时截图（验证产物放 .qoder/canvases/）
 /*.png
@@ -49,3 +55,4 @@ tongtian-tauri/src-tauri/vendor/
 
 # 图片生成中间产物（最终封面已压成 WebP 放在 src/renderer/assets/showcase/）
 vibe_images/
+image/

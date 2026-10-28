@@ -3,7 +3,7 @@
 > **文档版本**：v2.1
 > **更新日期**：2026-08-05
 > **负责人**：架构组
-> **关联 PRD**：`通天办公-PRD.html` v1.3（增强版）
+> **关联 PRD**：`通天办公-PRD.html` v1.3（增强版，本机资料，未入库）
 > **关联设计**：`tongtian-office-mvp-design.md` v2.1
 > **架构演进**：`docs/spec/spec-通天办公-qwenpaw-改造方案.md` v2.0（Electron → Tauri 架构演进方案）
 > **配套文档**：`spec-通天办公-云端与账号体系.md` v1.0、`spec-通天办公-占位能力清单.md` v1.0、`docs/changes/workbench-interaction/spec.md` v1.0

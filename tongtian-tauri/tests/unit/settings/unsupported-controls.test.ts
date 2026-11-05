@@ -156,7 +156,10 @@ describe('意识默认模板不再承诺自动写入', () => {
     const src = settings();
     expect(src).toContain('暂无记忆条目，可在下方手动新增');
     expect(src).toContain('onChange={(e) => patchCfg({ autoMemory: e.target.checked })}');
-    expect(src).toContain('任务成功后，把目标、结论与产物摘要写入 MEMORY.md');
+    expect(src).toContain('任务成功后，把目标、结论与产物摘要写入记忆库');
     expect(src).toContain('疑似凭据不写入，可在下方查看和删除');
+    // 记忆库按归属筛选，新增时可选择全局或当前项目
+    expect(src).toContain('全部');
+    expect(src).toContain('本项目');
   });
 });

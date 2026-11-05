@@ -259,7 +259,16 @@ describe('conversation-store：恢复组装', () => {
     expect(rows[0].content).toBe('ok');
     expect(store.toMessageRows({ not: 'array' })).toEqual([]);
     expect(store.toConversationRows([{ convId: 'c', firstGoal: '提问' }])).toEqual([
-      { convId: 'c', firstGoal: '提问', turnCount: 0, createdAtMs: 0, updatedAtMs: 0, lastTaskId: '' },
+      {
+        convId: 'c',
+        firstGoal: '提问',
+        turnCount: 0,
+        createdAtMs: 0,
+        updatedAtMs: 0,
+        lastTaskId: '',
+        // 旧库/旧通道没有 workspaceId：按迁移口径归到 default，不丢会话
+        workspaceId: 'default',
+      },
     ]);
   });
 });
@@ -572,7 +581,9 @@ describe('会话恢复接线：三条通道 + 提交/落库参数', () => {
   it('桌面通道映射到 Rust command，并转发会话键与轮次', () => {
     const src = read('renderer/lib/tauri-api.ts');
     expect(src).toContain("if (channel === 'chat:conversations') {");
-    expect(src).toContain("return invoke('chat_conversations', { limit: args[0] as number | undefined });");
+    expect(src).toContain("return invoke('chat_conversations', {");
+    expect(src).toContain('limit: args[0] as number | undefined,');
+    expect(src).toContain('workspaceId: (args[1] as string | undefined) || null,');
     expect(src).toContain("if (channel === 'chat:messages') {");
     expect(src).toContain("return invoke('chat_messages', {");
     expect(src).toContain('conversationId: args[0] as string,');

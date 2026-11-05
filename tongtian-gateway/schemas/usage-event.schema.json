@@ -1,0 +1,226 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "contractVersion": {
+      "default": "gateway-contract.v1",
+      "title": "Contractversion",
+      "type": "string"
+    },
+    "gatewayId": {
+      "title": "Gatewayid",
+      "type": "string"
+    },
+    "requestId": {
+      "title": "Requestid",
+      "type": "string"
+    },
+    "tenantId": {
+      "title": "Tenantid",
+      "type": "string"
+    },
+    "departmentId": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Departmentid"
+    },
+    "userId": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Userid"
+    },
+    "apiKeyId": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Apikeyid"
+    },
+    "projectId": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Projectid"
+    },
+    "origin": {
+      "default": "gateway",
+      "enum": [
+        "gateway",
+        "engine",
+        "desktop"
+      ],
+      "title": "Origin",
+      "type": "string"
+    },
+    "protocol": {
+      "enum": [
+        "openai",
+        "anthropic",
+        "gemini"
+      ],
+      "title": "Protocol",
+      "type": "string"
+    },
+    "endpoint": {
+      "title": "Endpoint",
+      "type": "string"
+    },
+    "modelAlias": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Modelalias"
+    },
+    "model": {
+      "title": "Model",
+      "type": "string"
+    },
+    "provider": {
+      "title": "Provider",
+      "type": "string"
+    },
+    "promptTokens": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Prompttokens",
+      "type": "integer"
+    },
+    "completionTokens": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Completiontokens",
+      "type": "integer"
+    },
+    "cachedTokens": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Cachedtokens",
+      "type": "integer"
+    },
+    "reasoningTokens": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Reasoningtokens",
+      "type": "integer"
+    },
+    "totalTokens": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Totaltokens",
+      "type": "integer"
+    },
+    "cost": {
+      "default": "0",
+      "title": "Cost",
+      "type": "string"
+    },
+    "currency": {
+      "default": "USD",
+      "title": "Currency",
+      "type": "string"
+    },
+    "priceVersion": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Priceversion"
+    },
+    "latencyMs": {
+      "minimum": 0,
+      "title": "Latencyms",
+      "type": "integer"
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "error",
+        "cancelled"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "errorCode": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Errorcode"
+    },
+    "stream": {
+      "default": false,
+      "title": "Stream",
+      "type": "boolean"
+    },
+    "estimated": {
+      "default": false,
+      "title": "Estimated",
+      "type": "boolean"
+    },
+    "startedAt": {
+      "title": "Startedat",
+      "type": "integer"
+    },
+    "finishedAt": {
+      "title": "Finishedat",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "gatewayId",
+    "requestId",
+    "tenantId",
+    "protocol",
+    "endpoint",
+    "model",
+    "provider",
+    "latencyMs",
+    "status",
+    "startedAt",
+    "finishedAt"
+  ],
+  "title": "UsageEvent",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tongtian.local/schemas/usage-event.schema.json"
+}

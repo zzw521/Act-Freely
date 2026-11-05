@@ -1,0 +1,400 @@
+{
+  "$defs": {
+    "ByokPolicy": {
+      "properties": {
+        "allowed": {
+          "default": true,
+          "title": "Allowed",
+          "type": "boolean"
+        },
+        "hardQuota": {
+          "default": false,
+          "title": "Hardquota",
+          "type": "boolean"
+        }
+      },
+      "title": "ByokPolicy",
+      "type": "object"
+    },
+    "DepartmentPolicy": {
+      "properties": {
+        "allowedModels": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Allowedmodels"
+        },
+        "quota": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QuotaDefaults"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "byokAllowed": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Byokallowed"
+        }
+      },
+      "title": "DepartmentPolicy",
+      "type": "object"
+    },
+    "GatewayEndpoint": {
+      "properties": {
+        "url": {
+          "title": "Url",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "title": "GatewayEndpoint",
+      "type": "object"
+    },
+    "ModelPolicy": {
+      "additionalProperties": true,
+      "properties": {
+        "provider": {
+          "title": "Provider",
+          "type": "string"
+        },
+        "upstreamModel": {
+          "title": "Upstreammodel",
+          "type": "string"
+        },
+        "capabilities": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Capabilities",
+          "type": "array"
+        },
+        "contextWindow": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Contextwindow"
+        },
+        "maxOutputTokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maxoutputtokens"
+        },
+        "priceVersion": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Priceversion"
+        },
+        "pricing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelPricing"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "provider",
+        "upstreamModel"
+      ],
+      "title": "ModelPolicy",
+      "type": "object"
+    },
+    "ModelPricing": {
+      "additionalProperties": false,
+      "properties": {
+        "currency": {
+          "pattern": "^[A-Z]{3}$",
+          "title": "Currency",
+          "type": "string"
+        },
+        "inputPer1M": {
+          "pattern": "^(0|[1-9]\\d*)(\\.\\d{1,8})?$",
+          "title": "Inputper1M",
+          "type": "string"
+        },
+        "outputPer1M": {
+          "pattern": "^(0|[1-9]\\d*)(\\.\\d{1,8})?$",
+          "title": "Outputper1M",
+          "type": "string"
+        },
+        "cachedInputPer1M": {
+          "anyOf": [
+            {
+              "pattern": "^(0|[1-9]\\d*)(\\.\\d{1,8})?$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cachedinputper1M"
+        },
+        "reasoningAsOutput": {
+          "default": true,
+          "title": "Reasoningasoutput",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "currency",
+        "inputPer1M",
+        "outputPer1M"
+      ],
+      "title": "ModelPricing",
+      "type": "object"
+    },
+    "QuotaDefaults": {
+      "properties": {
+        "monthlyTokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Monthlytokens"
+        },
+        "concurrency": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Concurrency"
+        },
+        "rpm": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rpm"
+        },
+        "tpm": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tpm"
+        },
+        "maxOutputTokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maxoutputtokens"
+        }
+      },
+      "title": "QuotaDefaults",
+      "type": "object"
+    },
+    "RoutePolicy": {
+      "properties": {
+        "chain": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Chain",
+          "type": "array"
+        },
+        "fallbackAllowed": {
+          "default": true,
+          "title": "Fallbackallowed",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "chain"
+      ],
+      "title": "RoutePolicy",
+      "type": "object"
+    }
+  },
+  "additionalProperties": true,
+  "properties": {
+    "contractVersion": {
+      "title": "Contractversion",
+      "type": "string"
+    },
+    "policyVersion": {
+      "title": "Policyversion",
+      "type": "string"
+    },
+    "version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Version"
+    },
+    "tenant": {
+      "title": "Tenant",
+      "type": "string"
+    },
+    "gateway": {
+      "$ref": "#/$defs/GatewayEndpoint"
+    },
+    "noLog": {
+      "default": true,
+      "title": "Nolog",
+      "type": "boolean"
+    },
+    "embeddingRoute": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Embeddingroute"
+    },
+    "byok": {
+      "$ref": "#/$defs/ByokPolicy"
+    },
+    "models": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ModelPolicy"
+      },
+      "title": "Models",
+      "type": "object"
+    },
+    "routes": {
+      "additionalProperties": {
+        "$ref": "#/$defs/RoutePolicy"
+      },
+      "title": "Routes",
+      "type": "object"
+    },
+    "allowedModels": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Allowedmodels",
+      "type": "array"
+    },
+    "quotaDefaults": {
+      "$ref": "#/$defs/QuotaDefaults"
+    },
+    "departments": {
+      "additionalProperties": {
+        "$ref": "#/$defs/DepartmentPolicy"
+      },
+      "title": "Departments",
+      "type": "object"
+    },
+    "issuedAt": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Issuedat"
+    },
+    "expiresAt": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Expiresat"
+    }
+  },
+  "required": [
+    "contractVersion",
+    "policyVersion",
+    "tenant",
+    "gateway",
+    "models",
+    "routes",
+    "allowedModels"
+  ],
+  "title": "PolicyDocument",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tongtian.local/schemas/policy.schema.json"
+}

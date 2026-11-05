@@ -27,6 +27,7 @@ const page = () => read('../../../src/renderer/pages/HooksManager/index.tsx');
 const rustMod = () => read('../../../src-tauri/src/align/mod.rs');
 const rustHooks = () => read('../../../src-tauri/src/align/hooks.rs');
 const rustGate = () => read('../../../src-tauri/src/bridge/hook_gate.rs');
+const sandboxMod = () => read('../../../src-tauri/src/sandbox/mod.rs');
 const rustLib = () => read('../../../src-tauri/src/lib.rs');
 const engineRuntime = () => read('../../../engine/hooks_runtime.py');
 const engineServer = () => read('../../../engine/server.py');
@@ -80,11 +81,33 @@ describe('执行权归属：shell 只在 Rust 网关，引擎只发事件', () =
     expect(src).toContain('x-tt-hook-token');
   });
 
-  it('放行的命令与「试运行」共用同一个 run_command（不允许各写一套执行逻辑）', () => {
+  it('放行的命令与「试运行」共用同一条执行路径（run_command → build_spawn，不允许各写一套）', () => {
     const src = rustHooks();
-    expect(src.split('pub fn run_command')[1].split('\n}\n')[0]).toContain('Command::new');
+    expect(src.split('pub fn run_command')[1].split('\n}\n')[0]).toContain(
+      'build_spawn(&shell_cmd',
+    );
+    const spawn = src.split('fn build_spawn')[1].split('\n}\n')[0];
+    expect(spawn).toContain('sandbox_wrap(shell_cmd, cwd)');
+    expect(spawn).toContain('Command::new');
     expect(rustMod()).toContain('hooks::run_command');
     expect(rustGate()).toContain('hooks::fire');
+  });
+
+  it('系统隔离生效时 Hook 只有套壳一条路：拆不出 argv 就拒绝，不回落裸跑', () => {
+    const src = rustHooks();
+    const wrap = src.split('fn sandbox_wrap')[1].split('\n}\n')[0];
+    expect(wrap).toContain('crate::sandbox::active()');
+    expect(wrap).toContain('wrap_for_spawn_extra');
+    // 未启用隔离才走 shell；启用后拆不出来必须报错（fail-closed），不能返回 None 让 cmd 接管
+    expect(wrap).toContain('return Ok(None)');
+    expect(wrap).toContain('split_argv(shell_cmd)?');
+    for (const code of ['HOOK_SANDBOX_SHELL_REQUIRED', 'HOOK_SANDBOX_UNBALANCED_QUOTE']) {
+      expect(src, `拆分失败要有可定位的中文错误码 ${code}`).toContain(code);
+    }
+    // 只读授权范围：命令行里的文件参数 + 事件 cwd，不含工作区写权限
+    const dirs = src.split('fn read_dirs_of')[1].split('\n}\n')[0];
+    expect(dirs).toContain('path.is_file()');
+    expect(dirs).toContain('dir.is_dir()');
   });
 
   it('网关只绑回环、校验 token、只认 POST /hook，且在 Tauri 异步运行时里起循环', () => {
@@ -186,5 +209,19 @@ describe('页面诚实口径', () => {
     expect(src).toContain('试运行会立即在本机执行该命令');
     expect(src).toContain('真实任务不会执行');
     expect(src).toContain('未放行：配置已保存，但真实任务不会执行该命令');
+  });
+
+  it('隔离口径三处一致：Rust 概览给事实、本地通道恒为 false、页面据此说明限制', () => {
+    const rust = rustHooks();
+    expect(rust.split('fn runtime_summary')[1]).toContain('"sandboxed"');
+    // 概览与套壳用的是同一个判定，页面才不会显示与执行相反的状态
+    expect(rust).toContain('crate::sandbox::platform_supported() && crate::sandbox::active().is_some()');
+    expect(rust.split('fn sandbox_wrap')[1]).toContain('crate::sandbox::platform_supported()');
+    expect(sandboxMod()).toContain('pub fn wrap_for_spawn_extra');
+    const local = localApi();
+    expect(local).toContain('sandboxed: false');
+    const src = page();
+    expect(src).toContain('status.sandboxed');
+    expect(src).toContain('程序 + 参数');
   });
 });

@@ -1,6 +1,6 @@
 """平台层配置与开关（单用户本地运行，不读数据库）
 
-配置根：`TT_PLATFORM_HOME`，缺省为 `{TT_DATA_HOME|~/.tongtianwork}/agent-platform`。
+配置根：`TT_PLATFORM_HOME`，缺省为 `{引擎数据根}/agent-platform`（数据根见 `data_paths.py`）。
 目录约定：
 
     agent-platform/
@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from data_paths import engine_home
+
 TRUTHY = {"1", "true", "yes", "on"}
 
 DEFAULT_SKILL = "general"
@@ -35,13 +37,11 @@ class ConfigError(Exception):
 
 
 def data_home() -> Path:
-    """平台数据根；`TT_PLATFORM_HOME` 优先，其次跟随引擎的 `TT_DATA_HOME`。"""
+    """平台数据根；`TT_PLATFORM_HOME` 优先，其次跟随引擎数据根（`data_paths`）。"""
     explicit = str(os.environ.get("TT_PLATFORM_HOME") or "").strip()
     if explicit:
         return Path(explicit).expanduser()
-    base = str(os.environ.get("TT_DATA_HOME") or "").strip()
-    root = Path(base).expanduser() if base else (Path.home() / ".tongtianwork")
-    return root / "agent-platform"
+    return engine_home() / "agent-platform"
 
 
 def bundled_dir() -> Path:

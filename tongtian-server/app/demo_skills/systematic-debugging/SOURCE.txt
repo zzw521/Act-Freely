@@ -1,0 +1,7 @@
+来源仓库：obra/superpowers（MIT License，见随包 LICENSE.txt）
+上游路径：skills/systematic-debugging/SKILL.md（含同目录 references/ 等配套文件）
+上游提交：2ce8aa15d05bd57213e6f746f953aafb7ded7a8b
+条目页：https://skills.sh/obra/superpowers/systematic-debugging
+获取时间：2026-11-02
+说明：本目录是通天办公市场演示数据，整目录镜像上游、未作改写；
+      市场卡片上的中文摘要与分类由服务端发布参数提供，不属于上游内容。

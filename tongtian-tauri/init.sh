@@ -24,7 +24,17 @@ else
 fi
 
 # 引擎与 Auth 服务的 Python 依赖（缺失才装，保持幂等）
-PY=$(command -v python3 || command -v python || true)
+# 优先项目内 .venv：系统 Python 可能被别的应用占着（本机 QwenPaw 钉死 agentscope==1.0.18）。
+# PATH 也要前置：Rust bridge 是按 PATH 里的 python 去拉引擎进程的。
+if [ -x ".venv/Scripts/python.exe" ]; then
+  PY=".venv/Scripts/python.exe"
+  export PATH="$(pwd)/.venv/Scripts:$PATH"
+elif [ -x ".venv/bin/python" ]; then
+  PY=".venv/bin/python"
+  export PATH="$(pwd)/.venv/bin:$PATH"
+else
+  PY=$(command -v python3 || command -v python || true)
+fi
 if [ -n "$PY" ]; then
   if "$PY" -c "import fastapi, uvicorn, agentscope" 2>/dev/null; then
     echo "  ✓ Python 引擎依赖已满足，跳过安装"

@@ -100,12 +100,13 @@ export const SKILL_SOURCE_META: Record<
   {
     label: string;
     blockLabel: string;
+    /** 柔和底：跟着皮肤翻的 chip 档，配 fg/deep 的文字档成对达标 */
     bg: string;
-    activeBg: string;
     border: string;
     activeBorder: string;
+    /** 文字与图标色（语义档） */
     fg: string;
-    /** 图标底色（实心） */
+    /** 图标底色（实心，白字专用 fill 档） */
     solid: string;
     /** 引用块内文字色 */
     deep: string;
@@ -114,34 +115,31 @@ export const SKILL_SOURCE_META: Record<
   builtin: {
     label: '内置',
     blockLabel: '内置技能',
-    bg: '#E7F8EF',
-    activeBg: '#C7EFDC',
+    bg: 'var(--tt-chip-success)',
     border: 'rgba(16, 185, 129, 0.28)',
     activeBorder: 'rgba(16, 185, 129, 0.55)',
-    fg: '#059669',
-    solid: '#10B981',
-    deep: '#047857',
+    fg: 'var(--tt-success)',
+    solid: 'var(--tt-teal-fill)',
+    deep: 'var(--tt-success)',
   },
   installed: {
     label: '已安装',
     blockLabel: '已安装技能',
-    bg: '#F1EBFF',
-    activeBg: '#E2D5FB',
+    bg: 'var(--tt-chip-accent)',
     border: 'rgba(139, 92, 246, 0.28)',
     activeBorder: 'rgba(139, 92, 246, 0.55)',
-    fg: '#8B5CF6',
-    solid: '#8B5CF6',
-    deep: '#6D28D9',
+    fg: 'var(--tt-accent-violet)',
+    solid: 'var(--tt-accent-fill)',
+    deep: 'var(--tt-accent-violet)',
   },
   suite: {
     label: '套件指令',
     blockLabel: '专家套件指令',
-    bg: '#FFF3E0',
-    activeBg: '#FFE3C2',
+    bg: 'var(--tt-chip-warning)',
     border: 'rgba(245, 158, 11, 0.32)',
     activeBorder: 'rgba(245, 158, 11, 0.6)',
-    fg: '#B45309',
-    solid: '#F59E0B',
-    deep: '#B45309',
+    fg: 'var(--tt-warning)',
+    solid: 'var(--tt-warning-fill)',
+    deep: 'var(--tt-warning)',
   },
 };

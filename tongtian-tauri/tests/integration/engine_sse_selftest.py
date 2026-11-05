@@ -176,11 +176,42 @@ def check_usage_tracking(client) -> None:
         print(f"[SKIP] 用量采集检查（agentscope 缺失: {exc}）")
         return
 
+    # 台账是落盘的（追加式增量日志，重启后重放）。自测若共用真实数据目录，
+    # 第二遍跑就会在上一遍的数字上继续累加，「calls == 1」这类断言必然假失败。
+    # 这里把台账换成临时文件，跑完再换回去。
+    import os
+    import tempfile
+
+    original_ledger = engine_server.USAGE_LEDGER
+    original_persist = os.environ.get("TT_ENGINE_USAGE_PERSIST")
+    os.environ["TT_ENGINE_USAGE_PERSIST"] = "0"
+    temp_log = engine_server.us.UsageDeltaLog()
+    temp_log.path = lambda: Path(tempfile.gettempdir()) / "tt-selftest-usage.jsonl"
+    engine_server.USAGE_LEDGER = engine_server.UsageLedger(log=temp_log)
+    try:
+        _run_usage_checks(client)
+    finally:
+        engine_server.USAGE_LEDGER = original_ledger
+        if original_persist is None:
+            os.environ.pop("TT_ENGINE_USAGE_PERSIST", None)
+        else:
+            os.environ["TT_ENGINE_USAGE_PERSIST"] = original_persist
+        Path(tempfile.gettempdir(), "tt-selftest-usage.jsonl").unlink(missing_ok=True)
+
+
+def _run_usage_checks(client) -> None:
+    """真正的用量断言体（在隔离过的临时台账文件里跑，重复执行结果一致）"""
+    import asyncio
+
+    from agentscope.formatter import DashScopeChatFormatter
+    from agentscope.message import Msg
+    from agentscope.model import ChatModelBase, ChatResponse
+    from agentscope.model._model_usage import ChatUsage
+
     class FakeModel(ChatModelBase):
         """固定返回一段文本 + 真实形状 usage 的假模型（一次调用即收尾）"""
 
-        def __init__(self, name: str = "fake-qwen", stream: bool = False):
-            super().__init__(model_name=name, stream=stream)
+        def __init__(self, name: str = "fake-qwen", stream: bool = False):            super().__init__(model_name=name, stream=stream)
 
         async def __call__(self, *args, **kwargs):
             if self.stream:
@@ -210,7 +241,8 @@ def check_usage_tracking(client) -> None:
     try:
         agent = engine_server.build_agent(
             "fake-qwen", Path(engine_server.WORK_DIR), None,
-            on_usage=lambda p, c, m: captured.append((p, c, m)),
+            # 引擎当前回调签名带 latency/cost/currency/priced，测试只关心前三个
+            on_usage=lambda p, c, m, *rest: captured.append((p, c, m)),
         )
         res = asyncio.run(agent(Msg(name="user", content="写一份周报", role="user")))
     finally:
@@ -226,8 +258,13 @@ def check_usage_tracking(client) -> None:
           and row["completionTokens"] == 7 and row["calls"] == 1, str(row))
 
     # 流式：usage 只在末尾 chunk，须恰好记一次（不得按 chunk 重复累计）
+    stream_seen: list = []
+
     async def drain_stream():
-        m = engine_server.UsageTrackingModel(FakeModel("fake-stream", stream=True))
+        m = engine_server.UsageTrackingModel(
+            FakeModel("fake-stream", stream=True),
+            on_usage=lambda *args: stream_seen.append(args),
+        )
         return [c async for c in await m([])]
 
     chunks = asyncio.run(drain_stream())
@@ -236,6 +273,76 @@ def check_usage_tracking(client) -> None:
           len(chunks) == 3 and srow is not None and srow["calls"] == 1
           and srow["promptTokens"] == 5 and srow["completionTokens"] == 3,
           f"chunks={len(chunks)} row={srow}")
+    # 首包（D-40 第 6 项）：回调第 8 个参数 = 第一个有内容增量的耗时。
+    # 基准要拿它与 Rust harness 的首包对比，缺这一列就只能报整包。
+    first_call = stream_seen[0] if stream_seen else ()
+    check("流式回调带得出首包耗时（第 8 个参数）",
+          len(first_call) == 8 and isinstance(first_call[7], int)
+          and first_call[3] is not None and first_call[7] <= first_call[3],
+          str(stream_seen)[:200])
+    # 只有 usage、没有正文的收尾包不许算成首包
+    quiet: list = []
+
+    async def drain_usage_only():
+        class LateContent(FakeModel):
+            async def __call__(self, *args, **kwargs):
+                async def gen():
+                    yield ChatResponse(content=[], usage=ChatUsage(
+                        input_tokens=4, output_tokens=1, time=0.1))
+                    yield ChatResponse(content=[{"type": "text", "text": "字"}], usage=None)
+                return gen()
+
+        m = engine_server.UsageTrackingModel(
+            LateContent("fake-quiet", stream=True),
+            on_usage=lambda *args: quiet.append(args),
+        )
+        return [c async for c in await m([])]
+
+    asyncio.run(drain_usage_only())
+    check("空内容的 usage 包不算首包（首包 ≤ 整包且取自真有正文的那一条）",
+          bool(quiet) and len(quiet[0]) == 8 and quiet[0][7] is not None
+          and quiet[0][7] <= quiet[0][3], str(quiet)[:200])
+
+    # 压缩摘要走结构化输出：模型没回 metadata 时 AgentScope 只留一条日志就继续跑，
+    # 包装层必须把「这轮其实没压成」记下来，界面才敢说，也才不会每轮白烧一次摘要调用
+    class StructuredModel(FakeModel):
+        def __init__(self, name: str, metadata):
+            super().__init__(name, stream=True)
+            self._metadata = metadata
+
+        async def __call__(self, *args, **kwargs):
+            async def gen():
+                yield ChatResponse(
+                    content=[{"type": "text", "text": "摘要"}],
+                    metadata=self._metadata,
+                    usage=ChatUsage(input_tokens=9, output_tokens=2, time=0.1),
+                )
+            return gen()
+
+    async def drain_structured(model):
+        m = engine_server.UsageTrackingModel(model)
+        # 压缩调用的形状：带 structured_model、不带 tools；生成器消费完才定性
+        chunks = [c async for c in await m([], structured_model=object())]
+        return m.last_structured_ok, len(chunks)
+
+    ok_meta = asyncio.run(drain_structured(StructuredModel("fake-struct-ok", {"task_overview": "基准"})))
+    bad_meta = asyncio.run(drain_structured(StructuredModel("fake-struct-bad", None)))
+    check("结构化输出拿到摘要时记 True", ok_meta[0] is True, str(ok_meta))
+    check("结构化输出空返回时记 False（压缩静默失败要能被上层看见）",
+          bad_meta[0] is False, str(bad_meta))
+
+    async def drain_plain():
+        m = engine_server.UsageTrackingModel(FakeModel("fake-plain", stream=True))
+        [c async for c in await m([])]           # 不带 structured_model 的普通调用
+        return m.last_structured_ok
+
+    check("普通调用不改写结构化结论（保持 None，不误判成压缩失败）",
+          asyncio.run(drain_plain()) is None, "")
+    trackers = engine_server._usage_trackers(
+        engine_server.RoutingChatModel([
+            engine_server.UsageTrackingModel(FakeModel("fake-inner"))
+        ]))
+    check("能从路由/包装层里找到用量包装层", len(trackers) == 1, str(trackers))
 
     # 只读端点：daily 只含今日台账；非法 period 降级 total 不报错
     body = client.get("/api/usage?period=daily").json()
@@ -245,7 +352,7 @@ def check_usage_tracking(client) -> None:
     bad = client.get("/api/usage?period=hourly").json()
     check("/api/usage 非法 period 降级 total", bad.get("period") == "total", str(bad)[:120])
 
-    # 清掉自测产生的台账行（内存态，无持久化副作用）
+    # 自测产生的台账行只活在临时文件里；这里再清一次内存态，避免同进程后续检查读到
     engine_server.USAGE_LEDGER.rows.clear()
 
 

@@ -6,7 +6,7 @@
  * - MainLayout 作为根路由
  * - 千问对标整改新增: /connectors /hooks /im /archive /awareness
  * - Octop 对标新增: /browser-use（受控浏览器会话，现并入设置「执行能力」）
- * - 执行能力（浏览器 AI+/终端 AI+/电脑操控/远程桌面）收进设置分区，旧路由保留重定向
+ * - 执行能力（浏览器 AI+/终端 AI+/电脑操控/本机画面）收进设置分区，旧路由保留重定向
  * - 专家团队并入专家套件页（?tab=experts），不再单独占导航位
  *
  * 注意：Suspense 边界下沉到 MainLayout 内容区（仅包裹 Outlet），
@@ -35,6 +35,8 @@ const HooksManager = lazy(() => import('./pages/HooksManager'));
 const IMChannel = lazy(() => import('./pages/IMChannel'));
 const ArchiveView = lazy(() => import('./pages/ArchiveView'));
 const Collaboration = lazy(() => import('./pages/Collaboration'));
+const SuperAgent = lazy(() => import('./pages/SuperAgent'));
+const AgentTickets = lazy(() => import('./pages/AgentTickets'));
 
 // ── App 组件 ──────────────────────────────────────────────────────────
 
@@ -70,6 +72,10 @@ const App: React.FC = () => {
           <Route path="/archive" element={<ArchiveView />} />
           {/* 跨用户/跨机器项目协作（桌面端 Rust → 账号服务） */}
           <Route path="/collaboration" element={<Collaboration />} />
+          {/* Super-agent 主动候选（缺陷 D-46 · 影子模式：只记账与研判，零自动执行） */}
+          <Route path="/superagent" element={<SuperAgent />} />
+          {/* 工单层（缺陷 D-47.5）：等你的工单——跨项目，人只在这页回答/验收/改授权/叫停 */}
+          <Route path="/tickets" element={<AgentTickets />} />
         </Route>
       </Routes>
       {/* 服务化模式：引擎返回 401 时输入令牌（仅网页通道，桌面版不会触发） */}

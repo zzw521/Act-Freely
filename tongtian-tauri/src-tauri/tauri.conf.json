@@ -11,19 +11,8 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [
-      {
-        "title": "任我行",
-        "width": 1280,
-        "height": 800,
-        "minWidth": 960,
-        "minHeight": 640,
-        "resizable": true,
-        "center": true
-      }
-    ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:* ipc: http://ipc.localhost; worker-src 'self' blob:"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:* ipc: http://ipc.localhost; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
     }
   },
   "bundle": {
@@ -32,9 +21,11 @@
     "publisher": "北京通天云计算有限公司",
     "copyright": "© 2026 北京通天云计算有限公司",
     "resources": {
-      "../engine": "engine",
+      "staged-engine": "engine",
       "../scripts/mock-agent.py": "scripts/mock-agent.py",
-      "../vendor/python": "python"
+      "../vendor/python": "python",
+      "../../LICENSE": "LICENSE",
+      "../../NOTICE": "NOTICE"
     },
     "icon": [
       "icons/32x32.png",
@@ -43,9 +34,22 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "licenseFile": "../../EULA.zh-CN.rtf",
     "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      },
       "wix": {
-        "language": "zh-CN"
+        "language": "zh-CN",
+        "upgradeCode": "0199CC21-8388-4FDD-967C-D87D4011171F"
+      },
+      "nsis": {
+        "languages": ["SimpChinese"],
+        "displayLanguageSelector": false,
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico"
       }
     },
     "useLocalToolsDir": true

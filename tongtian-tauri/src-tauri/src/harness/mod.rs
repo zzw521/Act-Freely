@@ -7,8 +7,10 @@
 
 pub mod checkpoint;
 pub mod clock;
+pub mod compress;
 pub mod model;
 pub mod prompt;
+pub mod provider;
 pub mod runner;
 pub mod tools;
 
@@ -38,6 +40,9 @@ pub struct Slot {
 
 pub struct SlotInner {
     pub model_config: Value,
+    /// 同一会话上一轮用的模型画像（仅 id/名称/窗口，不含密钥）。
+    /// 用来在换模型时给出可见说明：历史带没带过来、窗口变了多少。
+    pub prev_model: Option<Value>,
     pub runtime: Value,
     pub history: Vec<Value>,
     pub attachments: Vec<Value>,
@@ -66,6 +71,7 @@ impl Slot {
             cancelled: AtomicBool::new(false),
             inner: Mutex::new(SlotInner {
                 model_config,
+                prev_model: None,
                 runtime,
                 history,
                 attachments,
@@ -74,6 +80,13 @@ impl Slot {
                 checkpoint: Checkpoint::new(task_id),
             }),
         })
+    }
+
+    /// 记下同一会话上一轮用的模型：换模型时执行面要能说出「历史仍带着」这句话。
+    pub fn set_previous_model(&self, cfg: Value) {
+        if cfg.is_object() {
+            self.update(|inner| inner.prev_model = Some(cfg));
+        }
     }
 
     pub fn cancel(&self) {
@@ -93,6 +106,7 @@ impl Slot {
             mode: self.mode.clone(),
             work_dir: self.work_dir.clone(),
             model_config: inner.model_config.clone(),
+            prev_model: inner.prev_model.clone(),
             runtime: inner.runtime.clone(),
             history: inner.history.clone(),
             attachments: inner.attachments.clone(),
@@ -114,6 +128,8 @@ pub struct Snapshot {
     pub mode: String,
     pub work_dir: PathBuf,
     pub model_config: Value,
+    /// 上一轮的模型画像（换模型说明用，可能为 None：首轮或旧版检查点）
+    pub prev_model: Option<Value>,
     pub runtime: Value,
     pub history: Vec<Value>,
     pub attachments: Vec<Value>,
@@ -354,8 +370,30 @@ mod tests {
     }
 
     #[test]
-    fn hub_cancel_and_remove() {
-        let hub = Hub::new();
+    fn previous_model_is_carried_into_the_snapshot() {
+        let slot = Slot::new(
+            "t9",
+            "目标",
+            "general",
+            std::env::temp_dir(),
+            json!({"modelId": "m2"}),
+            json!({}),
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+        // 首轮没有「上一轮」：不能凭空报一条换模型说明
+        assert!(slot.snapshot().prev_model.is_none());
+        slot.set_previous_model(json!({ "modelId": "m1", "displayName": "上一个模型" }));
+        let snap = slot.snapshot();
+        assert_eq!(snap.prev_model.as_ref().unwrap()["modelId"], "m1");
+        // 非对象（环境变量兜底、缺配置）不接受：没有可比的事实就不编造切换
+        slot.set_previous_model(Value::Null);
+        assert!(slot.snapshot().prev_model.is_some());
+    }
+
+    #[test]
+    fn hub_cancel_and_remove() {        let hub = Hub::new();
         let slot = Slot::new(
             "t1",
             "目标",

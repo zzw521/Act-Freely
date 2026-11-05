@@ -1,5 +1,5 @@
 /**
- * 通天办公 - 远程桌面（本机实时画面）
+ * 任我行 - 本机画面（实时查看当前桌面）
  *
  * 事实来源：
  * - 平台/帧间隔/会话上限/跨主机边界来自 `remote:capabilities`
@@ -42,7 +42,7 @@ import type {
   RemoteDesktopCapabilities,
   RemoteDesktopSession,
 } from '../../../shared/contracts';
-import { errorTextOf } from '../../../shared/error-messages';
+import { errorTextOf, rawErrorText } from '../../../shared/error-messages';
 
 const POLL_FALLBACK_MS = 750;
 
@@ -126,14 +126,14 @@ const RemoteDesktopPanel: React.FC = () => {
         }
       }
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (msg.startsWith('REMOTE_SESSION_EXPIRED') || msg.startsWith('REMOTE_NO_SESSION')) {
+      const raw = rawErrorText(e);
+      if (raw.startsWith('REMOTE_SESSION_EXPIRED') || raw.startsWith('REMOTE_NO_SESSION')) {
         keepGoing = false;
         setSession(EMPTY_SESSION);
         setFrameSrc('');
         setFrameSize(null);
       }
-      if (mounted.current) setError(errorTextOf(e, '远程桌面画面读取失败'));
+      if (mounted.current) setError(errorTextOf(e, '本机画面读取失败'));
     } finally {
       if (keepGoing && polling.current && mounted.current) {
         pollTimer.current = window.setTimeout(() => void pollFrame(), POLL_FALLBACK_MS);
@@ -164,7 +164,7 @@ const RemoteDesktopPanel: React.FC = () => {
         setFrameSize(null);
       }
     } catch (e) {
-      if (mounted.current) setError(errorTextOf(e, '远程桌面能力读取失败'));
+      if (mounted.current) setError(errorTextOf(e, '本机画面能力读取失败'));
     } finally {
       if (mounted.current) setLoading(false);
     }
@@ -201,7 +201,7 @@ const RemoteDesktopPanel: React.FC = () => {
       polling.current = true;
       void pollFrame();
     } catch (e) {
-      if (mounted.current) setError(errorTextOf(e, '远程桌面开启失败'));
+      if (mounted.current) setError(errorTextOf(e, '本机画面开启失败'));
       // 确认被取消或档位禁用后，重新读一次状态，避免页面停在「已开启」的错觉里
       void getRemoteDesktopStatus()
         .then((s) => mounted.current && setSession(s))
@@ -222,7 +222,7 @@ const RemoteDesktopPanel: React.FC = () => {
       setFrameSrc('');
       setFrameSize(null);
     } catch (e) {
-      if (mounted.current) setError(errorTextOf(e, '结束远程桌面会话失败'));
+      if (mounted.current) setError(errorTextOf(e, '结束本机画面会话失败'));
     } finally {
       if (mounted.current) setStopping(false);
     }
@@ -239,7 +239,7 @@ const RemoteDesktopPanel: React.FC = () => {
     <Box>
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: theme.spacing(3), flexWrap: 'wrap' }}>
         <Typography variant="h5" sx={{ fontWeight: 700 }}>
-          远程桌面
+          本机画面
         </Typography>
         <Typography sx={{ fontSize: 12.5, color: 'text.secondary' }}>
           本机桌面的受控实时画面：显式开启、10 分钟到期、只看不控
@@ -264,13 +264,13 @@ const RemoteDesktopPanel: React.FC = () => {
 
       {caps && !caps.supported && (
         <Alert severity="info" sx={{ mb: 2, borderRadius: '10px' }}>
-          {caps.reason || '当前平台没有桌面截屏执行器，远程桌面不可用'}
+          {caps.reason || '当前平台没有桌面截屏执行器，本机画面不可用'}
         </Alert>
       )}
 
       {caps?.supported && policyDisabled && (
         <Alert severity="warning" sx={{ mb: 2, borderRadius: '10px' }}>
-          电脑操控档位为「禁用」，远程桌面无法开启；请先在「电脑操控」页调整档位。
+          电脑操控档位为「禁用」，本机画面无法开启；请先在「电脑操控」页调整档位。
         </Alert>
       )}
 
@@ -291,25 +291,25 @@ const RemoteDesktopPanel: React.FC = () => {
             sx={{
               height: 24,
               fontSize: 11.5,
-              bgcolor: caps?.localView ? '#ECFDF5' : '#F3F4F6',
-              color: caps?.localView ? '#047857' : '#6B7280',
+              bgcolor: caps?.localView ? 'var(--tt-chip-success)' : 'var(--tt-chip-neutral)',
+              color: caps?.localView ? 'var(--tt-success)' : 'var(--tt-text-3)',
               '& .MuiChip-icon': { color: 'inherit' },
             }}
           />
           <Chip
             size="small"
             label={`平台：${caps?.platform ?? '读取中'}`}
-            sx={{ height: 24, fontSize: 11.5, bgcolor: '#F3F4F6', color: '#4B5563' }}
+            sx={{ height: 24, fontSize: 11.5, bgcolor: 'var(--tt-chip-neutral)', color: 'var(--tt-text-2)' }}
           />
           <Chip
             size="small"
             label={`会话上限：${Math.round((caps?.sessionMaxMs ?? 600000) / 60000)} 分钟`}
-            sx={{ height: 24, fontSize: 11.5, bgcolor: '#F5F3FF', color: '#6D28D9' }}
+            sx={{ height: 24, fontSize: 11.5, bgcolor: 'var(--tt-chip-accent)', color: 'var(--tt-accent-violet)' }}
           />
           <Chip
             size="small"
             label={`帧间隔：≥${caps?.frameIntervalMs ?? 700}ms`}
-            sx={{ height: 24, fontSize: 11.5, bgcolor: '#EFF6FF', color: '#1D4ED8' }}
+            sx={{ height: 24, fontSize: 11.5, bgcolor: 'var(--tt-chip-info)', color: 'var(--tt-info)' }}
           />
           <Chip
             size="small"
@@ -318,8 +318,8 @@ const RemoteDesktopPanel: React.FC = () => {
             sx={{
               height: 24,
               fontSize: 11.5,
-              bgcolor: '#FFF7ED',
-              color: '#C2410C',
+              bgcolor: 'var(--tt-chip-warning)',
+              color: 'var(--tt-warning)',
               '& .MuiChip-icon': { color: 'inherit' },
             }}
           />
@@ -336,9 +336,9 @@ const RemoteDesktopPanel: React.FC = () => {
             sx={{
               textTransform: 'none',
               borderRadius: '10px',
-              bgcolor: '#111827',
-              '&:hover': { bgcolor: '#1F2937' },
-              '&.Mui-disabled': { bgcolor: '#E5E7EB', color: '#9CA3AF' },
+              bgcolor: 'var(--tt-accent-fill)',
+              '&:hover': { bgcolor: 'var(--tt-accent-fill-hover)' },
+              '&.Mui-disabled': { bgcolor: 'var(--tt-chip-neutral)', color: 'var(--tt-text-4)' },
             }}
           >
             {session.active ? '会话进行中' : starting ? '等待确认…' : '开启本机画面'}
@@ -360,7 +360,7 @@ const RemoteDesktopPanel: React.FC = () => {
             <Chip
               size="small"
               label={`剩余 ${formatRemaining(remainingMs)} · 已取 ${session.frames} 帧`}
-              sx={{ height: 24, fontSize: 11.5, bgcolor: '#ECFDF5', color: '#047857' }}
+              sx={{ height: 24, fontSize: 11.5, bgcolor: 'var(--tt-chip-success)', color: 'var(--tt-success)' }}
             />
           )}
         </Box>
@@ -399,12 +399,15 @@ const RemoteDesktopPanel: React.FC = () => {
             }}
           />
         ) : (
+          /* 这块 #0B1220 是「本机画面」的底板，刻意不随皮肤翻（亮的屏幕压在浅底上会糊成一片），
+             所以占位文字也得钉死成浅色档：亮色皮肤下 var(--tt-text-*) 是深灰，压在这里只有 2.9:1。
+             成对钉死的深底 + 浅字 = 暗色孤岛，a11y 表面契约按这个标记豁免。 */
           <Box sx={{ textAlign: 'center', px: 3, py: 6 }}>
-            <VisibilityIcon sx={{ fontSize: 46, color: '#334155', mb: 1 }} />
-            <Typography sx={{ fontSize: 14, fontWeight: 600, color: '#CBD5E1' }}>
+            <VisibilityIcon sx={{ fontSize: 46, color: '#94A3B8', mb: 1 }} />
+            <Typography sx={{ fontSize: 14, fontWeight: 600, color: '#E5E7EB' }}>
               {session.active ? '正在等待第一帧画面…' : '会话未开启，暂无画面'}
             </Typography>
-            <Typography sx={{ fontSize: 12, color: '#64748B', mt: 0.5 }}>
+            <Typography sx={{ fontSize: 12, color: '#94A3B8', mt: 0.5 }}>
               {supported
                 ? '点击「开启本机画面」并完成确认后，画面只在这里实时显示'
                 : '当前通道没有本机桌面截屏能力'}
@@ -426,7 +429,8 @@ const RemoteDesktopPanel: React.FC = () => {
               gap: 0.75,
             }}
           >
-            <LockOutlinedIcon sx={{ fontSize: 12, color: '#94A3B8' }} />
+            {/* 暗色孤岛：说明条压在画面底板上，文字固定浅色档（亮色皮肤的 --tt-text-* 是深灰，压不住） */}
+            <LockOutlinedIcon sx={{ fontSize: 12, color: '#CBD5E1' }} />
             <Typography sx={{ fontSize: 10.5, color: '#CBD5E1' }}>
               仅本窗口可见 · 不写盘
               {frameSize ? ` · ${frameSize.width}×${frameSize.height}` : ''}
@@ -444,7 +448,7 @@ const RemoteDesktopPanel: React.FC = () => {
         }}
       >
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-          <DevicesOtherIcon sx={{ fontSize: 18, color: '#6B7280' }} />
+          <DevicesOtherIcon sx={{ fontSize: 18, color: 'var(--tt-text-2)' }} />
           <Typography sx={{ fontSize: 13.5, fontWeight: 700 }}>能力边界</Typography>
           <Chip
             size="small"
@@ -452,8 +456,8 @@ const RemoteDesktopPanel: React.FC = () => {
             sx={{
               height: 22,
               fontSize: 11,
-              bgcolor: caps?.crossHost.supported ? '#ECFDF5' : '#FEF2F2',
-              color: caps?.crossHost.supported ? '#047857' : '#B91C1C',
+              bgcolor: caps?.crossHost.supported ? 'var(--tt-chip-success)' : 'var(--tt-chip-danger)',
+              color: caps?.crossHost.supported ? 'var(--tt-success)' : 'var(--tt-danger)',
             }}
           />
         </Box>

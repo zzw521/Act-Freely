@@ -74,6 +74,7 @@ const TaskSearchDialog: React.FC<TaskSearchDialogProps> = ({ open, onClose }) =>
     <Dialog
       open={open}
       onClose={onClose}
+      aria-label="搜索任务"
       fullWidth
       maxWidth="sm"
       PaperProps={{ sx: { borderRadius: '14px', overflow: 'hidden' } }}
@@ -92,7 +93,7 @@ const TaskSearchDialog: React.FC<TaskSearchDialogProps> = ({ open, onClose }) =>
         <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>↑↓ 选择 · Enter 打开 · Esc 关闭</Typography>
       </Box>
 
-      <Box ref={listRef} sx={{ maxHeight: ROW * 8, overflowY: 'auto' }}>
+      <Box ref={listRef} role="listbox" aria-label="搜索结果" sx={{ maxHeight: ROW * 8, overflowY: 'auto' }}>
         {hits.length === 0 ? (
           <Typography sx={{ px: 2, py: 3, fontSize: '13px', color: 'var(--tt-text-3)', textAlign: 'center' }}>
             {query.trim() ? `没有匹配「${query.trim()}」的任务` : '还没有任务，回到工作台提交一个再搜索'}
@@ -102,6 +103,8 @@ const TaskSearchDialog: React.FC<TaskSearchDialogProps> = ({ open, onClose }) =>
             <Box
               key={hit.convId}
               data-row={i}
+              role="option"
+              aria-selected={i === active}
               onClick={() => openHit(hit)}
               sx={{
                 display: 'flex',
@@ -120,7 +123,7 @@ const TaskSearchDialog: React.FC<TaskSearchDialogProps> = ({ open, onClose }) =>
                     {hit.title}
                   </Typography>
                   {hit.running ? (
-                    <CircularProgress size={10} sx={{ color: '#22C55E', flexShrink: 0 }} />
+                    <CircularProgress size={10} sx={{ color: 'var(--tt-link)', flexShrink: 0 }} />
                   ) : null}
                 </Box>
                 <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>

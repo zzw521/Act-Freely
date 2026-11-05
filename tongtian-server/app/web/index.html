@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>通天办公 · 技能市场</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+<a class="skip-link" href="#main-content">跳到主要内容</a>
+
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="#/market" aria-label="通天办公 · 技能市场">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M6 18 17.5 6.5"></path>
+          <path d="M8.5 6.5h9v9"></path>
+          <circle cx="6" cy="6" r="1.1" fill="currentColor" stroke="none"></circle>
+        </svg>
+      </span>
+      <span class="brand-copy">
+        <strong>通天办公</strong>
+        <small>企业智能体平台</small>
+      </span>
+    </a>
+
+    <nav class="side-nav" id="main-nav" aria-label="主导航">
+      <p class="nav-label">工作台</p>
+      <button type="button" class="nav-link active" data-view="market">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="3.5" y="3.5" width="7" height="7" rx="2"></rect>
+          <rect x="13.5" y="3.5" width="7" height="7" rx="2"></rect>
+          <rect x="3.5" y="13.5" width="7" height="7" rx="2"></rect>
+          <rect x="13.5" y="13.5" width="7" height="7" rx="2"></rect>
+        </svg>
+        <span>技能市场</span>
+      </button>
+      <button type="button" class="nav-link" data-view="admin" hidden>
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M4 7h9"></path>
+          <path d="M18.5 7H20"></path>
+          <circle cx="15.5" cy="7" r="2.2"></circle>
+          <path d="M4 17h2"></path>
+          <path d="M11.5 17H20"></path>
+          <circle cx="8.5" cy="17" r="2.2"></circle>
+        </svg>
+        <span>管理控制台</span>
+      </button>
+    </nav>
+
+    <div class="side-block">
+      <p class="nav-label">资源</p>
+      <a class="side-link" href="/docs" target="_blank" rel="noreferrer">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M5 4.5h9.5L19 9v10.5H5z"></path>
+          <path d="M14.5 4.5V9H19"></path>
+          <path d="M8.5 13h7M8.5 16h5"></path>
+        </svg>
+        <span>接口文档</span>
+        <span class="side-link-arrow" aria-hidden="true">↗</span>
+      </a>
+      <a class="side-link" href="/health" target="_blank" rel="noreferrer">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3.5 12h4l2-5 4 10 2-5h5"></path>
+        </svg>
+        <span>服务健康</span>
+        <span class="side-link-arrow" aria-hidden="true">↗</span>
+      </a>
+    </div>
+
+    <div class="sidebar-foot">
+      <div class="account" id="account"></div>
+      <p class="side-version">Tongtian Server · 控制台</p>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="crumbs" aria-label="当前位置">
+        <span class="crumb-root">通天办公</span>
+        <span class="crumb-sep" aria-hidden="true">/</span>
+        <span class="crumb-current" id="crumb-current">技能市场</span>
+      </div>
+      <div class="topbar-actions">
+        <span class="topbar-tag">Web Console</span>
+        <a class="topbar-link" href="/docs" target="_blank" rel="noreferrer">API 文档 <span aria-hidden="true">↗</span></a>
+      </div>
+    </header>
+
+    <main class="page" id="main-content">
+      <section id="view-market" class="view">
+        <div class="market-hero">
+          <span class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span>企业技能中枢</span>
+          <h1>技能市场</h1>
+          <p class="hero-sub">技能、专家套件与 MCP 插件，一处浏览、下载与收藏。</p>
+          <form class="search hero-search" id="market-search" role="search">
+            <span class="search-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="6.5"></circle>
+                <path d="m16 16 4 4"></path>
+              </svg>
+            </span>
+            <input type="search" id="market-q" placeholder="搜索名称、简介或标签" aria-label="搜索市场">
+            <button type="submit" class="btn primary">搜索</button>
+          </form>
+        </div>
+
+        <div class="market-toolbar">
+          <div class="type-tabs" id="market-types" role="tablist" aria-label="市场类型"></div>
+          <label class="sort">
+            排序
+            <select id="market-sort">
+              <option value="recommended">推荐</option>
+              <option value="latest">最新</option>
+              <option value="downloads">下载最多</option>
+              <option value="stars">收藏最多</option>
+              <option value="name">名称</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="category-row">
+          <div class="chips" id="market-categories"></div>
+        </div>
+
+        <p class="result-line" id="market-count"></p>
+        <div class="grid" id="market-grid"></div>
+        <nav class="pager" id="market-pager" aria-label="分页"></nav>
+      </section>
+
+      <section id="view-admin" class="view" hidden>
+        <header class="admin-head">
+          <div class="admin-head-copy">
+            <span class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span>Admin Console</span>
+            <h1>管理控制台</h1>
+            <p class="admin-sub">统一管理市场内容、账号权限、模型网关与审计日志。</p>
+          </div>
+          <span class="admin-env"><span class="env-dot" aria-hidden="true"></span>运营环境</span>
+        </header>
+
+        <nav class="admin-tabs" id="admin-tabs" role="tablist" aria-label="管理模块">
+          <button type="button" class="admin-tab active" data-admin-tab="items">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3.5" y="3.5" width="7" height="7" rx="2"></rect>
+              <rect x="13.5" y="3.5" width="7" height="7" rx="2"></rect>
+              <rect x="3.5" y="13.5" width="7" height="7" rx="2"></rect>
+              <rect x="13.5" y="13.5" width="7" height="7" rx="2"></rect>
+            </svg>
+            市场条目
+          </button>
+          <button type="button" class="admin-tab" data-admin-tab="users">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="9.5" cy="8" r="3.2"></circle>
+              <path d="M3.8 19c.5-3 2.8-4.6 5.7-4.6s5.2 1.6 5.7 4.6"></path>
+              <path d="M16 5.2a2.8 2.8 0 0 1 0 5.6"></path>
+              <path d="M17.5 14.6c1.7.4 2.7 1.7 3 3.9"></path>
+            </svg>
+            用户
+          </button>
+          <button type="button" class="admin-tab" data-admin-tab="gateway">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 7h9"></path>
+              <path d="M18.5 7H20"></path>
+              <circle cx="15.5" cy="7" r="2.2"></circle>
+              <path d="M4 17h2"></path>
+              <path d="M11.5 17H20"></path>
+              <circle cx="8.5" cy="17" r="2.2"></circle>
+            </svg>
+            模型网关
+          </button>
+          <button type="button" class="admin-tab" data-admin-tab="audit">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3.5 19 6v6.2c0 4-2.9 6.9-7 8.3-4.1-1.4-7-4.3-7-8.3V6z"></path>
+              <path d="m9 12 2.2 2.2L15.5 10"></path>
+            </svg>
+            审计
+          </button>
+          <button type="button" class="admin-tab" data-admin-tab="departments">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 20.5V5.5a1 1 0 0 1 1-1h8a1 1 0 0 1 1 1v15"></path>
+              <path d="M14 10h5a1 1 0 0 1 1 1v9.5"></path>
+              <path d="M7.5 8.5h3M7.5 12h3M7.5 15.5h3M17 13.5h.5M17 17h.5M3 20.5h18"></path>
+            </svg>
+            组织与部门
+          </button>
+        </nav>
+
+        <div id="admin-items-panel" class="console-panel">
+          <section class="admin-card">
+            <div class="admin-card-head">
+              <div class="admin-card-title">
+                <h2>市场条目</h2>
+                <p>审核、推荐并维护技能、套件与 MCP 插件的版本。</p>
+              </div>
+              <form class="search compact" id="admin-item-search" role="search">
+                <span class="search-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="11" cy="11" r="6.5"></circle>
+                    <path d="m16 16 4 4"></path>
+                  </svg>
+                </span>
+                <input type="search" id="admin-item-q" placeholder="搜索条目" aria-label="搜索条目">
+                <button type="submit" class="btn">搜索</button>
+              </form>
+            </div>
+            <div class="admin-card-body">
+              <div class="filter-row">
+                <div class="type-tabs small" id="admin-types" role="tablist" aria-label="条目类型"></div>
+                <p class="result-line" id="admin-items-count"></p>
+              </div>
+              <div class="table-wrap" id="admin-items"></div>
+              <nav class="pager" id="admin-items-pager" aria-label="条目分页"></nav>
+            </div>
+          </section>
+        </div>
+
+        <div id="admin-users-panel" class="console-panel" hidden>
+          <section class="admin-card">
+            <div class="admin-card-head">
+              <div class="admin-card-title">
+                <h2>用户与角色</h2>
+                <p>查看账号、调整平台角色并管理所属组织。</p>
+              </div>
+              <form class="search compact" id="admin-user-search" role="search">
+                <span class="search-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="11" cy="11" r="6.5"></circle>
+                    <path d="m16 16 4 4"></path>
+                  </svg>
+                </span>
+                <input type="search" id="admin-user-q" placeholder="搜索邮箱或昵称" aria-label="搜索用户">
+                <button type="submit" class="btn">搜索</button>
+              </form>
+            </div>
+            <div class="admin-card-body">
+              <div class="filter-row">
+                <p class="result-line" id="admin-users-count"></p>
+              </div>
+              <div class="table-wrap" id="admin-users"></div>
+              <nav class="pager" id="admin-users-pager" aria-label="用户分页"></nav>
+            </div>
+          </section>
+        </div>
+
+        <div id="admin-gateway-panel" class="console-panel" hidden>
+          <p class="result-line hint-line" id="gateway-readonly-hint" hidden>
+            当前角色为只读（审计员）：可以查看网关健康、密钥列表、配额与用量，但不能修改。
+          </p>
+
+          <section class="admin-card" id="gateway-health-card">
+            <div class="admin-card-head">
+              <div class="admin-card-title">
+                <h2>网关健康</h2>
+                <p>上游连接、策略版本与用量上报状态。</p>
+              </div>
+            </div>
+            <div class="admin-card-body">
+              <div class="table-wrap health-wrap" id="gateway-health"></div>
+            </div>
+          </section>
+
+          <section class="admin-card" id="gateway-providers-card">
+            <div class="admin-card-head">
+              <div class="admin-card-title">
+                <h2>Provider 与密钥</h2>
+                <p>接入上游模型服务；密钥明文仅在创建或轮换时显示一次。</p>
+              </div>
+            </div>
+            <div class="admin-card-body">
+              <form class="form-grid cols-3" id="gateway-provider-form" data-gateway-write>
+                <label class="form-field">
+                  <span>Provider ID</span>
+                  <input id="gw-provider-id" type="text" placeholder="azure_openai" required autocomplete="off">
+                </label>
+                <label class="form-field">
+                  <span>显示名称</span>
+                  <input id="gw-provider-label" type="text" placeholder="Azure OpenAI" autocomplete="off">
+                </label>
+                <label class="form-field">
+                  <span>上游地址</span>
+                  <input id="gw-provider-url" type="text" placeholder="https://upstream.example.com" required autocomplete="off">
+                </label>
+                <div class="form-actions">
+                  <label class="check"><input type="checkbox" id="gw-provider-private"> 允许访问内网地址</label>
+                  <button type="submit" class="btn primary">新增 Provider</button>
+                </div>
+              </form>
+              <div class="secret-once" id="gateway-secret" hidden>
+                <strong>密钥明文只显示这一次，请立即保存：</strong>
+                <pre class="mono" id="gateway-secret-text"></pre>
+                <button type="button" class="btn small" id="gateway-secret-copy">复制</button>
+                <button type="button" class="btn small ghost" id="gateway-secret-close">我已保存</button>
+              </div>
+              <div class="table-wrap" id="gateway-providers"></div>
+            </div>
+          </section>
+
+          <section class="admin-card" id="gateway-apikey-card">
+            <div class="admin-card-head">
+              <div class="admin-card-title">
+                <h2>CLI API Key</h2>
+                <p>为命令行工具签发访问凭证，可限定租户、部门、模型与额度。</p>
+              </div>
+            </div>
+            <div class="admin-card-body">
+              <form class="form-grid cols-4" id="gateway-apikey-form" data-gateway-write>
+                <label class="form-field span-2">
+                  <span>名称</span>
+                  <input id="gw-apikey-label" type="text" placeholder="claude-code-laptop" autocomplete="off">
+                </label>
+                <label class="form-field">
+                  <span>租户</span>
+                  <input id="gw-apikey-tenant" type="text" placeholder="acme" value="acme" required autocomplete="off">
+                </label>
+                <label class="form-field">
+                  <span>部门</span>
+                  <input id="gw-apikey-dept" type="text" placeholder="dept-sales" value="dept-sales" required autocomplete="off">
+                </label>
+                <label class="form-field">
+                  <span>用户</span>
+                  <input id="gw-apikey-sub" type="text" placeholder="u-1" value="u-1" required autocomplete="off">
+                </label>
+                <label class="form-field span-2">
+                  <span>模型白名单</span>
+                  <input id="gw-apikey-models" type="text" placeholder="逗号分隔，留空表示不限制" autocomplete="off">
+                </label>
+                <label class="form-field">
+                  <span>RPM 上限</span>
+                  <input id="gw-apikey-rpm" type="number" min="0" max="10000" step="1" placeholder="0 = 不限" aria-label="每分钟请求上限">
+                </label>
+                <label class="form-field">
+                  <span>月度 token 配额</span>
+                  <input id="gw-apikey-quota" type="number" min="0" step="1" placeholder="0 = 不限" aria-label="月度 token 配额">
+                </label>
+                <label class="form-field span-2">
+                  <span>过期时间</span>
+                  <input id="gw-apikey-expires" type="datetime-local" aria-label="过期时间（可空）">
+                </label>
+                <div class="form-scopes" id="gateway-apikey-scopes">
+                  <span class="form-scopes-label">权限范围</span>
+                  <label class="check"><input type="checkbox" name="gw-scope" value="chat" checked> chat</label>
+                  <label class="check"><input type="checkbox" name="gw-scope" value="embeddings"> embeddings</label>
+                  <label class="check"><input type="checkbox" name="gw-scope" value="models" checked> models</label>
+                  <label class="check"><input type="checkbox" name="gw-scope" value="messages"> messages</label>
+                  <label class="check"><input type="checkbox" name="gw-scope" value="gemini"> gemini</label>
+                </div>
+                <div class="form-actions">
+                  <span class="form-hint">签发后明文只显示一次，请妥善保存。</span>
+                  <button type="submit" class="btn primary">签发 API Key</button>
+                </div>
+              </form>
+              <div class="secret-once" id="apikey-secret" hidden>
+                <strong>Key 明文只显示这一次，请立即保存：</strong>
+                <pre class="mono" id="apikey-secret-text"></pre>
+                <button type="button" class="btn small" id="apikey-secret-copy">复制</button>
+                <button type="button" class="btn small ghost" id="apikey-secret-close">我已保存</button>
+              </div>
+              <div class="table-wrap" id="gateway-apikeys"></div>
+            </div>
+          </section>
+
+          <section class="admin-card" id="gateway-quota-card">
+            <div class="admin-card-head">
+              <div class="admin-card-title">
+                <h2>配额</h2>
+                <p>覆盖指定主体的当月 token 额度，留空则回落到策略默认值。</p>
+              </div>
+            </div>
+            <div class="admin-card-body">
+              <form class="form-grid" id="gateway-quota-form" data-gateway-write>
+                <label class="form-field span-2">
+                  <span>配额主体</span>
+                  <input id="gw-quota-principal" type="text" placeholder="tenant:dept:sub，部门级使用 tenant:dept:*" required autocomplete="off">
+                </label>
+                <label class="form-field">
+                  <span>当月额度</span>
+                  <input id="gw-quota-monthly" type="text" inputmode="numeric" placeholder="留空恢复策略值" autocomplete="off">
+                </label>
+                <label class="form-field">
+                  <span>周期</span>
+                  <input id="gw-quota-period" type="text" placeholder="YYYY-MM，留空为当月" autocomplete="off">
+                </label>
+                <div class="form-actions">
+                  <span class="form-hint">额度调整即时生效，已有会话无需重新登录。</span>
+                  <button type="submit" class="btn primary">调整额度</button>
+                </div>
+              </form>
+              <p class="result-line" id="gateway-quota-meta"></p>
+              <div class="table-wrap" id="gateway-quotas"></div>
+            </div>
+          </section>
+
+          <section class="admin-card" id="gateway-usage-card">
+            <div class="admin-card-head">
+              <div class="admin-card-title">
+                <h2>网关用量</h2>
+                <p>按租户、部门、用户或模型筛选调用量与 token 消耗。</p>
+              </div>
+            </div>
+            <div class="admin-card-body">
+              <form class="filter-form" id="gateway-usage-form">
+                <label class="form-field">
+                  <span>周期</span>
+                  <select id="gw-usage-period">
+                    <option value="monthly">本月</option>
+                    <option value="daily">今日</option>
+                    <option value="total">全部</option>
+                  </select>
+                </label>
+                <label class="form-field">
+                  <span>租户</span>
+                  <input id="gw-usage-tenant" type="text" placeholder="全部" autocomplete="off">
+                </label>
+                <label class="form-field">
+                  <span>部门</span>
+                  <input id="gw-usage-dept" type="text" placeholder="全部" autocomplete="off">
+                </label>
+                <label class="form-field">
+                  <span>用户</span>
+                  <input id="gw-usage-sub" type="text" placeholder="全部" autocomplete="off">
+                </label>
+                <label class="form-field">
+                  <span>模型</span>
+                  <input id="gw-usage-model" type="text" placeholder="全部" autocomplete="off">
+                </label>
+                <div class="filter-submit">
+                  <button type="submit" class="btn">查询</button>
+                </div>
+              </form>
+              <p class="result-line" id="gateway-usage-meta"></p>
+              <div class="table-wrap" id="gateway-usage"></div>
+            </div>
+          </section>
+        </div>
+
+        <div id="admin-audit-panel" class="console-panel" hidden>
+          <section class="admin-card">
+            <div class="admin-card-head">
+              <div class="admin-card-title">
+                <h2>审计日志</h2>
+                <p>控制面与模型网关操作留痕，支持哈希链校验与 NDJSON 导出。</p>
+              </div>
+              <div class="admin-card-actions">
+                <select id="audit-source" aria-label="审计来源">
+                  <option value="gateway">模型网关</option>
+                  <option value="control">控制面</option>
+                </select>
+                <button type="button" class="btn" id="audit-verify">校验哈希链</button>
+                <button type="button" class="btn" id="audit-export">导出 NDJSON</button>
+                <button type="button" class="btn primary" id="audit-refresh">刷新</button>
+              </div>
+            </div>
+            <div class="admin-card-body">
+              <p class="result-line" id="audit-verify-result"></p>
+              <div class="table-wrap" id="audit-entries"></div>
+              <button type="button" class="btn small" id="audit-more" hidden>加载更多</button>
+            </div>
+          </section>
+        </div>
+
+        <div id="admin-departments-panel" class="console-panel" hidden>
+          <section class="admin-card">
+            <div class="admin-card-head">
+              <div class="admin-card-title">
+                <h2>组织与部门</h2>
+                <p>维护租户内的组织架构，部门将参与网关配额与权限判定。</p>
+              </div>
+            </div>
+            <div class="admin-card-body">
+              <form class="form-grid cols-3" id="dept-form">
+                <label class="form-field">
+                  <span>组织标识</span>
+                  <input id="dept-org" type="text" placeholder="acme" required autocomplete="off">
+                </label>
+                <label class="form-field">
+                  <span>部门标识</span>
+                  <input id="dept-id" type="text" placeholder="dept-sales" required autocomplete="off">
+                </label>
+                <label class="form-field">
+                  <span>部门名称</span>
+                  <input id="dept-name" type="text" placeholder="销售部" autocomplete="off">
+                </label>
+                <div class="form-actions">
+                  <span></span>
+                  <button type="submit" class="btn primary">新增部门</button>
+                </div>
+              </form>
+              <p class="result-line" id="dept-meta"></p>
+              <div class="table-wrap" id="dept-table"></div>
+            </div>
+          </section>
+
+          <section class="admin-card">
+            <div class="admin-card-head">
+              <div class="admin-card-title">
+                <h2>成员分配</h2>
+                <p class="result-line" id="dept-member-hint">选择部门后可调整成员；成员变更后需重新登录，新 claims 才会生效。</p>
+              </div>
+              <div class="admin-card-actions">
+                <label class="select-field">
+                  <span>目标部门</span>
+                  <select id="dept-member-target"></select>
+                </label>
+                <form class="search compact" id="dept-member-search" role="search">
+                  <span class="search-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <circle cx="11" cy="11" r="6.5"></circle>
+                      <path d="m16 16 4 4"></path>
+                    </svg>
+                  </span>
+                  <input type="search" id="dept-member-q" placeholder="搜索邮箱或昵称" aria-label="搜索成员">
+                  <button type="submit" class="btn">搜索</button>
+                </form>
+              </div>
+            </div>
+            <div class="admin-card-body">
+              <div class="table-wrap" id="dept-members"></div>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<div class="overlay" id="drawer-overlay" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-label="条目详情">
+  <button type="button" class="icon-btn drawer-close" id="drawer-close" aria-label="关闭详情">×</button>
+  <div id="drawer-body"></div>
+</aside>
+
+<div class="overlay" id="auth-overlay" hidden></div>
+<div class="modal" id="auth-modal" role="dialog" aria-modal="true" aria-labelledby="auth-title" hidden>
+  <button type="button" class="icon-btn modal-close" id="auth-close" aria-label="关闭登录框">×</button>
+  <span class="eyebrow">Account</span>
+  <h2 id="auth-title">登录</h2>
+  <div class="auth-tabs" id="auth-tabs">
+    <button type="button" class="subtab active" data-auth-mode="login">登录</button>
+    <button type="button" class="subtab" data-auth-mode="register">注册</button>
+  </div>
+  <form id="auth-form" novalidate>
+    <label class="field">邮箱
+      <input id="auth-email" type="email" required autocomplete="username" placeholder="you@example.com">
+    </label>
+    <label class="field" id="auth-nickname-field" hidden>昵称
+      <input id="auth-nickname" type="text" maxlength="24" autocomplete="nickname" placeholder="最多 24 个字符">
+    </label>
+    <label class="field">密码
+      <input id="auth-password" type="password" required minlength="8" autocomplete="current-password" placeholder="至少 8 位">
+    </label>
+    <p class="form-error" id="auth-error" hidden></p>
+    <button type="submit" class="btn primary block" id="auth-submit">登录</button>
+  </form>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script src="./app.js"></script>
+</body>
+</html>

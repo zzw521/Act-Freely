@@ -7,6 +7,8 @@
    允许保留的环境变量，全部落在 `--` 之前，原命令原参数落在 `--` 之后；
 3. 配了沙箱却找不到启动器时必须抛 `SandboxUnavailable`，不许静默降级；
 4. 终端会话真的接了这一步：启动器缺失时报 `TERMINAL_SANDBOX_FAILED`，不留下半个会话。
+5. Rust 侧 Hooks 接的是同一个包装：隔离生效 ⇒ 先拆 argv 再套壳，拆不出就拒绝；
+   拆分算法本身由 `cargo test --lib align::hooks` 覆盖，这里只钉接线不被改回裸跑。
 
 用法: python tests/integration/engine_sandbox_wrapper_selftest.py
 """
@@ -100,6 +102,30 @@ def case_terminal_refuses() -> None:
         clear_env()
 
 
+HOOKS_RS = PROJECT_ROOT / "src-tauri" / "src" / "align" / "hooks.rs"
+SANDBOX_RS = PROJECT_ROOT / "src-tauri" / "src" / "sandbox" / "mod.rs"
+
+
+def case_rust_hooks_share_the_wrapper() -> None:
+    """Hooks 的套壳接线（拆分算法本身在 `cargo test --lib align::hooks` 里验）"""
+    src = HOOKS_RS.read_text(encoding="utf-8")
+    wrap = src.split("fn sandbox_wrap")[1].split("\n}\n")[0]
+    check("crate::sandbox::active()" in wrap, "未启用隔离时必须原样执行，不能凭空改变行为")
+    check("split_argv(shell_cmd)?" in wrap, "启用隔离必须先拆出 argv 再交给启动器")
+    check("wrap_for_spawn_extra" in wrap, "必须复用系统沙箱的包装，不许另写一套命令行")
+    build = src.split("fn build_spawn")[1].split("\n}\n")[0]
+    check("Command::new" in build and "sandbox_wrap(shell_cmd, cwd)" in build, "spawn 点仍集中在一个构造函数里")
+    for code in (
+        "HOOK_SANDBOX_SHELL_REQUIRED",
+        "HOOK_SANDBOX_UNBALANCED_QUOTE",
+        "HOOK_SANDBOX_FAILED",
+    ):
+        check(code in src, f"缺少可定位的中文错误码 {code}")
+    check('"sandboxed"' in src, "执行面概览必须如实暴露脚本有没有进容器")
+    sandbox_src = SANDBOX_RS.read_text(encoding="utf-8")
+    check("pub fn wrap_for_spawn_extra" in sandbox_src, "sandbox 侧要提供补充只读目录的入口")
+
+
 def main() -> int:
     original = {key: os.environ.get(key) for key in ENV_KEYS}
     try:
@@ -107,6 +133,7 @@ def main() -> int:
         case_argv_shape()
         case_missing_launcher()
         case_terminal_refuses()
+        case_rust_hooks_share_the_wrapper()
     finally:
         for key, value in original.items():
             if value is None:

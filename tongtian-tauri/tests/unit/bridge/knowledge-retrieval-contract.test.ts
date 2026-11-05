@@ -63,7 +63,10 @@ describe('知识库检索增强：召回 → 排序 → 读全文', () => {
   });
 
   it('Rust 仍下发知识库运行时块，页面说明与真实工具一致', () => {
-    expect(rustRuntime()).toContain('"knowledge": knowledge::runtime_bases(&knowledge_root)');
+    // 归属过滤：执行面只拿 global + 当前工作区私有的库
+    expect(rustRuntime()).toContain(
+      '"knowledge": knowledge::runtime_bases(&knowledge_root, workspace_id)',
+    );
     expect(knowledgePage()).toContain('read_knowledge_document');
   });
 });

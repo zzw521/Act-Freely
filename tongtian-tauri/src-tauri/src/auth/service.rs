@@ -92,7 +92,7 @@ pub fn client_for_base(base: &str) -> reqwest::Client {
     }
 }
 
-fn network_reason(err: &reqwest::Error) -> &'static str {
+pub(crate) fn network_reason(err: &reqwest::Error) -> &'static str {
     if err.is_timeout() {
         "连接或读取超时"
     } else if err.is_connect() {
@@ -166,6 +166,23 @@ pub async fn ensure_server_ready(base: &str) -> Result<(), String> {
 /// 生成登录流程 state（防 CSRF，回调时校验一致性）
 pub fn gen_state() -> String {
     uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// PKCE（RFC 7636）verifier：43-128 位 unreserved 字符，两个 UUID 去连字符共 64 位
+pub fn gen_code_verifier() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// S256 challenge：BASE64URL(SHA256(verifier))，去掉 padding
+pub fn code_challenge_s256(verifier: &str) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
 /// Mock 用户 profile（开发自测，不发浏览器不起回调）
@@ -284,11 +301,16 @@ pub async fn wait_loopback_callback(
 }
 
 /// 授权码换 token（综合服务端 /api/auth/exchange）
-pub async fn exchange_code(base_url: &str, code: &str, state: &str) -> Result<Value, String> {
+pub async fn exchange_code(
+    base_url: &str,
+    code: &str,
+    state: &str,
+    code_verifier: &str,
+) -> Result<Value, String> {
     validate_server_url(base_url)?;
     let resp = client_for_base(base_url)
         .post(format!("{base_url}/api/auth/exchange"))
-        .json(&json!({ "code": code, "state": state }))
+        .json(&json!({ "code": code, "state": state, "codeVerifier": code_verifier }))
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
@@ -670,6 +692,18 @@ mod tests {
         let b = gen_state();
         assert!(!a.is_empty());
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_pkce_challenge_matches_rfc7636_vector() {
+        // RFC 7636 附录 B 的官方测试向量
+        assert_eq!(
+            code_challenge_s256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+        let verifier = gen_code_verifier();
+        assert_eq!(verifier.len(), 64);
+        assert!(verifier.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

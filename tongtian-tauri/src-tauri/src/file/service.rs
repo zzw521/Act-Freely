@@ -374,6 +374,7 @@ pub fn stage_attachment_in(
     task_id: &str,
     src_path: &str,
 ) -> Result<AttachmentMeta, String> {
+    let workspace_id = crate::workspace::normalize_id(workspace_id)?;
     let src = Path::new(src_path);
     if !src.is_file() {
         return Err(format!("FILE_NOT_FOUND: {src_path}"));
@@ -385,7 +386,21 @@ pub fn stage_attachment_in(
 
     // 格式校验（docx/xlsx/pdf/csv/txt/md/json + 图片）
     let mime = mime_of(src);
-    let allowed = matches!(
+    if !attachment_mime_allowed(&mime) {
+        return Err(format!("FILE_REJECTED: 不支持的附件格式（{mime}）"));
+    }
+
+    let size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+    check_attachment_size(size, &mime)?;
+
+    let dest_dir = staging_dir(home, &workspace_id, task_id);
+    std::fs::create_dir_all(&dest_dir)
+        .map_err(|e| format!("FILE_BACKUP_FAILED: 暂存目录创建失败 {e}"))?;
+    stage_one(src, &dest_dir, file_name, &mime, size)
+}
+
+fn attachment_mime_allowed(mime: &str) -> bool {
+    matches!(
         mime,
         "text/plain"
             | "text/markdown"
@@ -394,12 +409,10 @@ pub fn stage_attachment_in(
             | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             | "application/pdf"
-    ) || mime.starts_with("image/");
-    if !allowed {
-        return Err(format!("FILE_REJECTED: 不支持的附件格式（{mime}）"));
-    }
+    ) || mime.starts_with("image/")
+}
 
-    let size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+fn check_attachment_size(size: u64, mime: &str) -> Result<(), String> {
     // 图片要转 base64 随请求进引擎，单独限 10MB；文本/Office 仍用 50MB 上限
     let limit = if mime.starts_with("image/") {
         MAX_IMAGE_ATTACH_BYTES
@@ -413,18 +426,32 @@ pub fn stage_attachment_in(
             size
         ));
     }
+    Ok(())
+}
 
-    // 暂存目录（与引擎 work-dir 同源布局）
+/// 暂存目录（与引擎 work-dir 同源布局）；task_id 只保留安全字符
+fn staging_dir(home: &Path, workspace_id: &str, task_id: &str) -> PathBuf {
     let safe_task: String = task_id
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect();
-    let dest_dir = workspace_files_root_in(home, workspace_id)
+    workspace_files_root_in(home, workspace_id)
         .join("attachments")
-        .join(&safe_task);
-    std::fs::create_dir_all(&dest_dir)
-        .map_err(|e| format!("FILE_BACKUP_FAILED: 暂存目录创建失败 {e}"))?;
+        .join(safe_task)
+}
+
+fn stage_one(
+    src: &Path,
+    dest_dir: &Path,
+    file_name: String,
+    mime: &str,
+    size: u64,
+) -> Result<AttachmentMeta, String> {
     let dest = dest_dir.join(&file_name);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("FILE_BACKUP_FAILED: 暂存目录创建失败 {e}"))?;
+    }
     std::fs::copy(src, &dest).map_err(|e| format!("FILE_BACKUP_FAILED: 附件复制失败 {e}"))?;
 
     // 敏感度抽样检测（文本读前 8KB；Office/PDF 先抽正文再取样，避免二进制附件只按文件名分级）
@@ -440,12 +467,139 @@ pub fn stage_attachment_in(
     })
 }
 
+/// 文件夹附件暂存的规模上限：单次最多 200 个文件、合计 200MB，递归深度 16。
+const MAX_FOLDER_FILES: usize = 200;
+const MAX_FOLDER_BYTES: u64 = 200 * 1024 * 1024;
+const MAX_FOLDER_DEPTH: usize = 16;
+
+fn collect_folder_files(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if depth > MAX_FOLDER_DEPTH {
+        return Err("FILE_REJECTED: 文件夹层级过深（上限 16 层）".into());
+    }
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("FILE_BACKUP_FAILED: 无法读取文件夹 {}：{e}", dir.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        // 不跟随符号链接：避免把链接目标（可能在工作区外）复制进暂存目录
+        if ft.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name == "node_modules" || name == "__pycache__" {
+            continue;
+        }
+        if ft.is_dir() {
+            collect_folder_files(root, &path, depth + 1, out)?;
+        } else if ft.is_file() && attachment_mime_allowed(&mime_of(&path)) {
+            out.push(path);
+            if out.len() > MAX_FOLDER_FILES {
+                return Err(format!("FILE_REJECTED: 文件夹内文件超过 {MAX_FOLDER_FILES} 个上限"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 文件夹附件暂存：递归复制受支持的文件（保留相对路径），逐个返回 AttachmentMeta。
+/// 返回空列表表示文件夹里没有可附加的文件。
+pub fn stage_folder_in(
+    home: &Path,
+    workspace_id: &str,
+    task_id: &str,
+    src_dir: &str,
+) -> Result<Vec<AttachmentMeta>, String> {
+    let workspace_id = crate::workspace::normalize_id(workspace_id)?;
+    let root = Path::new(src_dir);
+    if !root.is_dir() {
+        return Err(format!("FILE_NOT_FOUND: 文件夹不存在：{src_dir}"));
+    }
+    let mut files = Vec::new();
+    collect_folder_files(root, root, 0, &mut files)?;
+    files.sort();
+    if files.is_empty() {
+        return Err("FILE_REJECTED: 文件夹内没有可附加的文件".into());
+    }
+    let total: u64 = files
+        .iter()
+        .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .sum();
+    if total > MAX_FOLDER_BYTES {
+        return Err(format!(
+            "FILE_REJECTED: 文件夹合计超出 {}MB 上限",
+            MAX_FOLDER_BYTES / (1024 * 1024)
+        ));
+    }
+
+    let dest_dir = staging_dir(home, &workspace_id, task_id);
+    std::fs::create_dir_all(&dest_dir)
+        .map_err(|e| format!("FILE_BACKUP_FAILED: 暂存目录创建失败 {e}"))?;
+    let mut metas = Vec::with_capacity(files.len());
+    for src in files {
+        let rel = src
+            .strip_prefix(root)
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| src.file_name().unwrap_or_default().to_string_lossy().to_string());
+        let mime = mime_of(&src);
+        let size = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
+        check_attachment_size(size, &mime)?;
+        metas.push(stage_one(&src, &dest_dir, rel, &mime, size)?);
+    }
+    Ok(metas)
+}
+
 pub fn stage_attachment(
     workspace_id: &str,
     task_id: &str,
     src_path: &str,
 ) -> Result<AttachmentMeta, String> {
     stage_attachment_in(&data_home(), workspace_id, task_id, src_path)
+}
+
+pub fn stage_folder(
+    workspace_id: &str,
+    task_id: &str,
+    src_dir: &str,
+) -> Result<Vec<AttachmentMeta>, String> {
+    stage_folder_in(&data_home(), workspace_id, task_id, src_dir)
+}
+
+/// 清理超过保留期的 `pending-*` 暂存目录（用户选完附件但没发送就关掉应用）。
+/// 只删附件暂存目录，不碰正常任务目录与其他文件。
+pub fn cleanup_stale_pending() {
+    cleanup_stale_pending_in(&data_home(), std::time::Duration::from_secs(7 * 24 * 3600));
+}
+
+fn cleanup_stale_pending_in(home: &Path, max_age: std::time::Duration) {
+    let Ok(workspaces) = std::fs::read_dir(home.join("workspaces")) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for ws in workspaces.flatten() {
+        let Ok(entries) = std::fs::read_dir(ws.path().join("files").join("attachments")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_name().to_string_lossy().starts_with("pending-") {
+                continue;
+            }
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .map(|age| age > max_age)
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
 }
 
 /// 允许交给系统默认应用打开的扩展名（文档/图片/可直接预览的文本）。
@@ -773,6 +927,7 @@ mod tests {
             tool_blocklist: Vec::new(),
             exec_enabled: false,
             exec_allowlist: Vec::new(),
+            shell_enabled: false,
             network_enabled: false,
             network_allowlist: Vec::new(),
             max_cpu_percent: 50,

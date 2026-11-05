@@ -36,6 +36,8 @@ import { mcpAPI, skillAPI, systemAPI } from '../../lib/api';
 import { parseMcpJsonConfig, TRANSPORT_LABEL_TEXT } from '../../lib/mcp-local';
 import { isTauri } from '../../lib/tauri-api';
 import MarketBrowser from '../../components/MarketBrowser';
+import { useI18n } from '../../i18n';
+import { clickableProps } from '../../lib/a11y';
 
 // ── 对话创建技能的预置提示词（create-skill 流程，落盘目录与 skill:list 扫描目录同源） ──
 
@@ -82,7 +84,9 @@ type TabKey = 'skills' | 'connectors';
 // 这里只保留图标映射：原先写死的五张卡片里有三张对应的能力在引擎里根本没有注册，
 // 属于假宣传，已删除（清单见 shared/builtin-tools.ts 与契约测试）。
 const TOOL_ICONS: Record<string, typeof FolderOutlinedIcon> = {
+  list_directory: FolderOutlinedIcon,
   view_text_file: SearchIcon,
+  read_document: DescriptionOutlinedIcon,
   write_text_file: DescriptionOutlinedIcon,
   insert_text_file: InsightsIcon,
 };
@@ -101,6 +105,7 @@ const CONNECTORS = [
 
 const ExtensionsPage: React.FC = () => {
   const navigate = useNavigate();
+  const { t: tr } = useI18n();
   // 浏览器直连通道没有系统凭据库，无法持有 OAuth 令牌（授权按钮如实禁用）
   const desktopChannel = isTauri();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -497,7 +502,7 @@ const ExtensionsPage: React.FC = () => {
     <Box sx={{ maxWidth: 1080, mx: 'auto' }}>
       {/* 页头 */}
       <Typography variant="h5" sx={{ fontWeight: 700 }}>扩展</Typography>
-      <Typography sx={{ fontSize: '13px', color: '#6B7280', mt: 0.5, mb: 2 }}>
+      <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-2)', mt: 0.5, mb: 2 }}>
         智能体能力由两部分构成：技能、连接器（含内置工具与 MCP）
       </Typography>
 
@@ -506,7 +511,7 @@ const ExtensionsPage: React.FC = () => {
         value={tab}
         onChange={(_, v) => switchTab(v as TabKey)}
         sx={{
-          borderBottom: '1px solid #EEF0F2',
+          borderBottom: '1px solid var(--tt-border)',
           mb: 3,
           '& .MuiTab-root': { textTransform: 'none', fontSize: '14px', fontWeight: 600 },
         }}
@@ -533,9 +538,9 @@ const ExtensionsPage: React.FC = () => {
                 fontSize: '13px',
                 fontWeight: 600,
                 px: 2,
-                borderColor: '#E5E7EB',
-                color: '#374151',
-                '&:hover': { borderColor: '#4F46E5', color: '#4F46E5', bgcolor: 'rgba(79, 70, 229, 0.04)' },
+                borderColor: 'var(--tt-border)',
+                color: 'var(--tt-text-2)',
+                '&:hover': { borderColor: 'var(--tt-accent)', color: 'var(--tt-accent)', bgcolor: 'rgba(79, 70, 229, 0.04)' },
               }}
             >
               在线市场
@@ -546,13 +551,13 @@ const ExtensionsPage: React.FC = () => {
               startIcon={<AddIcon />}
               onClick={(e) => setSkillAddAnchor(e.currentTarget)}
               sx={{
-                bgcolor: '#111827',
+                bgcolor: 'var(--tt-cta-fill)',
                 borderRadius: '10px',
                 textTransform: 'none',
                 fontSize: '13px',
                 fontWeight: 600,
                 px: 2,
-                '&:hover': { bgcolor: '#4F46E5' },
+                '&:hover': { bgcolor: 'var(--tt-cta-fill-hover)' },
               }}
             >
               添加
@@ -579,6 +584,7 @@ const ExtensionsPage: React.FC = () => {
           >
             <Box
               onClick={handleCreateSkillByChat}
+              {...clickableProps(handleCreateSkillByChat, tr('通过对话创建技能'))}
               sx={{
                 display: 'flex',
                 gap: 1.25,
@@ -595,24 +601,25 @@ const ExtensionsPage: React.FC = () => {
                   width: 30,
                   height: 30,
                   borderRadius: '9px',
-                  background: '#E8F1FF',
+                  background: 'var(--tt-chip-info)',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
                   flexShrink: 0,
                 }}
               >
-                <ChatBubbleOutlineIcon sx={{ fontSize: 16, color: '#3B82F6' }} />
+                <ChatBubbleOutlineIcon sx={{ fontSize: 16, color: 'var(--tt-info)' }} />
               </Box>
               <Box sx={{ minWidth: 0 }}>
-                <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#1F2937' }}>通过对话创建</Typography>
-                <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF', mt: 0.25 }}>
+                <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)' }}>通过对话创建</Typography>
+                <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mt: 0.25 }}>
                   创建个性化技能，将保存在本地使用
                 </Typography>
               </Box>
             </Box>
             <Box
               onClick={openSkillUploadDialog}
+              {...clickableProps(openSkillUploadDialog, tr('上传本地技能文件'))}
               sx={{
                 display: 'flex',
                 gap: 1.25,
@@ -629,18 +636,18 @@ const ExtensionsPage: React.FC = () => {
                   width: 30,
                   height: 30,
                   borderRadius: '9px',
-                  background: '#F1EBFF',
+                  background: 'var(--tt-chip-accent)',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
                   flexShrink: 0,
                 }}
               >
-                <UploadFileIcon sx={{ fontSize: 16, color: '#8B5CF6' }} />
+                <UploadFileIcon sx={{ fontSize: 16, color: 'var(--tt-accent-violet)' }} />
               </Box>
               <Box sx={{ minWidth: 0 }}>
-                <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#1F2937' }}>上传技能</Typography>
-                <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF', mt: 0.25 }}>
+                <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)' }}>上传技能</Typography>
+                <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mt: 0.25 }}>
                   从本地 SKILL.md 安装，仅落地到运行目录
                 </Typography>
               </Box>
@@ -658,6 +665,7 @@ const ExtensionsPage: React.FC = () => {
               {/* 来源选择区：点击唤起原生对话框 */}
               <Box
                 onClick={() => void handlePickSkillSource(false)}
+                {...clickableProps(() => void handlePickSkillSource(false), tr('选择技能的 SKILL.md 文件'))}
                 sx={{
                   display: 'flex',
                   flexDirection: 'column',
@@ -665,18 +673,18 @@ const ExtensionsPage: React.FC = () => {
                   gap: 1,
                   py: 3.5,
                   borderRadius: '12px',
-                  border: '1.5px dashed #D1D5DB',
-                  background: '#FAFBFC',
+                  border: '1.5px dashed var(--tt-border)',
+                  background: 'var(--tt-surface-2)',
                   cursor: 'pointer',
                   transition: 'border-color 0.15s ease',
-                  '&:hover': { borderColor: '#8B5CF6' },
+                  '&:hover': { borderColor: 'var(--tt-accent-violet)' },
                 }}
               >
-                <CloudUploadOutlinedIcon sx={{ fontSize: 32, color: skillSourcePath ? '#8B5CF6' : '#9CA3AF' }} />
+                <CloudUploadOutlinedIcon sx={{ fontSize: 32, color: skillSourcePath ? 'var(--tt-accent-violet)' : 'var(--tt-text-4)' }} />
                 <Typography
                   sx={{
                     fontSize: '13px',
-                    color: skillSourcePath ? '#4C1D95' : '#6B7280',
+                    color: skillSourcePath ? 'var(--tt-accent-violet)' : 'var(--tt-text-3)',
                     fontWeight: skillSourcePath ? 600 : 400,
                     px: 2,
                     textAlign: 'center',
@@ -686,15 +694,24 @@ const ExtensionsPage: React.FC = () => {
                   {skillSourcePath ?? '点击选择技能的 SKILL.md 文件'}
                 </Typography>
                 {isTauri() && (
-                  <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF' }}>
+                  <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)' }}>
                     也可安装技能目录：
                     <Box
                       component="span"
+                      {...clickableProps(() => void handlePickSkillSource(true), tr('选择包含 SKILL.md 的技能目录'))}
                       onClick={(e: React.MouseEvent) => {
                         e.stopPropagation();
                         void handlePickSkillSource(true);
                       }}
-                      sx={{ color: '#6366F1', cursor: 'pointer', ml: 0.5 }}
+                      onKeyDown={(e: React.KeyboardEvent) => {
+                        // 阻止冒泡：否则键盘事件会先触发外层「选择文件」区域，导致双重唤起
+                        e.stopPropagation();
+                        if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+                          e.preventDefault();
+                          void handlePickSkillSource(true);
+                        }
+                      }}
+                      sx={{ color: 'var(--tt-accent)', cursor: 'pointer', ml: 0.5 }}
                     >
                       选择包含 SKILL.md 的目录
                     </Box>
@@ -704,20 +721,20 @@ const ExtensionsPage: React.FC = () => {
 
               {/* 文件要求说明（与 Rust 安装校验同口径，不夸大能力） */}
               <Box sx={{ mt: 2 }}>
-                <Typography sx={{ fontSize: '12px', color: '#6B7280', lineHeight: 1.7 }}>
+                <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-2)', lineHeight: 1.7 }}>
                   文件要求：
                 </Typography>
-                <Typography sx={{ fontSize: '12px', color: '#9CA3AF', lineHeight: 1.7 }}>
+                <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', lineHeight: 1.7 }}>
                   · 仅支持 SKILL.md 单文件，或内含 SKILL.md 的技能目录（暂不支持 .zip）
                 </Typography>
-                <Typography sx={{ fontSize: '12px', color: '#9CA3AF', lineHeight: 1.7 }}>
+                <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', lineHeight: 1.7 }}>
                   · 技能标识取自来源目录名，重名技能需先卸载（安装不会覆盖既有技能）
                 </Typography>
-                <Typography sx={{ fontSize: '12px', color: '#9CA3AF', lineHeight: 1.7 }}>
+                <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', lineHeight: 1.7 }}>
                   · 安装目录：{skillRoot?.skillsRoot ?? '（桌面版任我行运行目录下的 skills/）'}
                 </Typography>
                 {!isTauri() && (
-                  <Typography sx={{ fontSize: '12px', color: '#B45309', lineHeight: 1.7, mt: 0.5 }}>
+                  <Typography sx={{ fontSize: '12px', color: 'var(--tt-warning)', lineHeight: 1.7, mt: 0.5 }}>
                     浏览器预览通道不支持技能增删，请在桌面版任我行中管理技能
                   </Typography>
                 )}
@@ -730,15 +747,15 @@ const ExtensionsPage: React.FC = () => {
                   disabled={!skillSourcePath || skillInstalling}
                   onClick={() => void handleInstallSkill()}
                   sx={{
-                    bgcolor: skillSourcePath ? '#111827' : '#E5E7EB',
-                    color: skillSourcePath ? '#fff' : '#9CA3AF',
+                    bgcolor: skillSourcePath ? 'var(--tt-accent-fill)' : 'var(--tt-chip-neutral)',
+                    color: skillSourcePath ? '#fff' : 'var(--tt-text-4)',
                     borderRadius: '10px',
                     textTransform: 'none',
                     fontSize: '13px',
                     fontWeight: 600,
                     px: 3,
-                    '&:hover': { bgcolor: '#4F46E5' },
-                    '&.Mui-disabled': { bgcolor: '#E5E7EB', color: '#9CA3AF' },
+                    '&:hover': { bgcolor: 'var(--tt-accent-fill)' },
+                    '&.Mui-disabled': { bgcolor: 'var(--tt-chip-neutral)', color: 'var(--tt-text-4)' },
                   }}
                 >
                   {skillInstalling ? '安装中…' : '安装'}
@@ -755,7 +772,7 @@ const ExtensionsPage: React.FC = () => {
           >
             <DialogTitle sx={{ fontSize: '16px', fontWeight: 700 }}>卸载技能</DialogTitle>
             <DialogContent sx={{ pt: '8px !important' }}>
-              <Typography sx={{ fontSize: '13px', color: '#4B5563', lineHeight: 1.7 }}>
+              <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-2)', lineHeight: 1.7 }}>
                 确认卸载「{skillToRemove?.name}」？技能目录会被移出运行目录并放入回收目录
                 {skillRoot?.trashRoot ? `（${skillRoot.trashRoot}）` : ''}，不会物理删除，可随时人工找回。
               </Typography>
@@ -784,10 +801,10 @@ const ExtensionsPage: React.FC = () => {
 
           {skillsLoaded && skills.length === 0 && !skillsError ? (
             <Box sx={{ p: 4, textAlign: 'center' }}>
-              <Typography sx={{ fontSize: '13px', color: '#9CA3AF' }}>
+              <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-4)' }}>
                 运行目录下暂无技能（{skillRoot?.skillsRoot ?? 'skills/'}）
               </Typography>
-              <Typography sx={{ fontSize: '12px', color: '#B0B7C3', mt: 0.75 }}>
+              <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mt: 0.75 }}>
                 点击右上角「添加」，通过对话创建或直接安装本地 SKILL.md
               </Typography>
             </Box>
@@ -800,10 +817,10 @@ const ExtensionsPage: React.FC = () => {
                     display: 'flex',
                     alignItems: 'center',
                     gap: 2,
-                    border: '1px solid #EEF0F2',
+                    border: '1px solid var(--tt-border)',
                     borderRadius: '12px',
                     p: 2,
-                    background: '#FFFFFF',
+                    background: 'var(--tt-surface)',
                   }}
                 >
                   <Box
@@ -811,7 +828,7 @@ const ExtensionsPage: React.FC = () => {
                       width: 40,
                       height: 40,
                       borderRadius: '10px',
-                      background: 'linear-gradient(135deg, #34D399 0%, #06B6D4 100%)',
+                      background: 'linear-gradient(135deg, #047857 0%, #0F766E 100%)',
                       display: 'flex',
                       alignItems: 'center',
                       justifyContent: 'center',
@@ -822,23 +839,23 @@ const ExtensionsPage: React.FC = () => {
                   </Box>
                   <Box sx={{ flexGrow: 1, minWidth: 0 }}>
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                      <Typography sx={{ fontSize: '14px', fontWeight: 600, color: '#111827' }}>{s.name}</Typography>
+                      <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'var(--tt-text-1)' }}>{s.name}</Typography>
                       {!s.enabled && (
                         <Box
                           sx={{
                             px: 1,
                             py: 0.2,
                             borderRadius: '6px',
-                            background: '#F3F4F6',
+                            background: 'var(--tt-chip-neutral)',
                           }}
                         >
-                          <Typography sx={{ fontSize: '11px', fontWeight: 600, color: '#6B7280' }}>已禁用</Typography>
+                          <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-text-2)' }}>已禁用</Typography>
                         </Box>
                       )}
                       {!s.readable && (
-                        <Box sx={{ px: 1, py: 0.2, borderRadius: '6px', background: '#FEF3C7' }}>
+                        <Box sx={{ px: 1, py: 0.2, borderRadius: '6px', background: 'var(--tt-chip-warning)' }}>
                           <Tooltip title="SKILL.md 读取失败或超出大小上限，请卸载后重新安装">
-                            <Typography sx={{ fontSize: '11px', fontWeight: 600, color: '#B45309' }}>
+                            <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-warning)' }}>
                               不可读
                             </Typography>
                           </Tooltip>
@@ -860,14 +877,14 @@ const ExtensionsPage: React.FC = () => {
                               px: 1,
                               py: 0.2,
                               borderRadius: '6px',
-                              background: s.scan.level === 'block' ? '#FEE2E2' : '#FEF3C7',
+                              background: s.scan.level === 'block' ? 'var(--tt-chip-danger)' : 'var(--tt-chip-warning)',
                             }}
                           >
                             <Typography
                               sx={{
                                 fontSize: '11px',
                                 fontWeight: 600,
-                                color: s.scan.level === 'block' ? '#B91C1C' : '#B45309',
+                                color: s.scan.level === 'block' ? 'var(--tt-danger)' : 'var(--tt-warning)',
                               }}
                             >
                               {s.scan.level === 'block' ? '安全风险' : `提醒 ${s.scan.findings.length}`}
@@ -876,14 +893,14 @@ const ExtensionsPage: React.FC = () => {
                         </Tooltip>
                       )}
                     </Box>
-                    <Typography sx={{ fontSize: '12px', color: '#6B7280', mt: 0.25 }}>
+                    <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-2)', mt: 0.25 }}>
                       {s.description ?? '（SKILL.md 未填写描述）'}
                     </Typography>
                     <Tooltip title={s.path}>
                       <Typography
                         sx={{
                           fontSize: '11px',
-                          color: '#B0B7C3',
+                          color: 'var(--tt-text-4)',
                           mt: 0.25,
                           overflow: 'hidden',
                           textOverflow: 'ellipsis',
@@ -913,9 +930,10 @@ const ExtensionsPage: React.FC = () => {
                       <IconButton
                         size="small"
                         disabled={!isTauri() || skillBusyId === s.id}
+                        aria-label={tr('卸载技能：{name}', { name: s.name })}
                         onClick={() => setSkillToRemove(s)}
                       >
-                        <DeleteOutlineIcon sx={{ fontSize: 18, color: '#9CA3AF' }} />
+                        <DeleteOutlineIcon sx={{ fontSize: 18, color: 'var(--tt-text-4)' }} />
                       </IconButton>
                     </span>
                   </Tooltip>
@@ -942,7 +960,7 @@ const ExtensionsPage: React.FC = () => {
         <Box>
           {/* 标题 + 右上角「+ 添加」 */}
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-            <Typography sx={{ fontSize: '16px', fontWeight: 600, color: '#111827', flexGrow: 1 }}>
+            <Typography sx={{ fontSize: '16px', fontWeight: 600, color: 'var(--tt-text-1)', flexGrow: 1 }}>
               连接你的应用，释放生产力
             </Typography>
             <Button
@@ -950,14 +968,14 @@ const ExtensionsPage: React.FC = () => {
               startIcon={<AddIcon />}
               onClick={(e) => setConnAddAnchor(e.currentTarget)}
               sx={{
-                bgcolor: '#111827',
+                bgcolor: 'var(--tt-cta-fill)',
                 borderRadius: '10px',
                 textTransform: 'none',
                 fontSize: '13px',
                 fontWeight: 600,
                 px: 2,
                 flexShrink: 0,
-                '&:hover': { bgcolor: '#4F46E5' },
+                '&:hover': { bgcolor: 'var(--tt-cta-fill-hover)' },
               }}
             >
               添加
@@ -1012,6 +1030,7 @@ const ExtensionsPage: React.FC = () => {
                 <Box
                   key={opt.key}
                   onClick={opt.onClick}
+                  {...clickableProps(opt.onClick, tr(opt.label))}
                   sx={{
                     display: 'flex',
                     alignItems: 'center',
@@ -1038,7 +1057,7 @@ const ExtensionsPage: React.FC = () => {
                   >
                     <Icon sx={{ fontSize: 15, color: opt.iconColor }} />
                   </Box>
-                  <Typography sx={{ fontSize: '13px', fontWeight: 500, color: '#1F2937' }}>{opt.label}</Typography>
+                  <Typography sx={{ fontSize: '13px', fontWeight: 500, color: 'var(--tt-text-1)' }}>{opt.label}</Typography>
                 </Box>
               );
             })}
@@ -1052,13 +1071,13 @@ const ExtensionsPage: React.FC = () => {
           >
             <DialogTitle sx={{ pb: 0.5 }}>
               <Typography sx={{ fontSize: '16px', fontWeight: 700 }}>添加 MCP 服务器</Typography>
-              <Typography sx={{ fontSize: '12.5px', color: '#9CA3AF', mt: 0.25 }}>
+              <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-4)', mt: 0.25 }}>
                 手动配置新的 MCP 服务器连接
               </Typography>
             </DialogTitle>
             <DialogContent sx={{ pt: '12px !important' }}>
               {/* 服务器类型 */}
-              <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>服务器类型</Typography>
+              <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 0.75 }}>服务器类型</Typography>
               <Select
                 value={mcpType}
                 onChange={(e) => setMcpType(e.target.value as McpServerType)}
@@ -1072,8 +1091,8 @@ const ExtensionsPage: React.FC = () => {
               </Select>
 
               {/* 服务器名称 */}
-              <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>
-                服务器名称 <Box component="span" sx={{ color: '#EF4444' }}>*</Box>
+              <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 0.75 }}>
+                服务器名称 <Box component="span" sx={{ color: 'var(--tt-danger)' }}>*</Box>
               </Typography>
               <TextField
                 value={mcpName}
@@ -1086,8 +1105,8 @@ const ExtensionsPage: React.FC = () => {
               {mcpType === 'STDIO' ? (
                 <>
                   {/* 命令（STDIO） */}
-                  <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>
-                    命令 <Box component="span" sx={{ color: '#EF4444' }}>*</Box>
+                  <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 0.75 }}>
+                    命令 <Box component="span" sx={{ color: 'var(--tt-danger)' }}>*</Box>
                   </Typography>
                   <TextField
                     value={mcpCommand}
@@ -1097,12 +1116,12 @@ const ExtensionsPage: React.FC = () => {
                     multiline
                     minRows={3}
                     helperText="粘贴完整命令，如 npx -y @modelcontextprotocol/server-filesystem"
-                    FormHelperTextProps={{ sx: { fontSize: '11.5px', color: '#9CA3AF', mx: 0 } }}
+                    FormHelperTextProps={{ sx: { fontSize: '11.5px', color: 'var(--tt-text-4)', mx: 0 } }}
                     sx={{ mb: 2, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
                   />
 
                   {/* 环境变量（可选） */}
-                  <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>环境变量（可选）</Typography>
+                  <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 0.75 }}>环境变量（可选）</Typography>
                   {envVars.map((v, i) => (
                     <Box key={i} sx={{ display: 'flex', gap: 1, mb: 1 }}>
                       <TextField
@@ -1119,14 +1138,15 @@ const ExtensionsPage: React.FC = () => {
                         size="small"
                         sx={{ flex: 1.2, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
                       />
-                      <IconButton size="small" onClick={() => setEnvVars(envVars.filter((_, j) => j !== i))} sx={{ color: '#9CA3AF' }}>
+                      <IconButton size="small" aria-label={tr('删除第 {index} 行环境变量', { index: i + 1 })} onClick={() => setEnvVars(envVars.filter((_, j) => j !== i))} sx={{ color: 'var(--tt-text-4)' }}>
                         <DeleteOutlineIcon sx={{ fontSize: 17 }} />
                       </IconButton>
                     </Box>
                   ))}
                   <Typography
                     onClick={() => setEnvVars([...envVars, { key: '', value: '' }])}
-                    sx={{ fontSize: '12.5px', color: '#4F46E5', cursor: 'pointer', mb: 2, '&:hover': { textDecoration: 'underline' } }}
+                    {...clickableProps(() => setEnvVars([...envVars, { key: '', value: '' }]), tr('添加环境变量'))}
+                    sx={{ fontSize: '12.5px', color: 'var(--tt-accent)', cursor: 'pointer', mb: 2, '&:hover': { textDecoration: 'underline' } }}
                   >
                     + 添加变量
                   </Typography>
@@ -1134,8 +1154,8 @@ const ExtensionsPage: React.FC = () => {
               ) : (
                 <>
                   {/* 服务器地址（SSE / Streamable HTTP） */}
-                  <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>
-                    服务器地址 <Box component="span" sx={{ color: '#EF4444' }}>*</Box>
+                  <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 0.75 }}>
+                    服务器地址 <Box component="span" sx={{ color: 'var(--tt-danger)' }}>*</Box>
                   </Typography>
                   <TextField
                     value={mcpUrl}
@@ -1147,7 +1167,7 @@ const ExtensionsPage: React.FC = () => {
                   />
 
                   {/* Headers（可选） */}
-                  <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>Headers（可选）</Typography>
+                  <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 0.75 }}>Headers（可选）</Typography>
                   {headers.map((h, i) => (
                     <Box key={i} sx={{ display: 'flex', gap: 1, mb: 1 }}>
                       <TextField
@@ -1164,43 +1184,44 @@ const ExtensionsPage: React.FC = () => {
                         size="small"
                         sx={{ flex: 1.2, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
                       />
-                      <IconButton size="small" onClick={() => setHeaders(headers.filter((_, j) => j !== i))} sx={{ color: '#9CA3AF' }}>
+                      <IconButton size="small" aria-label={tr('删除第 {index} 行请求头', { index: i + 1 })} onClick={() => setHeaders(headers.filter((_, j) => j !== i))} sx={{ color: 'var(--tt-text-4)' }}>
                         <DeleteOutlineIcon sx={{ fontSize: 17 }} />
                       </IconButton>
                     </Box>
                   ))}
                   <Typography
                     onClick={() => setHeaders([...headers, { key: '', value: '' }])}
-                    sx={{ fontSize: '12.5px', color: '#4F46E5', cursor: 'pointer', mb: 2, '&:hover': { textDecoration: 'underline' } }}
+                    {...clickableProps(() => setHeaders([...headers, { key: '', value: '' }]), tr('添加请求头'))}
+                    sx={{ fontSize: '12.5px', color: 'var(--tt-accent)', cursor: 'pointer', mb: 2, '&:hover': { textDecoration: 'underline' } }}
                   >
                     + 添加 Header
                   </Typography>
 
                   {/* OAuth（仅 Streamable HTTP）：公共客户端 + PKCE，令牌不进配置文件 */}
                   {mcpType === 'STREAMABLE_HTTP' && (
-                    <Box sx={{ mb: 2, p: 1.5, border: '1px solid #EEF0F2', borderRadius: '12px', background: '#FAFBFC' }}>
+                    <Box sx={{ mb: 2, p: 1.5, border: '1px solid var(--tt-border)', borderRadius: '12px', background: 'var(--tt-surface-2)' }}>
                       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                         <Switch
                           size="small"
                           checked={mcpAuthEnabled}
                           onChange={(e) => setMcpAuthEnabled(e.target.checked)}
                         />
-                        <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#374151' }}>
+                        <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-2)' }}>
                           启用 OAuth 授权
                         </Typography>
                       </Box>
-                      <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF', lineHeight: 1.6 }}>
+                      <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', lineHeight: 1.6 }}>
                         公共客户端 + PKCE，无需 client_secret。授权与刷新令牌由桌面端保存在系统凭据库，不写入配置文件，也不会回显。
                       </Typography>
                       {oauthHeaderConflict && (
-                        <Typography sx={{ fontSize: '11.5px', color: '#DC2626', lineHeight: 1.6, mt: 0.5 }}>
+                        <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-danger)', lineHeight: 1.6, mt: 0.5 }}>
                           请移除上方 Authorization 请求头：它会覆盖 OAuth 自动附加的令牌。
                         </Typography>
                       )}
                       {mcpAuthEnabled && (
                         <Box sx={{ mt: 1.5 }}>
-                          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>
-                            授权地址 <Box component="span" sx={{ color: '#EF4444' }}>*</Box>
+                          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 0.75 }}>
+                            授权地址 <Box component="span" sx={{ color: 'var(--tt-danger)' }}>*</Box>
                           </Typography>
                           <TextField
                             value={mcpAuthUrl}
@@ -1210,8 +1231,8 @@ const ExtensionsPage: React.FC = () => {
                             placeholder="https://auth.example.com/oauth/authorize"
                             sx={{ mb: 1.5, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
                           />
-                          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>
-                            Token 地址 <Box component="span" sx={{ color: '#EF4444' }}>*</Box>
+                          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 0.75 }}>
+                            Token 地址 <Box component="span" sx={{ color: 'var(--tt-danger)' }}>*</Box>
                           </Typography>
                           <TextField
                             value={mcpTokenUrl}
@@ -1221,8 +1242,8 @@ const ExtensionsPage: React.FC = () => {
                             placeholder="https://auth.example.com/oauth/token"
                             sx={{ mb: 1.5, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
                           />
-                          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>
-                            client_id <Box component="span" sx={{ color: '#EF4444' }}>*</Box>
+                          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 0.75 }}>
+                            client_id <Box component="span" sx={{ color: 'var(--tt-danger)' }}>*</Box>
                           </Typography>
                           <TextField
                             value={mcpClientId}
@@ -1232,7 +1253,7 @@ const ExtensionsPage: React.FC = () => {
                             placeholder="tongtian-desktop"
                             sx={{ mb: 1.5, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
                           />
-                          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>Scopes（可选）</Typography>
+                          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 0.75 }}>Scopes（可选）</Typography>
                           <TextField
                             value={mcpScopes}
                             onChange={(e) => setMcpScopes(e.target.value)}
@@ -1240,7 +1261,7 @@ const ExtensionsPage: React.FC = () => {
                             size="small"
                             placeholder="openid profile，空格或逗号分隔"
                             helperText="授权与 Token 地址需为 HTTPS；本机服务（localhost / 127.0.0.1）允许 HTTP。"
-                            FormHelperTextProps={{ sx: { fontSize: '11.5px', color: '#9CA3AF', mx: 0 } }}
+                            FormHelperTextProps={{ sx: { fontSize: '11.5px', color: 'var(--tt-text-4)', mx: 0 } }}
                             sx={{ '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
                           />
                         </Box>
@@ -1251,7 +1272,7 @@ const ExtensionsPage: React.FC = () => {
               )}
 
               {/* 超时时间（可选） */}
-              <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>超时时间（可选）</Typography>
+              <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 0.75 }}>超时时间（可选）</Typography>
               <TextField
                 value={mcpTimeout}
                 onChange={(e) => setMcpTimeout(e.target.value)}
@@ -1260,7 +1281,7 @@ const ExtensionsPage: React.FC = () => {
                 type="number"
                 inputProps={{ min: 1, max: 600 }}
                 helperText="连接、工具列表获取及工具调用的超时时间，单位为秒（1-600）。留空使用默认值（60秒）。"
-                FormHelperTextProps={{ sx: { fontSize: '11.5px', color: '#9CA3AF', mx: 0 } }}
+                FormHelperTextProps={{ sx: { fontSize: '11.5px', color: 'var(--tt-text-4)', mx: 0 } }}
                 sx={{ mb: 2, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
               />
 
@@ -1274,13 +1295,13 @@ const ExtensionsPage: React.FC = () => {
                   mt: 1,
                   mb: 1,
                   py: 1.1,
-                  bgcolor: mcpValid ? '#111827' : '#E5E7EB',
+                  bgcolor: mcpValid ? 'var(--tt-accent-fill)' : 'var(--tt-chip-neutral)',
                   borderRadius: '10px',
                   textTransform: 'none',
                   fontSize: '14px',
                   fontWeight: 700,
-                  '&:hover': { bgcolor: '#4F46E5' },
-                  '&.Mui-disabled': { bgcolor: '#E5E7EB', color: '#9CA3AF' },
+                  '&:hover': { bgcolor: 'var(--tt-accent-fill)' },
+                  '&.Mui-disabled': { bgcolor: 'var(--tt-chip-neutral)', color: 'var(--tt-text-4)' },
                 }}
               >
                 {mcpSaving ? '登记中…' : '添加'}
@@ -1296,7 +1317,7 @@ const ExtensionsPage: React.FC = () => {
           >
             <DialogTitle sx={{ pb: 0.5 }}>
               <Typography sx={{ fontSize: '16px', fontWeight: 700 }}>通过 JSON 导入</Typography>
-              <Typography sx={{ fontSize: '12.5px', color: '#9CA3AF', mt: 0.25 }}>请粘贴您的配置 JSON</Typography>
+              <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-4)', mt: 0.25 }}>请粘贴您的配置 JSON</Typography>
             </DialogTitle>
             <DialogContent sx={{ pt: '12px !important' }}>
               <TextField
@@ -1310,7 +1331,7 @@ const ExtensionsPage: React.FC = () => {
                   '& .MuiOutlinedInput-root': {
                     fontSize: '12px',
                     fontFamily: 'SFMono-Regular, Consolas, monospace',
-                    background: '#FAFBFC',
+                    background: 'var(--tt-surface-2)',
                   },
                 }}
               />
@@ -1324,13 +1345,13 @@ const ExtensionsPage: React.FC = () => {
                   mt: 2,
                   mb: 1,
                   py: 1.1,
-                  bgcolor: jsonText.trim() ? '#111827' : '#E5E7EB',
+                  bgcolor: jsonText.trim() ? 'var(--tt-accent-fill)' : 'var(--tt-chip-neutral)',
                   borderRadius: '10px',
                   textTransform: 'none',
                   fontSize: '14px',
                   fontWeight: 700,
-                  '&:hover': { bgcolor: '#4F46E5' },
-                  '&.Mui-disabled': { bgcolor: '#E5E7EB', color: '#9CA3AF' },
+                  '&:hover': { bgcolor: 'var(--tt-accent-fill)' },
+                  '&.Mui-disabled': { bgcolor: 'var(--tt-chip-neutral)', color: 'var(--tt-text-4)' },
                 }}
               >
                 {mcpSaving ? '导入中…' : '导入'}
@@ -1339,7 +1360,7 @@ const ExtensionsPage: React.FC = () => {
           </Dialog>
 
           {/* 内置工具 / 市场 / 已安装 */}
-          <Box sx={{ display: 'flex', gap: 2.5, mt: 1.5, mb: 2.5, borderBottom: '1px solid #F3F4F6' }}>
+          <Box sx={{ display: 'flex', gap: 2.5, mt: 1.5, mb: 2.5, borderBottom: '1px solid var(--tt-border)' }}>
             {([
               ['builtin', `内置工具 ${builtinCount}`],
               ['market', '市场'],
@@ -1348,17 +1369,19 @@ const ExtensionsPage: React.FC = () => {
               <Box
                 key={key}
                 onClick={() => setConnectorTab(key)}
+                {...clickableProps(() => setConnectorTab(key), tr('切换到「{label}」分类', { label }))}
+                aria-pressed={connectorTab === key}
                 sx={{
                   pb: 1,
                   cursor: 'pointer',
-                  borderBottom: connectorTab === key ? '2px solid #111827' : '2px solid transparent',
+                  borderBottom: connectorTab === key ? '2px solid var(--tt-text-1)' : '2px solid transparent',
                 }}
               >
                 <Typography
                   sx={{
                     fontSize: '13px',
                     fontWeight: connectorTab === key ? 600 : 400,
-                    color: connectorTab === key ? '#111827' : '#6B7280',
+                    color: connectorTab === key ? 'var(--tt-text-1)' : 'var(--tt-text-3)',
                   }}
                 >
                   {label}
@@ -1370,12 +1393,12 @@ const ExtensionsPage: React.FC = () => {
           {/* 内置工具：清单来自引擎注册表（或同源声明值），不可卸载 */}
           {connectorTab === 'builtin' && (
             builtinError ? (
-              <Typography sx={{ fontSize: '12.5px', color: '#B91C1C', mb: 1.5 }}>{builtinError}</Typography>
+              <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-danger)', mb: 1.5 }}>{builtinError}</Typography>
             ) : !builtin ? (
-              <Typography sx={{ fontSize: '12.5px', color: '#9CA3AF', mb: 1.5 }}>正在读取内置工具清单…</Typography>
+              <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-4)', mb: 1.5 }}>正在读取内置工具清单…</Typography>
             ) : (
               <>
-                <Typography sx={{ fontSize: '12px', color: '#9CA3AF', mb: 1.5 }}>
+                <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mb: 1.5 }}>
                   {builtin.note ?? (builtin.source === 'engine'
                     ? '清单读自运行中引擎的工具注册表'
                     : '按与引擎同源的声明清单显示')}
@@ -1387,27 +1410,27 @@ const ExtensionsPage: React.FC = () => {
                   <Box
                     key={t.id}
                     sx={{
-                      border: '1px solid #EEF0F2',
+                      border: '1px solid var(--tt-border)',
                       borderRadius: '14px',
                       p: 2,
-                      background: '#FFFFFF',
+                      background: 'var(--tt-surface)',
                       display: 'flex',
                       flexDirection: 'column',
                       gap: 1,
                     }}
                   >
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                      <Icon sx={{ fontSize: 18, color: '#374151' }} />
-                      <Typography sx={{ fontSize: '14px', fontWeight: 600, color: '#111827' }}>{t.name}</Typography>
+                      <Icon sx={{ fontSize: 18, color: 'var(--tt-text-2)' }} />
+                      <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'var(--tt-text-1)' }}>{t.name}</Typography>
                       <Box sx={{ flexGrow: 1 }} />
-                      <Typography sx={{ fontSize: '11px', color: '#9CA3AF' }}>内置</Typography>
+                      <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>内置</Typography>
                     </Box>
-                    <Typography sx={{ fontSize: '12px', color: '#6B7280', lineHeight: 1.6, minHeight: 38 }}>
+                    <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-2)', lineHeight: 1.6, minHeight: 38 }}>
                       {t.desc}
                     </Typography>
                     <Box sx={{ display: 'flex', justifyContent: 'flex-end', mt: 0.5 }}>
-                      <Box sx={{ px: 1.5, py: 0.5, borderRadius: '8px', background: '#E6F7F4' }}>
-                        <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#0D9488' }}>已内置</Typography>
+                      <Box sx={{ px: 1.5, py: 0.5, borderRadius: '8px', background: 'var(--tt-chip-teal)' }}>
+                        <Typography sx={{ fontSize: '12px', fontWeight: 600, color: 'var(--tt-teal)' }}>已内置</Typography>
                       </Box>
                     </Box>
                   </Box>
@@ -1420,7 +1443,7 @@ const ExtensionsPage: React.FC = () => {
 
           {/* 市场目录：点开即打开手动配置弹窗并预填名称（市场自动安装未接入，不伪造「已安装」） */}
           {connectorTab === 'market' && (
-            <Typography sx={{ fontSize: '12px', color: '#9CA3AF', mb: 1.5 }}>
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mb: 1.5 }}>
               目录内连接器需在下方弹窗填写真实启动命令或服务地址后登记；登记完成即可点击「连接」握手取工具清单。
             </Typography>
           )}
@@ -1432,22 +1455,22 @@ const ExtensionsPage: React.FC = () => {
                 <Box
                   key={c.id}
                   sx={{
-                    border: '1px solid #EEF0F2',
+                    border: '1px solid var(--tt-border)',
                     borderRadius: '14px',
                     p: 2,
-                    background: '#FFFFFF',
+                    background: 'var(--tt-surface)',
                     display: 'flex',
                     flexDirection: 'column',
                     gap: 1,
                   }}
                 >
                   <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                    <Icon sx={{ fontSize: 18, color: '#374151' }} />
-                    <Typography sx={{ fontSize: '14px', fontWeight: 600, color: '#111827' }}>{c.name}</Typography>
+                    <Icon sx={{ fontSize: 18, color: 'var(--tt-text-2)' }} />
+                    <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'var(--tt-text-1)' }}>{c.name}</Typography>
                     <Box sx={{ flexGrow: 1 }} />
-                    <Typography sx={{ fontSize: '11px', color: '#9CA3AF' }}>{c.category}</Typography>
+                    <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>{c.category}</Typography>
                   </Box>
-                  <Typography sx={{ fontSize: '12px', color: '#6B7280', lineHeight: 1.6, minHeight: 38 }}>
+                  <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-2)', lineHeight: 1.6, minHeight: 38 }}>
                     {c.desc}
                   </Typography>
                   <Box sx={{ display: 'flex', justifyContent: 'flex-end', mt: 0.5 }}>
@@ -1456,12 +1479,12 @@ const ExtensionsPage: React.FC = () => {
                       variant="contained"
                       onClick={() => openMcpDialog(c.name)}
                       sx={{
-                        bgcolor: '#111827',
+                        bgcolor: 'var(--tt-cta-fill)',
                         borderRadius: '8px',
                         textTransform: 'none',
                         fontSize: '12px',
                         px: 2,
-                        '&:hover': { bgcolor: '#1F2937' },
+                        '&:hover': { bgcolor: 'var(--tt-cta-fill-hover)' },
                       }}
                     >
                       登记
@@ -1480,44 +1503,44 @@ const ExtensionsPage: React.FC = () => {
                 <Box
                   key={s.serverId}
                   sx={{
-                    border: '1px solid #EEF0F2',
+                    border: '1px solid var(--tt-border)',
                     borderRadius: '14px',
                     p: 2,
-                    background: '#FFFFFF',
+                    background: 'var(--tt-surface)',
                     display: 'flex',
                     flexDirection: 'column',
                     gap: 1,
                   }}
                 >
                   <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                    <TerminalIcon sx={{ fontSize: 18, color: '#374151' }} />
-                    <Typography sx={{ fontSize: '14px', fontWeight: 600, color: '#111827' }}>{s.name}</Typography>
+                    <TerminalIcon sx={{ fontSize: 18, color: 'var(--tt-text-2)' }} />
+                    <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'var(--tt-text-1)' }}>{s.name}</Typography>
                     <Box sx={{ flexGrow: 1 }} />
-                    <Typography sx={{ fontSize: '11px', color: '#9CA3AF' }}>
+                    <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
                       {TRANSPORT_LABEL_TEXT[s.transport] ?? s.transport}
                     </Typography>
                   </Box>
-                  <Typography sx={{ fontSize: '12px', color: '#6B7280', lineHeight: 1.6 }}>
+                  <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-2)', lineHeight: 1.6 }}>
                     {s.transport === 'stdio'
                       ? `启动命令：${s.command}${s.args.length ? ` ${s.args.join(' ')}` : ''}`
                       : `服务地址：${s.url}`}
                   </Typography>
                   {s.status === 'connected' ? (
-                    <Typography sx={{ fontSize: '12px', color: '#0D9488', fontWeight: 600 }}>
+                    <Typography sx={{ fontSize: '12px', color: 'var(--tt-teal)', fontWeight: 600 }}>
                       已连接 · {s.tools.length} 个工具
                     </Typography>
                   ) : s.status === 'failed' ? (
-                    <Typography sx={{ fontSize: '12px', color: '#DC2626', lineHeight: 1.6 }}>
+                    <Typography sx={{ fontSize: '12px', color: 'var(--tt-danger)', lineHeight: 1.6 }}>
                       上次连接失败：{s.lastError || '未知原因'}
                     </Typography>
                   ) : (
-                    <Typography sx={{ fontSize: '12px', color: '#9CA3AF' }}>
+                    <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>
                       未连接（配置已保存，握手后才会显示工具清单）
                     </Typography>
                   )}
                   {/* stdio 消耗环境变量、远程消耗请求头，另一侧不展示避免造成假凭据项 */}
                   {(s.transport === 'stdio' ? s.envKeys : s.headerKeys).length > 0 && (
-                    <Typography sx={{ fontSize: '11px', color: '#9CA3AF' }}>
+                    <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
                       凭据项：{(s.transport === 'stdio' ? s.envKeys : s.headerKeys).join('、')}（值仅存本机，不回显）
                     </Typography>
                   )}
@@ -1537,7 +1560,7 @@ const ExtensionsPage: React.FC = () => {
                             fontSize: '11px',
                             fontWeight: 600,
                             color:
-                              s.authStatus === 'authorized' ? '#0D9488' : s.authStatus === 'expired' ? '#B45309' : '#6B7280',
+                              s.authStatus === 'authorized' ? 'var(--tt-teal)' : s.authStatus === 'expired' ? 'var(--tt-warning)' : 'var(--tt-text-3)',
                           }}
                         >
                           {s.authStatus === 'authorized'
@@ -1547,7 +1570,7 @@ const ExtensionsPage: React.FC = () => {
                               : 'OAuth 未授权'}
                         </Typography>
                       </Box>
-                      <Typography sx={{ fontSize: '11px', color: '#9CA3AF' }}>
+                      <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
                         {s.authStatus === 'none'
                           ? '连接前需在系统浏览器完成授权'
                           : s.authStatus === 'expired'
@@ -1557,7 +1580,7 @@ const ExtensionsPage: React.FC = () => {
                     </Box>
                   )}
                   {s.auth && !desktopChannel && (
-                    <Typography sx={{ fontSize: '11px', color: '#B45309', lineHeight: 1.6 }}>
+                    <Typography sx={{ fontSize: '11px', color: 'var(--tt-warning)', lineHeight: 1.6 }}>
                       浏览器通道无法保存 OAuth 令牌，授权与连接请在桌面版任我行中完成。
                     </Typography>
                   )}
@@ -1568,7 +1591,7 @@ const ExtensionsPage: React.FC = () => {
                         variant="text"
                         disabled={mcpBusyId === s.serverId || !desktopChannel}
                         onClick={() => void handleRevokeMcp(s)}
-                        sx={{ borderRadius: '8px', textTransform: 'none', fontSize: '11.5px', minWidth: 0, color: '#9CA3AF' }}
+                        sx={{ borderRadius: '8px', textTransform: 'none', fontSize: '11.5px', minWidth: 0, color: 'var(--tt-text-4)' }}
                       >
                         撤销授权
                       </Button>
@@ -1591,12 +1614,12 @@ const ExtensionsPage: React.FC = () => {
                         disabled={mcpBusyId === s.serverId || !desktopChannel}
                         onClick={() => void handleAuthorizeMcp(s)}
                         sx={{
-                          bgcolor: '#111827',
+                          bgcolor: 'var(--tt-cta-fill)',
                           borderRadius: '8px',
                           textTransform: 'none',
                           fontSize: '12px',
                           px: 2,
-                          '&:hover': { bgcolor: '#1F2937' },
+                          '&:hover': { bgcolor: 'var(--tt-cta-fill-hover)' },
                         }}
                       >
                         {mcpBusyId === s.serverId ? '等待浏览器授权…' : '授权'}
@@ -1618,12 +1641,12 @@ const ExtensionsPage: React.FC = () => {
                         disabled={mcpBusyId === s.serverId}
                         onClick={() => void handleConnectMcp(s)}
                         sx={{
-                          bgcolor: '#111827',
+                          bgcolor: 'var(--tt-cta-fill)',
                           borderRadius: '8px',
                           textTransform: 'none',
                           fontSize: '12px',
                           px: 2,
-                          '&:hover': { bgcolor: '#1F2937' },
+                          '&:hover': { bgcolor: 'var(--tt-cta-fill-hover)' },
                         }}
                       >
                         {mcpBusyId === s.serverId ? '握手中…' : '连接'}
@@ -1631,8 +1654,9 @@ const ExtensionsPage: React.FC = () => {
                     )}
                     <IconButton
                       size="small"
+                      aria-label={tr('移除连接器：{name}', { name: s.name })}
                       onClick={() => setServerToRemove(s)}
-                      sx={{ color: '#9CA3AF', '&:hover': { color: '#DC2626' } }}
+                      sx={{ color: 'var(--tt-text-4)', '&:hover': { color: 'var(--tt-danger)' } }}
                     >
                       <DeleteOutlineIcon sx={{ fontSize: 16 }} />
                     </IconButton>
@@ -1642,7 +1666,7 @@ const ExtensionsPage: React.FC = () => {
             </Box>
           )}
           {connectorTab === 'installed' && mcpLoaded && mcpServers.length === 0 && (
-            <Typography sx={{ fontSize: '13px', color: '#9CA3AF', p: 4, textAlign: 'center' }}>
+            <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-4)', p: 4, textAlign: 'center' }}>
               {mcpError ?? '暂无已登记的 MCP 连接器，点击「+ 添加」手动配置或用 JSON 导入'}
             </Typography>
           )}
@@ -1651,7 +1675,7 @@ const ExtensionsPage: React.FC = () => {
           <Dialog open={!!serverToRemove} onClose={() => setServerToRemove(null)} maxWidth="xs" fullWidth>
             <DialogTitle sx={{ fontSize: '16px', fontWeight: 700 }}>移除连接器登记</DialogTitle>
             <DialogContent>
-              <Typography sx={{ fontSize: '13px', color: '#6B7280', lineHeight: 1.7 }}>
+              <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-2)', lineHeight: 1.7 }}>
                 将移除「{serverToRemove?.name}」的连接配置{serverToRemove?.status === 'connected' ? '（当前处于已连接状态）' : ''}。
                 {serverToRemove?.auth ? '该连接器保存在系统凭据库中的 OAuth 令牌也会一并清除。' : ''}
                 历史任务与审计记录不受影响，之后可用相同配置重新登记。

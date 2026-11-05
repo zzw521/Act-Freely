@@ -1,0 +1,9 @@
+来源仓库：anthropics/skills（该技能目录自带 LICENSE.txt，为 Apache License 2.0）
+上游路径：skills/frontend-design/SKILL.md
+上游提交：ca45fc496a3436251f191354091d557da31c15b5
+条目页：https://skills.sh/anthropics/skills/frontend-design
+获取时间：2026-11-02
+说明：本目录是通天办公市场演示数据，镜像上游原文件、未作改写；
+      市场卡片上的中文摘要与分类由服务端发布参数提供，不属于上游内容。
+      注意：anthropics/skills 仓库根目录没有统一许可证，pdf/docx/pptx/xlsx 等文档类技能
+      属于 source-available 而非开源许可，本演示目录未收录这些技能。

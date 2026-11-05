@@ -17,8 +17,8 @@
 //! - usage_stats / usage_report（用量总览与按日趋势报表，读同一 model_usage 台账）
 //! - file_list / file_read / file_preview / file_stage_attachment（文件能力 + 附件上传）
 //! - settings_get / settings_set_many（设置持久化；批量 patch 是唯一写入口）
-//! - awareness_get / update / memories / memory_add / memory_delete
-//!   （意识以 `~/.tongtianwork/awareness/main` 下真实文件为事实来源，与引擎同目录，不再第二份数据库副本）
+//! - awareness_get / update / memory_list / memory_add / memory_delete
+//!   （意识文件在 `~/.tongtianwork/awareness/main`；长期记忆条目落桌面库 `memories` 表）
 //!
 //! 账号与登录态（网页验证登录 · Loopback 方案，TT_AUTH_MOCK 开关）：
 //! - auth_status / auth_login / auth_logout
@@ -34,6 +34,7 @@
 //!   `market.trustedPublishers`，索引自报公钥不能替代用户信任
 
 mod align;
+mod app_update;
 mod auth;
 mod awareness;
 mod background;
@@ -44,6 +45,7 @@ mod computer;
 mod expert;
 mod file;
 mod harness;
+mod ipc;
 mod knowledge;
 mod market;
 mod mcp;
@@ -57,6 +59,7 @@ mod security;
 mod skill;
 mod store;
 mod suite;
+mod superagent;
 mod system;
 mod task;
 mod terminal;
@@ -127,6 +130,7 @@ async fn agent_start_workspace(
     let port = agent::start_workspace(&app, &state.inner(), &workspace_id).await?;
     Ok(json!({ "workspaceId": workspace_id, "port": port }))
 }
+
 
 /// 推送任务状态变更事件（status_change，含 wait_reason/成因码）
 fn emit_status_change(app: &AppHandle, record: &task::registry::TaskRecord) {
@@ -199,9 +203,69 @@ fn validate_work_dir(raw: Option<&str>) -> Result<Option<std::path::PathBuf>, St
     Ok(Some(buf))
 }
 
+/// 把本轮负责人专家的 id 盖进 runtime（检查点按执行体分目录要知道「谁跑的」）。
+///
+/// 只盖 id：提示词与模型绑定仍由执行面从 `runtime.experts` 取，这里不复制第二份事实。
+/// 没有专家时把键删掉，避免沿用上一轮残留的归属把快照放进别人的目录。
+fn stamp_expert(runtime: &mut Value, expert_id: Option<&str>) {
+    let Some(map) = runtime.as_object_mut() else {
+        return;
+    };
+    match expert_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => {
+            map.insert("expertId".into(), json!(id));
+        }
+        None => {
+            map.remove("expertId");
+        }
+    }
+}
+
+/// 把本轮的文件访问档位盖进 runtime（引擎与本地 harness 读同一个键）。
+///
+/// 「每次询问」要有确认框可弹，靠的是本机回环网关；网关平时只在逐工具审批
+/// 档位非 off 时才下发。这里补一刀：档位是「每次询问」而网关缺席时照样把
+/// gateUrl/gateToken 写进去（网关侧只对 `kind=file_permission` 的请求放行，
+/// 不会因此把普通工具调用从「不审批」变成「审批」）。网关起不来时如实写
+/// gateError，引擎据此降级为「目录内直接写、越界仍拒」，而不是假装弹过框。
+fn stamp_file_permission(runtime: &mut Value, mode: &str) {
+    let Some(map) = runtime.as_object_mut() else {
+        return;
+    };
+    map.insert(
+        security::file_perm::RUNTIME_KEY.into(),
+        json!(mode),
+    );
+    if mode != security::file_perm::DEFAULT_MODE {
+        return;
+    }
+    let block = map
+        .entry("toolApproval".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(approval) = block.as_object_mut() else {
+        return;
+    };
+    // 审批档位已经把网关下发了（或已给出不可用原因）就不要覆盖
+    if approval.contains_key("gateUrl") || approval.contains_key("gateError") {
+        return;
+    }
+    match bridge::tool_gate::endpoint() {
+        Some(g) => {
+            approval.insert("gateUrl".into(), json!(g.url));
+            approval.insert("gateToken".into(), json!(g.token));
+            approval.insert("askedForFilePermission".into(), json!(true));
+        }
+        None => {
+            approval.insert(
+                "gateError".into(),
+                json!("本机确认网关未启动，「每次询问」无法弹框；本轮按档位的目录边界强制执行"),
+            );
+        }
+    }
+}
+
 /// 本地 harness 的工作目录：用户自选优先，否则与引擎同用 workspace 目录
-fn harness_work_dir(
-    chosen: Option<&std::path::Path>,
+fn harness_work_dir(    chosen: Option<&std::path::Path>,
     ws: &str,
 ) -> Result<std::path::PathBuf, String> {
     match chosen {
@@ -236,11 +300,17 @@ async fn harness_slot_for(
     .map_err(|e| format!("CHECKPOINT_MODEL_UNAVAILABLE: 模型配置解析线程异常：{e}"))??;
     let rt_store = Arc::clone(store);
     let rt_ws = ws.to_string();
-    let runtime = tauri::async_runtime::spawn_blocking(move || {
+    let mut runtime = tauri::async_runtime::spawn_blocking(move || {
         bridge::runtime::build(Some(&rt_store), &rt_ws, &[]).runtime
     })
     .await
     .map_err(|e| format!("RUNTIME_BUNDLE_PANIC: 执行面输入装配线程异常：{e}"))?;
+    // 续跑沿用中断前那一档：档位记在检查点里，不重读全局默认——
+    // 用户在会话里选过「每次询问」，重启后不能悄悄变成「自动审批」。
+    let tier = harness::checkpoint::load(task_id)
+        .map(|cp| cp.meta.file_permission)
+        .unwrap_or_default();
+    stamp_file_permission(&mut runtime, &security::file_perm::normalize_or_default(Some(&tier)));
     let slot = harness::runner::slot_from_checkpoint(
         task_id,
         model_config.unwrap_or(Value::Null),
@@ -249,6 +319,36 @@ async fn harness_slot_for(
     )?;
     hub.insert(slot.clone());
     Ok(Some(slot))
+}
+
+/// 一条执行流结束后的状态落定。
+///
+/// 被预算拦停的任务（budget_paused）**不能**在这里被写成 done / pending_review：
+/// 计量点已经把状态和成因（BUDGET_EXHAUSTED）播报过了，收尾再改写一次，
+/// 界面就会把「被预算停下」显示成正常完成，「调高预算后点继续」的入口也就没了。
+fn settle_stream_status(
+    app: &AppHandle,
+    services: &Arc<P0Services>,
+    task_id: &str,
+    cancel_requested: bool,
+    normal: &str,
+) {
+    let paused = services
+        .registry
+        .get(task_id)
+        .map(|r| r.status == status::BUDGET_PAUSED)
+        .unwrap_or(false);
+    if paused {
+        return;
+    }
+    let next = if cancel_requested {
+        status::CANCELLED
+    } else {
+        normal
+    };
+    if let Some(r) = services.registry.update_status(task_id, next, None) {
+        emit_status_change(app, &r);
+    }
 }
 
 /// harness 任务收尾：状态回写、正文同步与租约释放（与引擎路径同一状态机）
@@ -267,14 +367,7 @@ fn finish_harness_task(
         .unwrap_or(false);
     match result {
         Ok(()) => {
-            let next = if cancel_requested {
-                status::CANCELLED
-            } else {
-                status::DONE
-            };
-            if let Some(r) = services.registry.update_status(task_id, next, None) {
-                emit_status_change(app, &r);
-            }
+            settle_stream_status(app, services, task_id, cancel_requested, status::DONE);
         }
         Err(err) => {
             // 恢复没有真正跑起来：回到之前的状态，不能把可重试的中断误标成 failed
@@ -332,10 +425,16 @@ async fn chat_submit(
     model_binding: Option<String>,
     // 所选已保存模型的 id（端点与密钥由 Rust 从 SQLite + keyring 解析，渲染层不传密钥）
     model_id: Option<String>,
+    // 同一会话上一轮用的模型 id：只为「换模型仍带着历史」这句可见说明而解析，
+    // 不解析密钥、也不参与模型选择本身（缺省或与本轮相同 → 不播报）。
+    previous_model_id: Option<String>,
     // 本轮负责人专家：只传注册表 id，提示词/模型绑定由引擎从 runtime.experts 取
     expert_id: Option<String>,
     work_dir: Option<String>,
     history: Option<Vec<Value>>,
+    // 本轮会话的文件访问档位（每次询问/自动审批/完全访问）：管「能写到哪、能不能删」，
+    // 与 toolApprovalMode（要不要逐个工具问）是两条轴。缺省时取设置里的全局默认。
+    file_permission: Option<String>,
 ) -> Result<Value, String> {
     let ws = workspace_id
         .filter(|s| !s.is_empty())
@@ -366,6 +465,25 @@ async fn chat_submit(
     let model_config = model::service::runtime_config(&p0.store, model_id.as_deref())?;
     // 本地 harness 的计划与执行同样需要这份配置；引擎路径继续用 override 下发
     let slot_model_config = model_config.clone();
+    // 上一轮用的哪台模型（画像不含密钥）：本轮与之不同时，执行面要播报
+    // 「历史仍按新端点重新编码带上」，而不是让用户自己猜上下文还在不在。
+    let prev_model_profile = match previous_model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => match model::service::get(&p0.store, id) {
+            Ok(Some(m)) => Some(model::service::profile_json(&m)),
+            // 上一轮的模型已被删除或读不出来：说明不了就不说，
+            // 不能因为一条「换模型说明」把本轮提交整个拒掉
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("[harness] previous model profile unavailable: {e}");
+                None
+            }
+        },
+        None => None,
+    };
     // 负责人专家在受理阶段校验：不存在/绑定模型不可用直接拒绝，不留下必然失败的任务
     let expert_id = match expert_id
         .as_deref()
@@ -390,13 +508,38 @@ async fn chat_submit(
         let store = Some(Arc::clone(&p0.store));
         let ws_for_runtime = ws.clone();
         let raw = attachments.clone();
+        let goal_for_runtime = goal.clone();
         let bundle = tauri::async_runtime::spawn_blocking(move || {
-            bridge::runtime::build(store.as_deref(), &ws_for_runtime, &raw)
+            bridge::runtime::build_for_task(store.as_deref(), &ws_for_runtime, &raw, &goal_for_runtime)
         })
         .await
         .map_err(|e| format!("RUNTIME_BUNDLE_PANIC: 执行面输入装配线程异常：{e}"))?;
         (bundle.runtime, bundle.attachments)
     };
+    // 文件访问档位：显式提交的值必须是三档之一（坏值拒绝提交，不猜一档继续跑）；
+    // 没表态时读设置里的全局默认，坏值归一到最保守档并留一条审计。
+    let file_permission = match file_permission.as_deref() {
+        Some(raw) => security::file_perm::normalize(raw)?,
+        None => {
+            let (mode, note) = security::file_perm::read_default(&p0.store);
+            if let Some(note) = note {
+                security::audit::record_quiet(
+                    &p0.store,
+                    security::audit::ACTION_FILE_WRITE,
+                    security::audit::SEV_WARNING,
+                    "file_permission",
+                    &format!("未生效：{note}"),
+                );
+            }
+            mode
+        }
+    };
+    // 档位随 runtime 下发：引擎读顶层 filePermission，本地 harness 读同一个键，
+    // 两条执行面共用一份判定，不会出现「换个执行面换个边界」。
+    let mut runtime = runtime;
+    stamp_file_permission(&mut runtime, &file_permission);
+    // 执行体归属同样随 runtime 下发：本地 harness 的检查点按「负责人/专家/成员」分目录
+    stamp_expert(&mut runtime, expert_id.as_deref());
     // 默认由客户端内嵌 harness 承接；只有它确实做不到的能力才交给引擎。
     // 图片识别与正文抽取只在装配后成立：门控与 harness 都看装配结果
     let harness_reason = harness::engine_required(&harness::GateRequest {
@@ -414,6 +557,8 @@ async fn chat_submit(
         work_dir: work_dir.map(|p| p.display().to_string()),
         history: history.unwrap_or_default(),
         runtime: Some(runtime.clone()),
+        // 本轮的文件访问档位：引擎在 /api/chat 顶层读它，非法值在引擎侧还会再校验一次
+        file_permission: Some(file_permission),
         // 执行面输入（意识/技能）由桥接层装配，这里不替它决定内容
         ..agent::SubmitOverrides::default()
     };
@@ -442,6 +587,7 @@ async fn chat_submit(
     if !privacy {
         if let Err(e) = store::messages::record_user_goal(
             &p0.store,
+            &ws,
             &conv_id,
             turn,
             &task_id,
@@ -484,6 +630,9 @@ async fn chat_submit(
             hydrated,
             privacy,
         );
+        if let Some(prev) = prev_model_profile {
+            slot.set_previous_model(prev);
+        }
         hub.insert(slot.clone());
         let app2 = app.clone();
         let services = p0.inner().clone();
@@ -498,14 +647,13 @@ async fn chat_submit(
                         .map(|r| r.cancel_requested)
                         .unwrap_or(false);
                     // 两阶段协议：计划流结束 → pending_review 待审阅（非任务终态）
-                    let next = if cancel_requested {
-                        status::CANCELLED
-                    } else {
-                        status::PENDING_REVIEW
-                    };
-                    if let Some(r) = services.registry.update_status(&tid, next, None) {
-                        emit_status_change(&app2, &r);
-                    }
+                    settle_stream_status(
+                        &app2,
+                        &services,
+                        &tid,
+                        cancel_requested,
+                        status::PENDING_REVIEW,
+                    );
                 }
                 Err(err) => {
                     eprintln!("[harness] plan failed: {err}");
@@ -580,14 +728,13 @@ async fn chat_submit(
             match result {
                 Ok(()) => {
                     // 两阶段协议：计划流结束 → pending_review 待审阅（非任务终态）
-                    let next = if cancel_requested {
-                        status::CANCELLED
-                    } else {
-                        status::PENDING_REVIEW
-                    };
-                    if let Some(r) = services.registry.update_status(&tid, next, None) {
-                        emit_status_change(&app2, &r);
-                    }
+                    settle_stream_status(
+                        &app2,
+                        &services,
+                        &tid,
+                        cancel_requested,
+                        status::PENDING_REVIEW,
+                    );
                 }
                 Err(err) => {
                     eprintln!("[bridge] chat failed: {err}");
@@ -665,6 +812,16 @@ async fn chat_review(
                     record.status
                 ));
             }
+            // 单任务预算已经用满的计划不能批准（缺陷 D-14.1）：计划阶段同样计入本任务用量，
+            // 明知超预算还批准执行，等于让执行面再发一轮模型调用。
+            if p0.quota.task_budget_blocked(&task_id) {
+                let s = p0.quota.task_snapshot(&task_id);
+                return Err(format!(
+                    "BUDGET_TASK_EXCEEDED: 本任务已用满单任务预算（{} / {} Token），不能批准执行；\
+                     在设置 →「模型与用量」调高「单任务预算」后再批准。",
+                    s.used_tokens, s.limit_tokens
+                ));
+            }
             // 执行阶段沿用提交时的隐私开关：期间用户可能已改设置，以当前值为准
             let privacy = privacy_enabled(&p0.store);
             // 本地 harness 计划（进程内或留盘检查点）优先由本机执行；
@@ -726,14 +883,13 @@ async fn chat_review(
                         .unwrap_or(false);
                     match result {
                         Ok(()) => {
-                            let next = if cancel_requested {
-                                status::CANCELLED
-                            } else {
-                                status::DONE
-                            };
-                            if let Some(r) = services.registry.update_status(&tid, next, None) {
-                                emit_status_change(&app2, &r);
-                            }
+                            settle_stream_status(
+                                &app2,
+                                &services,
+                                &tid,
+                                cancel_requested,
+                                status::DONE,
+                            );
                         }
                         Err(err) => {
                             eprintln!("[bridge] review approve failed: {err}");
@@ -762,15 +918,34 @@ async fn chat_review(
         "resume" => {
             // 断点续跑：检查点决定能否恢复，Rust 只做状态与租约编排。
             // 已结束的任务（done/failed/cancelled）才有检查点；执行中请走 control pause/resume。
+            // 被单任务预算拦停的（budget_paused）也算可恢复：这就是「调高预算后手动唤回」
+            // 的入口（转移 #26），但要先把「还在超预算」挡住。
+            let paused_by_budget = record.status == status::BUDGET_PAUSED;
             let resumable_status = matches!(
                 record.status.as_str(),
                 status::DONE | status::FAILED | status::CANCELLED
-            );
+            ) || paused_by_budget;
             if !resumable_status {
                 return Err(format!(
-                    "VALIDATION_ERROR: 当前状态 {} 不能从检查点恢复（仅 done/failed/cancelled 可恢复）",
+                    "VALIDATION_ERROR: 当前状态 {} 不能从检查点恢复（仅 done/failed/cancelled/预算暂停可恢复）",
                     record.status
                 ));
+            }
+            if paused_by_budget && p0.quota.task_budget_blocked(&task_id) {
+                let s = p0.quota.task_snapshot(&task_id);
+                return Err(format!(
+                    "BUDGET_TASK_EXCEEDED: 本任务已用 {} / {} Token，仍是超预算状态，不能唤回；\
+                     先在设置 →「模型与用量」调高「单任务预算」（填 0 为不限）再点继续。",
+                    s.used_tokens, s.limit_tokens
+                ));
+            }
+            // 日额度也拦到 100% 时不唤回：那是一整天的额度，不是这个任务的问题
+            if paused_by_budget {
+                if let Err(code) = p0.quota.check_submit() {
+                    return Err(format!(
+                        "{code}: 今日额度已用满，唤回后仍会被停住；请等下一个 UTC 日重置或调高今日预算。"
+                    ));
+                }
             }
             let privacy = privacy_enabled(&p0.store);
             let previous_status = record.status.clone();
@@ -862,14 +1037,13 @@ async fn chat_review(
                         .unwrap_or(false);
                     match result {
                         Ok(()) => {
-                            let next = if cancel_requested {
-                                status::CANCELLED
-                            } else {
-                                status::DONE
-                            };
-                            if let Some(r) = services.registry.update_status(&tid, next, None) {
-                                emit_status_change(&app2, &r);
-                            }
+                            settle_stream_status(
+                                &app2,
+                                &services,
+                                &tid,
+                                cancel_requested,
+                                status::DONE,
+                            );
                         }
                         Err(err) => {
                             // 恢复没有真正开始（检查点不可用/引擎已重启）：回到之前的状态，
@@ -1185,12 +1359,19 @@ async fn chat_history(
 }
 
 /// 会话列表（chat_messages 聚合，按最近活跃倒序）——重启后重建侧边栏「任务」
+///
+/// `workspace_id` 为空表示全部项目；有值则只返回该项目下的会话（侧边栏两档切换）。
 #[tauri::command]
 async fn chat_conversations(
     p0: State<'_, Arc<P0Services>>,
+    workspace_id: Option<String>,
     limit: Option<usize>,
 ) -> Result<Value, String> {
-    let rows = store::messages::list_conversations(&p0.store, limit)?;
+    let ws = workspace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let rows = store::messages::list_conversations(&p0.store, ws, limit)?;
     Ok(serde_json::to_value(rows).unwrap_or(Value::Array(vec![])))
 }
 
@@ -1417,6 +1598,13 @@ async fn usage_report(p0: State<'_, Arc<P0Services>>, period: String) -> Result<
     Ok(serde_json::to_value(view).map_err(|e| format!("USAGE_REPORT_FAILED: {e}"))?)
 }
 
+/// 把桌面台账上报到服务端合并视图（D-43）；未登录/无用量如实返回
+#[tauri::command]
+async fn usage_upload(p0: State<'_, Arc<P0Services>>) -> Result<Value, String> {
+    let result = model::usage_upload::upload_session(&p0.store).await?;
+    Ok(serde_json::to_value(result).map_err(|e| format!("USAGE_UPLOAD_FAILED: {e}"))?)
+}
+
 // ── 设置持久化（settings_kv） ─────────────────────────────────
 
 #[tauri::command]
@@ -1431,6 +1619,30 @@ async fn settings_get(p0: State<'_, Arc<P0Services>>) -> Result<Value, String> {
     Ok(Value::Object(out))
 }
 
+/// 只允许设置页键写入；带权限语义的内部键必须走各自带审计的命令。
+/// 典型绕过：直接写 `sandbox.file_allowlist.<ws>` 可把任意目录加进文件沙箱白名单。
+const RESERVED_SETTING_PREFIXES: &[&str] = &[
+    "sandbox.",
+    "auth.",
+    "experts.",
+    "market.",
+    "usage.",
+];
+const RESERVED_SETTINGS: &[&str] = &["filePermission"];
+
+fn ensure_settings_writable(key: &str) -> Result<(), String> {
+    if RESERVED_SETTINGS.contains(&key)
+        || RESERVED_SETTING_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+    {
+        return Err(format!(
+            "SETTING_KEY_RESERVED: 「{key}」由系统专用命令维护，不能通过设置页直接写入"
+        ));
+    }
+    Ok(())
+}
+
 /// 批量写设置（设置页对象 patch）：值为任意 JSON，序列化后落库；
 /// 需要系统行为联动的键（保持唤醒 / 网络代理）写入后立即生效
 #[tauri::command]
@@ -1438,6 +1650,9 @@ async fn settings_set_many(p0: State<'_, Arc<P0Services>>, patch: Value) -> Resu
     let obj = patch
         .as_object()
         .ok_or_else(|| "VALIDATION_ERROR: settings 补丁必须是对象".to_string())?;
+    for key in obj.keys() {
+        ensure_settings_writable(key)?;
+    }
     // HashMap 遍历顺序不定：代理三键若分两轮校验，可能先落 mode 再因地址缺失报错，
     // 留下半个生效配置。故先按「补丁叠加库内现值」的最终状态整组校验，通过后才写。
     proxy::spec_from_patch(&p0.store, obj)?;
@@ -1459,7 +1674,28 @@ fn bool_of_setting(value: &Value) -> bool {
     }
 }
 
-/// 设置项落库后的系统行为联动（保持唤醒 / 开机自启 / 后台常驻 / 网络代理）
+/// 从 `budget` 设置对象取一个 token 数值（0 = 不限）；缺键或非法值返回 None，保持既有额度
+fn budget_tokens(value: &Value, key: &str) -> Option<u64> {
+    let raw = value.get(key)?;
+    if let Some(n) = raw.as_u64() {
+        return Some(n);
+    }
+    raw.as_f64()
+        .filter(|f| f.is_finite() && *f >= 0.0)
+        .map(|f| f as u64)
+}
+
+/// 从 `budget` 设置对象取日额度（0 = 不限）；缺键或非法值返回 None，保持既有额度
+fn budget_daily_tokens(value: &Value) -> Option<u64> {
+    budget_tokens(value, "dailyTokens")
+}
+
+/// 从 `budget` 设置对象取单任务预算（缺键 = 未设，按不限处理，不猜一个数字）
+fn budget_per_task_tokens(value: &Value) -> Option<u64> {
+    budget_tokens(value, "perTaskTokens")
+}
+
+/// 设置项落库后的系统行为联动（保持唤醒 / 开机自启 / 后台常驻 / 网络代理 / 日额度）
 fn apply_setting_side_effect(p0: &P0Services, key: &str, value: &Value) -> Result<(), String> {
     match key {
         task::keep_awake::SETTING_KEY => p0.keep_awake.apply(bool_of_setting(value)),
@@ -1472,6 +1708,19 @@ fn apply_setting_side_effect(p0: &P0Services, key: &str, value: &Value) -> Resul
             // 否则用户会保留「开机弹出主窗口」的旧命令却以为已静默驻留
             if setting_bool(p0, system::autostart::SETTING_KEY) {
                 system::autostart::apply(true, bool_of_setting(value))?;
+            }
+            Ok(())
+        }
+        "budget" => {
+            // 日额度进 Rust 硬停台账：保存后无需重启，下一次提交即按新额度判定；
+            // 月额度仍由渲染层预算闸门判定（Rust 侧只有日台账）。
+            if let Some(tokens) = budget_daily_tokens(value) {
+                p0.quota.set_quota(tokens);
+            }
+            // 单任务预算（缺陷 D-14.1）同样进 Rust 台账：调高后正在被拦停的任务
+            // 立刻脱离「超预算」状态（唤回仍要用户点「继续」，见 chat_review 的 resume）。
+            if let Some(tokens) = budget_per_task_tokens(value) {
+                p0.quota.set_per_task_limit(tokens);
             }
             Ok(())
         }
@@ -1984,6 +2233,21 @@ async fn file_open_external(
     Ok(())
 }
 
+/// 附件暂存的作用域：workspace 校验后使用；task_id 缺省按批次生成
+fn staging_scope(
+    workspace_id: Option<String>,
+    task_id: Option<String>,
+) -> Result<(String, String), String> {
+    let ws = match workspace_id.filter(|s| !s.trim().is_empty()) {
+        Some(raw) => crate::workspace::normalize_id(&raw)?,
+        None => crate::workspace::DEFAULT_WORKSPACE.to_string(),
+    };
+    let tid = task_id
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("pending-{}", now_ms_u64()));
+    Ok((ws, tid))
+}
+
 /// 附件暂存（交互补设计 §3.1 附件模式）：复制到运行目录并返回 AttachmentMeta
 #[tauri::command]
 async fn file_stage_attachment(
@@ -1992,12 +2256,7 @@ async fn file_stage_attachment(
     task_id: Option<String>,
     workspace_id: Option<String>,
 ) -> Result<Value, String> {
-    let ws = workspace_id
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "default".into());
-    let tid = task_id
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("pending-{}", now_ms_u64()));
+    let (ws, tid) = staging_scope(workspace_id, task_id)?;
     let meta = audit_file_denied(
         file::service::stage_attachment(&ws, &tid, &src_path),
         &p0,
@@ -2020,6 +2279,27 @@ async fn file_stage_attachment(
     Ok(serde_json::to_value(meta).unwrap_or(Value::Null))
 }
 
+/// 文件夹附件暂存：递归复制受支持的文件，返回逐文件 AttachmentMeta 列表
+#[tauri::command]
+async fn file_stage_folder(
+    p0: State<'_, Arc<P0Services>>,
+    src_path: String,
+    task_id: Option<String>,
+    workspace_id: Option<String>,
+) -> Result<Value, String> {
+    let (ws, tid) = staging_scope(workspace_id, task_id)?;
+    let metas = file::service::stage_folder(&ws, &tid, &src_path)
+        .map_err(|e| format!("FILE_STAGE_FAILED: {e}"))?;
+    security::audit::record_quiet(
+        &p0.store,
+        security::audit::ACTION_FILE_WRITE,
+        security::audit::SEV_INFO,
+        &src_path,
+        &format!("文件夹附件暂存：{} 个文件", metas.len()),
+    );
+    Ok(serde_json::to_value(metas).unwrap_or(Value::Null))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2030,6 +2310,10 @@ pub fn run() {
         .manage(remote::new_state())
         .manage(background::new_state())
         .setup(|app| {
+            // 主窗口在 Rust 侧创建：配置生成的窗口挂不上导航守卫，远程页面
+            // 一旦导航进来就会继承 IPC 能力（外链一律交给系统浏览器）
+            system::navigation::create_main_window(app)?;
+
             // 随包资源根目录注入：安装后引擎脚本与嵌入式 Python 由此定位（开发模式无此目录）
             if let Ok(resource_dir) = app.path().resource_dir() {
                 bridge::python_env::init_resource_dir(resource_dir);
@@ -2067,11 +2351,68 @@ pub fn run() {
             });
             app.manage(services.clone());
 
+            // 清理上次运行遗留的 pending-* 附件暂存（选完附件未发送就退出的情况）
+            file::service::cleanup_stale_pending();
+
+            // 更新回路的结算（D-12）：上一次「已启动安装器」的动作在这里认账——
+            // 本机版本号变了就是装上/回退成功，没变就如实记安装失败。只认版本号这一件事，
+            // 不做任何自动重试、也不退出应用。
+            app_update::settle_at_startup();
+
+            // 额度随设置走：启动时把 settings_kv.budget 应用到硬停台账，
+            // 否则用户在设置页调过额度，重启后又回到出厂 20 万。
+            // 单任务预算同理——设置是用户口径，台账里那份只是运行期副本。
+            if let Some(raw) = store::settings::get(&services.store, "budget")
+                .ok()
+                .flatten()
+                .map(|v| store::settings::decode_value(&v))
+            {
+                if let Some(tokens) = budget_daily_tokens(&raw) {
+                    services.quota.set_quota(tokens);
+                }
+                if let Some(tokens) = budget_per_task_tokens(&raw) {
+                    services.quota.set_per_task_limit(tokens);
+                }
+            }
+
+            // D-43：启动时尽力把桌面台账推到服务端合并视图。未登录/服务不可达只记日志，
+            // 不阻断启动；设置页「模型与用量」另有手动上报入口可看真实结果。
+            {
+                let store = Arc::clone(&services.store);
+                tauri::async_runtime::spawn(async move {
+                    match model::usage_upload::upload_session(&store).await {
+                        Ok(out) if out.uploaded => {
+                            eprintln!("[usage] 启动上报完成：{}", out.message)
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[usage] 启动上报跳过: {e}"),
+                    }
+                });
+            }
+
+            // 旧 MEMORY.md 结构化条目一次性并入记忆库：只读原文件、按标记只跑一次
+            {
+                let now = security::audit::iso8601_utc(bridge::event_store::now_ms() as i64);
+                match store::memories::import_legacy(&services.store, &awareness::dir(), &now) {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("[memory] 已导入 {n} 条旧 MEMORY.md 记忆"),
+                    Err(e) => eprintln!("[memory] 旧 MEMORY.md 条目导入失败: {e}"),
+                }
+            }
+
             // 后台常驻：托盘建成才允许关窗隐藏；托盘失败时保持「关窗即退出」的原行为
             setup_background(&app.handle().clone(), &services);
 
             // 品牌外观：自定义名称/图标在每次启动时恢复（窗口标题、任务栏与托盘图标）
             system::branding::apply_startup(&app.handle().clone(), &services.store);
+
+            // 市场条目可用性：启动后异步查一次更新与撤销清单（未配置索引源就不发请求）
+            {
+                let market_store = Arc::clone(&services.store);
+                tauri::async_runtime::spawn(async move {
+                    market::startup_check(market_store).await;
+                });
+            }
 
             // 保持唤醒：恢复上次开启的状态（真实生效，失败仅告警不阻断启动）
             if keep_awake_requested(&services) {
@@ -2123,6 +2464,23 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 schedule_scan_loop(sched_handle, sched_bridge, sched_services).await;
             });
+
+            // D-46 影子段：Super-agent 事件巡检循环（桌面端内常驻，随应用存活，不宣称 7×24）。
+            // 这一层只记账与判定、不创建任务也不执行任何动作（口径见 superagent/mod.rs 头注释）；
+            // 缺省策略是 observe 且零入口授权，所以默认第一轮就只是「无事可判」。
+            // 第二层（模型研判）挂在巡检之后，配额闸门与它共用同一个 `QuotaGate`。
+            match superagent::ensure_startup_policy(&services.store) {
+                Ok(version) => eprintln!("[superagent] 生效策略版本 v{version}（影子模式，零自动执行）"),
+                Err(e) => eprintln!("[superagent] 缺省策略初始化失败，按最保守档位继续: {e}"),
+            }
+            {
+                let sa_store = Arc::clone(&services.store);
+                let sa_quota = Arc::clone(&services.quota);
+                let sa_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    superagent::sources::run_loop(sa_store, sa_handle, sa_quota).await;
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2149,11 +2507,14 @@ pub fn run() {
             model_usage,
             usage_stats,
             usage_report,
+            usage_upload,
             settings_get,
             settings_set_many,
             keep_awake_status,
             bridge::tools::agent_builtin_tools,
             bridge::im::im_channels,
+            bridge::im::im_login_start,
+            bridge::im::im_login_poll,
             bridge::im::im_configure,
             bridge::im::im_start,
             bridge::im::im_stop,
@@ -2181,6 +2542,7 @@ pub fn run() {
             file_preview,
             file_open_external,
             file_stage_attachment,
+            file_stage_folder,
             auth::auth_status,
             auth::auth_login,
             auth::auth_logout,
@@ -2200,6 +2562,37 @@ pub fn run() {
             collab::collab_update_task,
             collab::collab_add_comment,
             collab::collab_report_result,
+            collab::watch::collab_watch_start,
+            collab::watch::collab_watch_stop,
+            collab::watch::collab_watch_status,
+            collab::tickets::collab_ticket_my_tickets,
+            collab::tickets::collab_ticket_list,
+            collab::tickets::collab_ticket_detail,
+            collab::tickets::collab_ticket_create,
+            collab::tickets::collab_ticket_subscribe,
+            collab::tickets::collab_ticket_claim,
+            collab::tickets::collab_ticket_end_assignment,
+            collab::tickets::collab_ticket_report,
+            collab::tickets::collab_ticket_handback,
+            collab::tickets::collab_ticket_answer,
+            collab::tickets::collab_ticket_accept,
+            collab::tickets::collab_ticket_amend,
+            collab::tickets::collab_ticket_stop,
+            collab::tickets::collab_ticket_mark_read,
+            superagent::superagent_stats,
+            superagent::superagent_list_sources,
+            superagent::superagent_register_source,
+            superagent::superagent_set_source_enabled,
+            superagent::superagent_list_candidates,
+            superagent::superagent_export_candidates,
+            superagent::superagent_list_decisions,
+            superagent::superagent_list_triggers,
+            superagent::superagent_get_trigger,
+            superagent::superagent_get_policy,
+            superagent::superagent_save_policy,
+            superagent::superagent_policy_versions,
+            superagent::superagent_pump_now,
+            superagent::superagent_assess_now,
             security::security_scan_data,
             security::security_get_domain_control,
             security::security_set_domain_control,
@@ -2239,6 +2632,11 @@ pub fn run() {
             market::market_trust_get,
             market::market_trust_add,
             market::market_trust_remove,
+            market::market_update_check,
+            market::market_installed_list,
+            market::market_skill_upgrade,
+            market::market_suite_upgrade,
+            market::market_upgrade_all,
             knowledge::knowledge_list,
             knowledge::knowledge_create,
             knowledge::knowledge_update,
@@ -2290,9 +2688,17 @@ pub fn run() {
             terminal::acp_status,
             awareness::awareness_get,
             awareness::awareness_update,
-            awareness::awareness_memories,
-            awareness::awareness_memory_add,
-            awareness::awareness_memory_delete,
+            awareness::memory_list,
+            awareness::memory_add,
+            awareness::memory_delete,
+            awareness::memory_review,
+            awareness::memory_entities,
+            awareness::memory_export,
+            awareness::memory_import,
+            awareness::memory_compact,
+            awareness::memory_doc_sync,
+            awareness::memory_export_package,
+            awareness::memory_import_package,
             mcp::mcp_list_servers,
             mcp::mcp_add_server,
             mcp::mcp_remove_server,
@@ -2300,7 +2706,18 @@ pub fn run() {
             mcp::mcp_disconnect,
             mcp::mcp_list_tools,
             mcp::mcp_oauth_authorize,
-            mcp::mcp_oauth_revoke
+            mcp::mcp_oauth_revoke,
+            // ── #164 IPC 车道：七条分派命令一次挂齐 ──────────────────────
+            // generate_handler! 是字面量清单，七个窗口往里插行必然互相覆盖（本仓库没有 git）。
+            // 所以每条车道预挂一条分派命令，方法表在 src-tauri/src/ipc/<lane>.rs 里，谁的车道谁改；
+            // 通道常量在 src/shared/contracts_<lane>.ts，前端只经 src/shared/ipc-lanes.ts 一个入口。
+            ipc::knowledge::lane_knowledge,
+            ipc::artifact::lane_artifact,
+            ipc::workspace::lane_workspace,
+            ipc::exec::lane_exec,
+            ipc::connect::lane_connect,
+            ipc::orchestrate::lane_orchestrate,
+            ipc::voice::lane_voice
         ])
         .build(tauri::generate_context!())
         .expect("error while building tongtian-tauri")
@@ -2324,6 +2741,11 @@ pub fn run() {
             tauri::RunEvent::Exit => {
                 if let Some(services) = handle.try_state::<Arc<P0Services>>() {
                     services.keep_awake.stop();
+                }
+                // 引擎是常驻 Python 进程：必须随桌面端退出回收整棵进程树，
+                // 否则下次启动会留下占用 18000-19000 端口的孤儿引擎。
+                if let Some(bridge) = handle.try_state::<BridgeState>() {
+                    agent::stop_all_now(bridge.inner());
                 }
             }
             _ => {}

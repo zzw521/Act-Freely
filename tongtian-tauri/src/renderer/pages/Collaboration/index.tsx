@@ -2,7 +2,11 @@
  * 通天办公 - 项目协作页（跨用户 / 跨机器）
  *
  * 数据真值只有一个来源：账号服务的项目快照（Rust `collab_*` command 代理）。
- * 页面不做本地乐观缓存，所有变更成功后重新拉快照；轮询间隔 10s。
+ * 页面不做本地乐观缓存，所有变更成功后重新拉快照。
+ *
+ * 更新来源（缺陷 D-06）：桌面端订阅账号服务的项目事件流，事件到达即刷新；
+ * 实时时仍保留 60 秒低频对账，订阅不在实时状态（未建立 / 断线重连中 / 被拒 / 非桌面
+ * 通道）退回 10 秒轮询，状态在项目名称旁以「实时 / 降级·轮询 / 订阅已停止」如实标出。
  *
  * 边界（界面如实说明）：
  * - 共享：项目元数据、成员与角色、任务、评论、结果摘要、产物文件名
@@ -52,6 +56,7 @@ import AutorenewIcon from '@mui/icons-material/Autorenew';
 import RadioButtonUncheckedIcon from '@mui/icons-material/RadioButtonUnchecked';
 import { errorTextOf } from '../../../shared/error-messages';
 import type {
+  CollabEvent,
   CollabProject,
   CollabRole,
   CollabSnapshot,
@@ -59,8 +64,10 @@ import type {
   CollabTask,
   CollabTaskPatch,
   CollabTaskStatus,
+  CollabWatchStateEvent,
 } from '../../../shared/contracts';
 import { api } from '../../lib/api';
+import { clickableProps } from '../../lib/a11y';
 import {
   bindCollabRun,
   discardPendingReport,
@@ -85,13 +92,68 @@ const STATUS_META: Record<
   CollabTaskStatus,
   { label: string; fg: string; bg: string; icon: React.ElementType }
 > = {
-  todo: { label: '待处理', fg: '#4B5563', bg: '#EEF0F2', icon: RadioButtonUncheckedIcon },
-  doing: { label: '进行中', fg: '#B45309', bg: '#FEF3C7', icon: AutorenewIcon },
-  review: { label: '待验收', fg: '#1D4ED8', bg: '#DBEAFE', icon: RateReviewIcon },
-  done: { label: '已完成', fg: '#047857', bg: '#D1FAE5', icon: TaskAltIcon },
+  todo: { label: '待处理', fg: 'var(--tt-text-2)', bg: 'var(--tt-border-soft)', icon: RadioButtonUncheckedIcon },
+  doing: { label: '进行中', fg: 'var(--tt-warning)', bg: 'var(--tt-chip-warning)', icon: AutorenewIcon },
+  review: { label: '待验收', fg: 'var(--tt-info)', bg: 'var(--tt-chip-info)', icon: RateReviewIcon },
+  done: { label: '已完成', fg: 'var(--tt-success)', bg: 'var(--tt-chip-success)', icon: TaskAltIcon },
 };
 
 const STATUS_ORDER: CollabTaskStatus[] = ['todo', 'doing', 'review', 'done'];
+
+/**
+ * 订阅状态（缺陷 D-06）。实时、降级、已停止是三种不同的用户预期，必须标出来：
+ * 「页面看起来没动静」和「订阅断了正在按游标重连」不能长成同一个样子。
+ */
+function WatchChip({ watch }: { watch: CollabWatchStateEvent | null }) {
+  const meta = (() => {
+    switch (watch?.state) {
+      case 'streaming':
+        return {
+          label: '实时',
+          fg: 'var(--tt-teal)',
+          bg: 'var(--tt-chip-teal)',
+          tip: `已订阅项目事件流，游标 ${watch.cursor}（断线按游标续传，不丢事件）`,
+        };
+      case 'connecting':
+        return {
+          label: '连接中',
+          fg: 'var(--tt-text-2)',
+          bg: 'var(--tt-chip-neutral)',
+          tip: watch.reason || '正在建立事件订阅；这期间仍按 10 秒轮询兜底',
+        };
+      case 'degraded':
+        return {
+          label: '降级·轮询',
+          fg: 'var(--tt-warning)',
+          bg: 'var(--tt-chip-warning)',
+          tip: watch.reason || '事件订阅暂不可用，改用 10 秒轮询',
+        };
+      case 'closed':
+        return {
+          label: '订阅已停止',
+          fg: 'var(--tt-danger)',
+          bg: 'var(--tt-chip-warning)',
+          tip: watch.reason || '服务端已结束本项目的订阅（项目已删除或你已不在成员里）',
+        };
+      default:
+        return {
+          label: '轮询',
+          fg: 'var(--tt-text-2)',
+          bg: 'var(--tt-chip-neutral)',
+          tip: '尚未建立事件订阅（非桌面通道或未登录），按 10 秒轮询',
+        };
+    }
+  })();
+  return (
+    <Tooltip title={meta.tip}>
+      <Chip
+        size="small"
+        label={meta.label}
+        sx={{ height: 21, fontSize: '11px', color: meta.fg, bgcolor: meta.bg }}
+      />
+    </Tooltip>
+  );
+}
 
 const timeText = (ms: number) =>
   new Date(ms).toLocaleString('zh-CN', { hour12: false }).replace(/\//g, '-');
@@ -100,10 +162,10 @@ const basename = (path: string) => path.replace(/\\/g, '/').split('/').pop() ?? 
 
 function RoleChip({ role }: { role: CollabRole }) {
   const palette: Record<CollabRole, { fg: string; bg: string; border: string }> = {
-    owner: { fg: '#B45309', bg: '#FEF3C7', border: '#FDE68A' },
-    admin: { fg: '#4338CA', bg: '#E0E7FF', border: '#C7D2FE' },
-    member: { fg: '#0F766E', bg: '#CCFBF1', border: '#99F6E4' },
-    viewer: { fg: '#4B5563', bg: '#F3F4F6', border: '#E5E7EB' },
+    owner: { fg: 'var(--tt-warning)', bg: 'var(--tt-chip-warning)', border: 'var(--tt-warning)' },
+    admin: { fg: 'var(--tt-accent)', bg: 'var(--tt-chip-accent)', border: 'var(--tt-accent)' },
+    member: { fg: 'var(--tt-teal)', bg: 'var(--tt-chip-teal)', border: 'var(--tt-teal)' },
+    viewer: { fg: 'var(--tt-text-2)', bg: 'var(--tt-chip-neutral)', border: 'var(--tt-border)' },
   };
   const c = palette[role];
   return (
@@ -148,6 +210,7 @@ const Collaboration: React.FC = () => {
   const [snapshot, setSnapshot] = useState<CollabSnapshot | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState('');
+  const [watch, setWatch] = useState<CollabWatchStateEvent | null>(null);
   const [tab, setTab] = useState(0);
   const [openTaskId, setOpenTaskId] = useState<string | null>(null);
   const [busy, setBusy] = useState('');
@@ -189,6 +252,15 @@ const Collaboration: React.FC = () => {
     activeIdRef.current = activeId;
   }, [activeId]);
 
+  /** 当前快照属于哪个项目、读到的是哪个事件游标；订阅从这里起步，不重放历史 */
+  const snapshotRef = useRef<{ projectId: string; seq: number }>({ projectId: '', seq: 0 });
+  /** 已经建立了订阅的项目（与 activeId 不同就要停掉旧的） */
+  const subscribedRef = useRef<string | null>(null);
+  /** 事件合并刷新的待决定时器 */
+  const refreshTimerRef = useRef<number | null>(null);
+  /** 待决刷新属于哪个项目：换项目时旧定时器要作废，不能把刷新记到新项目头上 */
+  const refreshProjectRef = useRef<string>('');
+
   const loadStatus = useCallback(async () => {
     setStatusError('');
     try {
@@ -227,6 +299,9 @@ const Collaboration: React.FC = () => {
       if (activeIdRef.current === projectId && snap.project.id === projectId) {
         setSnapshot(snap);
         setDetailError('');
+        // 记下读到的事件游标：订阅从这里起步，不重放历史。seq 全局递增且不连续，只取较大值
+        const prev = snapshotRef.current.projectId === projectId ? snapshotRef.current.seq : 0;
+        snapshotRef.current = { projectId, seq: Math.max(prev, snap.seq) };
       }
     } catch (err) {
       if (activeIdRef.current === projectId) {
@@ -236,6 +311,26 @@ const Collaboration: React.FC = () => {
       if (!silent) setDetailLoading(false);
     }
   }, []);
+
+  /**
+   * 事件合并刷新：一次改动常常连发几条事件（任务状态 + 评论 + 序号），
+   * 400ms 内只拉一次快照，不给每个事件都打一次详情接口。
+   */
+  const scheduleRefresh = useCallback(
+    (projectId: string) => {
+      if (refreshProjectRef.current !== projectId && refreshTimerRef.current !== null) {
+        window.clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = null;
+      }
+      if (refreshTimerRef.current !== null) return;
+      refreshProjectRef.current = projectId;
+      refreshTimerRef.current = window.setTimeout(() => {
+        refreshTimerRef.current = null;
+        if (activeIdRef.current === projectId) void loadDetail(projectId, true);
+      }, 400);
+    },
+    [loadDetail],
+  );
 
   useEffect(() => {
     void authInit();
@@ -255,14 +350,82 @@ const Collaboration: React.FC = () => {
     else setSnapshot(null);
   }, [activeId, loadDetail]);
 
-  // 轮询快照：仅页面可见时拉取，避免后台空转
+  // 事件监听：只在本页存活期间挂载一次；非桌面通道拿到的是空取消函数
+  useEffect(() => {
+    const offEvent = api.collab.onEvent((event: CollabEvent) => {
+      if (event.projectId === activeIdRef.current) scheduleRefresh(event.projectId);
+    });
+    const offState = api.collab.onWatchState((event) => {
+      if (event.projectId !== activeIdRef.current) return;
+      setWatch(event);
+      // 重连后由服务端按游标补拉：断线期间的事件会一次追进来，用一次快照对账兜底
+      if (event.state === 'streaming') scheduleRefresh(event.projectId);
+    });
+    return () => {
+      offEvent();
+      offState();
+    };
+  }, [scheduleRefresh]);
+
+  // 建立/释放订阅：等当前项目的快照落地后才起步，游标用快照的 seq，不重放历史
+  useEffect(() => {
+    if (subscribedRef.current && subscribedRef.current !== activeId) {
+      void api.collab.unwatch(subscribedRef.current).catch(() => {});
+      subscribedRef.current = null;
+      setWatch(null);
+    }
+    if (!activeId || !status?.supported || !status.serverValid || !status.loggedIn) {
+      if (subscribedRef.current) {
+        void api.collab.unwatch(subscribedRef.current).catch(() => {});
+        subscribedRef.current = null;
+      }
+      setWatch(null);
+      return;
+    }
+    // 快照还没到位（或晚属于别的项目）时不订阅：没有游标的订阅会重放历史
+    if (snapshot?.project.id !== activeId) return;
+    if (subscribedRef.current === activeId) return;
+    subscribedRef.current = activeId;
+    const sinceSeq = snapshotRef.current.projectId === activeId ? snapshotRef.current.seq : 0;
+    setWatch({ projectId: activeId, state: 'connecting', cursor: sinceSeq, reason: '' });
+    void api.collab.watch(activeId, sinceSeq).catch((err) => {
+      // 订阅建不起来就如实退回轮询，界面必须看得见这是降级而不是实时
+      if (activeIdRef.current !== activeId) return;
+      setWatch({
+        projectId: activeId,
+        state: 'degraded',
+        cursor: snapshotRef.current.seq,
+        reason: `${errorTextOf(err, '事件订阅不可用')}，改用 10 秒轮询`,
+      });
+    });
+  }, [activeId, status, snapshot]);
+
+  // 离开页面时释放订阅与待决刷新，避免后台留一条没人看的流
+  useEffect(
+    () => () => {
+      if (subscribedRef.current) {
+        void api.collab.unwatch(subscribedRef.current).catch(() => {});
+        subscribedRef.current = null;
+      }
+      if (refreshTimerRef.current !== null) {
+        window.clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = null;
+      }
+    },
+    [],
+  );
+
+  // 快照兜底：实时时用 60 秒低频对账，降级/连接中回到 10 秒轮询；仅页面可见时拉取，避免后台空转
   useEffect(() => {
     if (!activeId || !status?.supported || !status.serverValid || !status.loggedIn) return;
+    // 服务端明确结束订阅（项目已删或已不在成员里）：再轮询也拿不到，交给详情接口的错误说话
+    if (watch?.state === 'closed') return;
+    const intervalMs = watch?.state === 'streaming' ? 60_000 : 10_000;
     const timer = window.setInterval(() => {
       if (document.visibilityState === 'visible') void loadDetail(activeId, true);
-    }, 10_000);
+    }, intervalMs);
     return () => window.clearInterval(timer);
-  }, [activeId, status, loadDetail]);
+  }, [activeId, status, watch?.state, loadDetail]);
 
   const refreshAll = async () => {
     setToast(null);
@@ -635,6 +798,8 @@ const Collaboration: React.FC = () => {
                   <Box
                     key={p.id}
                     onClick={() => setActiveId(p.id)}
+                    {...clickableProps(() => setActiveId(p.id), `选择项目：${p.name}`)}
+                    aria-pressed={selected}
                     sx={{
                       px: 1.5,
                       py: 1.25,
@@ -668,22 +833,22 @@ const Collaboration: React.FC = () => {
           {pending.length > 0 && (
             <Box
               sx={{
-                border: '1px solid #FDE68A',
+                border: '1px solid var(--tt-warning)',
                 borderRadius: '14px',
-                bgcolor: '#FFFBEB',
+                bgcolor: 'var(--tt-chip-warning)',
                 p: 1.5,
               }}
             >
-              <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#92400E', mb: 0.75 }}>
+              <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-warning)', mb: 0.75 }}>
                 待回报结果（{pending.length}）
               </Typography>
               <Stack spacing={1}>
                 {pending.map((row) => (
                   <Box key={row.id}>
-                    <Typography sx={{ fontSize: '12px', color: '#78350F' }}>
+                    <Typography sx={{ fontSize: '12px', color: 'var(--tt-warning)' }}>
                       {row.projectName} / {row.taskTitle}
                     </Typography>
-                    <Typography sx={{ fontSize: '11px', color: '#B45309', wordBreak: 'break-all' }}>
+                    <Typography sx={{ fontSize: '11px', color: 'var(--tt-warning)', wordBreak: 'break-all' }}>
                       {row.error}
                     </Typography>
                     <Stack direction="row" spacing={0.75} sx={{ mt: 0.5 }}>
@@ -703,7 +868,7 @@ const Collaboration: React.FC = () => {
                           discardPendingReport(row.id);
                           setPending(pendingReports());
                         }}
-                        sx={{ textTransform: 'none', minWidth: 0, py: 0, fontSize: '11.5px', color: '#92400E' }}
+                        sx={{ textTransform: 'none', minWidth: 0, py: 0, fontSize: '11.5px', color: 'var(--tt-warning)' }}
                       >
                         丢弃
                       </Button>
@@ -754,6 +919,7 @@ const Collaboration: React.FC = () => {
                         {snapshot.project.name}
                       </Typography>
                       <RoleChip role={snapshot.project.myRole} />
+                      <WatchChip watch={watch} />
                       {detailLoading && <CircularProgress size={13} />}
                     </Stack>
                     <Typography
@@ -899,6 +1065,7 @@ const Collaboration: React.FC = () => {
                             <Tooltip title="转让所有权">
                               <IconButton
                                 size="small"
+                                aria-label={`转让所有权：${member.nickname || member.uid}`}
                                 onClick={() => askTransferOwner(member.uid, member.nickname)}
                               >
                                 <SwapHorizIcon sx={{ fontSize: 17 }} />
@@ -909,9 +1076,10 @@ const Collaboration: React.FC = () => {
                             <Tooltip title="移除成员">
                               <IconButton
                                 size="small"
+                                aria-label={`移除成员：${member.nickname || member.uid}`}
                                 onClick={() => askRemoveMember(member.uid, member.nickname)}
                               >
-                                <DeleteOutlineIcon sx={{ fontSize: 17, color: '#B91C1C' }} />
+                                <DeleteOutlineIcon sx={{ fontSize: 17, color: 'var(--tt-danger)' }} />
                               </IconButton>
                             </Tooltip>
                           )}
@@ -1236,7 +1404,7 @@ function PageShell({
             display: 'grid',
             placeItems: 'center',
             bgcolor: 'rgba(99,102,241,0.12)',
-            color: '#4F46E5',
+            color: 'var(--tt-accent)',
           }}
         >
           <GroupsIcon sx={{ fontSize: 20 }} />
@@ -1251,7 +1419,12 @@ function PageShell({
         </Box>
         <Tooltip title="刷新">
           <span>
-            <IconButton size="small" onClick={() => void onRefresh()} disabled={busy}>
+            <IconButton
+              size="small"
+              aria-label={`刷新${title}数据`}
+              onClick={() => void onRefresh()}
+              disabled={busy}
+            >
               <RefreshIcon sx={{ fontSize: 19 }} />
             </IconButton>
           </span>
@@ -1266,6 +1439,7 @@ function TaskCard({ task, onClick }: { task: CollabTask; onClick: () => void }) 
   return (
     <Box
       onClick={onClick}
+      {...clickableProps(onClick, `打开任务：${task.title}`)}
       sx={{
         p: 1.25,
         borderRadius: '10px',
@@ -1282,13 +1456,13 @@ function TaskCard({ task, onClick }: { task: CollabTask; onClick: () => void }) 
         <Chip
           size="small"
           label={task.assignee?.nickname || '未指派'}
-          sx={{ height: 20, fontSize: '10.5px', bgcolor: task.assignee ? '#EEF2FF' : '#F3F4F6', color: task.assignee ? '#3730A3' : '#6B7280' }}
+          sx={{ height: 20, fontSize: '10.5px', bgcolor: task.assignee ? 'var(--tt-chip-accent)' : 'var(--tt-chip-neutral)', color: task.assignee ? 'var(--tt-accent)' : 'var(--tt-text-3)' }}
         />
         {task.result && (
           <Chip
             size="small"
             label={`${task.result.artifacts.length} 个产物`}
-            sx={{ height: 20, fontSize: '10.5px', bgcolor: '#ECFDF5', color: '#047857' }}
+            sx={{ height: 20, fontSize: '10.5px', bgcolor: 'var(--tt-chip-success)', color: 'var(--tt-success)' }}
           />
         )}
         <Typography sx={{ fontSize: '10.5px', color: 'var(--tt-text-4)', ml: 'auto !important' }}>
@@ -1414,11 +1588,11 @@ function TaskDialog({
         )}
 
         {task.result && (
-          <Box sx={{ p: 1.25, borderRadius: '10px', bgcolor: '#F0FDF4', border: '1px solid #BBF7D0', mb: 2 }}>
-            <Typography sx={{ fontSize: '12px', fontWeight: 700, color: '#166534', mb: 0.5 }}>
+          <Box sx={{ p: 1.25, borderRadius: '10px', bgcolor: 'var(--tt-chip-success)', border: '1px solid var(--tt-success)', mb: 2 }}>
+            <Typography sx={{ fontSize: '12px', fontWeight: 700, color: 'var(--tt-success)', mb: 0.5 }}>
               执行结果
             </Typography>
-            <Typography sx={{ fontSize: '12.5px', color: '#14532D', whiteSpace: 'pre-wrap' }}>
+            <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-success)', whiteSpace: 'pre-wrap' }}>
               {task.result.summary}
             </Typography>
             {task.result.artifacts.length > 0 && (
@@ -1428,7 +1602,7 @@ function TaskDialog({
                 ))}
               </Stack>
             )}
-            <Typography sx={{ fontSize: '10.5px', color: '#15803D', mt: 0.75 }}>
+            <Typography sx={{ fontSize: '10.5px', color: 'var(--tt-success)', mt: 0.75 }}>
               {task.result.byNickname || task.result.by} · {task.result.machine || '未知机器'} ·{' '}
               {timeText(task.result.atMs)}
             </Typography>

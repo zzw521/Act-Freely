@@ -62,13 +62,26 @@ describe('技能静态扫描：安装 → 启用 → 运行时', () => {
 
   it('安装口是主闸门：高风险直接拒绝，没有强制安装旁路', () => {
     const src = skillMod();
-    const install = src.slice(src.indexOf('fn write_new_skill'), src.indexOf('fn uninstall_in'));
-    expect(install).toContain('skill_scan::scan(content)');
-    expect(install).toContain('if report.blocked()');
-    expect(install).toContain('SKILL_SCAN_BLOCKED: 技能「{id}」未安装');
-    // 扫描必须在创建暂存目录之前
-    expect(install.indexOf('skill_scan::scan')).toBeLessThan(install.indexOf('create_dir_all(&staging)'));
+    // 闸门本身：大小上限 + 静态扫描，扫描不过就拒绝，没有 force 分支
+    const gate = src.slice(src.indexOf('fn validate_content'), src.indexOf('fn write_new_skill'));
+    expect(gate).toContain('skill_scan::scan(content)');
+    expect(gate).toContain('if report.blocked()');
+    expect(gate).toContain('SKILL_SCAN_BLOCKED: 技能「{id}」未安装');
+    expect(gate).not.toContain('force');
+    // 扫描必须在动盘之前：暂存目录连建都不建（升级尤其如此，否则等于弄丢旧技能）
+    const install = src.slice(src.indexOf('fn write_new_skill'), src.indexOf('fn recycle_dir'));
+    expect(install.indexOf('validate_content(id, content)?')).toBeGreaterThanOrEqual(0);
+    expect(install.indexOf('validate_content')).toBeLessThan(install.indexOf('create_dir_all(&staging)'));
     expect(install).not.toContain('force');
+    // 安装与升级吃同一道闸门，升级不是绕过扫描的旁路
+    expect(src.slice(src.indexOf('pub fn install_content_in'), src.indexOf('fn validate_content')))
+      .toContain('write_new_skill(base, &id, content)');
+    const upgrade = src.slice(src.indexOf('pub fn upgrade_content_in'), src.indexOf('fn restore_after_failed_upgrade'));
+    expect(upgrade).toContain('validate_content(&id, content)?');
+    expect(upgrade).toContain('write_new_skill(base, &id, content)');
+    // 先移旧再落新，落新失败时把旧目录放回：最坏的结局不能是「旧的没了新的也没来」
+    expect(upgrade.indexOf('recycle_dir(base, &id)?')).toBeLessThan(upgrade.indexOf('write_new_skill(base'));
+    expect(upgrade).toContain('restore_after_failed_upgrade(base, &id, &trash, err)');
   });
 
   it('列表展示扫描结论，运行时正文被清空并带可见原因', () => {
@@ -85,7 +98,13 @@ describe('技能静态扫描：安装 → 启用 → 运行时', () => {
   it('启用开关不能把历史高风险技能重新放进来', () => {
     const src = skillMod();
     expect(src).toContain('fn ensure_enable_allowed');
-    expect(src).toContain('ensure_enable_allowed(&dir, &id)?;');
+    // 启用走的是双闸门：市场撤销在前、静态扫描在后，任一道拦下都拨不回执行面
+    expect(src).toContain('ensure_can_enable(&p0.store, &dir, &id)?;');
+    expect(src).toContain('ensure_enable_allowed(dir, id)');
+    expect(src).toContain('MARKET_ITEM_REVOKED: 技能「{id}」已被市场撤销');
+    const gate = src.slice(src.indexOf('fn ensure_can_enable'), src.indexOf('fn ensure_enable_allowed'));
+    expect(gate.indexOf('revoked_reason_for')).toBeGreaterThanOrEqual(0);
+    expect(gate.indexOf('revoked_reason_for')).toBeLessThan(gate.indexOf('ensure_enable_allowed(dir, id)'));
     expect(src).toContain('SKILL_SCAN_BLOCKED: 技能「{id}」被安全扫描拦截，不能启用');
     // 安装被拦截要审计
     expect(src).toContain('if err.starts_with("SKILL_SCAN_BLOCKED")');

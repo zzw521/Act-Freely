@@ -6,6 +6,7 @@
  * - 用量限额管理
  * - 使用周期切换（日/月/总计）
  * - 周期总览（usage:stats，顶部总览条）与按需报表（usage:report，趋势 + 导出文本）
+ * - Token 预算判定与档位跃迁提醒（缺陷 D-14：读设置里的日/月预算 × 用量台账）
  */
 
 import { create } from 'zustand';
@@ -14,6 +15,11 @@ import type { UsagePeriod, UsageReport, UsageStats } from '../../shared/contract
 import { errorTextOf } from '../../shared/error-messages';
 import api from '../lib/api';
 import { extractUsageRows, reportToMarkdown, toUsageStats } from '../lib/usage-local';
+import { getSettings } from '../lib/alignment-api';
+import { budgetAlertBody, collectBudgetAlerts, readBudgetVerdict } from '../lib/budget-gate';
+import type { BudgetRead } from '../lib/budget-gate';
+import { notifyTaskEvent } from '../lib/notify-local';
+import { useAppStore } from './useAppStore';
 
 // ── 类型定义 ──────────────────────────────────────────────────────
 
@@ -38,6 +44,10 @@ interface ModelUsageState {
   overviewError: string | null;
   /** 报表生成错误 */
   reportError: string | null;
+  /** 预算判定（日/月两档 × 用量台账；未读取为 null，不伪造「不限」） */
+  budget: BudgetRead | null;
+  /** 预算读取本身的失败原因（用量通道不可用等） */
+  budgetError: string | null;
 
   // ── Actions ──────────────────────────────────────────────────────
 
@@ -59,6 +69,8 @@ interface ModelUsageState {
   loadOverview: () => Promise<void>;
   /** 生成用量报表（趋势 + 可导出文本，由用户动作触发） */
   loadReport: () => Promise<UsageReport | null>;
+  /** 读取预算判定（日/月两档），档位跃迁时发出提醒 */
+  loadBudget: () => Promise<void>;
   /** 报表导出文本（Markdown；无报表时返回 null） */
   reportMarkdown: () => string | null;
 }
@@ -75,6 +87,8 @@ export const useModelUsageStore = create<ModelUsageState>((set, get) => ({
   error: null,
   overviewError: null,
   reportError: null,
+  budget: null,
+  budgetError: null,
 
   setPeriod: (period: UsagePeriod) => {
     // 总览与报表都按周期生成，切换后一律作废：留旧值会与新周期错配
@@ -179,5 +193,30 @@ export const useModelUsageStore = create<ModelUsageState>((set, get) => ({
   reportMarkdown: () => {
     const { report } = get();
     return report ? reportToMarkdown(report) : null;
+  },
+
+  loadBudget: async () => {
+    set({ budgetError: null });
+    // 设置读不到时按出厂预算判定（日 20 万），不因为读失败就把闸门关掉
+    const settings = await getSettings().catch(() => null);
+    try {
+      const read = await readBudgetVerdict((period) => api.usage.stats(period), settings);
+      set({ budget: read, budgetError: null });
+      for (const entry of collectBudgetAlerts(read.verdict)) {
+        const body = budgetAlertBody(entry);
+        useAppStore
+          .getState()
+          .showNotification(body, entry.snapshot.action === 'block' ? 'error' : 'warning');
+        const focused = typeof document === 'undefined' ? false : document.hasFocus();
+        notifyTaskEvent('budget_warning', body, {
+          desktopNotify: settings?.desktopNotify !== false,
+          soundNotify: Boolean(settings?.soundNotify),
+          focusCheck: () => focused,
+        });
+      }
+    } catch (err) {
+      // 判定不成不能留旧结果冒充当前档位：清空并说明原因
+      set({ budget: null, budgetError: errorTextOf(err, '预算状态读取失败') });
+    }
   },
 }));

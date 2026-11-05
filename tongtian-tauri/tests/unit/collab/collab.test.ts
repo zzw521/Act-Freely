@@ -3,6 +3,7 @@
  *
  * 覆盖：
  * - 浏览器/Mock 通道如实回报 supported=false，写操作统一 COLLAB_UNSUPPORTED
+ * - 事件订阅通道在非桌面端不被冒充，注册接口给的是可用的空取消函数（缺陷 D-06）
  * - 本机执行绑定 → deliver 暂存 → done 回报（产物只取文件名）
  * - 回报失败进入待回报队列，重试成功或手动丢弃后清空
  */
@@ -50,6 +51,27 @@ describe('浏览器/Mock 通道', () => {
     for (const channel of ['collab:listProjects', 'collab:createProject', 'collab:reportResult']) {
       await expect(win.tongtianAPI!.invoke(channel, {})).rejects.toThrow(/^COLLAB_UNSUPPORTED:/);
     }
+  });
+
+  it('事件订阅通道同样不被浏览器/Mock 通道冒充（页面据此退回轮询）', async () => {
+    for (const channel of ['collab:watchStart', 'collab:watchStop', 'collab:watchStatus']) {
+      await expect(win.tongtianAPI!.invoke(channel, { projectId: 'prj-1', sinceSeq: 0 })).rejects.toThrow(
+        /^COLLAB_UNSUPPORTED:/,
+      );
+    }
+  });
+
+  it('非桌面通道没有事件可订阅：注册返回可用的空取消函数，不抛也不收事件', () => {
+    const offEvent = api.collab.onEvent(() => {
+      throw new Error('不该被调用');
+    });
+    const offState = api.collab.onWatchState(() => {
+      throw new Error('不该被调用');
+    });
+    expect(() => {
+      offEvent();
+      offState();
+    }).not.toThrow();
   });
 });
 

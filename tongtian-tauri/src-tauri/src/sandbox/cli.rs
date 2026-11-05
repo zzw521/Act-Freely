@@ -19,11 +19,17 @@ pub struct RunOptions {
     pub network: bool,
     pub program: String,
     pub args: Vec<String>,
+    /// 参数按原文拼接成交给子进程的命令行，不逐个加引号。
+    ///
+    /// 只给 `cmd.exe` 这类**不吃 MSVCRT argv 转义**的壳用：它们自己有一套引号规则，
+    /// 逐参数转义会把 `"` 变成 `\"`，壳收到的是反斜杠而不是引号（D-48.4c 实测）。
+    /// 开了这一档，隔离照做，但命令行与不进容器时逐字一致——容器不许改变命令的含义。
+    pub raw_command_line: bool,
 }
 
 pub fn usage() -> String {
     format!(
-        "用法：{CLI_FLAG} [--profile <名称>] [--workspace <目录>] [--read-dir <目录>] [--allow-env <变量名>] [--network on|off] -- <程序> [参数...]"
+        "用法：{CLI_FLAG} [--profile <名称>] [--workspace <目录>] [--read-dir <目录>] [--allow-env <变量名>] [--network on|off] [--raw-command-line] -- <程序> [参数...]"
     )
 }
 
@@ -54,6 +60,7 @@ fn parse(args: &[String]) -> Result<RunOptions, String> {
     let mut read_dirs: Vec<PathBuf> = Vec::new();
     let mut keep_env: Vec<String> = Vec::new();
     let mut network = false;
+    let mut raw_command_line = false;
     let mut i = start + 1;
 
     while i < args.len() {
@@ -71,6 +78,7 @@ fn parse(args: &[String]) -> Result<RunOptions, String> {
                     network,
                     program: rest[0].clone(),
                     args: rest[1..].to_vec(),
+                    raw_command_line,
                 });
             }
             "--profile" => {
@@ -112,6 +120,9 @@ fn parse(args: &[String]) -> Result<RunOptions, String> {
                     Some("off") => false,
                     _ => return Err("--network 只接受 on 或 off".into()),
                 };
+            }
+            "--raw-command-line" => {
+                raw_command_line = true;
             }
             other => return Err(format!("未知参数「{other}」")),
         }
@@ -202,5 +213,52 @@ mod tests {
         assert!(opts.workspace.is_none());
         assert!(!opts.network);
         assert_eq!(opts.profile, super::super::PROFILE_NAME);
+    }
+
+    #[test]
+    fn raw_command_line_defaults_off() {
+        // 不带这一档时行为与改造前完全一致：其余调用方（终端、MCP、ACP、Hooks）不受影响
+        let opts = parse(&argv(&["app.exe", CLI_FLAG, "--", "python.exe", "-c", "print(1)"])).unwrap();
+        assert!(!opts.raw_command_line);
+    }
+
+    #[test]
+    fn parses_raw_command_line_switch() {
+        let opts = parse(&argv(&[
+            "app.exe",
+            CLI_FLAG,
+            "--network",
+            "off",
+            "--raw-command-line",
+            "--",
+            "cmd.exe",
+            "/d",
+            "/s",
+            "/c",
+            "echo \"hello world\"",
+        ]))
+        .unwrap();
+        assert!(opts.raw_command_line);
+        assert!(!opts.network);
+        assert_eq!(opts.program, "cmd.exe");
+    }
+
+    #[test]
+    fn raw_command_line_keeps_the_tail_verbatim() {
+        // 解析阶段不许动参数：调用方拼好的那条命令行要原样送到 win::resolve_program
+        let opts = parse(&argv(&[
+            "app.exe",
+            CLI_FLAG,
+            "--raw-command-line",
+            "--",
+            "cmd.exe",
+            "/d",
+            "/s",
+            "/c",
+            "echo \"hello world\"",
+        ]))
+        .unwrap();
+        assert_eq!(opts.args.last().unwrap(), "echo \"hello world\"");
+        assert_eq!(opts.args[0], "/d");
     }
 }

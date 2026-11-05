@@ -44,10 +44,16 @@ pub struct Outcome {
     pub completion_tokens: u64,
     pub model: String,
     pub latency_ms: u64,
+    /// 首包耗时：从发出请求到解析出第一个「有内容」的增量（正文或工具调用）。
+    /// 整包耗时看 `latency_ms`；这两个分开记，长任务基准才看得出「模型排队」与「出字慢」是两件事。
+    pub first_token_ms: u64,
     pub cost_micros: Option<i64>,
     pub currency: Option<String>,
     /// 本轮发生过的模型切换（from/to/reason），调用方摊成可见步骤与审计
     pub switches: Vec<Value>,
+    /// 端点拒收工具后退回纯文本的事实（model/reason）。
+    /// 有值就等于「这一轮没有任何工具真正执行过」，调用方必须把它写在脸上。
+    pub tools_degraded: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -189,13 +195,24 @@ pub fn endpoints(cfg: Option<&Value>) -> Result<Vec<Endpoint>, String> {
     Ok(out)
 }
 
-fn build_body(model: &str, messages: &[Value], tools: &[Value]) -> Value {
+fn build_body(model: &str, messages: &[Value], tools: &[Value], want_usage: bool) -> Value {
     let mut body = json!({
         "model": model,
         "messages": messages,
         "stream": true,
     });
     if let Some(map) = body.as_object_mut() {
+        if want_usage {
+            // OpenAI 兼容协议的流式**默认不回 usage**：不显式要，用量永远是 0 ——
+            // 日额度、单任务预算（D-14.1）、用量台账、成本全跟着变瞎子。
+            // 真机验收第一次连百炼就撞上：不带这个字段一个用量包都没有。
+            // 严格校验的自建服务会把它当非法字段 400 掉，所以 `call_once` 里
+            // 认出这类拒绝会去掉它重发一次（宁可少一个用量，也不能少一次回答）。
+            map.insert(
+                "stream_options".into(),
+                json!({ "include_usage": true }),
+            );
+        }
         if !tools.is_empty() {
             map.insert("tools".into(), Value::Array(tools.to_vec()));
             map.insert("tool_choice".into(), json!("auto"));
@@ -230,6 +247,9 @@ struct Delta {
     calls: BTreeMap<usize, ToolCall>,
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
+    /// 第一个「有内容」增量到达时距离请求起点的毫秒数（首包）。
+    /// 只有 usage、没有正文也没有工具调用的包不算首包。
+    first_ms: Option<u64>,
 }
 
 impl Delta {
@@ -281,6 +301,7 @@ impl Delta {
     }
 
     fn finish(self, ep: &Endpoint, started: Instant) -> Outcome {
+        let latency_ms = started.elapsed().as_millis() as u64;
         let mut calls: Vec<ToolCall> = self
             .calls
             .into_values()
@@ -298,12 +319,28 @@ impl Delta {
             prompt_tokens: self.prompt_tokens.unwrap_or(0),
             completion_tokens: self.completion_tokens.unwrap_or(0),
             model: ep.display.clone(),
-            latency_ms: started.elapsed().as_millis() as u64,
+            latency_ms,
+            // 一个有内容的包都没收到（例如整包一次到达且只被末尾兜底解析）时，
+            // 首包就等于整包：不编一个更小的数出来
+            first_token_ms: self.first_ms.unwrap_or(latency_ms),
             cost_micros: cost,
             currency,
             switches: Vec::new(),
+            tools_degraded: None,
         }
     }
+}
+
+/// 记下首包：只有真正带正文或工具调用的包才算「第一个字」。
+/// 只记第一次，之后的包不再改写。
+fn mark_first_packet(delta: &mut Delta, started: Instant) {
+    if delta.first_ms.is_some() {
+        return;
+    }
+    if delta.text.is_empty() && delta.calls.is_empty() {
+        return;
+    }
+    delta.first_ms = Some(started.elapsed().as_millis() as u64);
 }
 
 fn cost_of(ep: &Endpoint, prompt: u64, completion: u64) -> (Option<i64>, Option<String>) {
@@ -326,7 +363,41 @@ fn parse_sse_line(line: &str) -> Option<Value> {
     serde_json::from_str::<Value>(payload).ok()
 }
 
-async fn call_streaming(
+/// 发出请求并确认状态码：非 2xx 一律带上端点自己回的那段正文（截 400 字）。
+async fn open_stream(ep: &Endpoint, body: &Value) -> Result<reqwest::Response, ModelError> {
+    let resp = request(ep, body)
+        .map_err(ModelError::Failed)?
+        .send()
+        .await
+        .map_err(|e| ModelError::Failed(format!("MODEL_CONNECTION_FAILED: 模型请求失败：{e}")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        let brief: String = text.chars().take(400).collect();
+        return Err(ModelError::Failed(format!(
+            "MODEL_HTTP_{}: 模型返回错误：{}",
+            status.as_u16(),
+            brief.trim()
+        )));
+    }
+    Ok(resp)
+}
+
+/// 端点是否把 `stream_options` 本身当成非法字段（严格 schema 校验的自建服务会 400 它）。
+///
+/// 只认 400/415/422 这三类「请求本身被拒」，且错误正文点出这个字段名；
+/// 认证、限流、超时一类不算——去掉这个字段也不会变好，重试只是白烧一次请求。
+fn stream_options_rejection(err: &ModelError) -> bool {
+    let ModelError::Failed(msg) = err else {
+        return false;
+    };
+    let rejected = ["MODEL_HTTP_400", "MODEL_HTTP_415", "MODEL_HTTP_422"]
+        .iter()
+        .any(|code| msg.starts_with(code));
+    rejected && msg.to_ascii_lowercase().contains("stream_options")
+}
+
+async fn call_once(
     ep: &Endpoint,
     messages: &[Value],
     tools: &[Value],
@@ -336,22 +407,14 @@ async fn call_streaming(
         return Err(ModelError::Cancelled);
     }
     let started = Instant::now();
-    let body = build_body(&ep.model, messages, tools);
-    let resp = request(ep, &body)
-        .map_err(ModelError::Failed)?
-        .send()
-        .await
-        .map_err(|e| ModelError::Failed(format!("MODEL_CONNECTION_FAILED: 模型请求失败：{e}")))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        let brief: String = body.chars().take(400).collect();
-        return Err(ModelError::Failed(format!(
-            "MODEL_HTTP_{}: 模型返回错误：{}",
-            status.as_u16(),
-            brief.trim()
-        )));
-    }
+    // 先按「要用量」发；只有端点明确说这个字段非法，才退成「不要用量」再发一次。
+    let resp = match open_stream(ep, &build_body(&ep.model, messages, tools, true)).await {
+        Ok(resp) => resp,
+        Err(err) if stream_options_rejection(&err) => {
+            open_stream(ep, &build_body(&ep.model, messages, tools, false)).await?
+        }
+        Err(err) => return Err(err),
+    };
 
     let mut delta = Delta::default();
     let mut buf = String::new();
@@ -375,6 +438,7 @@ async fn call_streaming(
                     let line: String = buf.drain(..=pos).collect();
                     if let Some(payload) = parse_sse_line(&line) {
                         delta.merge(&payload);
+                        mark_first_packet(&mut delta, started);
                     }
                 }
             }
@@ -382,6 +446,7 @@ async fn call_streaming(
     }
     if let Some(payload) = parse_sse_line(&buf) {
         delta.merge(&payload);
+        mark_first_packet(&mut delta, started);
     }
     let outcome = delta.finish(ep, started);
     if outcome.text.trim().is_empty() && outcome.tool_calls.is_empty() {
@@ -390,6 +455,48 @@ async fn call_streaming(
         ));
     }
     Ok(outcome)
+}
+
+fn err_text(err: &ModelError) -> String {
+    match err {
+        ModelError::Cancelled => "任务已取消".to_string(),
+        ModelError::Failed(msg) => msg.clone(),
+    }
+}
+
+/// 端点是否把失败写在「工具」上：只看它自己回的话，不猜某个模型的能力。
+///
+/// 认 400/415/422 这三类请求本身被拒的状态码，且错误正文点出 tool/function；
+/// 认证、限流、超时一类不算（去掉工具也不会变好，重试只是白烧一次请求）。
+fn tool_schema_rejection(err: &ModelError) -> Option<String> {
+    let ModelError::Failed(msg) = err else {
+        return None;
+    };
+    let rest = msg.strip_prefix("MODEL_HTTP_")?;
+    let code: u16 = rest.get(..3)?.parse().ok()?;
+    if !matches!(code, 400 | 415 | 422) {
+        return None;
+    }
+    let lower = msg.to_lowercase();
+    if !(lower.contains("tool") || lower.contains("function")) {
+        return None;
+    }
+    Some(msg.chars().take(240).collect::<String>())
+}
+
+/// 一次调配：带工具失败且端点明确说工具不行时，同一端点退一次纯文本。
+///
+/// 换模型最容易撞上的不是「连不上」，而是新端点不接这份工具清单。
+/// 退一步让本轮仍给出回答，但 `tools_degraded` 必须留下事实：文件没有真的被写过。
+async fn call_degraded(
+    ep: &Endpoint,
+    messages: &[Value],
+    reason: &str,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<Outcome, ModelError> {
+    let mut out = call_once(ep, messages, &[], cancel).await?;
+    out.tools_degraded = Some(json!({ "model": ep.display, "reason": reason }));
+    Ok(out)
 }
 
 fn chain_error(endpoints: &[Endpoint], last: &str) -> ModelError {
@@ -404,6 +511,11 @@ fn chain_error(endpoints: &[Endpoint], last: &str) -> ModelError {
 }
 
 /// 流式调用：主模型在前，按容灾链依次尝试；只在「尚未输出任何内容」时切换。
+///
+/// 换模型最容易撞上的不是连不上，而是新端点不接这份工具清单。顺序是
+/// 「先换下一个带得动工具的端点」，全链都拒收才退纯文本：宁可少一次工具，
+/// 也不要一上来就把本轮降级成只能聊天。退纯文本成功时 `tools_degraded` 有值，
+/// 调用方必须把「本轮没有任何工具真正执行」写在过程里。
 pub async fn stream(
     endpoints: &[Endpoint],
     messages: &[Value],
@@ -412,11 +524,69 @@ pub async fn stream(
 ) -> Result<Outcome, ModelError> {
     let mut switches: Vec<Value> = Vec::new();
     let mut last_err = String::new();
+    // 第一个「明确说工具不行」的端点：退纯文本时落回它，而不是落回链尾
+    let mut tool_rejected: Option<(usize, String)> = None;
     for (i, ep) in endpoints.iter().enumerate() {
         if cancel() {
             return Err(ModelError::Cancelled);
         }
-        match call_streaming(ep, messages, tools, cancel).await {
+        match call_once(ep, messages, tools, cancel).await {
+            Ok(mut out) => {
+                out.switches = switches;
+                return Ok(out);
+            }
+            Err(ModelError::Cancelled) => return Err(ModelError::Cancelled),
+            Err(ModelError::Failed(err)) => {
+                // 没带工具时不谈「退纯文本」：那是模型侧的答复，不是本轮能改的请求
+                if !tools.is_empty() && tool_rejected.is_none() {
+                    if let Some(reason) = tool_schema_rejection(&ModelError::Failed(err.clone())) {
+                        tool_rejected = Some((i, reason));
+                    }
+                }
+                last_err = err;
+                if let Some(next) = endpoints.get(i + 1) {
+                    switches.push(json!({
+                        "from": ep.display,
+                        "to": next.display,
+                        "reason": last_err,
+                    }));
+                }
+            }
+        }
+    }
+    if let Some((idx, reason)) = tool_rejected {
+        if cancel() {
+            return Err(ModelError::Cancelled);
+        }
+        match call_degraded(&endpoints[idx], messages, &reason, cancel).await {
+            Ok(mut out) => {
+                out.switches = switches;
+                return Ok(out);
+            }
+            Err(retry) => {
+                // 退到纯文本仍跑不起来：原始原因更有信息量，重试结果补在后面
+                last_err = format!("{last_err}（去掉工具重试一次仍失败：{}）", err_text(&retry));
+            }
+        }
+    }
+    Err(chain_error(endpoints, &last_err))
+}
+
+/// 一次性调用（不带工具）：上下文压缩生成摘要用。
+/// 与 `stream` 同样的容灾链语义——主模型失败按链切换，取消优先返回 Cancelled。
+/// 摘要不该抢工具：请求体里不带 tools，模型也就不会在压缩这一步发起调用。
+pub async fn oneshot(
+    endpoints: &[Endpoint],
+    messages: &[Value],
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<Outcome, ModelError> {
+    let mut switches: Vec<Value> = Vec::new();
+    let mut last_err = String::new();
+    for (i, ep) in endpoints.iter().enumerate() {
+        if cancel() {
+            return Err(ModelError::Cancelled);
+        }
+        match call_once(ep, messages, &[], cancel).await {
             Ok(mut out) => {
                 out.switches = switches;
                 return Ok(out);
@@ -601,6 +771,124 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// 流式请求必须显式要用量：OpenAI 兼容协议默认不出 usage 包，
+    /// 而日额度、单任务预算（D-14.1）、用量台账、成本全靠这一个数。
+    #[test]
+    fn test_body_asks_for_stream_usage_by_default() {
+        let with = build_body("qwen-plus", &[], &[], true);
+        assert_eq!(with["stream_options"]["include_usage"], json!(true), "{with}");
+        assert_eq!(with["stream"], json!(true), "用量包只在流式里有意义");
+        let without = build_body("qwen-plus", &[], &[], false);
+        assert!(
+            without.get("stream_options").is_none(),
+            "端点不认这个字段时要能去掉：{without}"
+        );
+        // 工具清单与用量请求互不影响
+        let tools = json!([{"type": "function", "function": {"name": "write_text_file"}}]);
+        let both = build_body("qwen-plus", &[], tools.as_array().unwrap(), true);
+        assert_eq!(both["stream_options"]["include_usage"], json!(true));
+        assert_eq!(both["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(both["tool_choice"], json!("auto"));
+    }
+
+    #[test]
+    fn only_stream_options_shaped_rejection_is_worth_retrying() {
+        let hit = |m: &str| stream_options_rejection(&ModelError::Failed(m.to_string()));
+        assert!(hit("MODEL_HTTP_400: 模型返回错误：body.stream_options: extra inputs are not permitted"));
+        assert!(hit("MODEL_HTTP_422: 模型返回错误：unknown field STREAM_OPTIONS"));
+        // 工具类拒绝另有处理；鉴权/限流/连接类去掉这个字段也不会变好
+        assert!(!hit("MODEL_HTTP_400: 模型返回错误：this model does not support tools"));
+        assert!(!hit("MODEL_HTTP_401: 模型返回错误：stream_options is not authorized"));
+        assert!(!hit("MODEL_HTTP_429: 模型返回错误：rate limited on stream_options"));
+        assert!(!hit("MODEL_CONNECTION_FAILED: stream_options"));
+    }
+
+    /// 逐字节把一条 HTTP 请求的正文读出来（头里带 Content-Length）。
+    fn read_http_body(sock: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut head: Vec<u8> = Vec::new();
+        let mut byte = [0u8; 1];
+        while sock.read(&mut byte).unwrap_or(0) == 1 {
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let headers = String::from_utf8_lossy(&head).to_lowercase();
+        let len = headers
+            .split("content-length:")
+            .nth(1)
+            .and_then(|rest| rest.trim().split(|c: char| !c.is_ascii_digit()).next().map(str::to_owned))
+            .and_then(|digits| digits.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = vec![0u8; len];
+        if len > 0 {
+            sock.read_exact(&mut body).ok();
+        }
+        String::from_utf8_lossy(&body).to_string()
+    }
+
+    /// 严格 schema 的自建服务会把 `stream_options` 当非法字段 400 掉：
+    /// 这时要去掉它原地重发一次——宁可这一路没有用量，也不能没有回答。
+    #[tokio::test]
+    async fn test_stream_retries_without_stream_options_when_rejected() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut bodies: Vec<String> = Vec::new();
+            let (mut sock, _) = listener.accept().unwrap();
+            bodies.push(read_http_body(&mut sock));
+            let msg = r#"{"error":{"message":"body.stream_options: extra inputs are not permitted"}}"#;
+            let resp = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{}",
+                msg.len(),
+                msg
+            );
+            let _ = sock.write_all(resp.as_bytes());
+
+            let (mut sock, _) = listener.accept().unwrap();
+            bodies.push(read_http_body(&mut sock));
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"退一步也能答\"}}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes());
+            bodies
+        });
+
+        let endpoint = Endpoint {
+            base_url: format!("http://{addr}/v1"),
+            ..ep()
+        };
+        let out = stream(
+            &[endpoint],
+            &[json!({ "role": "user", "content": "hi" })],
+            &[],
+            &|| false,
+        )
+        .await
+        .expect("端点不认 stream_options 不该让本轮没有回答");
+        assert_eq!(out.text, "退一步也能答");
+        assert_eq!(out.prompt_tokens, 0, "退掉 stream_options 就没有用量可报");
+        let bodies = server.join().unwrap();
+        assert_eq!(bodies.len(), 2, "被拒后应当只重发一次");
+        assert!(bodies[0].contains("stream_options"), "{}", bodies[0]);
+        assert!(
+            !bodies[1].contains("stream_options"),
+            "重发要真的把字段去掉：{}",
+            bodies[1]
+        );
+    }
+
     #[tokio::test]
     async fn test_stream_honours_cancel_before_request() {
         let endpoint = Endpoint {
@@ -610,5 +898,131 @@ mod tests {
         };
         let out = stream(&[endpoint], &[], &[], &|| true).await;
         assert!(matches!(out, Err(ModelError::Cancelled)));
+    }
+
+    #[test]
+    fn only_tool_shaped_rejection_is_worth_retrying() {
+        let hit = |m: &str| tool_schema_rejection(&ModelError::Failed(m.to_string())).is_some();
+        assert!(hit("MODEL_HTTP_400: 模型返回错误：This model does not support tools"));
+        assert!(hit("MODEL_HTTP_422: 模型返回错误：invalid function definition"));
+        assert!(hit("MODEL_HTTP_415: 模型返回错误：tool_choice unsupported"));
+        // 鉴权/限流/连接类失败：去掉工具也不会变好，重试只是白烧一次请求
+        assert!(!hit("MODEL_HTTP_401: 模型返回错误：tools are not authorized"));
+        assert!(!hit("MODEL_HTTP_429: 模型返回错误：rate limited"));
+        assert!(!hit("MODEL_HTTP_500: 模型返回错误：internal error for tool"));
+        assert!(!hit("MODEL_CONNECTION_FAILED: 无法连接"));
+        assert!(!hit("MODEL_HTTP_4"));
+        assert!(matches!(
+            tool_schema_rejection(&ModelError::Cancelled),
+            None
+        ));
+    }
+
+    /// 每次连接按脚本返回一个响应；返回 base_url 与「收到的请求体」句柄
+    fn scripted(responses: Vec<(u16, String)>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for (status, body) in responses {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                bodies.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: text/event-stream\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+            bodies
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
+    #[tokio::test]
+    async fn test_stream_degrades_to_text_when_the_chain_rejects_tools() {
+        let ok = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"纯文本回答\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base, server) = scripted(vec![
+            (
+                400,
+                "{\"error\":{\"message\":\"This model does not support tools\"}}".to_string(),
+            ),
+            (200, ok.to_string()),
+        ]);
+        let endpoint = Endpoint {
+            base_url: base,
+            ..ep()
+        };
+        let tools = vec![json!({"type": "function", "function": {
+            "name": "write_text_file", "description": "写入", "parameters": {"type": "object"}
+        }})];
+        let out = stream(
+            &[endpoint],
+            &[json!({ "role": "user", "content": "hi" })],
+            &tools,
+            &|| false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.text, "纯文本回答");
+        let degraded = out.tools_degraded.expect("端点拒收工具必须留下事实");
+        assert!(
+            degraded["reason"].as_str().unwrap().contains("does not support"),
+            "{degraded}"
+        );
+        assert_eq!(degraded["model"].as_str(), Some("主模型"));
+        let bodies = server.join().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].contains("\"tools\""), "第一次请求带着工具清单");
+        assert!(
+            !bodies[1].contains("\"tools\""),
+            "退纯文本时不能继续带着被拒的字段"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_prefers_tool_capable_fallback_over_degrading() {
+        let ok = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"备用模型的回答\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base1, first) = scripted(vec![(
+            400,
+            "{\"error\":{\"message\":\"tools are not supported\"}}".to_string(),
+        )]);
+        let (base2, second) = scripted(vec![(200, ok.to_string())]);
+        let a = Endpoint {
+            base_url: base1,
+            display: "主模型".into(),
+            ..ep()
+        };
+        let b = Endpoint {
+            base_url: base2,
+            display: "备用模型".into(),
+            ..ep()
+        };
+        let tools = vec![json!({"type": "function", "function": {
+            "name": "write_text_file", "description": "写入", "parameters": {"type": "object"}
+        }})];
+        let out = stream(&[a, b], &[json!({ "role": "user", "content": "hi" })], &tools, &|| false)
+            .await
+            .unwrap();
+        assert!(
+            out.tools_degraded.is_none(),
+            "链上还有带得动工具的端点，不该先把本轮降级"
+        );
+        assert_eq!(out.model, "备用模型");
+        assert_eq!(out.switches.len(), 1);
+        assert_eq!(out.switches[0]["from"], "主模型");
+        let bodies = second.join().unwrap();
+        assert!(bodies[0].contains("\"tools\""), "备用端点仍要收到工具清单");
+        first.join().unwrap();
     }
 }

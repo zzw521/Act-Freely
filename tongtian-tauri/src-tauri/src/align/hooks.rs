@@ -228,6 +228,156 @@ fn kill_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+/// 依赖 shell 解释的控制符：出现任意一个就拆不出等价 argv
+const SHELL_CONTROL_CHARS: &[char] = &[
+    '&', '|', '<', '>', '^', '(', ')', ';', '`', '\n', '\r', '%',
+];
+
+/// 组装 Hook 子进程：系统隔离生效时改由沙箱启动器拉起，否则交系统 shell 解释
+#[cfg(windows)]
+fn build_spawn(shell_cmd: &str, cwd: Option<&std::path::Path>) -> Result<Command, String> {
+    use std::os::windows::process::CommandExt;
+    match sandbox_wrap(shell_cmd, cwd)? {
+        Some((program, args)) => {
+            let mut c = Command::new(&program);
+            c.args(&args).creation_flags(CREATE_NO_WINDOW);
+            Ok(c)
+        }
+        None => {
+            let mut c = Command::new("cmd");
+            c.args(["/C", shell_cmd]).creation_flags(CREATE_NO_WINDOW);
+            Ok(c)
+        }
+    }
+}
+
+/// 组装 Hook 子进程：macOS / Linux 尚无系统隔离实现，命令仍由 `/bin/sh` 解释
+#[cfg(not(windows))]
+fn build_spawn(shell_cmd: &str, cwd: Option<&std::path::Path>) -> Result<Command, String> {
+    match sandbox_wrap(shell_cmd, cwd)? {
+        Some((program, args)) => {
+            let mut c = Command::new(&program);
+            c.args(&args);
+            Ok(c)
+        }
+        None => {
+            let mut c = Command::new("/bin/sh");
+            c.args(["-c", shell_cmd]);
+            Ok(c)
+        }
+    }
+}
+
+/// 需要套壳时返回「启动器 + 参数」；本机没有隔离实现或未启用时返回 None
+///
+/// 报错等于命令不执行：这是 D-03 的 fail-closed 约定，不给「配了隔离却照旧裸跑」留路径。
+fn sandbox_wrap(
+    shell_cmd: &str,
+    cwd: Option<&std::path::Path>,
+) -> Result<Option<(std::path::PathBuf, Vec<String>)>, String> {
+    if !crate::sandbox::platform_supported() || crate::sandbox::active().is_none() {
+        return Ok(None);
+    }
+    let (program, args) = split_argv(shell_cmd)?;
+    crate::sandbox::wrap_for_spawn_extra(&program, &args, &read_dirs_of(&args, cwd), &[])
+        .map_err(|e| format!("HOOK_SANDBOX_FAILED: {e}"))
+}
+
+/// 把 Hook 命令行拆成「程序 + 参数」，供启动器直接 exec（不再经过 shell）
+///
+/// 引号内的空格按字面保留，`\"` 按 Windows 惯例算转义引号；
+/// 未闭合引号与 shell 控制符都直接拒绝，因为静默改写会执行成另一条命令。
+fn split_argv(raw: &str) -> Result<(String, Vec<String>), String> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut started = false;
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if !in_quotes && SHELL_CONTROL_CHARS.contains(&ch) {
+            return Err(shell_required(ch));
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            started = true;
+        } else if in_quotes && ch == '\\' && idx + 1 < chars.len() && chars[idx + 1] == '"' {
+            current.push('"');
+            idx += 2;
+            continue;
+        } else if !in_quotes && ch.is_whitespace() {
+            if started {
+                tokens.push(std::mem::take(&mut current));
+                started = false;
+            }
+        } else {
+            current.push(ch);
+            started = true;
+        }
+        idx += 1;
+    }
+    if in_quotes {
+        return Err(
+            "HOOK_SANDBOX_UNBALANCED_QUOTE: 命令里的双引号没有成对闭合，系统隔离下无法安全拆分参数"
+                .to_string(),
+        );
+    }
+    if started {
+        tokens.push(current);
+    }
+    if tokens.is_empty() || tokens[0].trim().is_empty() {
+        return Err("HOOK_INVALID_COMMAND: 命令为空，无法在系统隔离下执行".to_string());
+    }
+    let program = tokens.remove(0);
+    Ok((program, tokens))
+}
+
+fn shell_required(ch: char) -> String {
+    format!(
+        "HOOK_SANDBOX_SHELL_REQUIRED: 系统隔离已开启，Hook 命令不再由 shell 解释，出现了 `{ch}` 就无法等价执行。请改写为「程序 + 参数」的单条命令（例如 `python D:/hooks/check.py`），或先在设置页关闭系统隔离"
+    )
+}
+
+/// 命令行里已有的文件参数 + 事件工作目录：只读授权，脚本才读得到自己的与被检文件
+///
+/// 只给读，不给写：写越界仍由系统 ACL 拒绝（写暂存 + diff 审批是 D-03 §3 的未完成项）。
+fn read_dirs_of(args: &[String], cwd: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    let mut push = |p: std::path::PathBuf| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    for arg in args {
+        let path = std::path::Path::new(arg);
+        if path.is_file() {
+            if let Some(parent) = path.parent() {
+                push(parent.to_path_buf());
+            }
+        }
+    }
+    if let Some(dir) = cwd {
+        if dir.is_dir() {
+            push(dir.to_path_buf());
+        }
+    }
+    out
+}
+
+/// 事件输入里的工作目录（`HookInput.cwd`），空串按「没有工作目录」处理
+fn hook_cwd(input: &Value) -> Option<std::path::PathBuf> {
+    let raw = input
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(raw))
+}
+
 /// 试运行单条 hook 命令：真实拉起进程、stdin 喂事件 JSON、按秒数超时
 ///
 /// 阻塞语义：仅在具备阻塞能力的事件上把 exit 2 记为 `blocked`，
@@ -244,21 +394,19 @@ pub fn run_command(event: &str, command: &str, timeout_sec: u64, input: &Value) 
         };
     }
 
-    // Hook 命令是用户逐条放行的本机自动化，进程沿用应用权限；
-    // 系统级隔离只覆盖终端、MCP stdio 与 ACP（见 docs/缺陷与实现计划-任我行.md 的 D-03）。
-    #[cfg(windows)]
-    let mut spec = {
-        use std::os::windows::process::CommandExt;
-        let mut c = Command::new("cmd");
-        c.args(["/C", shell_cmd.as_str()])
-            .creation_flags(CREATE_NO_WINDOW);
-        c
-    };
-    #[cfg(not(windows))]
-    let mut spec = {
-        let mut c = Command::new("/bin/sh");
-        c.args(["-c", shell_cmd.as_str()]);
-        c
+    // 系统隔离生效时 Hook 也进容器（D-03）：命令先拆成 argv，再交给沙箱启动器；
+    // 拆不出来就拒绝执行，绝不静默回落到「按应用权限直接拉起」。
+    let mut spec = match build_spawn(&shell_cmd, hook_cwd(input).as_deref()) {
+        Ok(c) => c,
+        Err(reason) => {
+            return HookRun {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: reason,
+                blocked: false,
+                timed_out: false,
+            };
+        }
     };
 
     let mut child = match spec
@@ -574,6 +722,8 @@ pub fn runtime_summary(store: &Store) -> Result<Value, String> {
         "unfiredEvents": UNFIRED_EVENTS,
         "mountedUnfired": mounted_unfired,
         "ungranted": ungranted,
+        // 判定与 run_command 的套壳条件同源，页面才不会显示与执行相反的隔离状态
+        "sandboxed": crate::sandbox::platform_supported() && crate::sandbox::active().is_some(),
     }))
 }
 
@@ -902,6 +1052,101 @@ mod tests {
         }
     }
 
+    // ── 系统隔离下的命令拆分（D-03） ──────────────────────
+
+    #[test]
+    fn test_split_argv_keeps_program_and_args() {
+        let (program, args) = split_argv("python D:/hooks/check.py --strict").unwrap();
+        assert_eq!(program, "python");
+        assert_eq!(args, vec!["D:/hooks/check.py", "--strict"]);
+    }
+
+    #[test]
+    fn test_split_argv_preserves_quoted_spaces_and_escapes() {
+        let (program, args) = split_argv(r#""C:\My Docs\a.py" --msg "100% done" "b\"c""#).unwrap();
+        assert_eq!(program, r"C:\My Docs\a.py");
+        assert_eq!(args[0], "--msg");
+        // 引号内的 % 是字面量，不是 cmd 变量展开
+        assert_eq!(args[1], "100% done");
+        assert_eq!(args[2], r#"b"c"#);
+    }
+
+    #[test]
+    fn test_split_argv_rejects_shell_control_chars() {
+        for cmd in [
+            "echo fired > C:/tmp/x.txt",
+            "echo a && echo b",
+            "python a.py | tee log",
+            "echo %USERPROFILE%",
+            "python a.py; python b.py",
+            r"node `which x`.js",
+            "if exist a.txt (del a.txt)",
+        ] {
+            let err = split_argv(cmd).unwrap_err();
+            assert!(err.starts_with("HOOK_SANDBOX_SHELL_REQUIRED"), "{cmd} → {err}");
+        }
+    }
+
+    #[test]
+    fn test_split_argv_rejects_unbalanced_quote_and_blank() {
+        assert!(split_argv(r#"python "check.py"#)
+            .unwrap_err()
+            .starts_with("HOOK_SANDBOX_UNBALANCED_QUOTE"));
+        assert!(split_argv("   ")
+            .unwrap_err()
+            .starts_with("HOOK_INVALID_COMMAND"));
+    }
+
+    #[test]
+    fn test_split_argv_keeps_empty_quoted_argument() {
+        let (program, args) = split_argv("python a.py --text \"\"").unwrap();
+        assert_eq!(program, "python");
+        assert_eq!(args, vec!["a.py", "--text", ""]);
+    }
+
+    #[test]
+    fn test_sandbox_wrap_is_inert_when_isolation_not_effective() {
+        // 未启用（或本机没有隔离实现）时绝不能改动执行方式：shell 语法照旧交给 cmd / sh
+        if crate::sandbox::active().is_some() {
+            return;
+        }
+        assert!(sandbox_wrap("echo a && echo b", None).unwrap().is_none());
+        assert!(sandbox_wrap("python D:/hooks/check.py", None).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_hook_cwd_treats_blank_as_no_workspace() {
+        assert_eq!(hook_cwd(&json!({"cwd": ""})), None);
+        assert_eq!(hook_cwd(&json!({})), None);
+        assert_eq!(
+            hook_cwd(&json!({"cwd": "  d:/work  "})).map(|p| p.display().to_string()),
+            Some("d:/work".to_string())
+        );
+    }
+
+    #[test]
+    fn test_read_dirs_of_grants_script_dir_and_cwd_only_read() {
+        let dir = std::env::temp_dir().join(format!(
+            "tt-hooks-argv-{}",
+            crate::bridge::event_store::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("check.py");
+        std::fs::write(&script, "print(1)").unwrap();
+
+        let dirs = read_dirs_of(
+            &[script.to_string_lossy().to_string(), "--flag".to_string()],
+            Some(&dir),
+        );
+        assert_eq!(dirs.len(), 1, "脚本目录与工作目录同路径只授权一次：{dirs:?}");
+        assert_eq!(dirs[0], dir);
+
+        // 不存在的文件参数不授权（否则会把任意拼出来的路径整树放开）
+        let none = read_dirs_of(&["Z:/nope/missing.py".to_string()], None);
+        assert!(none.is_empty(), "{none:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_test_input_shape_matches_contract() {
         let v = test_input("Stop", "d:/cwd");
@@ -1115,6 +1360,8 @@ mod tests {
         assert!(s["firedEvents"].as_array().unwrap().contains(&json!("SubagentStart")));
         // 配了但引擎没有触发点的事件要单独列出来，页面才能逐条说明「不会执行」
         assert_eq!(s["mountedUnfired"], json!(["Notification"]));
+        // 未开系统隔离时绝不能宣称脚本进了容器
+        assert_eq!(s["sandboxed"], json!(false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

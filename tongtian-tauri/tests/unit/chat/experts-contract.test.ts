@@ -64,7 +64,7 @@ describe('对话内专家选择一路透传', () => {
     expect(src).toContain('[turnIndex]: expertId?.trim() || \'\',');
     expect(src).toContain('const expertId = conv.turnExperts[turnIdx] || undefined;');
     // 重新生成提交体里确实带上了当轮专家
-    const regen = src.split('regenerateTurn: async (')[1].split('resumeTask: async (')[0];
+    const regen = src.split('regenerateTurn: async (')[1].split('resumeTaskFromStep: async (')[0];
     expect(regen).toContain('expertId,');
     // 选择本身也放 store：欢迎页 → 对话态组件重挂时不能丢
     expect(src).toContain("chatExpertId: '',");

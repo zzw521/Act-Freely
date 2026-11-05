@@ -6,24 +6,44 @@ import logging
 import sys
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
+from .api_contract import API_CONTRACT_VERSION, CONTRACT_HEADER as API_CONTRACT_HEADER
+from .api_contract import router as api_contract_router
+from .audit_api import router as audit_router
 from .auth import ensure_admin, router as auth_router
 from .config import DEV_JWT_SECRET, settings
 from .db import init_db
+from .desktop_index import router as desktop_index_router
 from .errors import ApiError
+from .gateway_admin import router as gateway_admin_router
+from .gateway_policy import router as gateway_policy_router
+from .gateway_usage import router as gateway_usage_router
+from .keys import init_keys
 from .market import router as market_router
+from .model_tiers import router as model_tiers_router
+from .org_quota import router as org_quota_router
 from .projects import router as projects_router
+from .tickets import router as tickets_router
+from .usage import router as usage_router
+from .workflows import router as workflows_router
 
 logger = logging.getLogger("tongtian")
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_DRAIN_BYTES = 8 * 1024 * 1024
+WEB_DIR = Path(__file__).resolve().parent / "web"
+WEB_CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+    "connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+)
 
 
 def _configure_logging() -> None:
@@ -49,6 +69,10 @@ async def lifespan(_app: FastAPI):
         logger.warning("生产环境 CORS 仍为 *，建议通过 TT_CORS_ORIGINS 收窄来源")
 
     init_db()
+    store = init_keys()
+    logger.info("RS256 签名密钥已就绪：kid=%s", store.current_kid)
+    if not settings.gateway_service_token:
+        logger.warning("未配置 TT_GATEWAY_SERVICE_TOKEN：网关无法拉取策略")
     if ensure_admin():
         logger.info("管理员账号已就绪：%s", settings.admin_email or "(已存在账号提升)")
     if settings.seed_demo:
@@ -58,11 +82,16 @@ async def lifespan(_app: FastAPI):
     yield
 
 
+# 生产关闭交互文档与 OpenAPI：接口清单不该对公网暴露（排障走 /health 与日志）
+_public_docs = not settings.production
 app = FastAPI(
     title="通天办公服务端",
     description="账号登录、在线技能市场、专家套件市场与 MCP 插件市场",
     version=__version__,
     lifespan=lifespan,
+    docs_url="/docs" if _public_docs else None,
+    redoc_url="/redoc" if _public_docs else None,
+    openapi_url="/openapi.json" if _public_docs else None,
 )
 
 if settings.cors_origins == ("*",):
@@ -106,8 +135,13 @@ async def _security_headers(request: Request, call_next):
         response = await call_next(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.url.path == "/ui" or request.url.path.startswith("/ui/"):
+        response.headers.setdefault("Content-Security-Policy", WEB_CSP)
     if request.url.path.startswith(("/api/v1/auth", "/api/auth")):
         response.headers.setdefault("Cache-Control", "no-store")
+    if request.url.path.startswith("/api/v1"):
+        # 第三方不用先打一次 /api/v1/contract 就知道服务端说的是哪一版对外契约
+        response.headers.setdefault(API_CONTRACT_HEADER, API_CONTRACT_VERSION)
     return response
 
 
@@ -167,9 +201,40 @@ async def _unhandled_error(_request: Request, exc: Exception):
 
 
 app.include_router(auth_router)
-# 项目协作必须先于市场的 /api/v1/{plural} 通配路由注册，否则会被市场当成未知类型
+# 审计查询是控制面自己的只读接口，必须先于网关管理通配代理注册
+app.include_router(audit_router)
+# 用量上报/查询与项目协作都必须先于市场的 /api/v1/{plural} 通配路由注册，
+# 否则会被市场当成未知类型
+app.include_router(usage_router)
 app.include_router(projects_router)
+# 工单层（D-47）的 /api/v1/agent/tickets 同样是控制面自己的路由，
+# 必须先于市场的 /api/v1/{plural} 通配注册，否则 "agent" 会被当成未知条目类型
+app.include_router(tickets_router)
+app.include_router(gateway_policy_router)
+# 管理代理必须在策略路由之后：/policies、/policy/{tenant} 是控制面自己的路由，
+# 不能被通配代理抢走
+app.include_router(gateway_admin_router)
+app.include_router(gateway_usage_router)
+# 模型档位下发（D-44）也必须先于市场通配路由：/api/v1/model-tiers/effective 是两段路径，
+# 会被 /api/v1/{plural}/{item_id} 抢走并把 "effective" 当成条目 ID
+app.include_router(model_tiers_router)
+# 组织两级配额（D-23）必须先于市场通配路由：/api/v1/admin/orgs 是控制面自己的路由，
+# 不能被 /api/v1/{plural}/{item_id} 抢走并把 "orgs" 当成未知条目类型
+app.include_router(org_quota_router)
+# 桌面端索引适配层（D-07.4）必须先于市场通配路由注册：/api/v1/desktop/revoked.json
+# 是两段路径，会被 /api/v1/{plural}/{item_id} 抢走并把 "revoked.json" 当成条目 ID
+app.include_router(desktop_index_router)
+# 工作流层（D-10）同样必须先于市场通配路由：/api/v1/agent/workflow-runs 是两段路径，
+# 会被 /api/v1/{plural}/{item_id} 抢走并把 "workflow-runs" 当成未知条目 ID
+app.include_router(workflows_router)
+# 对外 API 契约（D-19 / #154）：/api/v1/contract 与 /api/v1/contract/verify 是两段路径，
+# 必须先于市场通配注册，否则 "contract" 会被当成未知条目类型（与 #142 那次
+# /api/v1/desktop/revoked.json 被吞同类，mock 测不出来，只有真路由表能发现）
+app.include_router(api_contract_router)
 app.include_router(market_router)
+
+# 轻量 Web 控制台：纯静态资源，直接调用上面的 API
+app.mount("/ui", StaticFiles(directory=WEB_DIR, html=True), name="web")
 
 
 @app.get("/health")
@@ -184,14 +249,17 @@ def health():
 
 @app.get("/")
 def root():
-    return {
+    body = {
         "ok": True,
         "service": "通天办公服务端",
         "version": __version__,
-        "docs": "/docs",
-        "openapi": "/openapi.json",
+        "ui": "/ui/",
         "health": "/health",
     }
+    if _public_docs:
+        body["docs"] = "/docs"
+        body["openapi"] = "/openapi.json"
+    return body
 
 
 if __name__ == "__main__":

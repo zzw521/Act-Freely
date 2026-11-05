@@ -1,6 +1,9 @@
 //! 逐工具审批本机网关
 //!
 //! 引擎在副作用工具真正执行前 POST `/tool/approve`，由桌面壳弹系统确认框。
+//! 同一个端点服务两类确认：`kind` 缺省是逐工具审批（受 `toolApprovalMode` 档位约束，
+//! off 即 403），`kind: "file_permission"` 是会话档位「每次询问」的写/删确认
+//! （与审批档位无关，off 时照样弹；只有档位声明为「每次询问」才受理）。
 //! 为什么放在 Rust：
 //! - 原生确认框与审计属于桌面壳，引擎拿不到任意弹窗/系统交互能力；
 //! - 档位每次请求都重新读取（设置页刚关闭就立即生效），非法档位 fail-closed；
@@ -128,6 +131,33 @@ async fn handle(mut stream: TcpStream, services: Arc<P0Services>) -> std::io::Re
         }
     };
 
+    // 请求种类：普通逐工具审批，还是「文件访问档位＝每次询问」的写/删确认。
+    // 后者由引擎声明档位，壳侧只把它当作「要不要弹框」的依据：确认框永远只会让
+    // 操作更难执行，不会更容易，所以伪造这个字段换不来任何放行。
+    let kind = req
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("tool")
+        .to_string();
+    let is_file_ask = kind == "file_permission";
+    if is_file_ask {
+        // 只有「每次询问」这一档该弹框；别的档位来问说明引擎侧不对，拒绝而不是弹框
+        let tier = req
+            .get("filePermission")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if tier != crate::security::file_perm::DEFAULT_MODE {
+            return write_response(
+                &mut stream,
+                403,
+                &json!({ "ok": false, "error": format!("FILE_PERMISSION_ASK_NOT_REQUIRED: 档位「{tier}」不该发起逐次确认") }),
+            )
+            .await;
+        }
+    }
+
     // 每次请求重新读档位：设置页刚关闭就立即生效
     let mode = match tool_approval::read_mode(&services.store) {
         Ok((m, _)) => m,
@@ -135,7 +165,9 @@ async fn handle(mut stream: TcpStream, services: Arc<P0Services>) -> std::io::Re
             return write_response(&mut stream, 403, &json!({ "ok": false, "error": e })).await;
         }
     };
-    if mode == "off" {
+    if mode == "off" && !is_file_ask {
+        // 审批关闭仍拒绝普通工具确认；文件档位确认不受这条影响（它由会话档位决定，
+        // 与「要不要逐个工具问模型」是两条轴）
         return write_response(
             &mut stream,
             403,
@@ -170,14 +202,27 @@ async fn handle(mut stream: TcpStream, services: Arc<P0Services>) -> std::io::Re
         .take(120)
         .collect::<String>();
     let (description, audit_description) = describe_for_user(&tool, &summary);
-    let desc = description.clone();
-    let confirmed =
-        tauri::async_runtime::spawn_blocking(move || tool_approval::confirm(&desc)).await;
+    // 两类确认共用一套系统弹窗与同一份审计口径，只在文案与「拒绝码」上分流。
+    // 档位标志是 Copy 的，随闭包一起搬进阻塞线程即可，不能借用。
+    let file_ask = is_file_ask;
+    let audit_action = if is_file_ask {
+        audit::ACTION_FILE_WRITE
+    } else {
+        audit::ACTION_TOOL_APPROVAL
+    };
+    let confirmed = tauri::async_runtime::spawn_blocking(move || {
+        if file_ask {
+            tool_approval::confirm_file_action(&description)
+        } else {
+            tool_approval::confirm(&description)
+        }
+    })
+    .await;
     match confirmed {
         Ok(Ok(())) => {
             audit::record_quiet(
                 &services.store,
-                audit::ACTION_TOOL_APPROVAL,
+                audit_action,
                 audit::SEV_INFO,
                 &tool,
                 &format!("用户放行：{audit_description}"),
@@ -187,7 +232,7 @@ async fn handle(mut stream: TcpStream, services: Arc<P0Services>) -> std::io::Re
             // 拒绝是安全事实：即使引擎随后退出也要留痕
             audit::record_quiet(
                 &services.store,
-                audit::ACTION_TOOL_APPROVAL,
+                audit_action,
                 audit::SEV_WARNING,
                 &tool,
                 &format!("未执行：{audit_description}；原因：{e}"),
@@ -198,7 +243,7 @@ async fn handle(mut stream: TcpStream, services: Arc<P0Services>) -> std::io::Re
             let message = format!("TOOL_APPROVAL_CONFIRM_UNAVAILABLE: 确认框线程异常：{e}");
             audit::record_quiet(
                 &services.store,
-                audit::ACTION_TOOL_APPROVAL,
+                audit_action,
                 audit::SEV_ERROR,
                 &tool,
                 &format!("未执行：{audit_description}；原因：{message}"),
@@ -210,7 +255,7 @@ async fn handle(mut stream: TcpStream, services: Arc<P0Services>) -> std::io::Re
     write_response(
         &mut stream,
         200,
-        &json!({ "ok": true, "tool": tool, "mode": mode, "taskId": task_id }),
+        &json!({ "ok": true, "tool": tool, "mode": mode, "kind": kind, "taskId": task_id }),
     )
     .await
 }

@@ -237,17 +237,22 @@ const ExpertsPage: React.FC<ExpertsPageProps> = ({ embedded = false }) => {
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
         {!embedded && (
           <>
-            <GroupsIcon sx={{ fontSize: 22, color: '#8B5CF6' }} />
+            <GroupsIcon sx={{ fontSize: 22, color: 'var(--tt-accent-violet)' }} />
             <Typography sx={{ fontSize: '20px', fontWeight: 700, color: 'var(--tt-text-1)' }}>
               专家团队
             </Typography>
           </>
         )}
-        {loading && <CircularProgress size={16} sx={{ color: '#8B5CF6' }} />}
+        {loading && <CircularProgress size={16} sx={{ color: 'var(--tt-accent-violet)' }} />}
         <Box sx={{ flexGrow: 1 }} />
         <Tooltip title="刷新专家列表">
           <span>
-            <IconButton size="small" onClick={() => void refresh()} disabled={!desktop || loading}>
+            <IconButton
+              size="small"
+              aria-label="刷新专家列表"
+              onClick={() => void refresh()}
+              disabled={!desktop || loading}
+            >
               <RefreshIcon sx={{ fontSize: 18 }} />
             </IconButton>
           </span>
@@ -280,12 +285,12 @@ const ExpertsPage: React.FC<ExpertsPageProps> = ({ embedded = false }) => {
             gap: 1,
           }}
         >
-          <WarningAmberIcon sx={{ fontSize: 18, color: '#D97706', mt: 0.1 }} />
+          <WarningAmberIcon sx={{ fontSize: 18, color: 'var(--tt-warning)', mt: 0.1 }} />
           <Box>
-            <Typography sx={{ fontSize: '13px', fontWeight: 700, color: '#B45309' }}>
+            <Typography sx={{ fontSize: '13px', fontWeight: 700, color: 'var(--tt-warning)' }}>
               当前是浏览器直连通道，专家团队不可用
             </Typography>
-            <Typography sx={{ fontSize: '12.5px', color: '#92400E', mt: 0.25 }}>
+            <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-warning)', mt: 0.25 }}>
               专家注册表保存在桌面端本机数据库，运行时的模型密钥也只由桌面端解析。
               浏览器通道保留本页作为能力说明，不显示示例专家，也不接受新建或修改。
             </Typography>
@@ -305,13 +310,13 @@ const ExpertsPage: React.FC<ExpertsPageProps> = ({ embedded = false }) => {
             gap: 1,
           }}
         >
-          <WarningAmberIcon sx={{ fontSize: 18, color: '#DC2626', mt: 0.1 }} />
-          <Typography sx={{ fontSize: '12.5px', color: '#B91C1C' }}>{loadError}</Typography>
+          <WarningAmberIcon sx={{ fontSize: 18, color: 'var(--tt-danger)', mt: 0.1 }} />
+          <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-danger)' }}>{loadError}</Typography>
         </Box>
       )}
 
       {desktop && !loading && experts.length === 0 && !loadError && (
-        <Box sx={{ mt: 2, border: '1px dashed #E5E7EB', borderRadius: '14px', p: 4, textAlign: 'center' }}>
+        <Box sx={{ mt: 2, border: '1px dashed var(--tt-border)', borderRadius: '14px', p: 4, textAlign: 'center' }}>
           <GroupsIcon sx={{ fontSize: 36, color: '#DDD6FE' }} />
           <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'var(--tt-text-2)', mt: 1 }}>
             还没有专家
@@ -363,15 +368,21 @@ const ExpertsPage: React.FC<ExpertsPageProps> = ({ embedded = false }) => {
                   </Typography>
                 </Box>
                 <Tooltip title="编辑专家">
-                  <IconButton size="small" onClick={() => openEdit(expert)} sx={{ color: 'var(--tt-text-3)' }}>
+                  <IconButton
+                    size="small"
+                    aria-label={`编辑专家：${expert.name}`}
+                    onClick={() => openEdit(expert)}
+                    sx={{ color: 'var(--tt-text-3)' }}
+                  >
                     <EditOutlinedIcon sx={{ fontSize: 17 }} />
                   </IconButton>
                 </Tooltip>
                 <Tooltip title="删除专家（只删注册表条目）">
                   <IconButton
                     size="small"
+                    aria-label={`删除专家：${expert.name}`}
                     onClick={() => setDeleteTarget(expert)}
-                    sx={{ color: 'var(--tt-text-3)', '&:hover': { color: '#EF4444' } }}
+                    sx={{ color: 'var(--tt-text-3)', '&:hover': { color: 'var(--tt-danger)' } }}
                   >
                     <DeleteOutlineIcon sx={{ fontSize: 17 }} />
                   </IconButton>
@@ -394,14 +405,14 @@ const ExpertsPage: React.FC<ExpertsPageProps> = ({ embedded = false }) => {
                       : expert.modelName
                         ? 'rgba(14, 165, 233, 0.08)'
                         : 'rgba(107, 114, 128, 0.08)',
-                    color: expert.modelError ? '#B91C1C' : expert.modelName ? '#0369A1' : '#6B7280',
+                    color: expert.modelError ? 'var(--tt-danger)' : expert.modelName ? 'var(--tt-info)' : 'var(--tt-text-3)',
                   }}
                 />
                 {expert.skills.length === 0 ? (
                   <Chip
                     size="small"
                     label="技能不限制"
-                    sx={{ fontSize: '11px', height: 22, bgcolor: 'rgba(107, 114, 128, 0.08)', color: '#6B7280' }}
+                    sx={{ fontSize: '11px', height: 22, bgcolor: 'rgba(107, 114, 128, 0.08)', color: 'var(--tt-text-2)' }}
                   />
                 ) : (
                   expert.skills.map((sid) => (
@@ -409,7 +420,7 @@ const ExpertsPage: React.FC<ExpertsPageProps> = ({ embedded = false }) => {
                       key={sid}
                       size="small"
                       label={skills.find((s) => s.id === sid)?.name ?? sid}
-                      sx={{ fontSize: '11px', height: 22, bgcolor: 'rgba(124, 58, 237, 0.08)', color: '#6D28D9' }}
+                      sx={{ fontSize: '11px', height: 22, bgcolor: 'rgba(124, 58, 237, 0.08)', color: 'var(--tt-accent-violet)' }}
                     />
                   ))
                 )}
@@ -426,7 +437,7 @@ const ExpertsPage: React.FC<ExpertsPageProps> = ({ embedded = false }) => {
                   overflowY: 'auto',
                 }}
               >
-                <Typography sx={{ fontSize: '11px', fontWeight: 600, color: '#7C3AED', mb: 0.25 }}>
+                <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-accent-violet)', mb: 0.25 }}>
                   角色提示词
                 </Typography>
                 <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-3)', whiteSpace: 'pre-wrap' }}>
@@ -601,7 +612,7 @@ const ExpertsPage: React.FC<ExpertsPageProps> = ({ embedded = false }) => {
             onClick={() => void confirmDelete()}
             disabled={deleting}
             variant="contained"
-            sx={{ fontSize: '13px', bgcolor: '#EF4444', '&:hover': { bgcolor: '#DC2626' } }}
+            sx={{ fontSize: '13px', bgcolor: 'var(--tt-danger-fill)', '&:hover': { bgcolor: '#DC2626' } }}
           >
             {deleting ? '删除中…' : '确认删除'}
           </Button>

@@ -22,6 +22,7 @@ Rust 随 `runtime.sandbox` 下发用户在工作区里的显式授权：
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import os
@@ -38,11 +39,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+import ticket_worker_adapter as twa  # 只借它的**睡等判定表**（D-48.4c）：什么算 sleep 只有一份答案，理由文案两边各写
+import sandbox_launcher as sl  # 系统隔离套壳（D-08）：受控执行与终端/MCP/ACP/Hooks 用同一只容器
+
 MAX_EXEC_TIMEOUT = 120
 DEFAULT_EXEC_TIMEOUT = 30
 MAX_EXEC_ARGS = 32
 MAX_EXEC_OUTPUT_CHARS = 8000
 MAX_TARGET_CHARS = 200
+# 通用 shell 的整条命令上限：再长就不是「一次操作」，而是把脚本塞进参数
+MAX_SHELL_COMMAND_CHARS = 8000
 
 # 单次受控执行的系统资源上限：Windows 用 Job Object，Unix 用 rlimit（尽力而为）
 EXEC_MEMORY_LIMIT_MB = 2048
@@ -81,6 +87,13 @@ ENV_KEEP = frozenset({
 def _brief(text: str, limit: int = 200) -> str:
     one = " ".join(str(text or "").split())
     return one if len(one) <= limit else one[:limit] + "…"
+
+
+def _shell_target(command: str) -> str:
+    """审计目标：通用 shell 的命令正文可能带凭据，只记长度与摘要，不原样入库"""
+    raw = str(command or "")
+    digest = hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:12]
+    return f"shell（{len(raw)} 字符，sha256:{digest}）"
 
 
 def _str_list(raw) -> list[str]:
@@ -326,7 +339,7 @@ def _posix_limit_setup(read_fd: int, write_fd: int):
 
 
 def _execute_limited(
-    argv: list[str], cwd: str, timeout: int
+    argv: list[str] | str, cwd: str, timeout: int
 ) -> tuple[subprocess.CompletedProcess, str]:
     """执行命令并施加系统资源限制；返回 (结果, 降级说明)。
 
@@ -419,6 +432,95 @@ def _execute_limited(
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err), limits_note
 
 
+# ── 系统隔离容器（D-08）────────────────────────────────────────
+#
+# 终端 / MCP stdio / ACP / Hooks 四条通道早就走 `sandbox_launcher.wrap` 进 AppContainer，
+# 但**受控执行**（`run_command` / `run_shell`）没有——而技能正文、套件指令、扩展带来的可执行件
+# 真正驱动的就是这一条：模型按扩展的指示执行一条命令时，拿到的是宿主权限，出网开关也管不到它。
+# D-08 的口径是把这条通道并进同一只容器，并且**未授权 / 容器不可用时一律不注册**，
+# 而不是注册完再在执行时拒绝（后者会让模型看见一个点不通的按钮，提示词还在教它用）。
+
+
+def container_state() -> dict:
+    """当前受控执行会落到哪只容器里（只读判定，不产生任何副作用）。
+
+    形状：`{"enabled", "ready", "launcher", "network", "reason"}`。
+    `enabled` 只说明桌面端注入了 `TT_SANDBOX_BIN`；`ready` 还要求那个文件真的在盘上。
+    """
+    launcher = sl.launcher()
+    if launcher is None:
+        return {"enabled": False, "ready": False, "launcher": "", "network": "",
+                "reason": "系统隔离未启用：受控执行只受资源限制、超时与工作目录约束"}
+    if not Path(launcher).is_file():
+        return {"enabled": True, "ready": False, "launcher": launcher, "network": "",
+                "reason": f"系统隔离已启用但启动器不在盘上（{launcher}）：受控执行不注册"}
+    return {"enabled": True, "ready": True, "launcher": launcher,
+            "network": sl_network(), "reason": ""}
+
+
+def sl_network() -> str:
+    """出网档位（`on` / `off`）：缺省按关闭，与启动器的读法一致。"""
+    return "on" if (os.environ.get("TT_SANDBOX_NETWORK") or "").strip().lower() == "on" else "off"
+
+
+def container_wrap(
+    program: str, args: list[str], workspace: str | None = None
+) -> tuple[list[str], str]:
+    """把一次执行套进系统隔离容器；返回 (交给 Popen 的 argv, 容器说明)。
+
+    - 未启用系统隔离 ⇒ 原样返回 `([program, *args], "")`，与改造前逐字一致；
+    - 启用 ⇒ 返回 `[启动器, --profile, …, --network, on|off, …, --, program, *args]`，
+      说明里点名「在容器内」与出网档位，让审计与界面都看得到这一轮到底进没进容器；
+    - 启动器不可用 ⇒ 抛 `sl.SandboxUnavailable`，**调用方必须拒绝执行**，不许静默降级成
+      不受隔离的进程（这条是 `sandbox_launcher` 的铁律，不在这里打折）。
+    """
+    argv = [program, *[str(a) for a in args]]
+    if not sl.enabled():
+        return argv, ""
+    wrapped = sl.wrap(program, [str(a) for a in args], workspace=workspace)
+    if wrapped is None:  # enabled() 与 wrap() 之间环境变量被抽掉：按不可用处理，不放行
+        raise sl.SandboxUnavailable(
+            "SANDBOX_LAUNCHER_MISSING: 系统隔离已启用但拿不到启动器，命令未执行"
+        )
+    exe, launcher_argv = wrapped
+    network = "开启" if sl_network() == "on" else "关闭"
+    note = f"本次在系统隔离容器（AppContainer）内执行，出网{network}"
+    return [exe, *launcher_argv], note
+
+
+def container_wrap_shell(
+    plain: object,
+    program: str,
+    args: list[str],
+    workspace: str | None = None,
+    raw_command_line: bool = False,
+) -> tuple[object, str]:
+    """shell 通道的套壳（D-08），与 `container_wrap` 同一条判定，但**保住 D-48.4c 的形状**。
+
+    未启用系统隔离时原样返回 `plain`：Windows 上那是整条命令行**字符串**——`cmd.exe` 不吃
+    Python 列表形式拼出的 `\"`，交列表会让带引号的命令 rc=0 静默空跑（D-48.4c 实测并钉住的坑），
+    接线时把它改回列表就是把这个坑重新挖开。
+    启用系统隔离时交出去的是启动器的真 argv 列表，其中 `raw_command_line=True` 让启动器把
+    参数**按原文**拼成子进程命令行（`--raw-command-line`，见 `sandbox_launcher.wrap`）：
+    容器里跑的那条命令行与不进容器时逐字一致，隔离只加边界、不改命令的含义。
+    """
+    if not sl.enabled():
+        return plain, ""
+    wrapped = sl.wrap(
+        program,
+        [str(a) for a in args],
+        workspace=workspace,
+        raw_command_line=raw_command_line,
+    )
+    if wrapped is None:
+        raise sl.SandboxUnavailable(
+            "SANDBOX_LAUNCHER_MISSING: 系统隔离已启用但拿不到启动器，命令未执行"
+        )
+    exe, launcher_argv = wrapped
+    network = "开启" if sl_network() == "on" else "关闭"
+    return [exe, *launcher_argv], f"本次在系统隔离容器（AppContainer）内执行，出网{network}"
+
+
 def _is_public_ip(raw: str) -> bool:
     try:
         ip = ipaddress.ip_address(raw)
@@ -477,6 +579,7 @@ class ToolGrantPolicy:
     error: str = ""
     exec_enabled: bool = False
     exec_allowlist: list[str] = field(default_factory=list)
+    shell_enabled: bool = False
     network_enabled: bool = False
     network_allowlist: list[str] = field(default_factory=list)
     _seq: int = 0
@@ -496,6 +599,8 @@ class ToolGrantPolicy:
             error=str(block.get("error") or "").strip(),
             exec_enabled=block.get("execEnabled") is True,
             exec_allowlist=[c.lower() for c in _str_list(block.get("execAllowlist"))],
+            # 通用 shell 依赖命令执行授权：壳侧漏传/旧版本没有该键时按关闭处理
+            shell_enabled=block.get("shellEnabled") is True,
             network_enabled=block.get("networkEnabled") is True,
             network_allowlist=[h.lower() for h in _str_list(block.get("networkAllowlist"))],
         )
@@ -518,6 +623,16 @@ class ToolGrantPolicy:
             return f"命令「{name}」不在授权白名单内（允许：{allowed}）"
         if shutil.which(name) is None:
             return f"本机找不到命令「{name}」（PATH 中没有可执行文件）"
+        return None
+
+    def shell_denial(self) -> str | None:
+        """通用 shell 是否可用：必须在受控命令执行之上再显式开启"""
+        if self.error:
+            return f"沙箱策略读取失败，通用 shell 不可用：{_brief(self.error)}"
+        if not self.exec_enabled:
+            return "用户未授权命令执行（受控执行默认关闭），通用 shell 也不可用"
+        if not self.shell_enabled:
+            return "用户未授权通用 shell（默认关闭）"
         return None
 
     def network_denial(self, url: str) -> str | None:
@@ -555,6 +670,14 @@ class ToolGrantPolicy:
                 )
             else:
                 out.append("受控命令执行已开启但命令白名单为空，run_command 未注册")
+        if self.shell_enabled:
+            if self.exec_enabled:
+                out.append(
+                    "通用 shell 已启用（高风险）：可执行任意命令（含管道、重定向与链式命令），"
+                    "工作目录固定为任务目录，超时/输出/系统资源有上限，每次调用写审计"
+                )
+            else:
+                out.append("通用 shell 已开启，但受控命令执行未开启，run_shell 未注册")
         if self.network_enabled:
             if self.network_allowlist:
                 out.append(
@@ -564,6 +687,19 @@ class ToolGrantPolicy:
                 )
             else:
                 out.append("联网获取已开启但主机白名单为空，fetch_url 未注册")
+        # D-08：容器这一层的读数单独摊出来。未启用系统隔离时一句都不加（与改造前逐字一致），
+        # 启用了就必须说清「这一轮到底进没进容器」——进不去就是**不注册**，不许装作能跑。
+        container = container_state()
+        if container["enabled"] and not container["ready"]:
+            out.append(
+                f"受控命令执行与通用 shell 未注册：{container['reason']}"
+                "（不把没有容器可用的执行面交给模型）"
+            )
+        elif container["ready"]:
+            out.append(
+                "系统隔离已启用：受控执行与终端/MCP/ACP/Hooks 同进 AppContainer，"
+                f"出网{'允许' if container['network'] == 'on' else '关闭'}"
+            )
         return out
 
     def system_hint(self) -> str:
@@ -587,6 +723,15 @@ class ToolGrantPolicy:
                 + "。工作目录固定为任务目录，不经 shell，参数按数组传递；"
                 + limits
                 + "每次调用都会写入审计日志。"
+            )
+        if self.shell_enabled and self.exec_enabled:
+            lines.append(
+                "- run_shell：运行一条通用 shell 命令（Windows 为 cmd，其他平台为 /bin/sh），"
+                "支持管道、重定向与 &&；工作目录固定为任务目录，超时与输出有上限，"
+                "命令正文只以哈希形式写入审计。只有管道/链式步骤确实无法用 run_command 表达时才使用。"
+                "shell 里禁用睡等（`sleep`/`Start-Sleep`/`timeout /t`/`ping -t`，"
+                "换成 `python -c \"import time;time.sleep(20)\"` 这类内联写法一样拒）——"
+                "等待靠排队不靠轮询；拦的是睡等写法，不是「跑得久」。"
             )
         if self.network_enabled and self.network_allowlist:
             lines.append(
@@ -628,6 +773,56 @@ class ToolGrantPolicy:
 
     # ── 工具注册 ────────────────────────────────────────────────
 
+    def registration_plan(self) -> dict:
+        """这一轮执行面有哪几个工具会进 toolkit，没进去的原因各是什么（D-08）。
+
+        `install()` 与「这个扩展声明了什么能力」的界面清单读的是**同一个判定**：
+        界面显示可用而模型点不通（或反过来）只可能来自两处各写一份规则，所以只留一处。
+        形状：`{"run_command": {"registered", "reason"}, "run_shell": {…}, "fetch_url": {…},
+        "container": container_state()}`。
+        """
+        container = container_state()
+        exec_blocked = container["enabled"] and not container["ready"]
+        plan: dict = {"container": container}
+
+        def item(registered: bool, reason: str) -> dict:
+            return {"registered": registered, "reason": "" if registered else reason}
+
+        if self.error:
+            why = f"沙箱策略读取失败：{self.error}"
+            return {
+                "run_command": item(False, why),
+                "run_shell": item(False, why),
+                "fetch_url": item(False, why),
+                "container": container,
+            }
+        if not self.exec_enabled:
+            command = item(False, "用户未授权受控命令执行")
+        elif not self.exec_allowlist:
+            command = item(False, "命令白名单为空")
+        elif exec_blocked:
+            command = item(False, container["reason"])
+        else:
+            command = item(True, "")
+        if not self.exec_enabled:
+            shell = item(False, "通用 shell 依赖命令执行授权，命令执行未开启")
+        elif not self.shell_enabled:
+            shell = item(False, "用户未授权通用 shell（高风险）")
+        elif exec_blocked:
+            shell = item(False, container["reason"])
+        else:
+            shell = item(True, "")
+        if not self.network_enabled:
+            net = item(False, "用户未授权联网获取")
+        elif not self.network_allowlist:
+            net = item(False, "主机白名单为空")
+        else:
+            net = item(True, "")
+        plan["run_command"] = command
+        plan["run_shell"] = shell
+        plan["fetch_url"] = net
+        return plan
+
     def install(
         self,
         toolkit,
@@ -635,12 +830,20 @@ class ToolGrantPolicy:
         emit: Callable[[str, dict], None] | None = None,
         task_id: str = "",
     ) -> None:
-        """按授权注册工具；未授权/白名单为空一律不注册（不写进工具面）"""
-        if self.error:
-            return
-        if self.exec_enabled and self.exec_allowlist:
+        """按授权注册工具；未授权/白名单为空一律不注册（不写进工具面）
+
+        D-08 再加一条：**系统隔离已启用但容器起不来时，执行面同样不注册**。
+        这条不是保守——技能正文、套件指令与扩展声明的可执行件都靠 `run_command` / `run_shell`
+        落地，容器不可用时把它们注册上去，等于让扩展内容以宿主权限跑；
+        联网获取走的是进程内 `urllib`（不产生子进程），不受这一条影响。
+        「不注册」的判定与界面清单共用 `registration_plan()`，两处不会各说一套。
+        """
+        plan = self.registration_plan()
+        if plan["run_command"]["registered"]:
             toolkit.register_tool_function(self._exec_tool(Path(work_dir), emit, task_id))
-        if self.network_enabled and self.network_allowlist:
+        if plan["run_shell"]["registered"]:
+            toolkit.register_tool_function(self._shell_tool(Path(work_dir), emit, task_id))
+        if plan["fetch_url"]["registered"]:
             toolkit.register_tool_function(self._fetch_tool(emit, task_id))
 
     def _exec_tool(
@@ -704,7 +907,17 @@ class ToolGrantPolicy:
                 return ToolResponse(content=[TextBlock(type="text", text=f"错误：{denial}")])
 
             try:
-                proc, limits_note = _execute_limited([executable, *args], str(base), timeout)
+                argv, container_note = container_wrap(executable, args, str(base))
+            except sl.SandboxUnavailable as exc:
+                denial = _brief(exc, 200)
+                self._audit(emit, task_id, "run_command", target, "denied", f"容器不可用：{denial}")
+                return ToolResponse(content=[TextBlock(
+                    type="text",
+                    text=f"错误：系统隔离已启用但命令无法进入容器，为避免以宿主权限执行已拒绝运行：{denial}",
+                )])
+
+            try:
+                proc, limits_note = _execute_limited(argv, str(base), timeout)
             except subprocess.TimeoutExpired:
                 detail = f"超过 {timeout} 秒被终止"
                 self._audit(emit, task_id, "run_command", target, "timeout", detail)
@@ -722,9 +935,12 @@ class ToolGrantPolicy:
                 emit, task_id, "run_command", target,
                 "ok" if proc.returncode == 0 else "failed",
                 f"exit={proc.returncode} timeout={timeout}s "
-                f"limits={'degraded' if limits_note else 'on'}",
+                f"limits={'degraded' if limits_note else 'on'} "
+                f"container={'on' if container_note else 'off'}",
             )
             parts = [f"命令：{command}", f"退出码：{proc.returncode}"]
+            if container_note:
+                parts.append(container_note)
             if limits_note:
                 parts.append("资源限制：" + limits_note)
             parts.append("stdout:\n" + (_cap(proc.stdout) or "（空）"))
@@ -732,6 +948,133 @@ class ToolGrantPolicy:
             return ToolResponse(content=[TextBlock(type="text", text="\n".join(parts))])
 
         return run_command
+
+    def _shell_tool(
+        self,
+        work_dir: Path,
+        emit: Callable[[str, dict], None] | None,
+        task_id: str,
+    ):
+        base = Path(work_dir).resolve()
+
+        def run_shell(command: str, timeout_seconds: int = 60):
+            """在任务工作目录内运行一条通用 shell 命令（用户显式授权，高风险）。
+
+            禁止睡等：命令里出现 `sleep N` / `Start-Sleep` / `timeout /t N` / `ping -t`，
+            或换成 `python -c "import time;time.sleep(20)"`、`setTimeout(...)` 这类内联写法
+            一样会被拒绝执行——等待靠排队不靠轮询，要等外部事件就让本轮结束、下一轮再接着看。
+            拦的是睡等**写法**不是「跑得久」：`npm run build`、`pytest -q` 再慢也放行。
+
+            Args:
+                command (`str`):
+                    完整命令行，例如 `npm install && npm run build`。
+                    Windows 交给 cmd，其他平台交给 /bin/sh；支持管道、重定向与链式命令。
+                timeout_seconds (`int`, optional):
+                    超时秒数，默认 60，最大 120。
+            """
+            from agentscope.message import TextBlock
+            from agentscope.tool import ToolResponse
+
+            denial = self.shell_denial()
+            if denial is not None:
+                self._audit(emit, task_id, "run_shell", "shell（未执行）", "denied", denial)
+                return ToolResponse(content=[TextBlock(
+                    type="text", text=f"错误：命令未执行。{denial}"
+                )])
+
+            raw = str(command or "").strip()
+            if not raw:
+                denial = "shell 命令不能为空"
+                self._audit(emit, task_id, "run_shell", "shell（空命令）", "denied", denial)
+                return ToolResponse(content=[TextBlock(type="text", text=f"错误：{denial}")])
+            if len(raw) > MAX_SHELL_COMMAND_CHARS:
+                denial = f"shell 命令超过 {MAX_SHELL_COMMAND_CHARS} 字符"
+                self._audit(emit, task_id, "run_shell", _shell_target(raw), "denied", denial)
+                return ToolResponse(content=[TextBlock(type="text", text=f"错误：{denial}")])
+
+            # 等待靠排队，不靠轮询（DSH 对照里「主会话的 shell 禁止 sleep」那一条）。
+            # 判定表与工单执行体**共用一份**（`twa.find_sleep_pattern`），理由各写各的：
+            # 执行体占的是 worker 槽位、等的是唤醒，主会话占的是**这一轮**与任务额度。
+            sleep_label = twa.find_sleep_pattern(raw)
+            if sleep_label:
+                denial = (
+                    f"命令里有 {sleep_label}——主会话的 shell 不许用睡等占着这一轮，"
+                    f"等待靠排队不靠轮询。要等外部事件就把这一轮说完、下一轮再接着看；"
+                    f"真需要长时间运行的活请直接跑（timeout_seconds 上限 {MAX_EXEC_TIMEOUT} 秒管的是**干活**，不是干等）。"
+                )
+                self._audit(emit, task_id, "run_shell", _shell_target(raw), "denied", denial)
+                return ToolResponse(content=[TextBlock(type="text", text=f"错误：命令未执行。{denial}")])
+
+            try:
+                timeout = int(timeout_seconds)
+            except Exception:  # noqa: BLE001
+                timeout = DEFAULT_EXEC_TIMEOUT
+            timeout = min(max(timeout, 1), MAX_EXEC_TIMEOUT)
+
+            if os.name == "nt":
+                shell = os.environ.get("COMSPEC") or "cmd.exe"
+                # cmd.exe 不是 MSVCRT 的 argv 消费者：把命令当**列表**交给 Popen 时，
+                # Python 会把 `"` 转义成 `\"`，cmd 原样收到反斜杠——实测
+                # `python -c "print(42)"` 退出码 0、stdout 全空（静默没跑），
+                # `echo "hello world"` 打出 `\"hello world\"`。声明里那句「支持管道/引号」
+                # 就是假的。正确形状是把整条命令行**拼成字符串**交给 CreateProcess，
+                # 让 `/s` 剥掉最外面这一对引号，里面的引号按 cmd 自己的规则保留。
+                tail = f'"{raw}"'
+                argv: object = f"{subprocess.list2cmdline([shell, '/d', '/s', '/c'])} {tail}"
+                shell_args = ["/d", "/s", "/c", tail]
+                raw_line = True
+            else:
+                shell = "/bin/sh"
+                argv = [shell, "-c", raw]
+                shell_args = ["-c", raw]
+                raw_line = False
+            target = _shell_target(raw)
+
+            # D-08：启用系统隔离时这条通道也进同一只 AppContainer（终端 / MCP / ACP / Hooks
+            # 早就进了）。容器不可用就当次拒绝，不放行成宿主权限的裸跑。
+            try:
+                argv, container_note = container_wrap_shell(
+                    argv, shell, shell_args, str(base), raw_command_line=raw_line
+                )
+            except sl.SandboxUnavailable as exc:
+                denial = _brief(exc, 200)
+                self._audit(emit, task_id, "run_shell", target, "denied", f"容器不可用：{denial}")
+                return ToolResponse(content=[TextBlock(
+                    type="text",
+                    text=f"错误：系统隔离已启用但命令无法进入容器，为避免以宿主权限执行已拒绝运行：{denial}")])
+
+            try:
+                proc, limits_note = _execute_limited(argv, str(base), timeout)
+            except subprocess.TimeoutExpired:
+                detail = f"超过 {timeout} 秒被终止"
+                self._audit(emit, task_id, "run_shell", target, "timeout", detail)
+                return ToolResponse(content=[TextBlock(
+                    type="text", text=f"错误：shell 命令执行超时（{detail}），整棵进程树已终止"
+                )])
+            except Exception as exc:  # noqa: BLE001
+                detail = _brief(exc, 200)
+                self._audit(emit, task_id, "run_shell", target, "failed", detail)
+                return ToolResponse(content=[TextBlock(
+                    type="text", text=f"错误：shell 命令启动失败：{detail}"
+                )])
+
+            self._audit(
+                emit, task_id, "run_shell", target,
+                "ok" if proc.returncode == 0 else "failed",
+                f"exit={proc.returncode} timeout={timeout}s "
+                f"limits={'degraded' if limits_note else 'on'} "
+                f"container={'on' if container_note else 'off'}",
+            )
+            parts = ["shell：通用命令（用户显式授权）", f"退出码：{proc.returncode}"]
+            if container_note:
+                parts.append(container_note)
+            if limits_note:
+                parts.append("资源限制：" + limits_note)
+            parts.append("stdout:\n" + (_cap(proc.stdout) or "（空）"))
+            parts.append("stderr:\n" + (_cap(proc.stderr) or "（空）"))
+            return ToolResponse(content=[TextBlock(type="text", text="\n".join(parts))])
+
+        return run_shell
 
     def _fetch_tool(
         self,

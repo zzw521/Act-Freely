@@ -10,6 +10,7 @@
 
 #![cfg(windows)]
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -144,6 +145,129 @@ fn appcontainer_blocks_outside_write_and_secret_read() {
     assert!(
         !outside.join("evil.txt").exists(),
         "越界文件不应被创建"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Hook 套壳形态的真机验收：命令行里没有 `--workspace`，脚本目录只给只读
+///
+/// 钉住三件 Hooks 依赖的系统事实（`align::hooks::run_command` 走的就是这条路径）：
+/// - 事件 JSON 能从父进程管道穿过启动器到达容器内脚本，stdout 能穿回来；
+/// - 只读目录读得到、写不进去（越界写由 ACL 拒绝，不是策略层提示）；
+/// - 唯一可写处是沙箱临时目录。
+#[test]
+fn hook_command_gets_stdio_and_only_writes_sandbox_temp() {
+    let Some(python) = python() else {
+        eprintln!("跳过：本机没有 python，无法执行 Hook 套壳验收");
+        return;
+    };
+
+    let root = temp_root("hooks");
+    let script_dir = root.join("scripts");
+    let home = root.join("home");
+    let work = root.join("work");
+    for dir in [&script_dir, &home, &work] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(home.join("tongtian.db"), "SECRET_KEY_SHOULD_NOT_LEAK").unwrap();
+
+    let script = script_dir.join("probe.py");
+    let outside = script_dir.join("evil.txt");
+    let body = format!(
+        r#"import json
+import os
+import sys
+
+raw = sys.stdin.read()
+event = ""
+try:
+    event = json.loads(raw).get("hook_event_name", "")
+except Exception:
+    event = ""
+
+result = {{"event": event, "script_read": "no"}}
+
+try:
+    with open(r"{script}", "r", encoding="utf-8") as f:
+        result["script_read"] = "allowed" if len(f.read()) > 0 else "empty"
+except Exception as e:
+    result["script_read"] = "denied:" + type(e).__name__
+
+try:
+    open(r"{outside}", "w", encoding="utf-8").write("evil")
+    result["readonly_write"] = "allowed"
+except Exception as e:
+    result["readonly_write"] = "denied:" + type(e).__name__
+
+temp = os.environ.get("TEMP") or ""
+try:
+    probe = os.path.join(temp, "tt-hook-temp-probe.txt")
+    open(probe, "w", encoding="utf-8").write("ok")
+    result["temp_write"] = "allowed"
+    os.remove(probe)
+except Exception as e:
+    result["temp_write"] = "denied:" + type(e).__name__
+
+print(json.dumps(result, ensure_ascii=True))
+"#,
+        script = script.display(),
+        outside = outside.display(),
+    );
+    std::fs::write(&script, body).unwrap();
+
+    let exe = env!("CARGO_BIN_EXE_tongtian-tauri");
+    let python_dir = python.parent().unwrap().to_string_lossy().to_string();
+    let mut child = Command::new(exe)
+        .arg("--tt-sandbox-run")
+        .arg("--network")
+        .arg("off")
+        .arg("--read-dir")
+        .arg(&script_dir)
+        .arg("--")
+        .arg(&python)
+        .arg(&script)
+        // 数据根指向本用例的临时目录：不能把拒绝访问的 ACL 落到用户真实目录上
+        .env("TONGTIAN_HOME", &home)
+        .env("TONGTIANWORK_HOME", &work)
+        .env("TT_SANDBOX_RUNTIME_DIRS", python_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("启动沙箱失败");
+    // Hook 的事件正文走 stdin，脚本回读后由启动器把 stdout 原样交回父进程
+    child
+        .stdin
+        .take()
+        .expect("拿不到标准输入")
+        .write_all(br#"{"hook_event_name":"PreToolUse"}"#)
+        .expect("写入事件 JSON 失败");
+    let out = child.wait_with_output().expect("等待沙箱进程失败");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "沙箱启动器退出码 {:?}\nstdout={stdout}\nstderr={stderr}",
+        out.status.code()
+    );
+    let line = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or_else(|| panic!("没有拿到探测结果：stdout={stdout} stderr={stderr}"));
+    let value: serde_json::Value = serde_json::from_str(line).expect("探测结果不是 JSON");
+
+    assert_eq!(value["event"], "PreToolUse", "事件 JSON 必须穿过启动器到达脚本");
+    assert_eq!(value["script_read"], "allowed", "只读授权的脚本目录必须可读");
+    assert_eq!(
+        value["readonly_write"], "denied:PermissionError",
+        "只给只读的目录绝不能写"
+    );
+    assert_eq!(value["temp_write"], "allowed", "沙箱临时目录必须可写");
+    assert!(
+        !outside.exists(),
+        "只读目录里不应留下文件"
     );
 
     let _ = std::fs::remove_dir_all(&root);

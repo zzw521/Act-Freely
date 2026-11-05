@@ -8,6 +8,7 @@
 import { create } from 'zustand';
 import type { BrandingCustomizeReq, BrandingInfo } from '../../shared/contracts';
 import { DEFAULT_BRANDING, customizeBranding, getBranding } from '../lib/branding-api';
+import { errorTextOf } from '../../shared/error-messages';
 
 interface BrandingState {
   info: BrandingInfo;
@@ -34,7 +35,7 @@ export const useBrandingStore = create<BrandingState>()((set, get) => ({
       const info = await getBranding();
       set({ info, loaded: true, loading: false, error: null });
     } catch (e) {
-      set({ loading: false, error: e instanceof Error ? e.message : String(e) });
+      set({ loading: false, error: errorTextOf(e, '品牌信息读取失败') });
     }
   },
 

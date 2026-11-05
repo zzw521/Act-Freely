@@ -28,27 +28,27 @@ interface ArtifactKind {
 export function artifactKindOf(fileName: string): ArtifactKind {
   const ext = fileName.split('.').pop()?.toLowerCase() ?? '';
   if (['html', 'htm'].includes(ext)) {
-    return { label: 'HTML', color: '#C2410C', bg: '#FFF7ED', icon: <CodeOutlinedIcon sx={{ fontSize: 18 }} /> };
+    return { label: 'HTML', color: 'var(--tt-warning)', bg: 'var(--tt-chip-warning)', icon: <CodeOutlinedIcon sx={{ fontSize: 18 }} /> };
   }
   if (['md', 'markdown', 'txt'].includes(ext)) {
-    return { label: ext === 'txt' ? 'TXT' : 'Markdown', color: '#2563EB', bg: '#EFF6FF', icon: <ArticleOutlinedIcon sx={{ fontSize: 18 }} /> };
+    return { label: ext === 'txt' ? 'TXT' : 'Markdown', color: 'var(--tt-info)', bg: 'var(--tt-chip-info)', icon: <ArticleOutlinedIcon sx={{ fontSize: 18 }} /> };
   }
   if (['docx', 'doc'].includes(ext)) {
-    return { label: 'Word', color: '#1D4ED8', bg: '#EFF6FF', icon: <DescriptionOutlinedIcon sx={{ fontSize: 18 }} /> };
+    return { label: 'Word', color: 'var(--tt-info)', bg: 'var(--tt-chip-info)', icon: <DescriptionOutlinedIcon sx={{ fontSize: 18 }} /> };
   }
   if (['xlsx', 'xls', 'csv'].includes(ext)) {
-    return { label: 'Excel', color: '#15803D', bg: '#ECFDF5', icon: <TableChartOutlinedIcon sx={{ fontSize: 18 }} /> };
+    return { label: 'Excel', color: 'var(--tt-success)', bg: 'var(--tt-chip-success)', icon: <TableChartOutlinedIcon sx={{ fontSize: 18 }} /> };
   }
   if (['pptx', 'ppt'].includes(ext)) {
-    return { label: 'PPT', color: '#C2410C', bg: '#FFF7ED', icon: <SlideshowOutlinedIcon sx={{ fontSize: 18 }} /> };
+    return { label: 'PPT', color: 'var(--tt-warning)', bg: 'var(--tt-chip-warning)', icon: <SlideshowOutlinedIcon sx={{ fontSize: 18 }} /> };
   }
   if (ext === 'pdf') {
-    return { label: 'PDF', color: '#DC2626', bg: '#FEF2F2', icon: <PictureAsPdfOutlinedIcon sx={{ fontSize: 18 }} /> };
+    return { label: 'PDF', color: 'var(--tt-danger)', bg: 'var(--tt-chip-danger)', icon: <PictureAsPdfOutlinedIcon sx={{ fontSize: 18 }} /> };
   }
   if (['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg'].includes(ext)) {
-    return { label: '图片', color: '#7C3AED', bg: '#F5F3FF', icon: <ImageOutlinedIcon sx={{ fontSize: 18 }} /> };
+    return { label: '图片', color: 'var(--tt-accent-violet)', bg: 'var(--tt-chip-accent)', icon: <ImageOutlinedIcon sx={{ fontSize: 18 }} /> };
   }
-  return { label: '文件', color: '#475569', bg: '#F1F5F9', icon: <InsertDriveFileOutlinedIcon sx={{ fontSize: 18 }} /> };
+  return { label: '文件', color: 'var(--tt-text-2)', bg: 'var(--tt-surface-2)', icon: <InsertDriveFileOutlinedIcon sx={{ fontSize: 18 }} /> };
 }
 
 export interface ArtifactCardProps {
@@ -85,11 +85,11 @@ const ArtifactCard: React.FC<ArtifactCardProps> = ({ path, onClick, hint }) => {
           cursor: 'pointer',
           transition: 'border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease',
           '&:hover': {
-            borderColor: '#5EEAD4',
+            borderColor: 'var(--tt-teal)',
             boxShadow: '0 6px 18px rgba(15, 23, 42, 0.07)',
             transform: 'translateY(-1px)',
           },
-          '&:focus-visible': { outline: '2px solid #14B8A6', outlineOffset: 2 },
+          '&:focus-visible': { outline: '2px solid var(--tt-teal)', outlineOffset: 2 },
         }}
       >
         <Box

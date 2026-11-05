@@ -49,14 +49,19 @@ describe('ChatInput 主按钮：发送与停止同键位', () => {
     expect(stops).toBe(2);
   });
 
-  it('取消后的收尾 done 不改写为已完成，计划流的 done 也不被当成任务收尾', () => {
+  it('取消/预算暂停后的收尾 done 不改写为已完成，计划流的 done 也不被当成任务收尾', () => {
     const src = read('../../../src/renderer/store/workbenchStore.ts');
     expect(src).toContain(
       'conv.taskStatus === TaskStatus.CANCELLED || conv.taskStatus === TaskStatus.FAILED',
     );
     // 引擎 done 只是事件流结束：计划流收尾时任务仍要进入审阅/执行
     expect(src).toContain('const preExecution =');
-    expect(src).toContain('taskStatus: terminal || preExecution ? conv.taskStatus : TaskStatus.DONE');
+    // 被单任务预算拦停的（缺陷 D-14.1）同样不能被 done 写成「已完成」，
+    // 否则「调高预算后点继续」的入口就没有了
+    expect(src).toContain('const pausedByBudget = conv.taskStatus === TaskStatus.BUDGET_PAUSED;');
+    expect(src).toContain(
+      'taskStatus: terminal || preExecution || pausedByBudget ? conv.taskStatus : TaskStatus.DONE',
+    );
   });
 
   it('错误事件落到 failed，迟到计划不复活已终态任务', () => {
@@ -79,8 +84,11 @@ describe('ChatInput 主按钮：发送与停止同键位', () => {
 
   it('Mock 取消后不再派发后续事件', () => {
     const src = read('../../../src/renderer/lib/mock-api.ts');
+    const schedules = (src.match(/timeline\.forEach/g) ?? []).length;
     const guarded = (src.match(/if \(!task\.cancelled\) fire\(\)/g) ?? []).length;
-    expect(guarded).toBe(2);
+    // 每条派发时间线（计划流 / 执行流 / 失败剧本 / 续跑剧本）都要带取消保护
+    expect(schedules).toBe(guarded);
+    expect(schedules).toBe(4);
   });
 });
 

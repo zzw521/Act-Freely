@@ -7,7 +7,18 @@
  */
 
 import { createTheme, responsiveFontSizes, type Theme } from '@mui/material/styles';
-import { primaryColors, secondaryColors, accentColors, semanticColors } from './tokens';
+import {
+  primaryColors,
+  secondaryColors,
+  accentColors,
+  semanticColors,
+  textSafePalette,
+  darkTextSafePalette,
+  darkContrastText,
+  darkAccent,
+  densityScales,
+  type Density,
+} from './tokens';
 import type { PaletteMode } from '@mui/material';
 
 // ── 主题创建 ──────────────────────────────────────────────────────
@@ -15,52 +26,36 @@ import type { PaletteMode } from '@mui/material';
 /**
  * 创建主题配置
  * @param mode - 配色模式 ('light' | 'dark')
+ * @param density - 界面密度（标准/紧凑/宽松），缩放 spacing 与组件尺寸
  */
-export function createAppTheme(mode: PaletteMode = 'light'): Theme {
+export function createAppTheme(mode: PaletteMode = 'light', density: Density = '标准'): Theme {
   const isDark = mode === 'dark';
+  const scale = densityScales[density] ?? 1;
+  const pad = (px: number) => `${Math.round(px * scale)}px`;
+  /* 语义色板按配色模式取档：亮色是 700 档（白字压得住），暗色反过来是 300–400 档
+     （文字压得住深底），实心填充上的文字也跟着换成深色。见 tokens.ts 两段注释。 */
+  const sem = isDark ? darkTextSafePalette : textSafePalette;
+  const onFill = isDark ? darkContrastText : '#FFFFFF';
 
   return createTheme({
     palette: {
       mode,
-      primary: {
-        main: primaryColors[600],
-        light: primaryColors[400],
-        dark: primaryColors[700],
-        contrastText: '#FFFFFF',
-      },
-      secondary: {
-        main: secondaryColors[500],
-        light: secondaryColors[300],
-        dark: secondaryColors[700],
-        contrastText: '#FFFFFF',
-      },
-      warning: {
-        main: accentColors[500],
-        light: accentColors[300],
-        dark: accentColors[700],
-      },
-      error: {
-        main: semanticColors.error,
-        light: '#FCA5A5',
-        dark: '#B91C1C',
-      },
-      success: {
-        main: semanticColors.success,
-        light: '#86EFAC',
-        dark: '#15803D',
-      },
-      info: {
-        main: semanticColors.info,
-        light: '#7DD3FC',
-        dark: '#0369A1',
-      },
+      // 文字压得住的色阶见 tokens.ts textSafePalette / darkTextSafePalette（WCAG 1.4.3 实算）
+      primary: { ...sem.primary, contrastText: onFill },
+      secondary: { ...sem.secondary, contrastText: onFill },
+      warning: { ...sem.warning, contrastText: onFill },
+      error: { ...sem.error, contrastText: onFill },
+      success: { ...sem.success, contrastText: onFill },
+      info: { ...sem.info, contrastText: onFill },
       background: {
         default: isDark ? '#0F172A' : semanticColors.background,
         paper: isDark ? '#1E293B' : semanticColors.surface,
       },
       text: {
         primary: isDark ? '#F1F5F9' : semanticColors.gray[900],
-        secondary: isDark ? '#94A3B8' : semanticColors.gray[500],
+        /* 次要文字取 globals.css 的 --tt-text-3 同档：gray[500]（#64748B）压 #F7F8FA 只有 4.48:1，
+           差 0.02 就是不合格；跟着令牌走，sx 里 color:'text.secondary' 与 var(--tt-text-3) 也不会分叉。 */
+        secondary: isDark ? '#B5C4D8' : '#576072',
         disabled: isDark ? '#475569' : semanticColors.gray[300],
       },
       divider: isDark ? 'rgba(148, 163, 184, 0.12)' : semanticColors.gray[200],
@@ -95,7 +90,9 @@ export function createAppTheme(mode: PaletteMode = 'light'): Theme {
       borderRadius: 12,
     },
 
-    spacing: 4,
+    // 密度直接乘在 spacing 因子上：全仓 2500+ 处 sx 的 p/m/gap 都走这里，
+    // 不需要逐组件加分支（D-25「界面密度」）
+    spacing: 4 * scale,
 
     components: {
       // ── 按钮：胶囊感 + 品牌绿 ─────────────────────────────
@@ -109,8 +106,10 @@ export function createAppTheme(mode: PaletteMode = 'light'): Theme {
             textTransform: 'none',
             borderRadius: '10px',
             fontWeight: 600,
-            padding: '8px 18px',
+            padding: `${pad(8)} ${pad(18)}`,
             transition: 'all 0.18s ease',
+            // 触控目标下限不随密度缩（WCAG 2.5.8：至少 24px，这里守 36px）
+            minHeight: '36px',
           },
           containedPrimary: {
             boxShadow: '0 1px 2px rgba(22, 163, 74, 0.2)',
@@ -120,7 +119,7 @@ export function createAppTheme(mode: PaletteMode = 'light'): Theme {
             },
           },
           sizeLarge: {
-            height: '44px',
+            height: pad(44),
             fontSize: '15px',
             borderRadius: '12px',
           },
@@ -163,7 +162,7 @@ export function createAppTheme(mode: PaletteMode = 'light'): Theme {
       MuiTextField: {
         defaultProps: {
           variant: 'outlined',
-          size: 'medium',
+          size: density === '紧凑' ? 'small' : 'medium',
         },
       },
 
@@ -238,10 +237,13 @@ export function createAppTheme(mode: PaletteMode = 'light'): Theme {
           root: {
             textTransform: 'none',
             fontWeight: 500,
-            minHeight: '44px',
+            // 选中的文字色不能再用 600 档（压白底 3.3:1），且 minHeight 是触控目标，不随密度缩
             '&.Mui-selected': {
-              color: primaryColors[600],
+              color: isDark ? darkAccent.selectedText : textSafePalette.primary.main,
             },
+            paddingLeft: pad(12),
+            paddingRight: pad(12),
+            minHeight: '44px',
           },
         },
       },
@@ -292,7 +294,9 @@ export function createAppTheme(mode: PaletteMode = 'light'): Theme {
           tooltip: {
             borderRadius: '8px',
             fontSize: '12px',
+            // 底色与文字一起定：只写底色会让默认文字压上去刚好卡在及格线以下
             backgroundColor: isDark ? '#334155' : semanticColors.gray[800],
+            color: '#FFFFFF',
           },
         },
       },
@@ -313,8 +317,10 @@ export function createAppTheme(mode: PaletteMode = 'light'): Theme {
           root: {
             borderRadius: '8px',
             margin: '2px 8px',
-            padding: '8px 12px',
+            padding: `${pad(8)} ${pad(12)}`,
             fontSize: '14px',
+            // 触控目标不随密度缩（WCAG 2.5.8）
+            minHeight: '36px',
             '&.Mui-selected': {
               backgroundColor: isDark ? 'rgba(34,197,94,0.12)' : primaryColors[50],
             },

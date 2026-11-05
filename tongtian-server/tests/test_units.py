@@ -283,6 +283,29 @@ def test_rate_limiter():
     check("不同 key 互不影响", limiter.check("k2", 1, 60)[0] is True)
 
 
+def test_auth_pkce():
+    print("\n[PKCE 授权码绑定]")
+    from app import auth as auth_mod
+
+    verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    challenge = auth_mod._pkce_challenge(verifier)
+    check(
+        "S256 challenge 与 RFC 7636 向量一致",
+        challenge == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        challenge,
+    )
+    redirect = "http://127.0.0.1:9/callback"
+    code = auth_mod.issue_code("u-1", "st-1", redirect, challenge)
+    check("缺 verifier 不放行", auth_mod.consume_code(code, "st-1") is None)
+    code = auth_mod.issue_code("u-1", "st-1", redirect, challenge)
+    check("错误 verifier 不放行", auth_mod.consume_code(code, "st-1", "wrong") is None)
+    code = auth_mod.issue_code("u-1", "st-1", redirect, challenge)
+    entry = auth_mod.consume_code(code, "st-1", verifier)
+    check("正确 verifier 通过", entry is not None and entry["uid"] == "u-1")
+    legacy = auth_mod.issue_code("u-1", "st-1", redirect)
+    check("旧客户端（无 challenge）仍可换取", auth_mod.consume_code(legacy, "st-1") is not None)
+
+
 def test_additive_migration():
     print("\n[数据库增量补列]")
     os.makedirs(_TMP, exist_ok=True)
@@ -292,6 +315,33 @@ def test_additive_migration():
         "created_at_ms INTEGER NOT NULL, PRIMARY KEY (uid, item_type, item_id))"
     )
     conn.execute("INSERT INTO stars VALUES ('u1', 'skill', 's1', 1)")
+    conn.execute(
+        "CREATE TABLE admin_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at_ms INTEGER NOT NULL, "
+        "actor_uid TEXT NOT NULL, action TEXT NOT NULL, object TEXT NOT NULL, "
+        "payload_json TEXT NOT NULL DEFAULT '{}', status INTEGER NOT NULL DEFAULT 200)"
+    )
+    conn.execute(
+        "INSERT INTO admin_audit (at_ms, actor_uid, action, object, payload_json, status) "
+        "VALUES (1, 'u-admin', 'user.role', 'u1', '{\"after\":\"auditor\"}', 200)"
+    )
+    # 旧库的 usage_rollup 有 org_id 但没有 dept_id：建表脚本里若直接为
+    # (org_id, dept_id, day) 建索引，executescript 会早于增量补列失败。
+    conn.execute(
+        "CREATE TABLE usage_rollup (source TEXT NOT NULL, device_id TEXT NOT NULL DEFAULT '', "
+        "sub TEXT NOT NULL, org_id TEXT NOT NULL DEFAULT '', model_name TEXT NOT NULL, "
+        "day TEXT NOT NULL, origin TEXT NOT NULL DEFAULT '', "
+        "prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0, "
+        "calls INTEGER NOT NULL DEFAULT 0, priced_calls INTEGER NOT NULL DEFAULT 0, "
+        "unpriced_calls INTEGER NOT NULL DEFAULT 0, latency_samples INTEGER NOT NULL DEFAULT 0, "
+        "latency_ms_total INTEGER NOT NULL DEFAULT 0, costs_json TEXT NOT NULL DEFAULT '{}', "
+        "last_used_at_ms INTEGER NOT NULL DEFAULT 0, reported_at_ms INTEGER NOT NULL, "
+        "PRIMARY KEY (source, device_id, sub, model_name, day, origin))"
+    )
+    conn.execute(
+        "INSERT INTO usage_rollup (source, device_id, sub, org_id, model_name, day, "
+        "prompt_tokens, completion_tokens, calls, reported_at_ms) "
+        "VALUES ('engine', 'd1', 'u1', '', 'gpt-test', '2026-10-30', 10, 5, 1, 1)"
+    )
     conn.commit()
     conn.close()
 
@@ -299,8 +349,100 @@ def test_additive_migration():
     with db.tx() as conn:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(stars)")}
         row = conn.execute("SELECT active FROM stars WHERE uid = 'u1'").fetchone()
+        audit_columns = {row["name"] for row in conn.execute("PRAGMA table_info(admin_audit)")}
+        rollup_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(usage_rollup)")
+        }
+        rollup_indexes = {
+            index["name"]
+            for index in conn.execute("PRAGMA index_list(usage_rollup)")
+        }
+        usage_row = conn.execute(
+            "SELECT org_id, dept_id, prompt_tokens, calls FROM usage_rollup "
+            "WHERE sub = 'u1' AND day = '2026-10-30'"
+        ).fetchone()
+        from app import audit as audit_mod
+
+        chain = audit_mod.verify_report(conn)
+        legacy = audit_mod.list_entries(conn)["entries"][0]
+        # 旧卷升级：新建表连同它的索引都在 SCHEMA 里一次建成，不依赖任何补列动作
+        tables = {
+            item["name"]
+            for item in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
     check("旧表补齐 active 列", "active" in columns)
     check("存量收藏默认激活", row is not None and row["active"] == 1)
+    check(
+        "旧审计表补齐链字段",
+        {"actor_role", "before_json", "after_json", "prev_hash", "entry_hash"}
+        <= audit_columns,
+        str(sorted(audit_columns)),
+    )
+    check("旧审计行回填后可验链", chain["brokenAt"] is None and chain["entries"] == 1, str(chain))
+    check("回填后的全量巡检同样判可信", chain["ok"] is True and chain["contiguous"] is True, str(chain))
+    check(
+        "旧卷升级后锚点表与档位表就位",
+        {"audit_anchors", "model_tier_tables", "model_tier_revisions"} <= tables,
+        str(sorted(tables))[:200],
+    )
+    check(
+        "旧审计行保留原 payload",
+        legacy["after"] == {"after": "auditor"} and legacy["actorRole"] == "admin",
+        json.dumps(legacy, ensure_ascii=False),
+    )
+    check("旧用量表补齐 dept_id 列", "dept_id" in rollup_columns, str(sorted(rollup_columns)))
+    check(
+        "补列后才建组织部门索引",
+        "idx_usage_rollup_org_dept" in rollup_indexes,
+        str(sorted(rollup_indexes)),
+    )
+    check(
+        "存量用量行补列后不变",
+        usage_row is not None
+        and usage_row["dept_id"] == ""
+        and usage_row["prompt_tokens"] == 10
+        and usage_row["calls"] == 1,
+        json.dumps(dict(usage_row or {})),
+    )
+
+
+def test_demo_publisher_rename():
+    print("\n[演示发布者改名]")
+    from app import seed as seed_mod
+    from app.security import hash_password
+
+    db.init_db()
+
+    def nickname_of() -> str | None:
+        with db.tx() as conn:
+            row = conn.execute(
+                "SELECT nickname FROM users WHERE email = ?1", (seed_mod.DEMO_EMAIL,)
+            ).fetchone()
+        return row["nickname"] if row else None
+
+    with db.tx() as conn:
+        conn.execute("DELETE FROM users WHERE email = ?1", (seed_mod.DEMO_EMAIL,))
+        conn.execute(
+            "INSERT INTO users (uid, email, password_hash, nickname, role, plan, created_at_ms) "
+            "VALUES ('u-demo', ?1, ?2, ?3, 'user', '个人免费版', 1)",
+            (seed_mod.DEMO_EMAIL, hash_password("legacy-secret"), seed_mod.LEGACY_DEMO_NICKNAME),
+        )
+    row, password = seed_mod._ensure_demo_user()
+    check("旧默认发布者名自动改名", nickname_of() == seed_mod.DEMO_NICKNAME, str(nickname_of()))
+    check("改名不重发密码", password is None and row["uid"] == "u-demo")
+
+    with db.tx() as conn:
+        conn.execute(
+            "UPDATE users SET nickname = ?2 WHERE email = ?1",
+            (seed_mod.DEMO_EMAIL, "我自己起的名字"),
+        )
+    seed_mod._ensure_demo_user()
+    check("用户自改的昵称不被覆盖", nickname_of() == "我自己起的名字", str(nickname_of()))
+
+    with db.tx() as conn:
+        conn.execute("DELETE FROM users WHERE email = ?1", (seed_mod.DEMO_EMAIL,))
+    _, fresh = seed_mod._ensure_demo_user()
+    check("全新库以新名字建号", nickname_of() == seed_mod.DEMO_NICKNAME and bool(fresh))
 
 
 def run():
@@ -312,7 +454,9 @@ def run():
     test_skill_package()
     test_suite_package()
     test_rate_limiter()
+    test_auth_pkce()
     test_additive_migration()
+    test_demo_publisher_rename()
     print(f"\n全部通过：{_passed} 项断言")
 
 

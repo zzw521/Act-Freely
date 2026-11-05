@@ -40,9 +40,9 @@ function chipLabelOf(op: FileOp, all: FileOp[]): string {
 }
 
 const EMPTY_ICON: Record<Exclude<WorkMode, 'general'>, React.ReactNode> = {
-  design: <DesignServicesOutlinedIcon sx={{ fontSize: 30, color: '#94A3B8' }} />,
-  slides: <SlideshowOutlinedIcon sx={{ fontSize: 30, color: '#94A3B8' }} />,
-  writing: <ArticleOutlinedIcon sx={{ fontSize: 30, color: '#94A3B8' }} />,
+  design: <DesignServicesOutlinedIcon sx={{ fontSize: 30, color: 'var(--tt-text-4)' }} />,
+  slides: <SlideshowOutlinedIcon sx={{ fontSize: 30, color: 'var(--tt-text-4)' }} />,
+  writing: <ArticleOutlinedIcon sx={{ fontSize: 30, color: 'var(--tt-text-4)' }} />,
 };
 
 const EmptyState: React.FC<{ mode: Exclude<WorkMode, 'general'> }> = ({ mode }) => {
@@ -66,14 +66,23 @@ const EmptyState: React.FC<{ mode: Exclude<WorkMode, 'general'> }> = ({ mode }) 
           minHeight: 0,
           overflow: 'auto',
           p: 2,
-          backgroundImage: 'radial-gradient(#D1D5DB 1px, transparent 1px)',
+          backgroundImage: 'radial-gradient(var(--tt-border) 1px, transparent 1px)',
           backgroundSize: '18px 18px',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
         }}
       >
-        <Box sx={{ textAlign: 'center', maxWidth: 280, p: 2.5, borderRadius: '14px', border: '1px dashed #CBD5E1', bgcolor: 'rgba(255, 255, 255, 0.9)' }}>
+        <Box
+          sx={{
+            textAlign: 'center',
+            maxWidth: 280,
+            p: 2.5,
+            borderRadius: '14px',
+            border: '1px dashed var(--tt-border)',
+            bgcolor: 'var(--tt-surface)',
+          }}
+        >
           {text}
         </Box>
       </Box>
@@ -88,8 +97,8 @@ const EmptyState: React.FC<{ mode: Exclude<WorkMode, 'general'> }> = ({ mode }) 
             maxWidth: 420,
             aspectRatio: '16 / 9',
             borderRadius: '10px',
-            border: '1px dashed #CBD5E1',
-            bgcolor: '#fff',
+            border: '1px dashed var(--tt-border)',
+            bgcolor: 'var(--tt-surface)',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
@@ -108,8 +117,8 @@ const EmptyState: React.FC<{ mode: Exclude<WorkMode, 'general'> }> = ({ mode }) 
         sx={{
           minHeight: '100%',
           borderRadius: '10px',
-          border: '1px dashed #CBD5E1',
-          bgcolor: '#fff',
+          border: '1px dashed var(--tt-border)',
+          bgcolor: 'var(--tt-surface)',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
@@ -192,7 +201,7 @@ const ModeCanvas: React.FC<ModeCanvasProps> = ({ mode, fileOps }) => {
   return (
     <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
       {/* 画布头：当前产物 + 只读说明 + 系统打开/刷新 */}
-      <Box sx={{ px: 2, py: 1, borderBottom: '1px solid #F3F4F6', display: 'flex', alignItems: 'center', gap: 0.5 }}>
+      <Box sx={{ px: 2, py: 1, borderBottom: '1px solid var(--tt-border)', display: 'flex', alignItems: 'center', gap: 0.5 }}>
         <Typography
           noWrap
           title={selected?.srcPath}
@@ -211,14 +220,14 @@ const ModeCanvas: React.FC<ModeCanvasProps> = ({ mode, fileOps }) => {
         )}
         {selected && (
           <Tooltip title={tr('用系统默认应用打开')}>
-            <IconButton size="small" sx={{ color: '#9CA3AF' }} onClick={() => void handleOpenExternal()}>
+            <IconButton size="small" aria-label={tr('用系统默认应用打开')} sx={{ color: 'var(--tt-text-4)' }} onClick={() => void handleOpenExternal()}>
               <OpenInNewIcon sx={{ fontSize: 16 }} />
             </IconButton>
           </Tooltip>
         )}
         {selected && kind !== 'external' && (
           <Tooltip title={tr('刷新内容')}>
-            <IconButton size="small" sx={{ color: '#9CA3AF' }} onClick={() => setLoadKey((k) => k + 1)}>
+            <IconButton size="small" aria-label={tr('刷新内容')} sx={{ color: 'var(--tt-text-4)' }} onClick={() => setLoadKey((k) => k + 1)}>
               <RefreshIcon sx={{ fontSize: 16 }} />
             </IconButton>
           </Tooltip>
@@ -227,7 +236,7 @@ const ModeCanvas: React.FC<ModeCanvasProps> = ({ mode, fileOps }) => {
 
       {/* 多件同类产物：切换查看，不把其他产物藏起来 */}
       {artifacts.length > 1 && (
-        <Box sx={{ display: 'flex', gap: 0.5, px: 2, py: 0.75, overflowX: 'auto', borderBottom: '1px solid #F3F4F6' }}>
+        <Box sx={{ display: 'flex', gap: 0.5, px: 2, py: 0.75, overflowX: 'auto', borderBottom: '1px solid var(--tt-border)' }}>
           {artifacts.map((a) => {
             const active = a.srcPath === selected?.srcPath;
             return (
@@ -242,7 +251,7 @@ const ModeCanvas: React.FC<ModeCanvasProps> = ({ mode, fileOps }) => {
                   height: 22,
                   fontSize: '11px',
                   bgcolor: active ? 'rgba(20, 184, 166, 0.10)' : 'transparent',
-                  color: active ? '#0D9488' : 'var(--tt-text-3)',
+                  color: active ? 'var(--tt-teal)' : 'var(--tt-text-3)',
                   border: `1px solid ${active ? 'rgba(20, 184, 166, 0.45)' : 'var(--tt-border)'}`,
                 }}
               />
@@ -264,7 +273,7 @@ const ModeCanvas: React.FC<ModeCanvasProps> = ({ mode, fileOps }) => {
       ) : kind === 'external' ? (
         <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center', p: 2 }}>
           <Box sx={{ textAlign: 'center', maxWidth: 280 }}>
-            <SlideshowOutlinedIcon sx={{ fontSize: 32, color: '#94A3B8', mb: 1 }} />
+            <SlideshowOutlinedIcon sx={{ fontSize: 32, color: 'var(--tt-text-4)', mb: 1 }} />
             <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-2)', wordBreak: 'break-all' }}>
               {fileNameOf(selected)}
             </Typography>
@@ -288,7 +297,7 @@ const ModeCanvas: React.FC<ModeCanvasProps> = ({ mode, fileOps }) => {
         </Box>
       ) : current?.status === 'error' ? (
         <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 1, p: 2 }}>
-          <Typography sx={{ fontSize: '12.5px', color: '#DC2626', textAlign: 'center' }}>{current.error}</Typography>
+          <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-danger)', textAlign: 'center' }}>{current.error}</Typography>
           <Button
             size="small"
             variant="outlined"
@@ -304,7 +313,13 @@ const ModeCanvas: React.FC<ModeCanvasProps> = ({ mode, fileOps }) => {
           srcDoc={current?.content ?? ''}
           sandbox="allow-scripts allow-forms"
           title={fileNameOf(selected)}
-          sx={{ flex: 1, minHeight: 0, border: 'none', background: '#fff' }}
+          sx={{
+            /* 亮色孤岛：产物 HTML 是模型写出的独立文档，按白底排版；画布面翻暗只会让它自己的透明背景糊掉 */
+            flex: 1,
+            minHeight: 0,
+            border: 'none',
+            background: '#fff',
+          }}
         />
       ) : kind === 'markdown' ? (
         <Box className="markdown-body" sx={{ flex: 1, minHeight: 0, overflow: 'auto', px: 2, py: 1.5, color: 'var(--tt-text-2)' }}>

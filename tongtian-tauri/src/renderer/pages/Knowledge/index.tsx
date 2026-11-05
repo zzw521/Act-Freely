@@ -21,7 +21,11 @@ import {
   DialogContent,
   DialogContentText,
   DialogTitle,
+  FormControl,
   IconButton,
+  InputLabel,
+  MenuItem,
+  Select,
   Switch,
   TextField,
   Tooltip,
@@ -46,8 +50,10 @@ import type {
 } from '../../../shared/contracts';
 import { errorTextOf } from '../../../shared/error-messages';
 import { knowledgeAPI } from '../../lib/api';
+import { clickableProps } from '../../lib/a11y';
 import { isTauri } from '../../lib/tauri-api';
 import { useAppStore } from '../../stores/useAppStore';
+import { useWorkspaceStore } from '../../store/workspaceStore';
 
 const DOC_FILTERS = [
   { name: '文档', extensions: ['md', 'txt', 'csv', 'json', 'docx', 'xlsx', 'pptx', 'pdf'] },
@@ -82,7 +88,9 @@ const KnowledgePage: React.FC = () => {
   const [editing, setEditing] = useState<KnowledgeBase | null>(null);
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
+  const [scope, setScope] = useState('global');
   const [saving, setSaving] = useState(false);
+  const activeWorkspaceId = useWorkspaceStore((s) => s.activeId);
 
   // 删除知识库 / 移除文档确认
   const [deleteTarget, setDeleteTarget] = useState<KnowledgeBase | null>(null);
@@ -103,6 +111,17 @@ const KnowledgePage: React.FC = () => {
     () => bases.find((b) => b.id === selectedId) ?? bases[0] ?? null,
     [bases, selectedId],
   );
+
+  // 归属选项：共享 + 当前项目；编辑他项目私有库时补上它自己的那一项，避免打开就被改回共享
+  const scopeOptions = useMemo(() => {
+    const own = activeWorkspaceId ? `workspace:${activeWorkspaceId}` : '';
+    const opts = [{ value: 'global', label: '所有项目共享' }];
+    if (own) opts.push({ value: own, label: `仅当前项目（${activeWorkspaceId}）` });
+    if (scope && scope !== 'global' && scope !== own) {
+      opts.push({ value: scope, label: `仅项目 ${scope.replace(/^workspace:/, '')}` });
+    }
+    return opts;
+  }, [activeWorkspaceId, scope]);
 
   const replaceBase = useCallback((next: KnowledgeBase) => {
     setBases((prev) => prev.map((b) => (b.id === next.id ? next : b)));
@@ -144,6 +163,7 @@ const KnowledgePage: React.FC = () => {
     setEditing(null);
     setName('');
     setDescription('');
+    setScope('global');
     setEditorOpen(true);
   };
 
@@ -151,6 +171,7 @@ const KnowledgePage: React.FC = () => {
     setEditing(kb);
     setName(kb.name);
     setDescription(kb.description);
+    setScope(kb.scope || 'global');
     setEditorOpen(true);
   };
 
@@ -167,11 +188,12 @@ const KnowledgePage: React.FC = () => {
         const next = await knowledgeAPI.update(editing.id, {
           name: trimmed,
           description: description.trim(),
+          scope,
         });
         replaceBase(next);
         showNotification(`知识库「${next.name}」已更新`, 'success');
       } else {
-        const created = await knowledgeAPI.create(trimmed, description.trim());
+        const created = await knowledgeAPI.create(trimmed, description.trim(), scope);
         setBases((prev) => [...prev, created]);
         setSelectedId(created.id);
         showNotification(`知识库「${created.name}」已创建`, 'success');
@@ -298,15 +320,20 @@ const KnowledgePage: React.FC = () => {
   return (
     <Box sx={{ height: 'calc(100vh - 104px)', overflowY: 'auto', pr: 1 }}>
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-        <MenuBookIcon sx={{ fontSize: 22, color: '#6366F1' }} />
+        <MenuBookIcon sx={{ fontSize: 22, color: 'var(--tt-accent)' }} />
         <Typography sx={{ fontSize: '20px', fontWeight: 700, color: 'var(--tt-text-1)' }}>
           知识库
         </Typography>
-        {loading && <CircularProgress size={16} sx={{ color: '#6366F1' }} />}
+        {loading && <CircularProgress size={16} sx={{ color: 'var(--tt-accent)' }} />}
         <Box sx={{ flexGrow: 1 }} />
         <Tooltip title="刷新列表">
           <span>
-            <IconButton size="small" onClick={() => void refresh()} disabled={!desktop || loading}>
+            <IconButton
+              size="small"
+              aria-label="刷新知识库列表"
+              onClick={() => void refresh()}
+              disabled={!desktop || loading}
+            >
               <RefreshIcon sx={{ fontSize: 18 }} />
             </IconButton>
           </span>
@@ -317,7 +344,7 @@ const KnowledgePage: React.FC = () => {
           startIcon={<AddIcon />}
           onClick={openCreate}
           disabled={!desktop}
-          sx={{ textTransform: 'none', borderRadius: '8px', bgcolor: '#4F46E5', '&:hover': { bgcolor: '#4338CA' } }}
+          sx={{ textTransform: 'none', borderRadius: '8px', bgcolor: 'var(--tt-accent-fill)', '&:hover': { bgcolor: '#4338CA' } }}
         >
           新建知识库
         </Button>
@@ -339,12 +366,12 @@ const KnowledgePage: React.FC = () => {
             gap: 1,
           }}
         >
-          <WarningAmberIcon sx={{ fontSize: 18, color: '#D97706', mt: 0.1 }} />
+          <WarningAmberIcon sx={{ fontSize: 18, color: 'var(--tt-warning)', mt: 0.1 }} />
           <Box>
-            <Typography sx={{ fontSize: '13px', fontWeight: 700, color: '#B45309' }}>
+            <Typography sx={{ fontSize: '13px', fontWeight: 700, color: 'var(--tt-warning)' }}>
               当前是浏览器直连通道，知识库不可用
             </Typography>
-            <Typography sx={{ fontSize: '12.5px', color: '#92400E', mt: 0.25 }}>
+            <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-warning)', mt: 0.25 }}>
               知识库需要把文档写入本机运行目录并抽取正文，只有桌面版具备该能力。
               浏览器通道保留本页作为能力说明，不显示示例知识库，也不接受新建或添加。
             </Typography>
@@ -364,8 +391,8 @@ const KnowledgePage: React.FC = () => {
             gap: 1,
           }}
         >
-          <WarningAmberIcon sx={{ fontSize: 18, color: '#DC2626', mt: 0.1 }} />
-          <Typography sx={{ fontSize: '12.5px', color: '#B91C1C' }}>{loadError}</Typography>
+          <WarningAmberIcon sx={{ fontSize: 18, color: 'var(--tt-danger)', mt: 0.1 }} />
+          <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-danger)' }}>{loadError}</Typography>
         </Box>
       )}
 
@@ -382,7 +409,7 @@ const KnowledgePage: React.FC = () => {
           {/* 左栏：知识库列表 */}
           <Box>
             {bases.length === 0 && !loading ? (
-              <Box sx={{ border: '1px dashed #E5E7EB', borderRadius: '14px', p: 3, textAlign: 'center' }}>
+              <Box sx={{ border: '1px dashed var(--tt-border)', borderRadius: '14px', p: 3, textAlign: 'center' }}>
                 <MenuBookIcon sx={{ fontSize: 32, color: '#C7D2FE' }} />
                 <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-3)', mt: 1 }}>
                   还没有知识库
@@ -407,6 +434,8 @@ const KnowledgePage: React.FC = () => {
                   <Box
                     key={kb.id}
                     onClick={() => setSelectedId(kb.id)}
+                    {...clickableProps(() => setSelectedId(kb.id), `选择知识库：${kb.name}`)}
+                    aria-pressed={active}
                     sx={{
                       p: 1.5,
                       mb: 1,
@@ -423,7 +452,7 @@ const KnowledgePage: React.FC = () => {
                         sx={{
                           fontSize: '13.5px',
                           fontWeight: 700,
-                          color: active ? '#4338CA' : 'var(--tt-text-1)',
+                          color: active ? 'var(--tt-accent)' : 'var(--tt-text-1)',
                           overflow: 'hidden',
                           textOverflow: 'ellipsis',
                           whiteSpace: 'nowrap',
@@ -443,10 +472,26 @@ const KnowledgePage: React.FC = () => {
                           fontWeight: 600,
                           flexShrink: 0,
                           bgcolor: kb.enabled ? 'rgba(16, 185, 129, 0.12)' : 'rgba(107, 114, 128, 0.12)',
-                          color: kb.enabled ? '#059669' : '#6B7280',
+                          color: kb.enabled ? 'var(--tt-success)' : 'var(--tt-text-3)',
                         }}
                       >
                         {kb.enabled ? '已启用' : '已停用'}
+                      </Box>
+                      <Box
+                        component="span"
+                        sx={{
+                          px: 0.75,
+                          py: 0.1,
+                          borderRadius: '999px',
+                          fontSize: '10.5px',
+                          fontWeight: 600,
+                          flexShrink: 0,
+                          bgcolor: 'var(--tt-chip-neutral)',
+                          color: 'var(--tt-text-3)',
+                        }}
+                        title={kb.scope === 'global' ? '所有项目共享' : kb.scope}
+                      >
+                        {kb.scope && kb.scope !== 'global' ? '仅项目' : '共享'}
                       </Box>
                     </Box>
                     {kb.description && (
@@ -559,13 +604,13 @@ const KnowledgePage: React.FC = () => {
 
                   <Box sx={{ display: 'flex', gap: 1, mt: 1.5 }}>
                     {[
-                      { label: '文档总数', value: selected.docs.length, color: '#4F46E5' },
+                      { label: '文档总数', value: selected.docs.length, color: 'var(--tt-accent)' },
                       {
                         label: '已抽取正文',
                         value: selected.docs.filter((d) => d.hasText).length,
-                        color: '#059669',
+                        color: 'var(--tt-success)',
                       },
-                      { label: '缺少正文', value: selected.missingText.length, color: '#D97706' },
+                      { label: '缺少正文', value: selected.missingText.length, color: 'var(--tt-warning)' },
                     ].map((stat) => (
                       <Box
                         key={stat.label}
@@ -589,7 +634,7 @@ const KnowledgePage: React.FC = () => {
                         border: '1px solid rgba(217, 119, 6, 0.25)',
                       }}
                     >
-                      <Typography sx={{ fontSize: '12px', color: '#92400E' }}>
+                      <Typography sx={{ fontSize: '12px', color: 'var(--tt-warning)' }}>
                         以下文档没有可检索正文，AI 检索不到：{selected.missingText.join('、')}
                       </Typography>
                     </Box>
@@ -605,12 +650,12 @@ const KnowledgePage: React.FC = () => {
                         border: lastAdd.errors.length ? '1px solid rgba(217, 119, 6, 0.25)' : '1px solid rgba(16, 185, 129, 0.25)',
                       }}
                     >
-                      <Typography sx={{ fontSize: '12px', fontWeight: 600, color: lastAdd.errors.length ? '#92400E' : '#047857' }}>
+                      <Typography sx={{ fontSize: '12px', fontWeight: 600, color: lastAdd.errors.length ? 'var(--tt-warning)' : 'var(--tt-success)' }}>
                         最近一次添加：成功 {lastAdd.added.length} 篇
                         {lastAdd.errors.length ? `，失败 ${lastAdd.errors.length} 篇` : ''}
                       </Typography>
                       {lastAdd.errors.map((err) => (
-                        <Typography key={err} sx={{ fontSize: '11.5px', color: '#92400E', mt: 0.25 }}>
+                        <Typography key={err} sx={{ fontSize: '11.5px', color: 'var(--tt-warning)', mt: 0.25 }}>
                           {err}
                         </Typography>
                       ))}
@@ -651,7 +696,7 @@ const KnowledgePage: React.FC = () => {
                           '&:last-of-type': { borderBottom: 'none' },
                         }}
                       >
-                        <DescriptionOutlinedIcon sx={{ fontSize: 17, color: '#818CF8', flexShrink: 0 }} />
+                        <DescriptionOutlinedIcon sx={{ fontSize: 17, color: 'var(--tt-accent)', flexShrink: 0 }} />
                         <Box sx={{ flexGrow: 1, minWidth: 0 }}>
                           <Typography
                             sx={{
@@ -670,18 +715,19 @@ const KnowledgePage: React.FC = () => {
                         </Box>
                         {doc.hasText ? (
                           <Tooltip title="正文已抽取，可被检索">
-                            <CheckCircleIcon sx={{ fontSize: 16, color: '#10B981', flexShrink: 0 }} />
+                            <CheckCircleIcon sx={{ fontSize: 16, color: 'var(--tt-success)', flexShrink: 0 }} />
                           </Tooltip>
                         ) : (
                           <Tooltip title="缺少正文，AI 检索不到">
-                            <WarningAmberIcon sx={{ fontSize: 16, color: '#D97706', flexShrink: 0 }} />
+                            <WarningAmberIcon sx={{ fontSize: 16, color: 'var(--tt-warning)', flexShrink: 0 }} />
                           </Tooltip>
                         )}
                         <Tooltip title="移除文档（移入 .trash/）">
                           <IconButton
                             size="small"
+                            aria-label={`移除文档：${doc.name}`}
                             onClick={() => setDocToRemove(doc.name)}
-                            sx={{ color: 'var(--tt-text-4)', '&:hover': { color: '#EF4444' } }}
+                            sx={{ color: 'var(--tt-text-4)', '&:hover': { color: 'var(--tt-danger)' } }}
                           >
                             <DeleteOutlineIcon sx={{ fontSize: 16 }} />
                           </IconButton>
@@ -694,7 +740,7 @@ const KnowledgePage: React.FC = () => {
                 {/* 检索自测 */}
                 <Box sx={{ border: '1px solid var(--tt-border-soft)', borderRadius: '14px', p: 2, bgcolor: 'var(--tt-surface)', mt: 1.5 }}>
                   <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
-                    <SearchIcon sx={{ fontSize: 18, color: '#0EA5E9' }} />
+                    <SearchIcon sx={{ fontSize: 18, color: 'var(--tt-info)' }} />
                     <Typography sx={{ fontSize: '13.5px', fontWeight: 700, color: 'var(--tt-text-1)' }}>
                       检索自测
                     </Typography>
@@ -727,7 +773,7 @@ const KnowledgePage: React.FC = () => {
 
                   {searchError && (
                     <Box sx={{ mt: 1, p: 1, borderRadius: '8px', bgcolor: 'rgba(239, 68, 68, 0.06)', border: '1px solid rgba(239, 68, 68, 0.25)' }}>
-                      <Typography sx={{ fontSize: '12px', color: '#B91C1C' }}>{searchError}</Typography>
+                      <Typography sx={{ fontSize: '12px', color: 'var(--tt-danger)' }}>{searchError}</Typography>
                     </Box>
                   )}
 
@@ -753,7 +799,7 @@ const KnowledgePage: React.FC = () => {
                                   py: 0.1,
                                   borderRadius: '6px',
                                   bgcolor: 'rgba(14, 165, 233, 0.12)',
-                                  color: '#0369A1',
+                                  color: 'var(--tt-info)',
                                   fontSize: '11px',
                                   fontWeight: 600,
                                 }}
@@ -821,7 +867,26 @@ const KnowledgePage: React.FC = () => {
             helperText={`${description.length}/500`}
             sx={{ mt: 1.5, '& .MuiInputBase-root': { fontSize: '13px' } }}
           />
+          <FormControl fullWidth size="small" sx={{ mt: 1.5 }}>
+            <InputLabel id="kb-scope-label">归属</InputLabel>
+            <Select
+              labelId="kb-scope-label"
+              label="归属"
+              value={scope}
+              onChange={(e) => setScope(e.target.value)}
+              sx={{ fontSize: '13px' }}
+            >
+              {scopeOptions.map((o) => (
+                <MenuItem key={o.value} value={o.value} sx={{ fontSize: '13px' }}>
+                  {o.label}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
           <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mt: 1 }}>
+            共享库进入每个项目的检索面；「仅当前项目」只在该工作区的任务里可见，切到其他工作区不会检索到它。
+          </Typography>
+          <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mt: 0.5 }}>
             支持 md / txt / csv / json / docx / xlsx / pptx / pdf，单篇不超过 32MB，单库最多 500 篇。
           </Typography>
         </DialogContent>
@@ -833,7 +898,7 @@ const KnowledgePage: React.FC = () => {
             onClick={() => void submitEditor()}
             disabled={saving || !name.trim()}
             variant="contained"
-            sx={{ fontSize: '13px', bgcolor: '#4F46E5', '&:hover': { bgcolor: '#4338CA' } }}
+            sx={{ fontSize: '13px', bgcolor: 'var(--tt-accent-fill)', '&:hover': { bgcolor: '#4338CA' } }}
           >
             {saving ? '保存中…' : editing ? '保存' : '创建'}
           </Button>
@@ -857,7 +922,7 @@ const KnowledgePage: React.FC = () => {
             onClick={() => void confirmDelete()}
             disabled={deleting}
             variant="contained"
-            sx={{ fontSize: '13px', bgcolor: '#EF4444', '&:hover': { bgcolor: '#DC2626' } }}
+            sx={{ fontSize: '13px', bgcolor: 'var(--tt-danger-fill)', '&:hover': { bgcolor: '#DC2626' } }}
           >
             {deleting ? '删除中…' : '确认删除'}
           </Button>
@@ -881,7 +946,7 @@ const KnowledgePage: React.FC = () => {
             onClick={() => void confirmRemoveDoc()}
             disabled={removingDoc}
             variant="contained"
-            sx={{ fontSize: '13px', bgcolor: '#EF4444', '&:hover': { bgcolor: '#DC2626' } }}
+            sx={{ fontSize: '13px', bgcolor: 'var(--tt-danger-fill)', '&:hover': { bgcolor: '#DC2626' } }}
           >
             {removingDoc ? '移除中…' : '确认移除'}
           </Button>

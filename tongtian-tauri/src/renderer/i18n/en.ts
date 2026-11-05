@@ -24,6 +24,8 @@ export const EN_DICT: Record<string, string> = {
   全部: 'All',
   '近 7 天': 'Last 7 days',
   '近 30 天': 'Last 30 days',
+  全部项目: 'All projects',
+  当前项目: 'Current project',
   没有符合筛选条件的任务: 'No tasks match these filters',
   '暂无任务，点击上方「新任务」开始': 'No tasks yet. Click “New Task” above to start.',
   '暂无 IM 会话，在「IM 频道」开通渠道后即可接收': 'No IM conversations yet. Connect a channel under “IM Channels” to receive them.',
@@ -133,12 +135,24 @@ export const EN_DICT: Record<string, string> = {
   在独立窗口打开: 'Open in separate window',
   从检查点继续: 'Resume from checkpoint',
   '检查点时间：{time}': 'Checkpoint time: {time}',
-  '从最近一次模型调用前的检查点继续，已完成的工具调用不会重复执行':
-    'Continues from the checkpoint before the last model call; completed tool calls will not run again',
+  '回到最近一次模型调用前的快照：已成功的写入类工具按台账不重做，只读与未登记工具会再执行一次':
+    'Restores the snapshot taken before the last model call: completed write-type tools are skipped by the ledger, read-only and unregistered tools run again',
+  '点击后先列出将要重新执行的步骤，含写操作需勾选确认':
+    'Clicking first lists the steps that will re-run; write operations require an explicit acknowledgement',
+  '本任务被「单任务预算」拦停：先在设置 →「模型与用量」调高单任务预算（填 0 为不限），再点这里唤回。上限不会到点自动重置，不调高点了也会被拒。':
+    'This task was stopped by its per-task budget: raise the per-task budget in Settings → “Models & usage” (0 means unlimited) and then click here to recall it. The limit never resets by itself, and clicking before raising it will be refused',
   '检查点只保存在本次引擎进程内，引擎重启后无法恢复':
     'The checkpoint lives only in this engine process and cannot be recovered after an engine restart',
   '检查点已保存到本机磁盘，刷新或引擎重启后仍可继续':
     'The checkpoint is saved to this machine and can still be resumed after a refresh or engine restart',
+  '中断发生在一轮工具调用里：还欠 {count} 个（{names}），继续时从这儿接上，已拿到结果的那些不重做':
+    'The interruption happened inside one tool turn: {count} call(s) still outstanding ({names}). Resuming picks up right there and does not redo the ones that already returned',
+  '中断前的 {count} 条对话由「{model}」产出：继续这一轮仍用它，历史原样带上、按端点重新编码':
+    'The {count} messages before the interruption were produced by “{model}”: resuming still uses that model, carries the history as-is and re-encodes it for the endpoint',
+  '；输入框现在选的是另一台模型，要换模型请重新提问（续跑不跟随选择框）':
+    '; the input box currently selects a different model — to switch models, send a new message (resuming does not follow the selector)',
+  '这份检查点属于执行体「{scope}」，与各成员的进度分目录存放':
+    'This checkpoint belongs to the executor “{scope}” and is stored in its own directory, apart from every member’s progress',
 
   // ── 对话输入 ────────────────────────────────────────────────
   '描述任务，输入 /调用技能': 'Describe the task, type / to use a skill',
@@ -171,6 +185,13 @@ export const EN_DICT: Record<string, string> = {
   '打开文件对话框失败：{msg}': 'Could not open the file picker: {msg}',
   '打开文件夹对话框失败：{msg}': 'Could not open the folder picker: {msg}',
   '附件上传失败：{name}（{msg}）': 'Attachment upload failed: {name} ({msg})',
+  '文件过大：{name}': 'File too large: {name}',
+  '已跳过过大文件：{name}': 'Skipped oversized file: {name}',
+  '当前版本不支持文件夹附件（缺少暂存接口）':
+    'This build cannot attach folders (staging API unavailable)',
+  '文件夹内没有可附加的文件': 'No attachable files in this folder',
+  '当前版本不支持本地附件暂存（缺少暂存接口）':
+    'This build cannot stage local attachments (staging API unavailable)',
   '{name}（失败）': '{name} (failed)',
   '{folder}（文件夹）': '{folder} (folder)',
   '「{folder}」内没有可附加的文件（支持 {exts}）':
@@ -233,6 +254,14 @@ export const EN_DICT: Record<string, string> = {
   '执行过程（{done} 个步骤完成，{failed} 个失败）':
     'Execution ({done} completed, {failed} failed)',
   '执行过程 · {done} 个步骤已完成': 'Execution · {done} steps completed',
+  重试此步: 'Retry this step',
+  从此步继续: 'Continue from here',
+  续跑前先确认将要重做的步骤: 'Confirm which steps will re-run before resuming',
+  会重做: 'Will re-run',
+  不重做: 'Will not re-run',
+  内部步骤: 'Internal step',
+  我已知悉上面列出的操作会再执行一次: 'I understand these operations will run again',
+  从检查点续跑: 'Resume from checkpoint',
   通天助手: 'Tongtian Assistant',
   工具调用: 'Tool call',
   任务完成: 'Task completed',
@@ -316,6 +345,11 @@ export const EN_DICT: Record<string, string> = {
   打开文件失败: 'Failed to open file',
   '打开失败（HTTP {status}）': 'Failed to open (HTTP {status})',
   打开失败: 'Open failed',
+  '启动引擎并重试': 'Start engine and retry',
+  '正在启动引擎…': 'Starting engine…',
+  引擎启动失败: 'Engine failed to start',
+  '也可以点右上角用系统默认应用打开（这条路不需要引擎）':
+    'You can also use the top-right button to open it with the system default app — that path needs no engine.',
 
   // ── 设置页：导航与偏好 ──────────────────────────────────────
   扩展与集成: 'Extensions & Integrations',
@@ -341,6 +375,13 @@ export const EN_DICT: Record<string, string> = {
   亮色: 'Light',
   暗色: 'Dark',
   跟随系统: 'System',
+  '四套皮肤都各自校准过文字对比度（WCAG AA），暗色下不会出现浅字压浅底':
+    'Every skin is tuned for WCAG AA text contrast, including dark mode.',
+  界面密度: 'Interface density',
+  紧凑: 'Compact',
+  宽松: 'Roomy',
+  '紧凑档只收内边距与字号间隔，按钮与菜单项的点击目标仍不小于 36px':
+    'Compact tightens padding and spacing only; buttons and menu items keep a 36px target.',
   界面风格: 'UI style',
   '四套皮肤即时生效；皮肤同时适配亮色与暗色主题':
     'Four skins apply instantly and support both light and dark themes.',
@@ -440,4 +481,103 @@ export const EN_DICT: Record<string, string> = {
   窗口标题: 'Window title',
   任务栏图标: 'Taskbar icon',
   托盘图标: 'Tray icon',
+
+  // ── 无障碍：读屏标签与键盘路径（D-25） ──────────────────────
+  跳到主要内容: 'Skip to main content',
+  收起侧边栏: 'Collapse sidebar',
+  侧栏列表: 'Sidebar list',
+  '归档 {title}': 'Archive {title}',
+  打开个人中心: 'Open my account',
+  关闭设置并返回工作台: 'Close settings and return to the workbench',
+  在右侧预览: 'Preview on the right',
+  关闭预览: 'Close preview',
+  返回任务: 'Back to task',
+  关闭面板: 'Close panel',
+  在面板内预览: 'Preview in the panel',
+  重试该步骤: 'Retry this step',
+  '尚未安装技能，去技能页安装': 'No skills installed yet. Install one on the Skills page.',
+  '尚未登记连接器，去连接器页添加': 'No connectors registered yet. Add one on the Connectors page.',
+  换一批推荐案例: 'Show other examples',
+  通过模版开启第一个任务: 'Start your first task from a template',
+
+  // 输入区
+  '引用技能：{name}': 'Reference skill: {name}',
+  '选择负责人专家（当前：{name}）': 'Choose lead expert (current: {name})',
+  '选择负责人专家（本轮由该专家组织结论，可绑定模型）':
+    'Choose the lead expert. This expert organizes the conclusion and can bind a model.',
+  '选择模型（当前：{name}）': 'Choose model (current: {name})',
+  '不指定专家，按当前模型与技能执行': 'No expert selected; runs with the current model and skills',
+  '绑定模型不可用：{msg}': 'Bound model unavailable: {msg}',
+  '模型：{name}': 'Model: {name}',
+  沿用当前模型: 'Keep the current model',
+  通用助手: 'General assistant',
+  原因未知: 'Reason unknown',
+  上传未成功: 'Upload failed',
+  更换工作目录: 'Change working folder',
+  模板: 'Template',
+  幻灯片模板: 'Slide template',
+  '（导入）': ' (imported)',
+  浏览器直连仅内置主题: 'Browser direct mode supports built-in themes only',
+  '幻灯片模式按所选模板生成 .pptx；可在「设置 → 工作台 → 幻灯片模板」导入本机模板':
+    'Slides mode generates a .pptx from the chosen template. Import your own under Settings → Workbench → Slide templates.',
+
+  // 文件访问档位（对话输入框内 + 号旁的盾牌）
+  '{desc}｜当前目录：{dir}': '{desc} | Current folder: {dir}',
+  '未绑定，产出落在应用工作目录': 'Not bound; output goes to the app working folder',
+  '文件访问权限：{name}': 'File access: {name}',
+  文件访问权限: 'File access',
+  '启用「完全访问」？': 'Enable “Full access”?',
+  '开启后，AI 在本次会话里可以直接读写工作目录之外的本机路径，并删除文件，不再逐次询问。':
+    'With it on, the AI can read and write local paths outside the working folder in this conversation, and delete files, without asking each time.',
+  '删除是不可逆操作：文件会先复制进应用回收目录并记下原路径与原因，但找回仍需手动操作。建议只在核对过执行计划的会话里开启，用完切回「每次询问」。':
+    'Deletion is irreversible: the file is copied into the app’s trash folder with its original path and reason first, but restoring it is still a manual step. Turn this on only for conversations whose plan you have reviewed, and switch back to “Ask every time” when done.',
+  '家目录、系统关键目录与应用数据目录始终硬拒：完全访问放开的是目录边界，不是整台电脑。':
+    'Your home folder, critical system directories and the app data directory stay hard-denied: Full access moves the folder boundary, not the whole machine.',
+  '我已了解，启用完全访问': 'I understand — enable Full access',
+
+  // 模型配置
+  关闭模型设置弹窗: 'Close model settings',
+  '设为默认模型：{name}': 'Set as default model: {name}',
+  '编辑模型：{name}': 'Edit model: {name}',
+  '删除模型：{name}': 'Delete model: {name}',
+  '上移备用模型：{name}': 'Move fallback model up: {name}',
+  '下移备用模型：{name}': 'Move fallback model down: {name}',
+  '移除备用模型：{name}': 'Remove fallback model: {name}',
+  打开配置文件所在目录: 'Open the config folder',
+  '打开配置文件所在目录：{path}': 'Open config folder: {path}',
+  '显示 API Key': 'Show API key',
+  '隐藏 API Key': 'Hide API key',
+  关闭连接测试结果提示: 'Dismiss connection test result',
+  设为全局默认模型: 'Set as the global default model',
+  '强制本地模式：敏感任务使用本地模型': 'Force local mode: sensitive tasks use the local model',
+  '统计周期：今日': 'Usage period: today',
+  '统计周期：本月': 'Usage period: this month',
+  '统计周期：总计': 'Usage period: all time',
+
+  // 技能与连接器
+  通过对话创建技能: 'Create a skill by chatting',
+  上传本地技能文件: 'Upload a local skill file',
+  '选择技能的 SKILL.md 文件': 'Choose the skill’s SKILL.md file',
+  '选择包含 SKILL.md 的技能目录': 'Choose a skill folder containing SKILL.md',
+  '卸载技能：{name}': 'Uninstall skill: {name}',
+  '移除连接器：{name}': 'Remove connector: {name}',
+  '删除第 {index} 行环境变量': 'Delete environment variable row {index}',
+  添加环境变量: 'Add environment variable',
+  '删除第 {index} 行请求头': 'Delete request header row {index}',
+  添加请求头: 'Add request header',
+  '切换到「{label}」分类': 'Switch to the “{label}” category',
+
+  // 专家套件与设置页
+  '复制文件 {path}': 'Copy file {path}',
+  '卸载套件 {name}': 'Uninstall suite {name}',
+  '安装套件 {name}': 'Install suite {name}',
+  '选择头像背景色 {color}': 'Choose avatar background color {color}',
+  '复制账户 UID': 'Copy account UID',
+  '打开「{name}」的系统授权设置': 'Open system permission settings for “{name}”',
+  '录制「{name}」快捷键': 'Record the shortcut for “{name}”',
+  '恢复「{name}」默认快捷键': 'Restore the default shortcut for “{name}”',
+  '查看能力文件 {title}': 'View capability file {title}',
+  '删除记忆条目「{content}」': 'Delete memory entry “{content}”',
+  '归档记忆条目「{content}」': 'Archive memory entry “{content}”',
+  '删除模板「{name}」': 'Delete template “{name}”',
 };

@@ -8,7 +8,8 @@
  * 执行面口径（页面文案必须与之一致，不能宣称「配了就会跑」）:
  * - 配置 ≠ 执行：命令需在本页「放行」后，才会由本机在真实任务里拉起；
  * - 12 类事件里只有 10 类在当前执行链路有真实触发点，另外 2 类只能配置与试运行；
- * - 删除某条配置的同时，它的放行一并作废。
+ * - 删除某条配置的同时，它的放行一并作废；
+ * - 系统隔离生效时命令由沙箱启动器以容器令牌拉起：只接受「程序 + 参数」，工作目录只读。
  */
 
 import React, { useState, useEffect, useCallback } from 'react';
@@ -31,6 +32,7 @@ import {
   revokeHook,
 } from '../../lib/alignment-api';
 import { errorTextOf } from '../../../shared/error-messages';
+import { clickableProps } from '../../lib/a11y';
 import { useAppStore } from '../../stores/useAppStore';
 import type { HookConfigStore, HookEventName, HooksStatus } from '../../../shared/contracts';
 
@@ -238,8 +240,8 @@ const HooksManager: React.FC = () => {
 
   return (
     <Box sx={{ height: 'calc(100vh - 104px)', display: 'flex', flexDirection: 'column' }}>
-      <Typography sx={{ fontSize: '20px', fontWeight: 700, color: '#111827' }}>Hooks</Typography>
-      <Typography sx={{ fontSize: '13px', color: '#9CA3AF', mt: 0.5 }}>
+      <Typography sx={{ fontSize: '20px', fontWeight: 700, color: 'var(--tt-text-1)' }}>Hooks</Typography>
+      <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-4)', mt: 0.5 }}>
         在执行的关键节点插入自定义逻辑。脚本通过 stdin 接收 JSON，exit code 2 表示阻塞（仅支持阻塞的事件生效）。
         命令需在本页「放行」后才会由本机在真实任务里执行——放行前只保存配置，不会拉起进程。
       </Typography>
@@ -250,24 +252,30 @@ const HooksManager: React.FC = () => {
             mt: 1.5,
             p: 1.5,
             borderRadius: '12px',
-            bgcolor: status.mountedUnfired.length || status.gateError ? '#FFFBEB' : '#F0FDF4',
+            bgcolor: status.mountedUnfired.length || status.gateError ? 'var(--tt-chip-warning)' : 'var(--tt-chip-success)',
             border: `1px solid ${status.mountedUnfired.length || status.gateError ? '#FDE68A' : '#BBF7D0'}`,
           }}
         >
-          <Typography sx={{ fontSize: '12px', color: '#374151', lineHeight: 1.7 }}>
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-2)', lineHeight: 1.7 }}>
             当前 {status.configured} 条配置，其中 {status.ungranted.length} 条未放行（真实任务里不会执行）。
             {status.configured > 0 && status.ungranted.length === 0
               ? ' 已配置的命令均已放行。'
               : ''}
           </Typography>
           {status.mountedUnfired.length > 0 && (
-            <Typography sx={{ fontSize: '12px', color: '#92400E', mt: 0.5, lineHeight: 1.7 }}>
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-warning)', mt: 0.5, lineHeight: 1.7 }}>
               这些事件在当前执行链路没有触发点，只能配置与试运行，真实任务里不会执行：
               {status.mountedUnfired.join('、')}
             </Typography>
           )}
+          {status.sandboxed && (
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-warning)', mt: 0.5, lineHeight: 1.7 }}>
+              系统隔离已生效：脚本以容器令牌启动，工作目录只读、只有沙箱临时目录可写，越界读写由系统直接拒绝。
+              命令必须是「程序 + 参数」的单条形式——逻辑运算符、管道、重定向、变量展开与 cmd 内建（echo、exit /b）会被拒绝执行，请改写成独立脚本文件。
+            </Typography>
+          )}
           {status.gateError && (
-            <Typography sx={{ fontSize: '12px', color: '#92400E', mt: 0.5, lineHeight: 1.7 }}>
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-warning)', mt: 0.5, lineHeight: 1.7 }}>
               {status.gateError}
             </Typography>
           )}
@@ -280,14 +288,17 @@ const HooksManager: React.FC = () => {
           {hookEvents.map((ev) => {
             const isActive = selectedEvent === ev.name;
             const count = hooks.filter((h) => h.event === ev.name).length;
+            const selectEvent = () => {
+              setSelectedEvent(ev.name);
+              setEditing(null);
+              setTestResult(null);
+            };
             return (
               <Box
                 key={ev.name}
-                onClick={() => {
-                  setSelectedEvent(ev.name);
-                  setEditing(null);
-                  setTestResult(null);
-                }}
+                onClick={selectEvent}
+                {...clickableProps(selectEvent, `选择事件：${ev.name}`)}
+                aria-pressed={isActive}
                 sx={{
                   display: 'flex',
                   alignItems: 'center',
@@ -297,8 +308,8 @@ const HooksManager: React.FC = () => {
                   mb: 0.25,
                   borderRadius: '10px',
                   cursor: 'pointer',
-                  background: isActive ? '#E6F7F4' : 'transparent',
-                  '&:hover': { background: isActive ? '#E6F7F4' : 'rgba(15, 23, 42, 0.04)' },
+                  background: isActive ? 'var(--tt-chip-teal)' : 'transparent',
+                  '&:hover': { background: isActive ? 'var(--tt-chip-teal)' : 'rgba(15, 23, 42, 0.04)' },
                 }}
               >
                 <Box sx={{ flexGrow: 1, minWidth: 0 }}>
@@ -306,17 +317,17 @@ const HooksManager: React.FC = () => {
                     sx={{
                       fontSize: '12.5px',
                       fontWeight: isActive ? 600 : 400,
-                      color: isActive ? '#0D9488' : '#374151',
+                      color: isActive ? 'var(--tt-teal)' : 'var(--tt-text-2)',
                     }}
                   >
                     {ev.name}
                   </Typography>
                   {!ev.fired && (
-                    <Typography sx={{ fontSize: '10.5px', color: '#C2913A' }}>无触发点</Typography>
+                    <Typography sx={{ fontSize: '10.5px', color: 'var(--tt-warning)' }}>无触发点</Typography>
                   )}
                 </Box>
                 {count > 0 && (
-                  <Typography sx={{ fontSize: '11px', color: '#9CA3AF' }}>{count}</Typography>
+                  <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>{count}</Typography>
                 )}
               </Box>
             );
@@ -327,15 +338,15 @@ const HooksManager: React.FC = () => {
         <Box sx={{ flex: 1, minWidth: 0, overflowY: 'auto', pr: 1, maxWidth: 760 }}>
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1.5 }}>
             <Box>
-              <Typography sx={{ fontSize: '16px', fontWeight: 700, color: '#111827' }}>
+              <Typography sx={{ fontSize: '16px', fontWeight: 700, color: 'var(--tt-text-1)' }}>
                 {eventDef.name}
               </Typography>
-              <Typography sx={{ fontSize: '12px', color: '#9CA3AF' }}>
+              <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>
                 {eventDef.desc}
                 {eventDef.blockable ? ' · 支持阻塞(exit 2)' : ''} · matcher 匹配：{eventDef.matcherLabel}
               </Typography>
               {!eventDef.fired && (
-                <Typography sx={{ fontSize: '12px', color: '#B45309', mt: 0.25 }}>
+                <Typography sx={{ fontSize: '12px', color: 'var(--tt-warning)', mt: 0.25 }}>
                   该事件在当前执行链路没有触发点 · 可配置与试运行，但真实任务不会执行
                 </Typography>
               )}
@@ -345,7 +356,7 @@ const HooksManager: React.FC = () => {
               size="small"
               startIcon={<AddIcon sx={{ fontSize: 16 }} />}
               onClick={handleAdd}
-              sx={{ bgcolor: '#111827', color: '#fff', fontSize: '12px', '&:hover': { bgcolor: '#1F2937' } }}
+              sx={{ bgcolor: 'var(--tt-cta-fill)', color: 'var(--tt-cta-ink)', fontSize: '12px', '&:hover': { bgcolor: 'var(--tt-cta-fill-hover)' } }}
             >
               新增 Hook
             </Button>
@@ -353,8 +364,8 @@ const HooksManager: React.FC = () => {
 
           {/* Hook 列表 */}
           {loaded && eventHooks.length === 0 && !editing && (
-            <Box sx={{ border: '1px dashed #E5E7EB', borderRadius: '14px', p: 4, textAlign: 'center' }}>
-              <Typography sx={{ fontSize: '13px', color: '#9CA3AF' }}>
+            <Box sx={{ border: '1px dashed var(--tt-border)', borderRadius: '14px', p: 4, textAlign: 'center' }}>
+              <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-4)' }}>
                 该事件暂无 Hook 配置 · 未配置则不会执行任何脚本
               </Typography>
             </Box>
@@ -367,23 +378,30 @@ const HooksManager: React.FC = () => {
                   setEditing({ ...h });
                   setTestResult(null);
                 }}
+                {...clickableProps(
+                  () => {
+                    setEditing({ ...h });
+                    setTestResult(null);
+                  },
+                  `编辑 Hook：${h.command || '未配置命令'}`,
+                )}
                 sx={{
                   display: 'flex',
                   alignItems: 'center',
                   gap: 1.5,
-                  bgcolor: '#FFFFFF',
-                  border: '1px solid #E5E7EB',
+                  bgcolor: 'var(--tt-surface)',
+                  border: '1px solid var(--tt-border)',
                   borderRadius: '14px',
                   px: 2,
                   py: 1.5,
                   mb: 1,
                   cursor: 'pointer',
-                  '&:hover': { borderColor: '#14B8A6' },
+                  '&:hover': { borderColor: 'var(--tt-teal)' },
                 }}
               >
                 <Box sx={{ flexGrow: 1, minWidth: 0 }}>
                   <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                    <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#111827' }}>
+                    <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)' }}>
                       matcher: {h.matcher || '*'}
                     </Typography>
                     {grantedOf(h.command) ? (
@@ -392,8 +410,8 @@ const HooksManager: React.FC = () => {
                           px: 0.75,
                           py: 0.1,
                           borderRadius: '6px',
-                          bgcolor: '#DCFCE7',
-                          color: '#15803D',
+                          bgcolor: 'var(--tt-chip-success)',
+                          color: 'var(--tt-success)',
                           fontSize: '11px',
                           fontWeight: 600,
                         }}
@@ -406,8 +424,8 @@ const HooksManager: React.FC = () => {
                           px: 0.75,
                           py: 0.1,
                           borderRadius: '6px',
-                          bgcolor: '#FEF3C7',
-                          color: '#B45309',
+                          bgcolor: 'var(--tt-chip-warning)',
+                          color: 'var(--tt-warning)',
                           fontSize: '11px',
                           fontWeight: 600,
                         }}
@@ -416,10 +434,10 @@ const HooksManager: React.FC = () => {
                       </Box>
                     )}
                   </Box>
-                  <Typography sx={{ fontSize: '12px', color: '#9CA3AF', mt: 0.25 }} noWrap>
+                  <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mt: 0.25 }} noWrap>
                     {h.command || '(未配置命令)'} · 超时 {h.timeout}s
                   </Typography>
-                  <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF', mt: 0.25 }}>
+                  <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mt: 0.25 }}>
                     {grantedOf(h.command)
                       ? '真实任务命中该节点时由本机执行'
                       : eventDef.fired
@@ -438,8 +456,8 @@ const HooksManager: React.FC = () => {
                     }}
                     sx={{
                       fontSize: '12px',
-                      color: grantedOf(h.command) ? '#6B7280' : '#0D9488',
-                      borderColor: grantedOf(h.command) ? '#E5E7EB' : '#14B8A6',
+                      color: grantedOf(h.command) ? 'var(--tt-text-3)' : 'var(--tt-teal)',
+                      borderColor: grantedOf(h.command) ? 'var(--tt-border)' : 'var(--tt-teal)',
                       border: '1px solid',
                       borderRadius: '8px',
                       px: 1.25,
@@ -450,7 +468,7 @@ const HooksManager: React.FC = () => {
                   </Button>
                 )}
                 <DeleteOutlineIcon
-                  sx={{ fontSize: 17, color: '#9CA3AF', '&:hover': { color: '#EF4444' } }}
+                  sx={{ fontSize: 17, color: 'var(--tt-text-4)', '&:hover': { color: 'var(--tt-danger)' } }}
                   onClick={(e) => {
                     e.stopPropagation();
                     const next = hooks.filter((x) => x.id !== h.id);
@@ -464,8 +482,8 @@ const HooksManager: React.FC = () => {
 
           {/* 编辑器 */}
           {editing && (
-            <Box sx={{ bgcolor: '#FFFFFF', border: '1px solid #14B8A6', borderRadius: '14px', p: 2.5, mt: 1 }}>
-              <Typography sx={{ fontSize: '13px', fontWeight: 700, color: '#111827', mb: 1.5 }}>
+            <Box sx={{ bgcolor: 'var(--tt-surface)', border: '1px solid var(--tt-teal)', borderRadius: '14px', p: 2.5, mt: 1 }}>
+              <Typography sx={{ fontSize: '13px', fontWeight: 700, color: 'var(--tt-text-1)', mb: 1.5 }}>
                 编辑 Hook
               </Typography>
               <TextField
@@ -482,7 +500,7 @@ const HooksManager: React.FC = () => {
                 <MenuItem value="Write | Edit">Write | Edit</MenuItem>
                 <MenuItem value="mcp__.*">mcp__.*（正则）</MenuItem>
               </TextField>
-              <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF', mb: 1.5 }}>
+              <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mb: 1.5 }}>
                 正则按「包含」匹配（不锚定起止）；工具类事件匹配工具名，其余事件匹配
                 source / reason / trigger。改命令文本等同于换一条脚本，需重新放行。
               </Typography>
@@ -503,23 +521,23 @@ const HooksManager: React.FC = () => {
                   onChange={(e) => setEditing({ ...editing, timeout: Number(e.target.value) || 60 })}
                   sx={{ width: 120, '& .MuiInputBase-input': { fontSize: '13px' } }}
                 />
-                <Button size="small" startIcon={<PlayArrowIcon sx={{ fontSize: 15 }} />} onClick={handleTest} sx={{ color: '#0D9488', fontSize: '12px' }}>
+                <Button size="small" startIcon={<PlayArrowIcon sx={{ fontSize: 15 }} />} onClick={handleTest} sx={{ color: 'var(--tt-teal)', fontSize: '12px' }}>
                   试运行
                 </Button>
                 <Box sx={{ flexGrow: 1 }} />
-                <Button size="small" onClick={() => setEditing(null)} sx={{ color: '#6B7280', fontSize: '12px' }}>
+                <Button size="small" onClick={() => setEditing(null)} sx={{ color: 'var(--tt-text-2)', fontSize: '12px' }}>
                   取消
                 </Button>
                 <Button
                   size="small"
                   variant="contained"
                   onClick={handleSave}
-                  sx={{ bgcolor: '#111827', fontSize: '12px', '&:hover': { bgcolor: '#1F2937' } }}
+                  sx={{ bgcolor: 'var(--tt-cta-fill)', fontSize: '12px', '&:hover': { bgcolor: 'var(--tt-cta-fill-hover)' } }}
                 >
                   保存
                 </Button>
               </Box>
-              <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF', mt: 1 }}>
+              <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mt: 1 }}>
                 试运行会立即在本机执行该命令（不等放行），用于验证脚本本身；真实任务是否执行只由「放行」决定。
               </Typography>
               {testResult && (
@@ -528,11 +546,11 @@ const HooksManager: React.FC = () => {
                   sx={{
                     mt: 1.5,
                     p: 1.5,
-                    bgcolor: '#F9FAFB',
-                    border: '1px solid #E5E7EB',
+                    bgcolor: 'var(--tt-chat-code-bg)',
+                    border: '1px solid var(--tt-border)',
                     borderRadius: '8px',
                     fontSize: '12px',
-                    color: '#374151',
+                    color: 'var(--tt-text-2)',
                     fontFamily: 'Consolas, monospace',
                     whiteSpace: 'pre-wrap',
                   }}

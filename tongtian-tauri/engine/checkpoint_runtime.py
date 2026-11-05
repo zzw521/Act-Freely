@@ -23,6 +23,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+import data_paths as dp  # 引擎数据根的唯一解析处（同目录模块，导入方已把引擎目录加入 sys.path）
+import side_effect_registry as ser  # #164：副作用名单的唯一落表处，本文件只派生不定义
+
 # 单份快照的体积上限（JSON 字符数）：超出时从最早消息开始丢弃并如实标记
 MAX_CHECKPOINT_CHARS = 400_000
 # 单条工具结果的保留上限：恢复需要的是「工具做过什么、返回了什么关键信息」
@@ -33,18 +36,11 @@ MAX_TOOL_INPUT_CHARS = 8_000
 MAX_TOOL_RECORDS = 1_000
 
 _MEDIA_TYPES = {"image", "audio", "video"}
-_READ_ONLY_TOOLS = {"view_text_file", "use_skill"}
-_SIDE_EFFECT_TOOLS = {
-    "write_text_file",
-    "insert_text_file",
-    "generate_pptx",
-    "spawn_subagents",
-}
-_SIDE_EFFECT_KEYWORDS = (
-    "write", "create", "delete", "remove", "move", "rename", "upload",
-    "send", "execute", "insert", "append", "save", "export", "publish",
-    "shell", "command", "run",
-)
+_READ_ONLY_TOOLS = {"list_directory", "view_text_file", "read_document", "use_skill"}
+# 名单本体在 engine/side_effect_registry.py（四张视图同源，含本表与沙箱/审批表的成员差异说明）。
+# 派生成本地名字是为了保住判定里的查表写法与 tests/unit/workbench/step-replay.test.ts 的同源校验。
+_SIDE_EFFECT_TOOLS = set(ser.view("checkpoint"))
+_SIDE_EFFECT_KEYWORDS = ser.keywords()
 
 
 def is_side_effect_tool(name: str) -> bool:
@@ -78,7 +74,7 @@ def signature_of(name: str, args: Any) -> str:
 
 # ── 磁盘检查点 ────────────────────────────────────────────────
 #
-# 位置与 models.json / 意识目录同一套 TONGTIANWORK_HOME 规则；文件名用 taskId 的
+# 位置由 data_paths 统一解析（与 models.json / 意识目录同一数据根）；文件名用 taskId 的
 # 哈希，避免外部传入的 id 拼出目录穿越路径。文件里只有恢复所需内容，不含密钥。
 
 CHECKPOINT_VERSION = 1
@@ -87,9 +83,8 @@ MAX_DISK_CHECKPOINT_CHARS = 16_000_000
 
 
 def checkpoint_home() -> Path:
-    root = str(os.environ.get("TONGTIANWORK_HOME") or "").strip()
-    base = Path(root) if root else Path.home() / ".tongtianwork"
-    return base / "checkpoints"
+    """检查点目录：数据根由 `data_paths` 统一解析（D-43 路径单一来源）"""
+    return dp.checkpoints_dir()
 
 
 def _checkpoint_file(task_id: str) -> Path:
@@ -620,3 +615,397 @@ def install(toolkit, checkpoint: TaskCheckpoint) -> str | None:
         return None
     except Exception as exc:  # noqa: BLE001
         return str(exc)
+
+
+# ── 成员真运行时检查点台账（缺陷 D-40.5 / #149）───────────────────
+#
+# 团队房间里的一个成员 = 一条工单（`房间~成员`），它跑的是 D-48 那条执行回路：
+# 每轮结束由 `ticket_dispatch_runtime` 按**这份领取的 checkpoint_key** 落一份磁盘检查点
+# （带 ticketId / assignmentId 自证）。所以「成员有没有真运行时检查点」这件事的答案
+# 不在这里另建一套存储，而是：**这份台账只做索引与结论**，正文仍旧躺在
+# `checkpoints/<摘要>.json` 里——一份事实只有一个来源。
+#
+# 台账要回答的是编排层答不出的三个问题：
+# 1. 这个成员此刻有没有可续跑的快照（`resumable` 由磁盘那份自证，不由内存猜）；
+# 2. 换一份新领取时该接哪一份旧检查点（`carry_forward` 给出来源键与恢复注记）；
+# 3. 收口之后证据还在不在（`finished` 会被执行体删档，`dropped/lost` 留着——
+#    这里如实转述执行体的回执，不自己删、也不假装删了）。
+
+
+#: 台账条目的检查点状态。`inflight`=这份领取还开着；`interrupted`=领取结束但没干完，
+#: 检查点留在盘上等着被接；`released`=干完收口，执行体已按口径删档。
+MEMBER_CHECKPOINT_STATES = ("inflight", "interrupted", "released")
+
+#: 恢复注记的兜底文案：没接调度器（`dispatcher`）时用。内容与
+#: `ticket_restart_resume.build_recovery_note` 的检查点段同口径，但不冒充它生成过。
+_MEMBER_CARRY_NOTE = (
+    "接上你上一次中断的派工（{prev_job_id}）：那份检查点里有 {messages} 条对话快照。"
+    "续跑前先查目录、git 历史与远端现状，再重复任何外部动作——"
+    "上一轮的收发与写盘可能已经发生，不要当成没做过。"
+)
+_MEMBER_CARRY_EMPTY = (
+    "上一次派工（{prev_job_id}）留下了中断记录，但磁盘上没有可恢复的对话快照："
+    "这一份按新任务从头做，别声称接上了上下文。"
+)
+
+
+def checkpoint_summary(task_id: Any) -> dict:
+    """一份检查点的**只读摘要**（不返回正文）：有没有、可不可续跑、多少条。
+
+    界面与 `status_of` 都要回答「这个成员的检查点还在不在」，但都不该把对话正文
+    端上屏幕，所以自述走这里；正文只有真要续跑的那一方按 `load_checkpoint` 自己取。
+    这里读的是 `load_checkpoint`，所以过期/版本不符/坏文件的既有口径一并继承——
+    不另写一份「能不能读」的判断。
+    """
+    tid = str(task_id or "").strip()
+    if not tid:
+        return {"exists": False, "resumable": False, "messages": 0, "sideEffects": 0,
+                "savedAtMs": 0, "scope": "none", "reason": "没有检查点键：这份领取还没落过检查点"}
+    data = load_checkpoint(tid)
+    if data is None:
+        return {"exists": False, "resumable": False, "messages": 0, "sideEffects": 0,
+                "savedAtMs": 0, "scope": "none", "reason": (
+                    "磁盘上没有这份检查点（从未落过、已过 7 天 TTL、或收口时按「干完了」删掉）")}
+    messages = data.get("messages") if isinstance(data.get("messages"), list) else []
+    records = data.get("toolRecords") if isinstance(data.get("toolRecords"), dict) else {}
+    resumable = bool(data.get("resumable")) and bool(messages)
+    reason = str(data.get("reason") or "")
+    if not resumable:
+        reason = reason or (
+            "快照里没有对话（例如只有 worker 退出证据），只能当侧证：续跑请按新任务做"
+            if not messages else "这份检查点当时标为不可续跑"
+        )
+    return {
+        "exists": True,
+        "resumable": resumable,
+        "reason": reason,
+        "scope": "disk",
+        "messages": len(messages),
+        "sideEffects": len(records),
+        "modelCalls": int(data.get("modelCalls") or 0),
+        "savedAtMs": int(data.get("savedAtMs") or 0),
+        "ownerTicketId": str(data.get("ticketId") or ""),
+        "ownerAssignmentId": str(data.get("assignmentId") or ""),
+    }
+
+
+class MemberCheckpointLedger:
+    """按（房间, 成员）索引成员运行时检查点；正文仍归磁盘检查点文件。
+
+    `jobs` 必须就是团队那一层的派工台账（同一份 `team_jobs.json`）——再存一份
+    「哪个成员有检查点」就会出现第二个事实源，两份不一致时没人说得出哪条是真的。
+    `dispatcher` 只用于借它已有的恢复注记生成器（与重启补查同一口径），没接就用兜底文案。
+    `key_fn` 必须是 `ticket_worker_runtime.checkpoint_task_id` 本身（由装配现场注入）：
+    本模块不许 import 它——`ticket_worker_runtime` 已经 import 本模块，反过来再引一次
+    就是循环导入；而键的算式更不能在这里抄第二遍，抄错一次的结果是索引指向一个
+    执行体从来没写过的文件，续跑永远读空。
+    """
+
+    def __init__(
+        self, jobs: Any, *, dispatcher: Any = None, key_fn: Callable[[str], str] | None = None
+    ) -> None:
+        self.jobs = jobs
+        self.dispatcher = dispatcher
+        self.key_fn = key_fn
+
+    def bind_dispatcher(self, dispatcher: Any) -> None:
+        """装配现场晚一步接上调度器（注册表先于调度器存在是 D-48 装配的形状）。"""
+        self.dispatcher = dispatcher
+
+    def bind_key_fn(self, key_fn: Callable[[str], str] | None) -> None:
+        self.key_fn = key_fn
+
+    # ── 写入 ────────────────────────────────────────────────
+
+    def record_assignment(
+        self,
+        *,
+        room: Any = "",
+        member_id: Any = "",
+        assignment_id: Any,
+        ticket_id: Any = "",
+        delivered_assignment_id: Any = "",
+        checkpoint_key: Any = "",
+    ) -> dict:
+        """把这份领取标成「有检查点索引」。
+
+        `delivered_assignment_id` 是执行体**实际**绑上的那份：同一成员的第二条派工会
+        并进他当前那份领取（`existing-worker`），此时传进来的 job id 只是台账号，
+        真正会落检查点的是实际那一份。索引记错这条，续跑时就会去读一个永远为空的键。
+
+        索引字段走 `JobStore.set_fields`（只补记、不动状态）：这是台账唯一的第二个
+        写入口，与 `transition` 共用同一把锁与同一次原子写。不开 `transition` 的同态
+        改写是因为 `ended` 那道拒绝防的是「同一件事收两次口」，而检查点状态恰恰要在收口
+        之后才问得到执行体——把那条拒绝改弱，代价是台账从此分不清重复收口与补记。
+        """
+        jid = str(assignment_id or "").strip()
+        job = self._job(jid)
+        if job is None:
+            return {"ok": False, "reason": f"查不到派工「{jid}」：没有台账条目的领取无法索引检查点"}
+        if self.key_fn is None:
+            return {"ok": False, "reason": (
+                "装配没注入检查点键算式（`checkpoint_task_id`）：这里不许自己抄一份——"
+                "抄出来的键与执行体落盘用的键只要差一次摘要，续跑就会去读一个空文件，"
+                "而读空会被当成「这个成员没有检查点」，把真实存在的证据说成没有"
+            )}
+        actual = str(delivered_assignment_id or "").strip() or jid
+        try:
+            key = str(checkpoint_key or "").strip() or str(self.key_fn(actual) or "").strip()
+        except Exception as exc:  # noqa: BLE001  算不出键就等于没有可索引的坐标
+            return {"ok": False, "reason": f"检查点键算不出来：{exc}"}
+        if not key:
+            return {"ok": False, "reason": f"领取「{actual}」算出的检查点键是空的，无法索引"}
+        fields = {
+            "checkpointKey": key,
+            "checkpointAssignmentId": actual,
+            "checkpointTicketId": str(ticket_id or job.get("ticketId") or ""),
+            "checkpointState": "inflight",
+            "checkpointTrackedAtMs": int(time.time() * 1000),
+        }
+        # 同一成员被并进别人那份领取时，这条 job 不会单独落检查点：标出来，
+        # 否则「这条派工有可续跑检查点」会是假的（它连自己的键都没有）。
+        if actual != jid:
+            fields["checkpointSharedWith"] = actual
+        return self.jobs.set_fields(jid, **fields)
+
+    def release(
+        self,
+        *,
+        room: Any = "",
+        member_id: Any = "",
+        assignment_id: Any,
+        status: Any,
+        end_result: dict | None = None,
+    ) -> dict:
+        """领取收口：按执行体的回执更新索引（`finished` 档已被删、`dropped/lost` 留证）。"""
+        jid = str(assignment_id or "").strip()
+        job = self._job(jid)
+        if job is None:
+            return {"ok": False, "reason": f"查不到派工「{jid}」：没有台账条目的收口不记检查点状态"}
+        end = end_result if isinstance(end_result, dict) else {}
+        st = str(status or "").strip()
+        state = "released" if st == "finished" else "interrupted"
+        fields = {
+            "checkpointState": state,
+            "checkpointReleasedAtMs": int(time.time() * 1000),
+            "checkpointReleaseStatus": st,
+        }
+        if end:
+            fields["checkpointDeletedByWorker"] = bool(end.get("checkpointDeleted"))
+            fields["checkpointKeyAtRelease"] = str(end.get("checkpointKey") or "")
+            if not end.get("ok"):
+                fields["checkpointReleaseNote"] = (
+                    f"执行体那侧没有收成口：{end.get('reason')}（索引仍按 {state} 记，"
+                    "但那份领取可能还占着槽位）"
+                )
+        return self.jobs.set_fields(jid, **fields)
+
+    # ── 读取与续跑 ──────────────────────────────────────────
+
+    def _job(self, job_id: str) -> dict | None:
+        getter = getattr(self.jobs, "get_job", None)
+        if callable(getter):
+            found = getter(job_id)
+            if isinstance(found, dict):
+                return found
+        for job in self.jobs.all_jobs():
+            if str(job.get("jobId") or "") == job_id:
+                return job
+        return None
+
+    def tracked_jobs(self, room: Any = "", member_id: Any = "") -> list:
+        """带检查点索引的派工条目（按房间/成员过滤，都留空就是全量）。"""
+        rid, mid = str(room or "").strip(), str(member_id or "").strip().lower()
+        out = []
+        for job in self.jobs.all_jobs():
+            if rid and str(job.get("room") or "") != rid:
+                continue
+            if mid and str(job.get("memberId") or "") != mid:
+                continue
+            if job.get("checkpointKey"):
+                out.append(job)
+        return out
+
+    def last_interrupted(self, room: Any, member_id: Any) -> dict | None:
+        """最近一份**可以接**的旧领取（中断留证的）；没有就返回 None。
+
+        带 `checkpointSharedWith` 的那些先排掉：同一成员被并进别人那份领取时，这条 job
+        自己没有独立的检查点文件（落盘的是实际那份领取），把它当候选会把「接上了上下文」
+        记在一个从来没有独立检查点的 job 上。
+        排序取「中断时刻 + 创建时刻」里最新的一条；重启降级的那一批用
+        `checkpointInterruptedAtMs`（没有收口时刻），两者取其一即可比出先后。
+        """
+        candidates = [
+            j for j in self.tracked_jobs(room, member_id)
+            if str(j.get("checkpointState") or "") == "interrupted"
+            and not str(j.get("checkpointSharedWith") or "")
+        ]
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda j: (
+                int(j.get("checkpointReleasedAtMs") or j.get("checkpointInterruptedAtMs") or 0),
+                int(j.get("createdAtMs") or 0),
+            ),
+        )
+
+    def carry_forward(
+        self,
+        *,
+        room: Any,
+        member_id: Any,
+        next_assignment_id: Any,
+        title: str = "",
+    ) -> dict:
+        """派工前问一句「这个成员有没有该接的上一份」；**只读**，不改台账。
+
+        改状态归 `record_assignment`（投递成功之后）与 `release`（收口之后）：
+        这里如果顺手把旧条目改成「已被接走」，投递一旦被拒（槽位满）就会留下一条
+        「检查点已被消费」的假记录——那份证据下次再没人会接。
+        """
+        rid, mid = str(room or "").strip(), str(member_id or "").strip().lower()
+        nxt = str(next_assignment_id or "").strip()
+        out: dict = {"ok": True, "carriedFrom": "", "resumable": False, "recoveryNote": ""}
+        if not rid or not mid:
+            out["reason"] = "房间与成员 id 都必填：缺一个就不知道要接谁的检查点"
+            return out
+        prev = self.last_interrupted(rid, mid)
+        if prev is None:
+            out["reason"] = "这个成员没有留下中断的检查点：按新任务起一份"
+            return out
+        prev_job_id = str(prev.get("jobId") or "")
+        if prev_job_id == nxt:
+            out["reason"] = "该接的那一份就是这一次领取本身，不接自己"
+            return out
+        source_key = str(prev.get("checkpointKey") or "")
+        ticket_id = str(prev.get("checkpointTicketId") or prev.get("ticketId") or "")
+        summary = checkpoint_summary(source_key)
+        if summary.get("ownerTicketId") and ticket_id and summary["ownerTicketId"] != ticket_id:
+            # D-48.5g 那条 wrong-owner 拒绝的同一条防线，这里提前一步：
+            # 检查点里自证的工单与要接的成员工单不一致，就当没有这份可续跑证据。
+            out["reason"] = (
+                f"候选检查点自证属于工单「{summary['ownerTicketId']}」，与成员工单「{ticket_id}」不符："
+                "按新任务起一份，不把别人的对话接进这个成员"
+            )
+            out["rejectedSource"] = prev_job_id
+            return out
+        note = ""
+        note_source = ""
+        if self.dispatcher is not None:
+            try:
+                note = str(self.dispatcher.recovery_note_for(
+                    ticket_id, prev_assignment_id=prev_job_id, title=title
+                ) or "")
+                note_source = "dispatcher"
+            except Exception as exc:  # noqa: BLE001  注记生成失败不能挡住派工
+                note = ""
+                note_source = f"调度器生成失败，改用兜底文案：{exc}"
+        if not note:
+            template = _MEMBER_CARRY_NOTE if summary["resumable"] else _MEMBER_CARRY_EMPTY
+            note = template.format(
+                prev_job_id=prev_job_id, messages=int(summary.get("messages") or 0)
+            )
+            note_source = note_source or "fallback"
+        out.update({
+            "carriedFrom": prev_job_id,
+            "sourceCheckpointKey": source_key,
+            "resumable": bool(summary["resumable"]),
+            "snapshot": summary,
+            "recoveryNote": note,
+            "noteSource": note_source,
+            "ticketId": ticket_id,
+        })
+        return out
+
+    def status_of(self, room: Any, member_id: Any) -> dict:
+        """这个成员的检查点现状（给房间视图与界面）；只报状态与计数，不报正文。"""
+        rid, mid = str(room or "").strip(), str(member_id or "").strip().lower()
+        tracked = self.tracked_jobs(rid, mid)
+        live = [j for j in tracked if str(j.get("checkpointState") or "") == "inflight"]
+        interrupted = [j for j in tracked if str(j.get("checkpointState") or "") == "interrupted"]
+        released = [j for j in tracked if str(j.get("checkpointState") or "") == "released"]
+        newest = (
+            max(
+                tracked,
+                key=lambda j: (int(j.get("updatedAtMs") or 0), int(j.get("createdAtMs") or 0)),
+            )
+            if tracked else None
+        )
+        view: dict = {
+            "room": rid,
+            "memberId": mid,
+            "tracked": len(tracked),
+            "inflight": [str(j.get("jobId") or "") for j in live],
+            "interrupted": [str(j.get("jobId") or "") for j in interrupted],
+            "released": len(released),
+            "hasResumable": False,
+        }
+        if newest is None:
+            view["reason"] = "这个成员还没有带检查点索引的派工"
+            return view
+        key = str(newest.get("checkpointKey") or "")
+        shared = str(newest.get("checkpointSharedWith") or "")
+        summary = checkpoint_summary(key)
+        view.update({
+            "lastJobId": str(newest.get("jobId") or ""),
+            "state": str(newest.get("checkpointState") or ""),
+            "checkpointKey": key,
+            "scope": str(summary.get("scope") or "none"),
+            "exists": bool(summary.get("exists")),
+            "resumable": bool(summary.get("resumable")),
+            "snapshotMessages": int(summary.get("messages") or 0),
+            "sideEffects": int(summary.get("sideEffects") or 0),
+            "savedAtMs": int(summary.get("savedAtMs") or 0),
+            "reason": str(summary.get("reason") or ""),
+            "releaseStatus": str(newest.get("checkpointReleaseStatus") or ""),
+        })
+        if shared:
+            view["note"] = (
+                f"这条派工并进了领取「{shared}」（同一成员串行）：它自己没有独立的检查点，"
+                "要看那份领取的状态"
+            )
+        # 「有没有可续跑的」跨条目回答：最新一条可能刚收口（released、档已删），
+        # 但更早那条可能留着中断证据——那才是下一次派工真能接上的东西。
+        for job in interrupted:
+            if checkpoint_summary(str(job.get("checkpointKey") or ""))["resumable"]:
+                view["hasResumable"] = True
+                view["resumableFrom"] = str(job.get("jobId") or "")
+                break
+        return view
+
+    def room_view(self, room: Any) -> dict:
+        """整个房间的成员检查点概览（`/api/checkpoint/members` 的直接返回体）。"""
+        rid = str(room or "").strip()
+        members: dict = {}
+        for job in self.tracked_jobs(rid):
+            mid = str(job.get("memberId") or "")
+            if mid:
+                members.setdefault(mid, str(job.get("memberName") or mid))
+        items = []
+        for mid, name in members.items():
+            status = self.status_of(rid, mid)
+            status["memberName"] = name
+            items.append(status)
+        items.sort(key=lambda s: str(s.get("memberId") or ""))
+        return {
+            "ok": True,
+            "room": rid,
+            "members": items,
+            "resumableCount": sum(1 for s in items if s.get("hasResumable")),
+            "interruptedCount": sum(1 for s in items if str(s.get("state") or "") == "interrupted"),
+            "note": "正文不落在这里：本视图只自述「有没有、可不可续跑、多少条」，"
+                    "对话快照仍旧在 checkpoints 目录那一份文件里",
+        }
+
+    def snapshot(self) -> dict:
+        """装配自述：索引条数与「调度器接没接」——注记口径的差别要看得见。"""
+        tracked = self.tracked_jobs()
+        return {
+            "tracked": len(tracked),
+            "byState": {
+                state: sum(1 for j in tracked if str(j.get("checkpointState") or "") == state)
+                for state in MEMBER_CHECKPOINT_STATES
+            },
+            "dispatcher": self.dispatcher is not None,
+        }

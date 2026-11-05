@@ -35,9 +35,13 @@ import RefreshIcon from '@mui/icons-material/Refresh';
 import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
 import Markdown from 'react-markdown';
 import { Message, Role, ChatEvent, StepType } from '../../../shared/types';
+import { errorTextOf } from '../../../shared/error-messages';
+import { stepToolName } from '../../../shared/step-replay';
 import ArtifactCard from '../ArtifactCard';
+import ResumeReplayDialog from '../ResumeReplayDialog';
 import Panda, { type PandaState } from '../Panda';
 import { useAppSettings } from '../../lib/use-app-settings';
+import { disclosureProps } from '../../lib/a11y';
 import { useI18n } from '../../i18n';
 
 // re-export for external usage of event types
@@ -59,7 +63,7 @@ const SandboxedHtml: React.FC<{ code: string }> = ({ code }) => {
       border: '1px solid var(--tt-border-soft)',
       borderRadius: '10px',
       overflow: 'hidden',
-      bgcolor: '#fff',
+      bgcolor: 'var(--tt-surface)',
     }}
   >
     <Box
@@ -79,11 +83,20 @@ const SandboxedHtml: React.FC<{ code: string }> = ({ code }) => {
         {tr('脚本可运行，但无法访问本机数据')}
       </Typography>
     </Box>
+    {/* 沙箱预览：srcDoc 是模型生成的独立文档，样式表按白底写；容器翻暗只会让产物里没写背景的
+        元素（默认透明）糊在暗底上，所以预览面固定白底 —— 下面 iframe 的 #fff 是有意豁免。 */}
     <iframe
       title={tr('生成式 UI 预览')}
       sandbox="allow-scripts allow-forms"
       srcDoc={code}
-      style={{ display: 'block', width: '100%', height: 420, border: 0, background: '#fff' }}
+      style={{
+        /* 亮色孤岛：生成的 HTML 自带白底文档语义，不跟随皮肤 */
+        display: 'block',
+        width: '100%',
+        height: 420,
+        border: 0,
+        background: '#fff',
+      }}
     />
   </Box>
   );
@@ -113,11 +126,18 @@ interface ChatStreamProps {
   onFeedback?: (turnIdx: number, kind: 'up' | 'down' | null) => Promise<void>;
   /** Ctrl+F 会话内查找当前定位到的轮次（0 基，与 data-turn 一致） */
   highlightTurn?: number | null;
+  /**
+   * 检查点所属轮次：只有这一轮的执行记录挂得出续跑入口。
+   * 快照按任务采集，挂到别的轮次就是承诺一个跑不起来的操作。
+   */
+  resumeTurn?: number | null;
+  /** 单步续跑（预览确认后调用）：从检查点恢复并让锚点步骤重新执行 */
+  onResumeStep?: (turnIdx: number, stepId: string) => void;
   /** 产物点击：由工作台统一接管（展开右侧任务栏并在面板内预览） */
   onArtifactOpen: (path: string) => void;
 }
 
-const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, isLoading, regeneratingTurn, onRegenerate, busy, onEditTurn, feedback = EMPTY_FEEDBACK, onFeedback, highlightTurn, onArtifactOpen }) => {
+const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, isLoading, regeneratingTurn, onRegenerate, busy, onEditTurn, feedback = EMPTY_FEEDBACK, onFeedback, highlightTurn, resumeTurn, onResumeStep, onArtifactOpen }) => {
   const { t: tr, locale } = useI18n();
   const messagesEndRef = useRef<HTMLDivElement>(null);
   // 每轮执行过程默认折叠，点击展开查看详情
@@ -127,6 +147,8 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
   // 正在改写的轮次与草稿（同一时刻只编辑一轮）
   const [editingTurn, setEditingTurn] = useState<number | null>(null);
   const [editText, setEditText] = useState('');
+  // 单步续跑：先把「哪些步骤会重做」摊开，确认后才真的发起
+  const [resumeTarget, setResumeTarget] = useState<{ turnIdx: number; stepId: string } | null>(null);
 
   // 对话字号与字体（偏好设置真实生效）
   const [appSettings] = useAppSettings();
@@ -183,7 +205,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
     try {
       await onFeedback(turnIdx, feedback[turnIdx] === kind ? null : kind);
     } catch (err: unknown) {
-      setActionMsg(err instanceof Error ? err.message : tr('评价保存失败'));
+      setActionMsg(errorTextOf(err, tr('评价保存失败')));
     }
   };
 
@@ -251,6 +273,64 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
     onEditTurn(turnIdx, next);
   };
 
+  // ── 单步续跑入口 ────────────────────────────────────────────
+
+  /**
+   * 本轮哪些步骤行挂得出续跑入口：只有检查点所属的那一轮、任务已停、且是工具步骤。
+   * 可挂的两类：失败的步骤（它没进副作用台账，续跑一定会重做——就是"重试它"），
+   * 与最后执行到的工具步骤（快照就在它之前——"从这里继续"才是真话）。
+   * 其余步骤不给入口：续跑回到的是最后一次模型调用前，不是用户选的任意一步，
+   * 挂在中间某个已完成的步骤上等于承诺一个跑不起来的操作。
+   */
+  const resumeAnchors = (
+    turnIdx: number,
+    running: boolean,
+    evts: ChatEvent[],
+  ): { state: Map<string, 'done' | 'failed' | 'running'>; anchors: Set<string> } | null => {
+    if (!onResumeStep || resumeTurn !== turnIdx || running) return null;
+    const state = new Map<string, 'done' | 'failed' | 'running'>();
+    let lastToolStep = '';
+    for (const e of evts) {
+      if (e.type === 'step_start') {
+        if (e.stepId && stepToolName(e)) {
+          state.set(e.stepId, 'running');
+          lastToolStep = e.stepId;
+        }
+      } else if (e.type === 'step_done' && e.stepId && state.has(e.stepId)) {
+        state.set(e.stepId, 'done');
+      } else if (e.type === 'step_failed' && e.stepId && state.has(e.stepId)) {
+        state.set(e.stepId, 'failed');
+      }
+    }
+    const anchors = new Set<string>();
+    state.forEach((status, id) => {
+      if (status === 'failed') anchors.add(id);
+    });
+    if (lastToolStep) anchors.add(lastToolStep);
+    return { state, anchors };
+  };
+
+  const renderResumeAction = (event: ChatEvent, turnIdx: number, running: boolean, evts: ChatEvent[]): React.ReactNode => {
+    if (event.type !== 'step_start') return null;
+    const stepId = event.stepId;
+    if (!stepId) return null;
+    const ctx = resumeAnchors(turnIdx, running, evts);
+    if (!ctx || !ctx.anchors.has(stepId)) return null;
+    const retry = ctx.state.get(stepId) === 'failed';
+    return (
+      <Box sx={{ mt: -0.75, mb: 1, ml: 2.75 }}>
+        <Button
+          size="small"
+          variant="outlined"
+          onClick={() => setResumeTarget({ turnIdx, stepId })}
+          sx={{ textTransform: 'none', fontSize: '12px', py: 0.1, px: 1 }}
+        >
+          {retry ? tr('重试此步') : tr('从此步继续')}
+        </Button>
+      </Box>
+    );
+  };
+
   // ── 执行过程明细渲染 ──────────────────────────────────────
 
   const renderEventDetail = (event: ChatEvent, idx: number, running: boolean): React.ReactNode => {
@@ -299,11 +379,11 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
     if (event.type === 'step_done') {
       return (
         <Box key={`evt-${idx}`} sx={{ mb: 1.5, display: 'flex', alignItems: 'flex-start', gap: 0.75 }}>
-          <CheckCircleIcon sx={{ fontSize: 16, color: '#22C55E', mt: '2px' }} />
+          <CheckCircleIcon sx={{ fontSize: 16, color: 'var(--tt-success)', mt: '2px' }} />
           <Box>
-            <Typography sx={{ fontSize: '13px', color: '#15803D', fontWeight: 500 }}>{tr('步骤完成')}</Typography>
+            <Typography sx={{ fontSize: '13px', color: 'var(--tt-success)', fontWeight: 500 }}>{tr('步骤完成')}</Typography>
             {event.output && (
-              <Typography sx={{ fontSize: '12px', color: '#94A3B8' }}>{event.output.substring(0, 200)}</Typography>
+              <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>{event.output.substring(0, 200)}</Typography>
             )}
           </Box>
         </Box>
@@ -313,8 +393,8 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
     if (event.type === 'step_failed') {
       return (
         <Box key={`evt-${idx}`} sx={{ mb: 1.5, display: 'flex', alignItems: 'flex-start', gap: 0.75 }}>
-          <ErrorOutlineIcon sx={{ fontSize: 16, color: '#EF4444', mt: '2px' }} />
-          <Typography sx={{ fontSize: '13px', color: '#DC2626' }}>{tr('步骤失败: {error}', { error: event.error ?? '' })}</Typography>
+          <ErrorOutlineIcon sx={{ fontSize: 16, color: 'var(--tt-danger)', mt: '2px' }} />
+          <Typography sx={{ fontSize: '13px', color: 'var(--tt-danger)' }}>{tr('步骤失败: {error}', { error: event.error ?? '' })}</Typography>
         </Box>
       );
     }
@@ -364,7 +444,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
           // 回复操作栏默认淡出，悬停整轮时再完整显示
           '&:hover .turn-actions': { opacity: 1 },
           // 查找命中轮次：描边标出位置，不改布局
-          ...(highlightTurn === turnIdx ? { outline: '2px solid #0D9488', outlineOffset: 4, borderRadius: '10px' } : {}),
+          ...(highlightTurn === turnIdx ? { outline: '2px solid var(--tt-teal)', outlineOffset: 4, borderRadius: '10px' } : {}),
         }}
       >
         <Box
@@ -390,6 +470,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
             {processEvents.length > 0 && (
               <Box sx={{ mb: delivers.length > 0 || running ? 1.25 : 0 }}>
                 <Box
+                  {...disclosureProps(processOpen, () => toggleTurn(turnIdx, processOpen), headerText)}
                   onClick={() => toggleTurn(turnIdx, processOpen)}
                   sx={{
                     display: 'inline-flex',
@@ -407,19 +488,19 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                   }}
                 >
                   {processRunning ? (
-                    <CircularProgress size={13} sx={{ color: '#22C55E' }} />
+                    <CircularProgress size={13} sx={{ color: 'var(--tt-link)' }} />
                   ) : failedCount > 0 ? (
-                    <ErrorOutlineIcon sx={{ fontSize: 14, color: '#EF4444' }} />
+                    <ErrorOutlineIcon sx={{ fontSize: 14, color: 'var(--tt-danger)' }} />
                   ) : (
-                    <CheckCircleIcon sx={{ fontSize: 14, color: '#22C55E' }} />
+                    <CheckCircleIcon sx={{ fontSize: 14, color: 'var(--tt-link)' }} />
                   )}
-                  <Typography sx={{ fontSize: '12px', color: processRunning ? '#475569' : '#64748B', flexGrow: 1 }}>
+                  <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-3)', flexGrow: 1 }}>
                     {headerText}
                   </Typography>
                   <KeyboardArrowDownIcon
                     sx={{
                       fontSize: 15,
-                      color: '#94A3B8',
+                      color: 'var(--tt-text-4)',
                       transform: processOpen ? 'rotate(180deg)' : 'none',
                       transition: 'transform 0.2s ease',
                     }}
@@ -427,7 +508,12 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                 </Box>
                 <Collapse in={processOpen}>
                   <Box sx={{ mt: 1, px: 1.5, py: 1, borderRadius: '10px', border: '1px solid var(--tt-border-soft)', background: 'var(--tt-chat-process-bg)' }}>
-                    {processEvents.map((e, i) => renderEventDetail(e, i, running))}
+                    {processEvents.map((e, i) => (
+                      <Box key={`step-row-${i}`}>
+                        {renderEventDetail(e, i, running)}
+                        {renderResumeAction(e, turnIdx, running, processEvents)}
+                      </Box>
+                    ))}
                   </Box>
                 </Collapse>
               </Box>
@@ -450,7 +536,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                     <Box sx={{ width: 40, height: 40, flexShrink: 0 }}>
                       <Panda state="done" size={40} />
                     </Box>
-                    <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#15803D' }}>
+                    <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-success)' }}>
                       {tr('任务已完成，这是你的交付物')}
                     </Typography>
                   </Box>
@@ -521,24 +607,46 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
               }}
             >
               <Tooltip title={tr('点赞')}>
-                <IconButton size="small" sx={{ width: 26, height: 26 }} onClick={() => toggleFeedback(turnIdx, 'up')}>
-                  <ThumbUpOutlinedIcon sx={{ fontSize: 15, color: feedback[turnIdx] === 'up' ? '#16A34A' : '#9CA3AF' }} />
+                <IconButton
+                  size="small"
+                  sx={{ width: 26, height: 26 }}
+                  aria-label={tr('点赞')}
+                  aria-pressed={feedback[turnIdx] === 'up'}
+                  onClick={() => toggleFeedback(turnIdx, 'up')}
+                >
+                  <ThumbUpOutlinedIcon sx={{ fontSize: 15, color: feedback[turnIdx] === 'up' ? 'var(--tt-success)' : 'var(--tt-text-4)' }} />
                 </IconButton>
               </Tooltip>
               <Tooltip title={tr('点踩')}>
-                <IconButton size="small" sx={{ width: 26, height: 26 }} onClick={() => toggleFeedback(turnIdx, 'down')}>
-                  <ThumbDownOutlinedIcon sx={{ fontSize: 15, color: feedback[turnIdx] === 'down' ? '#EF4444' : '#9CA3AF' }} />
+                <IconButton
+                  size="small"
+                  sx={{ width: 26, height: 26 }}
+                  aria-label={tr('点踩')}
+                  aria-pressed={feedback[turnIdx] === 'down'}
+                  onClick={() => toggleFeedback(turnIdx, 'down')}
+                >
+                  <ThumbDownOutlinedIcon sx={{ fontSize: 15, color: feedback[turnIdx] === 'down' ? 'var(--tt-danger)' : 'var(--tt-text-4)' }} />
                 </IconButton>
               </Tooltip>
               <Tooltip title={copiedTurn === turnIdx ? tr('已复制') : tr('复制回复')}>
-                <IconButton size="small" sx={{ width: 26, height: 26 }} onClick={() => copyTurn(turnIdx, evts)}>
-                  <ContentCopyIcon sx={{ fontSize: 14, color: copiedTurn === turnIdx ? '#16A34A' : '#9CA3AF' }} />
+                <IconButton
+                  size="small"
+                  sx={{ width: 26, height: 26 }}
+                  aria-label={tr('复制回复')}
+                  onClick={() => copyTurn(turnIdx, evts)}
+                >
+                  <ContentCopyIcon sx={{ fontSize: 14, color: copiedTurn === turnIdx ? 'var(--tt-success)' : 'var(--tt-text-4)' }} />
                 </IconButton>
               </Tooltip>
               {/* 分享：仅在本轮有文件产出时显示；复制真实产物路径，不伪造分享链接 */}
               {delivers.some((d) => (d.artifacts ?? []).length > 0) && (
                 <Tooltip title={tr('复制产出文件路径')}>
-                  <IconButton size="small" sx={{ width: 26, height: 26 }} onClick={() => copyArtifactPaths(evts)}>
+                  <IconButton
+                    size="small"
+                    sx={{ width: 26, height: 26 }}
+                    aria-label={tr('复制产出文件路径')}
+                    onClick={() => copyArtifactPaths(evts)}
+                  >
                     <ShareIcon sx={{ fontSize: 15, color: 'var(--tt-text-4)' }} />
                   </IconButton>
                 </Tooltip>
@@ -548,6 +656,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                   <IconButton
                     size="small"
                     sx={{ width: 26, height: 26 }}
+                    aria-label={tr('重新生成')}
                     disabled={regeneratingTurn != null}
                     onClick={() => onRegenerate?.(turnIdx)}
                   >
@@ -556,7 +665,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                 </span>
               </Tooltip>
               {copiedTurn === turnIdx && (
-                <Typography sx={{ fontSize: '11px', color: '#16A34A', ml: 0.5 }}>{tr('已复制')}</Typography>
+                <Typography sx={{ fontSize: '11px', color: 'var(--tt-success)', ml: 0.5 }}>{tr('已复制')}</Typography>
               )}
             </Box>
           )}
@@ -590,7 +699,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
               justifyContent: 'flex-end',
               mb: 2,
               ...(highlightTurn === currentTurn
-                ? { outline: '2px solid #0D9488', outlineOffset: 4, borderRadius: '16px' }
+                ? { outline: '2px solid var(--tt-teal)', outlineOffset: 4, borderRadius: '16px' }
                 : {}),
             }}
           >
@@ -629,7 +738,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                     }}
                   />
                   {userMessages.length - currentTurn - 1 > 0 && (
-                    <Typography sx={{ fontSize: '11.5px', color: '#B45309', mt: 0.5 }}>
+                    <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-warning)', mt: 0.5 }}>
                       {tr('提交后将删除这轮之后的 {n} 轮对话，并重新执行本轮', {
                         n: userMessages.length - currentTurn - 1,
                       })}
@@ -648,7 +757,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                         editText.trim() === String(msg.content ?? '').trim()
                       }
                       onClick={() => saveEdit(currentTurn, String(msg.content ?? ''))}
-                      sx={{ bgcolor: '#0D9488', '&:hover': { bgcolor: '#0F766E' } }}
+                      sx={{ bgcolor: 'var(--tt-teal-fill)', '&:hover': { bgcolor: '#0F766E' } }}
                     >
                       {tr('保存并重新执行')}
                     </Button>
@@ -679,6 +788,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                     <Tooltip title={tr('编辑提问')}>
                       <IconButton
                         size="small"
+                        aria-label={tr('编辑提问')}
                         onClick={() => beginEdit(currentTurn, String(msg.content ?? ''))}
                         sx={{
                           width: 24,
@@ -739,7 +849,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
               <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-2)' }}>
                 {isAi ? tr('通通') : tr('工具调用')}
               </Typography>
-              <Typography sx={{ fontSize: '11px', color: '#CBD5E1' }}>
+              <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
                 {new Date(msg.ts).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' })}
               </Typography>
               {isTool && Boolean(msg.attachments?.['toolName']) && (
@@ -750,7 +860,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                     height: 20,
                     fontSize: '11px',
                     bgcolor: 'rgba(14, 165, 233, 0.1)',
-                    color: '#0284C7',
+                    color: 'var(--tt-info)',
                     fontWeight: 600,
                   }}
                 />
@@ -778,7 +888,7 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
                       label={`📎 ${file}`}
                       size="small"
                       variant="outlined"
-                      sx={{ fontSize: '11px', height: 22, borderColor: '#E2E8F0', color: 'var(--tt-text-3)' }}
+                      sx={{ fontSize: '11px', height: 22, borderColor: 'var(--tt-border)', color: 'var(--tt-text-3)' }}
                     />
                   ))}
                 </Box>
@@ -809,6 +919,10 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
   };
   void getStepTypeLabel;
 
+  const resumePreview = resumeTarget
+    ? { turnIdx: resumeTarget.turnIdx, stepId: resumeTarget.stepId, events: turnEvents?.[resumeTarget.turnIdx] ?? [] }
+    : null;
+
   return (
     <Box
       sx={{
@@ -830,6 +944,19 @@ const ChatStream: React.FC<ChatStreamProps> = ({ messages, events, turnEvents, i
           {actionMsg}
         </Alert>
       </Snackbar>
+
+      {/* 续跑预览：先摊开「哪一步会重做、哪一步不重做」，含写操作时要勾选确认才发起 */}
+      <ResumeReplayDialog
+        open={resumePreview !== null}
+        events={resumePreview?.events ?? []}
+        anchorStepId={resumePreview?.stepId ?? ''}
+        onClose={() => setResumeTarget(null)}
+        onConfirm={(anchorStepId) => {
+          const target = resumeTarget;
+          setResumeTarget(null);
+          if (target) onResumeStep?.(target.turnIdx, anchorStepId);
+        }}
+      />
 
       {/* 自动滚动锚点 */}
       <div ref={messagesEndRef} />

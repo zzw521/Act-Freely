@@ -110,8 +110,8 @@ export interface BuiltinChatModel {
 }
 
 export const BUILTIN_CHAT_MODELS: BuiltinChatModel[] = [
-  { id: 'auto', name: 'Auto Mode', desc: '使用默认模型（未设置时按引擎配置）', color: '#6366F1' },
-  { id: 'qwen-max', name: 'Qwen3.8-Max', desc: '千问最强模型', color: '#8B5CF6', binding: 'qwen3.8-max' },
+  { id: 'auto', name: 'Auto Mode', desc: '使用默认模型（未设置时按引擎配置）', color: 'var(--tt-accent)' },
+  { id: 'qwen-max', name: 'Qwen3.8-Max', desc: '千问最强模型', color: 'var(--tt-accent-violet)', binding: 'qwen3.8-max' },
   { id: 'advanced', name: '高级', desc: '擅长复杂任务', color: '#3B82F6', binding: 'qwen3.7-max' },
   { id: 'basic', name: '基础', desc: '日常任务够用', color: '#10B981', binding: 'qwen-plus' },
   { id: 'economy', name: '经济', desc: '适合简单任务', color: '#F59E0B', binding: 'qwen-flash' },

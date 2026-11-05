@@ -54,6 +54,24 @@ describe('handleLocalMarketChannel · 如实降级', () => {
     expect(res.value).toEqual({ supported: false, skillIndexUrl: null, suiteIndexUrl: null });
   });
 
+  it('检查更新与本机清单在不支持时返回空结论而不是伪造条目', () => {
+    const check = handleLocalMarketChannel('market:updateCheck', []);
+    expect(check.handled).toBe(true);
+    expect(check.value).toMatchObject({
+      supported: false,
+      checkedAtMs: 0,
+      sourcesConfigured: 0,
+      items: [],
+      summary: { updateAvailable: 0, revoked: 0, delisted: 0, disabledApplied: 0 },
+    });
+    // 降级时也要带 errors：不能把「这条通道做不到」显示成「检查过，一切正常」
+    expect((check.value as { errors: string[] }).errors.join('')).toContain('MARKET_UNSUPPORTED');
+
+    const installed = handleLocalMarketChannel('market:installedList', []);
+    expect(installed.handled).toBe(true);
+    expect(installed.value).toEqual({ supported: false, items: [], lastCheckAtMs: null });
+  });
+
   it('列表返回 supported=false / configured=false / 空条目', () => {
     for (const channel of ['market:skillList', 'market:suiteList']) {
       const res = handleLocalMarketChannel(channel, []);
@@ -70,7 +88,7 @@ describe('handleLocalMarketChannel · 如实降级', () => {
     }
   });
 
-  it('信任查询如实声明不支持，写配置/安装/信任变更明确拒绝', async () => {
+  it('信任查询如实声明不支持，写配置/安装/升级/信任变更明确拒绝', async () => {
     expect(handleLocalMarketChannel('market:trustGet', [])).toEqual({
       handled: true,
       value: { supported: false, publishers: [] },
@@ -79,6 +97,9 @@ describe('handleLocalMarketChannel · 如实降级', () => {
       'market:configSet',
       'market:skillInstall',
       'market:suiteInstall',
+      'market:skillUpgrade',
+      'market:suiteUpgrade',
+      'market:upgradeAll',
       'market:trustAdd',
       'market:trustRemove',
     ]) {
@@ -110,6 +131,12 @@ describe('marketAPI · 走 mock-api 真实分发', () => {
     );
   });
 
+  it('浏览器通道不会假装能升级：三条升级通道同样以 MARKET_UNSUPPORTED 失败', async () => {
+    await expect(api.marketAPI.upgradeSkill('demo')).rejects.toThrowError(/^MARKET_UNSUPPORTED/);
+    await expect(api.marketAPI.upgradeSuite('demo')).rejects.toThrowError(/^MARKET_UNSUPPORTED/);
+    await expect(api.marketAPI.upgradeAll()).rejects.toThrowError(/^MARKET_UNSUPPORTED/);
+  });
+
   it('错误文案指向桌面版，不承诺浏览器可下载', () => {
     expect(errorMessageOf(ErrorCode.MARKET_UNSUPPORTED)).toContain('桌面版');
   });
@@ -118,7 +145,7 @@ describe('marketAPI · 走 mock-api 真实分发', () => {
 // ── 通道契约 ───────────────────────────────────────────────
 
 describe('市场通道与 Rust 注册', () => {
-  it('九条通道登记在 IPC 契约里', () => {
+  it('十四条通道登记在 IPC 契约里', () => {
     expect(IPC_CHANNELS.MARKET_CONFIG_GET).toBe('market:configGet');
     expect(IPC_CHANNELS.MARKET_CONFIG_SET).toBe('market:configSet');
     expect(IPC_CHANNELS.MARKET_SKILL_LIST).toBe('market:skillList');
@@ -128,9 +155,16 @@ describe('市场通道与 Rust 注册', () => {
     expect(IPC_CHANNELS.MARKET_TRUST_GET).toBe('market:trustGet');
     expect(IPC_CHANNELS.MARKET_TRUST_ADD).toBe('market:trustAdd');
     expect(IPC_CHANNELS.MARKET_TRUST_REMOVE).toBe('market:trustRemove');
+    // D-07 客户端段：检查更新 + 本机已安装清单
+    expect(IPC_CHANNELS.MARKET_UPDATE_CHECK).toBe('market:updateCheck');
+    expect(IPC_CHANNELS.MARKET_INSTALLED_LIST).toBe('market:installedList');
+    // D-07.3 一键升级：单条（技能 / 套件）+ 批量
+    expect(IPC_CHANNELS.MARKET_SKILL_UPGRADE).toBe('market:skillUpgrade');
+    expect(IPC_CHANNELS.MARKET_SUITE_UPGRADE).toBe('market:suiteUpgrade');
+    expect(IPC_CHANNELS.MARKET_UPGRADE_ALL).toBe('market:upgradeAll');
   });
 
-  it('桌面通道映射到九个 Rust command', () => {
+  it('桌面通道映射到 Rust command', () => {
     const tauriApi = src('../../../src/renderer/lib/tauri-api.ts');
     expect(tauriApi).toContain("if (channel === 'market:configGet') return invoke('market_config_get')");
     expect(tauriApi).toContain("invoke('market_config_set', { req: args[0] })");
@@ -141,6 +175,12 @@ describe('市场通道与 Rust 注册', () => {
     expect(tauriApi).toContain("if (channel === 'market:trustGet') return invoke('market_trust_get')");
     expect(tauriApi).toContain("invoke('market_trust_add', { req: args[0] })");
     expect(tauriApi).toContain("invoke('market_trust_remove', { req: args[0] })");
+    expect(tauriApi).toContain("if (channel === 'market:updateCheck') return invoke('market_update_check')");
+    expect(tauriApi).toContain("if (channel === 'market:installedList') return invoke('market_installed_list')");
+    // 升级同样只传 itemId：下载地址仍由 Rust 重新拉索引得到，页面碰不到 url
+    expect(tauriApi).toContain("invoke('market_skill_upgrade', { req: { itemId:");
+    expect(tauriApi).toContain("invoke('market_suite_upgrade', { req: { itemId:");
+    expect(tauriApi).toContain("if (channel === 'market:upgradeAll') return invoke('market_upgrade_all')");
   });
 
   it('Rust 侧命令已注册，market 模块已挂载', () => {
@@ -156,9 +196,31 @@ describe('市场通道与 Rust 注册', () => {
       'market_trust_get',
       'market_trust_add',
       'market_trust_remove',
+      'market_update_check',
+      'market_installed_list',
+      'market_skill_upgrade',
+      'market_suite_upgrade',
+      'market_upgrade_all',
     ]) {
       expect(lib, `lib.rs 缺少 market::${name}`).toContain(`market::${name},`);
     }
+  });
+
+  it('启动时后台检查一次撤销，不阻塞窗口且失败不打扰用户', () => {
+    const lib = src('../../../src-tauri/src/lib.rs');
+    expect(lib).toContain('market::startup_check(market_store)');
+    const market = src('../../../src-tauri/src/market/mod.rs');
+    expect(market).toContain('pub async fn startup_check(store: std::sync::Arc<Store>)');
+    expect(market).toContain('installed::check_updates(&store, &base).await');
+    // 检查失败只落一条 info 审计：启动路径不能被网络打断
+    expect(market).toContain('启动检查未完成（不影响本机使用）');
+    expect(market).toContain('audit::ACTION_MARKET_REVOKE');
+    expect(src('../../../src-tauri/src/security/audit.rs')).toContain(
+      'pub const ACTION_MARKET_REVOKE: &str = "market_revoke";',
+    );
+    expect(src('../../../src/renderer/components/AuditLog/index.tsx')).toContain(
+      "market_revoke: '⛔ 市场撤销'",
+    );
   });
 
   it('Mock 与引擎直连通道都先走本地市场实现', () => {
@@ -171,7 +233,7 @@ describe('市场通道与 Rust 注册', () => {
     }
   });
 
-  it('api.ts 暴露 marketAPI 九个方法', () => {
+  it('api.ts 暴露 marketAPI 十一个方法', () => {
     const s = src('../../../src/renderer/lib/api.ts');
     expect(s).toContain('export const marketAPI');
     for (const ch of [
@@ -184,9 +246,23 @@ describe('市场通道与 Rust 注册', () => {
       'MARKET_TRUST_GET',
       'MARKET_TRUST_ADD',
       'MARKET_TRUST_REMOVE',
+      'MARKET_UPDATE_CHECK',
+      'MARKET_INSTALLED_LIST',
+      'MARKET_SKILL_UPGRADE',
+      'MARKET_SUITE_UPGRADE',
+      'MARKET_UPGRADE_ALL',
     ]) {
       expect(s).toContain(`IPC_CHANNELS.${ch}`);
     }
+    expect(s).toContain('updateCheck()');
+    expect(s).toContain('installedList()');
+    expect(s).toContain('upgradeSkill(itemId: string)');
+    expect(s).toContain('upgradeSuite(itemId: string)');
+    expect(s).toContain('upgradeAll()');
+    // 升级入参同样只有 itemId：下载地址只能由 Rust 重新拉索引得到
+    expect(s).toContain('IPC_CHANNELS.MARKET_SKILL_UPGRADE, { itemId }');
+    expect(s).toContain('IPC_CHANNELS.MARKET_SUITE_UPGRADE, { itemId }');
+    expect(s).not.toMatch(/upgrade(Skill|Suite)\([^)]*(?:url|downloadUrl)/i);
   });
 });
 
@@ -251,6 +327,131 @@ describe('Rust 市场客户端安全边界', () => {
     expect(src('../../../src-tauri/src/skill/mod.rs')).toContain('pub fn install_content_in');
     expect(src('../../../src-tauri/src/suite/mod.rs')).toContain('pub fn install_bytes_in');
   });
+
+  it('D-07.3 升级复用同一条校验链，落盘改成回收旧版本', () => {
+    // 校验链由安装与升级共用一个函数，升级不是旁路
+    expect(market).toContain('async fn verified_skill_item(');
+    expect(market).toContain('async fn verified_suite_item(');
+    expect(market.match(/verified_(?:skill|suite)_item\(/g)?.length).toBeGreaterThanOrEqual(4);
+    // 升级只走一次索引：批量升级 N 条不能变成 2N+1 次请求
+    expect(market.slice(market.indexOf('async fn upgrade_item('))).toContain('verified_skill_item(&url, raw_id, &trust)');
+    // 落盘：技能与套件各自把旧版本移进回收目录，且失败时放回
+    expect(src('../../../src-tauri/src/skill/mod.rs')).toContain('pub fn upgrade_content_in(');
+    expect(src('../../../src-tauri/src/suite/mod.rs')).toContain('pub fn upgrade_bytes_in(');
+    expect(src('../../../src-tauri/src/skill/mod.rs')).toContain('fn restore_after_failed_upgrade(');
+    expect(src('../../../src-tauri/src/suite/mod.rs')).toContain('fn restore_after_failed_upgrade(');
+    // 升级成功后本机清单跟着走新版本，并清掉该条目的撤销标记
+    expect(market.slice(market.indexOf('async fn upgrade_item('))).toContain('installed::note_install(');
+    // 升级写独立审计动作，页面能区分「装」和「升」
+    expect(market).toContain('audit::ACTION_MARKET_UPGRADE');
+    expect(src('../../../src-tauri/src/security/audit.rs')).toContain(
+      'pub const ACTION_MARKET_UPGRADE: &str = "market_upgrade";',
+    );
+    expect(src('../../../src/renderer/components/AuditLog/index.tsx')).toContain(
+      "market_upgrade: '📦 市场升级'",
+    );
+    // 批量升级先检查、只吃 updateAvailable，单条失败不牵连其余
+    const all = market.slice(market.indexOf('pub async fn upgrade_all('));
+    expect(all).toContain('installed::check_updates(store, base).await?');
+    expect(all).toContain('"updateAvailable"');
+    expect(all).toContain('failed');
+  });
+
+  it('市场安装仍然不覆盖既有条目（升级才是覆盖式的那条路）', () => {
+    expect(src('../../../src-tauri/src/skill/mod.rs')).toContain('不覆盖既有技能');
+    expect(src('../../../src-tauri/src/suite/mod.rs')).toContain('不覆盖既有套件');
+    // 升级对「本机没装过」的条目直接拒绝，不借升级之名装新东西
+    expect(src('../../../src-tauri/src/skill/mod.rs')).toContain('尚未安装，无法升级；请改用安装');
+    expect(src('../../../src-tauri/src/suite/mod.rs')).toContain('尚未安装，无法升级；请改用安装');
+  });
+});
+
+// ── D-07 客户端段：已安装清单 → 检查更新 → 撤销不可执行 ───────
+
+describe('已安装清单与撤销拦截（D-07 客户端段）', () => {
+  const installed = src('../../../src-tauri/src/market/installed.rs');
+  const market = src('../../../src-tauri/src/market/mod.rs');
+  const runtime = src('../../../src-tauri/src/bridge/runtime.rs');
+  const skillMod = src('../../../src-tauri/src/skill/mod.rs');
+  const suiteMod = src('../../../src-tauri/src/suite/mod.rs');
+
+  it('三份本机状态分键存放，撤销标记独立于用户开关', () => {
+    expect(installed).toContain('const REGISTRY_KEY: &str = "market.installed"');
+    expect(installed).toContain('const REVOKED_KEY: &str = "market.revoked"');
+    expect(installed).toContain('const LAST_CHECK_KEY: &str = "market.lastCheckAtMs"');
+    // 执行面读的是撤销标记，不是用户能拨的禁用清单
+    expect(installed).toContain('pub fn blocked_ids(store: &Store, kind: &str) -> Vec<String>');
+  });
+
+  it('安装成功落清单、卸载清记录，撤销命中才写标记', () => {
+    expect(market).toContain('installed::note_install(');
+    expect(skillMod).toContain('crate::market::installed::forget(&p0.store, crate::market::KIND_SKILL, id)?');
+    expect(suiteMod).toContain(
+      'crate::market::installed::forget(&p0.store, crate::market::KIND_SUITE, id)?',
+    );
+    expect(installed).toContain('pub fn note_install(');
+    expect(installed).toContain('pub fn forget(');
+  });
+
+  it('撤销只作用于市场安装的记录，本机扫盘补齐的同名条目不误伤', () => {
+    expect(installed).toContain('PROVENANCE_MARKET: &str = "market"');
+    expect(installed).toContain('const PROVENANCE_SCANNED: &str = "scanned"');
+    expect(installed).toContain('r.provenance.as_deref() == Some(PROVENANCE_MARKET)');
+    // 版本对不上时不阻断：拿不确定的版本去禁用属于误伤
+    expect(installed).toContain('(Some(_), None) => false');
+  });
+
+  it('检查更新会真的把撤销落到禁用清单并写审计', () => {
+    expect(installed).toContain('skill::set_disabled(store, &mark.item_id, true)');
+    expect(installed).toContain('suite::set_disabled(store, &mark.item_id, true)');
+    expect(installed).toContain('audit::ACTION_MARKET_REVOKE');
+    // 状态词表固定六种，比不了就说不清，不写「已最新」
+    for (const status of [
+      '"upToDate"',
+      '"updateAvailable"',
+      '"ahead"',
+      '"unknownVersion"',
+      '"delisted"',
+      '"revoked"',
+    ]) {
+      expect(installed, `缺少状态 ${status}`).toContain(status);
+    }
+  });
+
+  it('已撤销条目在安装口被拒，列表页与安装口径一致', () => {
+    expect(market).toContain('fn ensure_not_revoked(');
+    expect(market).toContain('MARKET_ITEM_REVOKED');
+    // 技能与套件两条安装路径都要过这道闸门
+    expect(market.match(/ensure_not_revoked\(/g)?.length).toBeGreaterThanOrEqual(2);
+    expect(market).toContain('fn revoked_decl_for(');
+  });
+
+  it('用户开关不能把已撤销的包重新放回执行面', () => {
+    expect(skillMod).toContain('fn ensure_can_enable(store: &Store, dir: &Path, id: &str)');
+    expect(skillMod).toContain('crate::market::installed::revoked_reason_for(');
+    expect(skillMod).toContain('MARKET_ITEM_REVOKED');
+    // 既有的安全扫描闸门仍在同一函数里，没被市场改动绕过
+    expect(skillMod).toContain('ensure_enable_allowed(dir, id)');
+  });
+
+  it('运行时装配按撤销标记把技能与套件一起摘掉', () => {
+    expect(runtime).toContain('crate::market::installed::blocked_ids(s, crate::market::KIND_SKILL)');
+    expect(runtime).toContain('crate::market::installed::blocked_ids(s, crate::market::KIND_SUITE)');
+    expect(runtime).toContain('已被市场撤销，本轮未进入执行面');
+    expect(runtime).toContain('ids.extend(blocked_suites.iter().cloned());');
+    expect(suiteMod).toContain('套件「{id}」已禁用（用户停用或市场撤销），本轮未进入执行面');
+  });
+
+  it('撤销声明三个来源合并，读不到时如实带出而不是当作没有撤销', () => {
+    expect(market).toContain('"revokedVersions"');
+    expect(market).toContain('.get("revokedUrl")');
+    expect(market).toContain('async fn fetch_revoked_decls');
+    // 撤销清单走与索引相同的地址校验，不能借 revokedUrl 跳到内网
+    expect(market.slice(market.indexOf('async fn fetch_revoked_decls')))
+      .toContain('ensure_target_allowed(&url, local).await?');
+    expect(market).toContain('revokedSourceOk');
+    expect(market).toContain('revokedSourceError');
+  });
 });
 
 // ── 页面接线 ───────────────────────────────────────────────
@@ -274,6 +475,41 @@ describe('市场窗口与页面接线', () => {
   it('浏览器通道在市场窗口里如实提示，不展示条目', () => {
     expect(browser).toContain('当前运行通道没有市场下载与落盘能力');
     expect(browser).toContain('config !== null && !config.supported');
+  });
+
+  it('窗口里接线了检查更新与本机清单，且降级时不伪造状态', () => {
+    expect(browser).toContain('await marketAPI.updateCheck()');
+    expect(browser).toContain('await marketAPI.installedList()');
+    expect(browser).toContain('检查更新');
+    expect(browser).toContain('上次检查');
+    // 撤销条目在列表里就显示出来，并把安装入口换成不可安装
+    expect(browser).toContain('item.revoked');
+    expect(browser).toContain('不可安装');
+    expect(browser).toContain('已撤销');
+    // 从未检查过时显示「从未」，而不是编一个时间
+    expect(browser).toContain("if (!ms || !Number.isFinite(ms)) return '从未'");
+    // 本机清单读不到时留空并说明，不拿示例条目冒充
+    expect(browser).toContain('本机清单读不到不影响市场浏览');
+    // 版本比不了时如实说比不了（六种状态词表在前端同样只报查得出来的）
+    expect(browser).toContain('unknownVersion: { label: ');
+    expect(browser).not.toMatch(/status === 'unknownVersion'[\s\S]{0,80}已是最新/);
+  });
+
+  it('D-07.3：页面有单条升级与全部升级入口，旧的「先卸载再安装」口径已作废', () => {
+    expect(browser).toContain('await marketAPI.upgradeSkill(item.id)');
+    expect(browser).toContain('await marketAPI.upgradeSuite(item.id)');
+    expect(browser).toContain('await marketAPI.upgradeAll()');
+    expect(browser).toContain('全部升级');
+    expect(browser).toContain("'升级'");
+    // 升级入参同样只有 itemId
+    expect(browser).not.toMatch(/upgrade(?:Skill|Suite)\(\s*item\.(?:url|downloadUrl)/);
+    // 教用户「先卸载再安装」的提示不能留下：那是升级还没做时的临时口径
+    expect(browser).not.toContain('先卸载再安装即可完成更新');
+    expect(browser).not.toContain('需先卸载再安装');
+    // 升级不替用户把被撤销/禁用后的开关拨回去：回执里的禁用状态要显示出来
+    expect(browser).toContain('该条目仍是禁用状态');
+    // 批量升级的失败条目要说清「失败的仍停在原版本」，不能一句「部分失败」糊过去
+    expect(browser).toContain('失败的仍停在原版本');
   });
 
   it('技能页有在线市场入口，并保留本地上传/对话创建', () => {
@@ -308,6 +544,8 @@ describe('市场错误码文案全覆盖', () => {
     ErrorCode.MARKET_ITEM_NOT_FOUND,
     ErrorCode.MARKET_HASH_MISMATCH,
     ErrorCode.MARKET_TOO_LARGE,
+    ErrorCode.MARKET_ITEM_REVOKED,
+    ErrorCode.MARKET_UNTRUSTED_PUBLISHER,
   ];
 
   it('每个市场错误码都有中文文案，不裸奔', () => {

@@ -18,11 +18,13 @@ import type {
   ChatStepPreview,
   WaitReason,
   WorkMode,
+  FilePermissionMode,
   CheckpointInfo,
 } from '../../shared/types';
 import { Role, PlanStatus, StepStatus, FileOpType, FileOpStatus, TaskStatus } from '../../shared/types';
 import type { QuotaSnapshot } from '../../shared/contracts';
-import { errorMessageOf, errorTextOf } from '../../shared/error-messages';
+import { errorMessageOf, errorTextOf, rawErrorText } from '../../shared/error-messages';
+import { unavailableReasonZh } from '../../shared/step-replay';
 import { archiveTask, getSettings, listArchived } from '../lib/alignment-api';
 import {
   feedbackOfTurns,
@@ -44,6 +46,7 @@ import { chatModelSelectionOf, modelBaseUrl } from '../lib/chat-models';
 import { browserPptxTemplates } from '../../shared/pptx-templates';
 import { getActiveWorkspaceId } from './workspaceStore';
 import { useAppStore } from '../stores/useAppStore';
+import { useModelUsageStore } from '../stores/useModelUsageStore';
 import {
   claimNoticeKey,
   noticeKindFor,
@@ -51,6 +54,14 @@ import {
   type NoticeKind,
 } from '../lib/notify-local';
 import { markTaskUnread } from '../lib/badge-local';
+import {
+  dropConversationFilePermission,
+  filePermissionAfterConfirm,
+  getConversationFilePermission,
+  normalizeFileMode,
+  resolveFilePermission,
+  setConversationFilePermission,
+} from '../lib/file-permission';
 import { captureCollabDeliver, captureCollabFailure, completeCollabRun } from '../lib/collab-run';
 
 // ── 状态接口 ─────────────────────────────────────────────────
@@ -80,6 +91,12 @@ export interface ConversationState {
   /** 本轮/本会话使用的模式（重新生成时沿用，避免通用模式重跑幻灯片任务） */
   workMode?: WorkMode;
   /**
+   * 本会话的文件访问档位（真实目录里的创建/更新/删除能放开到哪）。
+   * 与 workMode 同性质：本会话内一直有效，重新生成/改写都沿用这一档，
+   * 权威值同时落在 lib/file-permission.ts 的本地台账里（刷新后仍在）。
+   */
+  filePermission?: FilePermissionMode;
+  /**
    * 轮次 → 当轮提交的模型选择。重新生成回放的是这一轮当初的模型，
    * 不是当前输入框里后来切换的选择；空对象表示当轮用 Auto（不覆盖后端默认）。
    * 只活在本次会话状态里：刷新后旧轮次没有记录，回退到当前选择。
@@ -102,12 +119,19 @@ export interface ConversationState {
   taskStatus: TaskStatus | null;
   taskMeta: TaskMetaView;
   quotaSnapshot: QuotaSnapshot | null;
+  /** 会话所属工作区（新建时取当前工作区；从正文库恢复时取库内归属） */
+  workspaceId: string;
   /**
    * 最近一次任务收尾时的检查点状态。resumable=true 才显示「从检查点继续」；
    * 检查点默认落盘（scope=disk），刷新或引擎重启后仍可恢复；
    * 落盘失败时 scope=same-process，会如实告知本次进程外不可恢复。
    */
   checkpoint: CheckpointInfo | null;
+  /**
+   * 检查点属于哪一轮（0 基）。续跑回到的是这一轮最后一次模型调用前的快照，
+   * 别的轮次根本没有对应检查点 —— 入口挂错轮次就是假承诺。
+   */
+  checkpointTurn: number | null;
   isLoading: boolean;
   error: string | null;
   /**
@@ -123,6 +147,8 @@ export interface ConversationSummary {
   title: string;
   createdAt: number;
   isLoading: boolean;
+  /** 所属工作区（侧边栏「当前项目」筛选按它匹配） */
+  workspaceId: string;
 }
 
 interface WorkbenchState {
@@ -144,8 +170,21 @@ interface WorkbenchState {
   taskMeta: TaskMetaView;
   quotaSnapshot: QuotaSnapshot | null;
   checkpoint: CheckpointInfo | null;
+  /** 当前激活会话检查点所属轮次（镜像） */
+  checkpointTurn: number | null;
   isLoading: boolean;
   error: string | null;
+  /**
+   * 当前激活会话的文件访问档位（镜像）。undefined = 这一轮会话还没表态，
+   * 提交时回落到设置页的全局默认；档位本体在会话态与 tt:conversationFilePermission 台账里。
+   */
+  filePermission: FilePermissionMode | undefined;
+
+  /**
+   * 新任务页（还没有会话）里选下的档位草稿。第一条消息建会话时写进该会话的档位台账，
+   * 之后就是普通的每会话档位；切换或新建会话即作废，不会跟着漂到别的会话。
+   */
+  draftFilePermission: { mode: FilePermissionMode; confirmedAtMs: number | null } | null;
 
   /** 历史任务列表（chat_history，保留兼容） */
   historyTasks: unknown[];
@@ -187,7 +226,7 @@ interface WorkbenchState {
    * 失败时抛错，由调用方提示（不静默移除会话）。
    */
   archiveConversation: (id: string) => Promise<void>;
-  submitGoal: (goal: string, attachments?: import('../../shared/types').AttachmentMeta[], modelBinding?: string, workDir?: string, modelId?: string, mode?: WorkMode, expertId?: string) => Promise<void>;
+  submitGoal: (goal: string, attachments?: import('../../shared/types').AttachmentMeta[], modelBinding?: string, workDir?: string, modelId?: string, mode?: WorkMode, expertId?: string, filePermission?: FilePermissionMode) => Promise<void>;
   /** 重新生成指定轮次的回复（重置该轮事件流后重新提交原目标） */
   regenerateTurn: (turnIdx: number) => Promise<void>;
   /**
@@ -202,8 +241,13 @@ interface WorkbenchState {
    */
   setTurnFeedback: (convId: string, turnIdx: number, kind: 'up' | 'down' | null) => Promise<void>;
   reviewPlan: (action: 'approve' | 'reject' | 'modify', patch?: Partial<Step>[]) => Promise<void>;
-  /** 从中断前最近一次模型调用前的检查点继续（同一 taskId，不新增对话轮次） */
-  resumeTask: () => Promise<void>;
+  /**
+   * 从检查点续跑（同一 taskId，不新增对话轮次）：stepId 是界面上选定的锚点步骤，
+   * 通常就是失败的那一步；传空表示本轮已没有步骤记录，只能整任务续跑。
+   * 运行时回到的是最后一次模型调用前的快照，不是所选步骤；已成功的副作用调用
+   * 由台账按指纹跳过，所以「只重做这一步」只在它确实没成功时才成立。
+   */
+  resumeTaskFromStep: (turnIdx: number, stepId?: string) => Promise<void>;
   cancelTask: () => Promise<void>;
   loadHistory: () => Promise<void>;
   /** 按正文库重建会话显示（设置页「运行修复」的真实动作），返回各分类条数 */
@@ -221,6 +265,11 @@ interface WorkbenchState {
   setChatExpertId: (id: string) => void;
   /** 记住输入框选中的工作台模式（跨 ChatInput 实例重挂不丢） */
   setWorkMode: (mode: WorkMode) => void;
+  /**
+   * 切换当前会话的文件访问档位。`confirmedAtMs` 只在切到「完全访问」时有意义：
+   * 没有它，lib/file-permission 会把这次选择按最保守档落账（红色确认没做过就不算批准）。
+   */
+  setFilePermission: (mode: FilePermissionMode, confirmedAtMs?: number) => void;
   clearError: () => void;
   reset: () => void;
 }
@@ -230,7 +279,9 @@ const WAIT_REASON_TEXT: Record<string, string> = {
   rate_limited: '模型繁忙，退避重试中',
   circuit_break: '模型熔断，切换备用模型中',
   quota_wait: '配额排队中',
-  budget_wait: '预算暂停，恢复后自动继续',
+  // 本机的预算暂停没有自动恢复：单任务上限不会到点重置，必须人工调高后点「继续」。
+  // 旧文案写「恢复后自动继续」是句假话，用户会干等。
+  budget_wait: '预算暂停：调高预算后需在任务上点「继续」，不会自动恢复',
   lease_wait: '等待执行租约',
   pending_review_ttl: '审阅超期',
 };
@@ -270,7 +321,9 @@ function emptyConv(): ConversationState {
     taskStatus: null,
     taskMeta: {},
     quotaSnapshot: null,
+    workspaceId: getActiveWorkspaceId() || 'default',
     checkpoint: null,
+    checkpointTurn: null,
     isLoading: false,
     error: null,
   };
@@ -293,8 +346,10 @@ function mirrorOf(c: ConversationState | undefined) {
     taskMeta: conv.taskMeta,
     quotaSnapshot: conv.quotaSnapshot,
     checkpoint: conv.checkpoint,
+    checkpointTurn: conv.checkpointTurn,
     isLoading: conv.isLoading,
     error: conv.error,
+    filePermission: conv.filePermission,
   };
 }
 
@@ -302,7 +357,13 @@ function summariesOf(convs: Record<string, ConversationState>, order: string[]):
   return order
     .map((id) => convs[id])
     .filter((c) => c && c.messages.length > 0)
-    .map((c) => ({ id: c.id, title: c.title, createdAt: c.createdAt, isLoading: c.isLoading }));
+    .map((c) => ({
+      id: c.id,
+      title: c.title,
+      createdAt: c.createdAt,
+      isLoading: c.isLoading,
+      workspaceId: c.workspaceId,
+    }));
 }
 
 /** 正文库轮次 → 交付物面板条目（与 applyEvent('deliver') 同一构造口径） */
@@ -327,11 +388,18 @@ function restoredFileOps(turns: RestoredTurn[]): FileOp[] {
  * 正文库 → 会话状态（刷新/重启后重建侧边栏与对话正文）。
  * 过程明细此刻不补齐：事件流按任务回放，等到首次切进该会话再做，避免启动时打一堆回放。
  */
-function restoredConv(convId: string, title: string, createdAtMs: number, turns: RestoredTurn[]): ConversationState {
+function restoredConv(
+  convId: string,
+  title: string,
+  createdAtMs: number,
+  turns: RestoredTurn[],
+  workspaceId: string
+): ConversationState {
   const base = emptyConv();
   return {
     ...base,
     id: convId,
+    workspaceId: workspaceId || 'default',
     title,
     createdAt: createdAtMs || base.createdAt,
     messages: restoredUserMessages(turns),
@@ -340,6 +408,9 @@ function restoredConv(convId: string, title: string, createdAtMs: number, turns:
     feedbackByTurn: feedbackOfTurns(turns),
     fileOps: restoredFileOps(turns),
     taskId: turns.length ? turns[turns.length - 1].taskId : null,
+    // 档位不在消息台账里（隐私模式故意不写消息台账），刷新后从本地档位台账补水；
+    // 没记录就是未表态，由全局默认决定。
+    filePermission: getConversationFilePermission(convId) ?? undefined,
     pendingProcess: true,
   };
 }
@@ -406,7 +477,7 @@ export async function approvePlanWhenReady(
       await review(taskId);
       return;
     } catch (err) {
-      const raw = typeof err === 'string' ? err : err instanceof Error ? err.message : '';
+      const raw = rawErrorText(err);
       const retriable = APPROVE_NOT_READY.test(raw) && !APPROVE_TASK_SETTLED.test(raw);
       if (!retriable || attempt === maxAttempts) {
         onFailure(errorTextOf(err, '自动批准失败'));
@@ -440,6 +511,8 @@ async function notifyForEvent(kind: NoticeKind, title: string, taskId: string | 
     soundNotify: Boolean(s?.soundNotify),
     focusCheck: () => focused,
   });
+  // 交付即落账：任务完成后重读预算，档位跃迁才会当场变成用户看得见的提醒（缺陷 D-14）
+  if (kind === 'delivered') void useModelUsageStore.getState().loadBudget();
 }
 
 function applyEvent(
@@ -524,11 +597,17 @@ function applyEvent(
       // 取消/失败后收尾仍可能补发 done：终态不能被改写成「已完成」
       const terminal =
         conv.taskStatus === TaskStatus.CANCELLED || conv.taskStatus === TaskStatus.FAILED;
+      // 被单任务预算拦停的也一样：done 只代表这一轮事件流结束了，任务其实是
+      // 停在「预算暂停」等人工唤回（缺陷 D-14.1/14.2）。改写成就绪态的话，
+      // 徽标变成「已完成」，「调高预算后点继续」的入口看起来就像没必要点。
+      const pausedByBudget = conv.taskStatus === TaskStatus.BUDGET_PAUSED;
       return {
         ...base,
         ...regenPatch,
+        // 流确实结束了：isLoading 必须放开，否则「继续」会被自己的
+        // 「任务仍在执行中」闸门挡住（resumeTaskFromStep 先看 isLoading）。
         isLoading: preExecution ? conv.isLoading : false,
-        taskStatus: terminal || preExecution ? conv.taskStatus : TaskStatus.DONE,
+        taskStatus: terminal || preExecution || pausedByBudget ? conv.taskStatus : TaskStatus.DONE,
       };
     }
 
@@ -563,6 +642,10 @@ function applyEvent(
     }
 
     case 'quota_warning': {
+      // 单任务预算的预警（scope=task）不能盖掉日额度快照：两本账的口径不同，
+      // 拿「本任务已用 / 单任务上限」去填「今日已用 / 今日额度」，用量页就会显示假数字。
+      // 这一档的可见信息走事件流本身（暂停说明 + status_change 徽标），不改快照。
+      if (event.scope === 'task') return base;
       return {
         ...base,
         quotaSnapshot: {
@@ -576,7 +659,12 @@ function applyEvent(
 
     // 引擎收尾时下发：resumable=true 才能续跑。同一任务续跑成功后会被新的收尾事件覆盖为 false。
     case 'checkpoint':
-      return { ...base, checkpoint: event };
+      // 记下检查点归属的轮次：续跑入口只能挂在这一轮，别的轮次没有对应快照
+      return {
+        ...base,
+        checkpoint: event,
+        checkpointTurn: event.taskId ? conv.taskTurnMap[event.taskId] ?? turnIdx : turnIdx,
+      };
 
     case 'heartbeat':
       return null; // 心跳仅保活，不产生 UI 变更
@@ -653,6 +741,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
             turnIndex: turnIdx,
             role: 'assistant',
             taskId: evTaskId ?? '',
+            workspaceId: target.workspaceId,
             content,
             artifacts: deliver.artifacts ?? [],
             tsMs: Date.now(),
@@ -715,13 +804,18 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
         : { checkpoints: {} as Record<string, CheckpointInfo> };
       const finalConv = get().convs[convId];
       if (!finalConv || finalConv.isLoading || finalConv.turnEvents.length !== turns.length) return;
+      const restoredCheckpoint =
+        finalConv.checkpoint ??
+        (latestTaskId ? checkpointResp.checkpoints[latestTaskId] ?? null : null);
       patchConv(convId, {
         turnEvents: restoredTurnEvents(turns, processByTask),
         taskTurnMap: { ...finalConv.taskTurnMap, ...taskTurnMapOf(turns) },
         // 运行中的任务查询结果不可续跑；实时事件已写入的检查点优先保留
-        checkpoint:
-          finalConv.checkpoint ??
-          (latestTaskId ? checkpointResp.checkpoints[latestTaskId] ?? null : null),
+        checkpoint: restoredCheckpoint,
+        // 查询回来的检查点属于最后一轮任务：续跑入口只挂在那一轮
+        ...(finalConv.checkpoint === null && restoredCheckpoint
+          ? { checkpointTurn: turns.length - 1 }
+          : {}),
         pendingProcess: false,
       });
     } catch {
@@ -737,6 +831,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
     activeId: null,
     conversations: [],
     ...mirrorOf(undefined),
+    // 新任务页在会话建立之前选的档位先搁在这儿，第一条消息建会话时写进台账
+    draftFilePermission: null,
     historyTasks: [],
     planVisible: false,
     filePanelOpen: true,
@@ -761,6 +857,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
         activeId: conv.id,
         conversations: summariesOf({ ...st.convs, [conv.id]: conv }, [conv.id, ...st.convOrder]),
         ...mirrorOf(conv),
+        // 会话已建立，档位归会话台账管：欢迎页的草稿不能跟着漂进这条新会话
+        draftFilePermission: null,
         planVisible: false,
         error: null,
       }));
@@ -770,7 +868,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
       const s = get();
       const conv = s.convs[id];
       if (!conv || id === s.activeId) return;
-      set({ activeId: id, ...mirrorOf(conv) });
+      set({ activeId: id, ...mirrorOf(conv), draftFilePermission: null });
       // 刷新后重建出来的会话：首次切到时按任务回放事件流补齐「执行过程」明细
       if (conv.pendingProcess) void hydrateProcess(id);
     },
@@ -783,6 +881,9 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
       if (!conv) return;
       // 会话未提交过任务时以会话 id 为归档键，保证本地通道仍可标记与恢复
       await archiveTask(conv.taskId ?? id, { title: conv.title });
+
+      // 会话没了就不该留下越权档位：归档即清，避免留孤儿键（尤其是完全访问）
+      dropConversationFilePermission(id);
 
       const nextOrder = s.convOrder.filter((k) => k !== id);
       const nextConvs: Record<string, ConversationState> = {};
@@ -804,8 +905,11 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
 
     // ── 提交目标 ──────────────────────────────────────────────
 
-    submitGoal: async (goal: string, attachments?: import('../../shared/types').AttachmentMeta[], modelBinding?: string, workDir?: string, modelId?: string, mode?: WorkMode, expertId?: string) => {
+    submitGoal: async (goal: string, attachments?: import('../../shared/types').AttachmentMeta[], modelBinding?: string, workDir?: string, modelId?: string, mode?: WorkMode, expertId?: string, filePermission?: FilePermissionMode) => {
       ensureRouter();
+      // 欢迎页（还没有会话）选的档位先攥在这儿，建完会话立刻写进它的档位台账，
+      // 否则用户确认过的「完全访问」会在第一条消息时回落成全局默认。
+      const draft = get().draftFilePermission;
       let s = get();
       // 无激活会话则先创建（直接进入的兜底路径）
       if (!s.activeId || !s.convs[s.activeId]) {
@@ -813,6 +917,9 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
         s = get();
       }
       const convId = s.activeId as string;
+      if (draft) {
+        setConversationFilePermission(convId, draft.mode, { confirmedAtMs: draft.confirmedAtMs });
+      }
 
       const userMsg: Message = {
         id: `msg-${Date.now()}-user`,
@@ -826,6 +933,15 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
       // 本轮轮次号（0 起）：正文库与后端按它定位本轮回复，重新生成时覆盖同一轮
       const turnIndex = conv.turnEvents.length;
       const userTs = Date.now();
+
+      // 隐私模式与文件访问档位都读自设置：这里读一次，落账与提交共用同一个值
+      const settings = await getSettings().catch(() => null);
+      const privacy = Boolean(settings?.privacyMode);
+      // 本轮实际生效档位：调用方显式指定 > 会话已选（台账补水） > 全局默认 > 最保守档
+      const effectiveFilePermission =
+        filePermission ??
+        conv.filePermission ??
+        resolveFilePermission(convId, settings?.filePermissionDefault);
 
       // 组装此前轮次对话历史（同会话上下文保持；截断压缩由引擎侧完成）
       const history: Array<{ role: 'user' | 'assistant'; content: string }> = [];
@@ -848,11 +964,14 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
         fileOps: [],
         taskMeta: {},
         checkpoint: null,
+        checkpointTurn: null,
         // 新任务从干净状态开始：上一轮的 failed/cancelled 不能带进这一轮
         taskStatus: null,
         isLoading: true,
         error: null,
         workMode: mode ?? 'general',
+        // 本轮实际生效的文件访问档位：重新生成/改写沿用它，不跟着输入框后来的选择变
+        filePermission: effectiveFilePermission,
         // 记住这一轮提交时的模型选择：重新生成要回放当轮模型，而不是当前输入框的选择
         turnModels: {
           ...conv.turnModels,
@@ -869,9 +988,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
         title: conv.messages.length === 0 ? goal.slice(0, 20) : conv.title,
       });
 
-      // 隐私模式：本轮提问与回复都不写本地台账（桌面端由 Rust 同步跳过 SQLite）
-      const settings = await getSettings().catch(() => null);
-      const privacy = Boolean(settings?.privacyMode);
+      // 隐私模式与档位用的 settings 已在本轮开头一次读好（见 effectiveFilePermission）
 
       // 提问正文先落库（桌面端由 Rust 随任务写入，这里服务 Mock / 浏览器直连引擎）：
       // 即便随后提交失败，刷新后这轮提问仍在会话里，与界面所见一致
@@ -881,6 +998,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
           turnIndex,
           role: 'user',
           taskId: '',
+          workspaceId: get().convs[convId]?.workspaceId || getActiveWorkspaceId(),
           content: goal,
           artifacts: [],
           tsMs: userTs,
@@ -902,8 +1020,12 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
           attachments,
           modelBinding,
           modelId,
+          // 上一轮实际用的模型：本轮换了就在过程里说清「历史带着走，只按新端点重新编码」
+          previousModelId: conv.turnModels[turnIndex - 1]?.modelId,
           expertId: expertId?.trim() || undefined,
           workDir,
+          // 文件访问档位：桌面端 Rust 会再按会话/设置归一一次，浏览器直连靠这个字段带给引擎
+          filePermission: effectiveFilePermission,
           secureEnv,
           // 桌面端由 Rust 从设置表装配 runtime；浏览器直连靠这一项把档位带给引擎
           piiOutboundMode: settings?.piiOutboundMode,
@@ -935,6 +1057,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
             turnIndex,
             role: 'user',
             taskId,
+            workspaceId: get().convs[convId]?.workspaceId || getActiveWorkspaceId(),
             content: goal,
             artifacts: [],
             tsMs: userTs,
@@ -964,7 +1087,18 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
       patchConv(conv.id, {
         turnEvents: conv.turnEvents.map((g, i) => (i === turnIdx ? [] : g)),
         regeneratingTurn: turnIdx,
-        ...(isLast ? { plan: null, fileOps: [], taskMeta: {}, checkpoint: null, isLoading: true, error: null, taskStatus: null } : {}),
+        ...(isLast
+          ? {
+              plan: null,
+              fileOps: [],
+              taskMeta: {},
+              checkpoint: null,
+              checkpointTurn: null,
+              isLoading: true,
+              error: null,
+              taskStatus: null,
+            }
+          : {}),
       });
 
       try {
@@ -982,6 +1116,9 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
           goal,
           // 重新生成沿用原会话模式：幻灯片任务不该在通用模式下重跑成 Markdown
           mode: conv.workMode ?? 'general',
+          // 同样沿用当轮确认过的文件访问档位：重新生成不能把「完全访问」悄悄降成默认档，
+          // 也不能反过来把没确认过的档位悄悄升上去（档位没记录时按最保守档）
+          filePermission: conv.filePermission ?? 'ask_every_time',
           workspaceId: getActiveWorkspaceId(),
           secureEnv,
           piiOutboundMode: settings?.piiOutboundMode,
@@ -1013,6 +1150,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
             turnIndex: turnIdx,
             role: 'user',
             taskId,
+            workspaceId: conv.workspaceId,
             content: goal,
             artifacts: [],
             tsMs: Date.now(),
@@ -1089,6 +1227,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
         fileOps: [],
         taskMeta: {},
         checkpoint: null,
+        checkpointTurn: null,
         taskStatus: null,
         taskId: null,
         regeneratingTurn: turnIdx,
@@ -1106,6 +1245,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
           goal: trimmed,
           // 沿用原会话模式：幻灯片任务不该在通用模式下重跑成 Markdown
           mode: conv.workMode ?? 'general',
+          // 改写提问后重跑同样沿用当轮档位；没记录就回到最保守档，不跟随全局默认放开
+          filePermission: conv.filePermission ?? 'ask_every_time',
           workspaceId: getActiveWorkspaceId(),
           secureEnv,
           piiOutboundMode: settings?.piiOutboundMode,
@@ -1120,6 +1261,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
               : undefined,
           modelBinding: model.modelBinding,
           modelId: model.modelId,
+          // 重跑也按「上一轮的模型 → 本轮的模型」判断是否换了：说明口径与首发一致
+          previousModelId: conv.turnModels[turnIdx - 1]?.modelId,
           expertId: conv.turnExperts[turnIdx] || undefined,
           history: history.length > 0 ? history : undefined,
           conversationId: conv.id,
@@ -1136,6 +1279,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
             turnIndex: turnIdx,
             role: 'user',
             taskId,
+            workspaceId: conv.workspaceId,
             content: trimmed,
             artifacts: [],
             tsMs: Date.now(),
@@ -1169,7 +1313,9 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
         if (before) rollback[turnIdx] = before;
         else delete rollback[turnIdx];
         patchConv(convId, { feedbackByTurn: rollback });
-        throw err instanceof Error ? err : new Error(String(err));
+        // 原样上抛：Rust/引擎的拒绝值已经是 `CODE: 详情`，界面用 errorTextOf 归一；
+        // 在这里包装成 Error 只会把非 Error 载荷压成 [object Object]
+        throw err;
       }
     },
 
@@ -1205,20 +1351,61 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
       }
     },
 
-    // ── 从检查点继续（同一 taskId 重跑，不新增对话轮次） ──────────
+    // ── 从检查点续跑（同一 taskId 重跑，不新增对话轮次） ──────────
 
-    resumeTask: async () => {
+    resumeTaskFromStep: async (turnIdx: number, stepId?: string) => {
       const s = get();
       const conv = s.activeId ? s.convs[s.activeId] : undefined;
-      const taskId = conv?.taskId;
-      if (!conv || !taskId) return;
-      // 运行中的任务不能再起一条恢复流；检查点不属于当前任务时不展示/不恢复
-      if (conv.isLoading || !conv.checkpoint?.resumable || conv.checkpoint.taskId !== taskId) return;
+      if (!conv) return;
+
+      // 锚点必须真的属于这一轮：拿别轮/已丢弃的步骤号续跑等于凭空造一个现场
+      const anchor = (stepId ?? '').trim();
+      if (anchor) {
+        const anchorExists = (conv.turnEvents[turnIdx] ?? []).some(
+          (e) => e.type === 'step_start' && e.stepId === anchor,
+        );
+        if (!anchorExists) {
+          patchConv(conv.id, { error: '该步骤不在本轮执行记录里，无法从它续跑' });
+          return;
+        }
+      }
+      const taskId =
+        Object.entries(conv.taskTurnMap).find(([, idx]) => idx === turnIdx)?.[0] ?? conv.taskId;
+      if (!taskId) {
+        patchConv(conv.id, { error: '本轮没有任务编号，无法从检查点续跑' });
+        return;
+      }
+      // 运行中的任务不能再起一条恢复流；检查点不属于该轮任务时不发起
+      if (conv.isLoading) {
+        patchConv(conv.id, { error: '任务仍在执行中，不能同时再起一条恢复流' });
+        return;
+      }
+      const cp = conv.checkpoint;
+      if (!cp?.resumable || cp.taskId !== taskId) {
+        patchConv(conv.id, {
+          error: unavailableReasonZh(
+            cp && cp.resumable && cp.taskId !== taskId
+              ? `检查点属于另一轮任务（${cp.taskId || '未知'}），本轮没有可续跑的快照`
+              : cp?.reason,
+          ),
+        });
+        return;
+      }
 
       patchConv(conv.id, { isLoading: true, error: null, taskMeta: {} });
-
       try {
-        await api.chat.review(taskId, { action: 'resume' });
+        const result = await api.chat.review(taskId, { action: 'resume' });
+        if (result && result.ok === false) {
+          // 后端明确回了「恢复没起来」（Mock / Rust 直接返回状态码，不抛异常）
+          patchConv(conv.id, {
+            isLoading: false,
+            error: unavailableReasonZh(result.status ? `恢复未启动：${result.status}` : '恢复未启动'),
+          });
+          return;
+        }
+        // 恢复被后端接受：任务重新回到执行中。失败/取消是终态锁，不放开的话
+        // 续跑成功后徽标仍停在「失败」，看上去就像点了重试什么也没发生
+        patchConv(conv.id, { taskStatus: TaskStatus.EXECUTING });
       } catch (err: unknown) {
         // 恢复没启动成功：保留检查点与入口，把不可恢复的真实原因显示出来
         patchConv(conv.id, { isLoading: false, error: errorTextOf(err, '从检查点恢复失败') });
@@ -1293,7 +1480,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
         if (convs[row.convId]) continue;
         // 没有任何提问记录的轮次无法作为对话轮渲染（旧版本任务只落了回复）：不硬凑一条假提问
         if (!turns.some((t) => t.userContent)) continue;
-        convs[row.convId] = restoredConv(row.convId, titleOf(row.firstGoal), row.createdAtMs, turns);
+        convs[row.convId] = restoredConv(row.convId, titleOf(row.firstGoal), row.createdAtMs, turns, row.workspaceId);
         if (!order.includes(row.convId)) order.push(row.convId);
         changed = true;
       }
@@ -1310,6 +1497,27 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
     setChatModelId: (id: string) => set({ chatModelId: id }),
     setChatExpertId: (id: string) => set({ chatExpertId: id }),
     setWorkMode: (mode: WorkMode) => set({ workMode: mode }),
+
+    setFilePermission: (mode: FilePermissionMode, confirmedAtMs?: number) => {
+      const convId = get().activeId;
+      const normalized = normalizeFileMode(mode);
+      if (convId && get().convs[convId]) {
+        // 先落台账再回读：完全访问没带确认时刻时台账会把它降级成每次询问，
+        // 界面镜像的必须是台账实际认可的那一档，不能显示「已经放开」的假状态
+        setConversationFilePermission(convId, normalized, {
+          confirmedAtMs: confirmedAtMs ?? null,
+        });
+        patchConv(convId, { filePermission: getConversationFilePermission(convId) ?? undefined });
+        return;
+      }
+      // 新任务页还没有会话可落台账：档位先搁在草稿里，第一条消息建会话时写进台账。
+      // 没有这一步，用户在欢迎页确认的「完全访问」会点了没反应，第一条消息悄悄回落到全局默认。
+      const granted = filePermissionAfterConfirm(normalized, confirmedAtMs ?? null);
+      set({
+        draftFilePermission: { mode: granted, confirmedAtMs: confirmedAtMs ?? null },
+        filePermission: granted,
+      });
+    },
 
     clearError: () => {
       const s = get();
@@ -1361,7 +1569,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => {
         }
         const turns = groupTurns(await fetchConversationMessages(row.convId, 200).catch(() => []));
         if (!turns.some((t) => t.userContent)) continue;
-        convs[row.convId] = restoredConv(row.convId, titleOf(row.firstGoal), row.createdAtMs, turns);
+        convs[row.convId] = restoredConv(row.convId, titleOf(row.firstGoal), row.createdAtMs, turns, row.workspaceId);
         order.push(row.convId);
         rebuilt += 1;
       }

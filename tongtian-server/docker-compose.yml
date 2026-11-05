@@ -1,0 +1,41 @@
+name: tongtian-server
+
+services:
+  server:
+    build: .
+    image: tongtian-server:0.1.0
+    container_name: tongtian-server
+    restart: unless-stopped
+    ports:
+      # 默认只绑定宿主机回环地址，对外请经 Caddy/Nginx 反向代理
+      - "${TT_SERVER_BIND:-127.0.0.1}:${TT_SERVER_PORT:-8000}:${TT_SERVER_PORT:-8000}"
+    environment:
+      TT_SERVER_ENV: ${TT_SERVER_ENV:-production}
+      TT_SERVER_HOST: 0.0.0.0
+      TT_SERVER_PORT: ${TT_SERVER_PORT:-8000}
+      TT_SERVER_DATA_DIR: /data
+      # 生产环境必须显式提供，留空时 compose 直接报错而不是用开发密钥启动
+      TT_SERVER_JWT_SECRET: ${TT_SERVER_JWT_SECRET:?请先在 .env 中设置 TT_SERVER_JWT_SECRET}
+      TT_AUTH_ISSUER: ${TT_AUTH_ISSUER:-tongtian-auth}
+      TT_AUTH_AUDIENCE: ${TT_AUTH_AUDIENCE:-tongtian-engine}
+      TT_ACCESS_TTL_SECONDS: ${TT_ACCESS_TTL_SECONDS:-900}
+      TT_REFRESH_TTL_SECONDS: ${TT_REFRESH_TTL_SECONDS:-2592000}
+      TT_ALLOW_REGISTRATION: ${TT_ALLOW_REGISTRATION:-true}
+      TT_CORS_ORIGINS: "${TT_CORS_ORIGINS:-*}"
+      TT_TRUST_PROXY: ${TT_TRUST_PROXY:-false}
+      TT_SEED_DEMO: ${TT_SEED_DEMO:-false}
+      TT_DEMO_PASSWORD: ${TT_DEMO_PASSWORD:-}
+      TT_ADMIN_EMAIL: ${TT_ADMIN_EMAIL:-}
+      TT_ADMIN_PASSWORD: ${TT_ADMIN_PASSWORD:-}
+      TT_ADMIN_NICKNAME: ${TT_ADMIN_NICKNAME:-平台管理员}
+    volumes:
+      - tongtian-data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 15s
+
+volumes:
+  tongtian-data:
+    name: tongtian-server-data

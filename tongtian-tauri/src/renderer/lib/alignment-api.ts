@@ -5,7 +5,7 @@
  * - 纯浏览器（Mock / 引擎直连）：委托 `alignment-local`，与 Rust 同口径的本地权威实现
  */
 
-import { IPC_CHANNELS } from '../../shared/contracts';
+import { DEFAULT_BUDGET, IPC_CHANNELS } from '../../shared/contracts';
 import type {
   AppSettingsData,
   ArchiveRecord,
@@ -26,8 +26,18 @@ import type {
   HookResult,
   HooksStatus,
   ImChannelsSnapshot,
+  ImLoginPoll,
+  ImLoginStart,
   ImPreferences,
+  MemoryCompactResult,
+  MemoryDocSyncResult,
+  MemoryEntityPage,
   MemoryEntry,
+  MemoryExportResult,
+  MemoryImportResult,
+  MemoryPackageExportResult,
+  MemoryPackageImportResult,
+  MemoryReviewAction,
   ProxyStatus,
   RemoteDesktopCapabilities,
   RemoteDesktopFrame,
@@ -42,6 +52,7 @@ import type {
   TerminalSessionInfo,
 } from '../../shared/contracts';
 import { handleLocalAlignmentChannel } from './alignment-local';
+import { rawErrorText } from '../../shared/error-messages';
 import { handleLocalAwarenessChannel } from './awareness-local';
 import { localProxyStatus } from './proxy-local';
 import { localAutostart } from './system-local';
@@ -125,6 +136,7 @@ const DEFAULT_SETTINGS: Partial<AppSettingsData> = {
   browserUsePolicy: 'ask_every_time',
   piiOutboundMode: 'off',
   toolApprovalMode: 'off',
+  filePermissionDefault: 'ask_every_time',
   agentMaxIters: 8,
   agentAutoCompress: true,
   agentLazyMcpTools: true,
@@ -132,6 +144,8 @@ const DEFAULT_SETTINGS: Partial<AppSettingsData> = {
   workbenchModes: ['general', 'design', 'slides'],
   workbenchDefaultMode: 'general',
   pptxTemplateId: 'business-blue',
+  // 预算缺省值与 Rust 日配额同口径；每次给新对象，避免调用方就地改坏出厂常量
+  budget: { ...DEFAULT_BUDGET },
   shortcuts: {},
   experiments: {},
 };
@@ -205,7 +219,7 @@ export async function getAutostartStatus(): Promise<AutostartStatus> {
     raw = await api.invoke(IPC_CHANNELS.SYSTEM_AUTOSTART_STATUS);
   } catch (e) {
     // 桌面端读注册表失败必须可见：静默降级成「未开启」会让用户以为系统里没有启动项
-    throw e instanceof Error ? e : new Error('AUTOSTART_FAILED: 系统启动项状态读取失败');
+    throw new Error(rawErrorText(e) || 'AUTOSTART_FAILED: 系统启动项状态读取失败');
   }
   // Mock / 引擎直连没有这个 command（invoke 兜底返回空值）→ 按本地事实推导
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw as AutostartStatus;
@@ -372,16 +386,19 @@ export async function listMemories(): Promise<MemoryEntry[]> {
   return localAwareness<MemoryEntry[]>(IPC_CHANNELS.AWARENESS_MEMORIES, []);
 }
 
-/** `awareness:memoryAdd`：新增一条长期记忆（内容为空时后端拒绝） */
+/** `awareness:memoryAdd`：新增一条长期记忆（内容为空/归属非法时后端拒绝） */
 export async function addMemory(
   content: string,
   source: MemoryEntry['source'] = 'manual',
+  scope: MemoryEntry['scope'] = 'global',
+  workspaceId?: string,
 ): Promise<MemoryEntry> {
   const api = getAPI();
+  const payload = { content, source, scope, workspaceId };
   if (api) {
-    return (await api.invoke(IPC_CHANNELS.AWARENESS_MEMORY_ADD, { content, source })) as MemoryEntry;
+    return (await api.invoke(IPC_CHANNELS.AWARENESS_MEMORY_ADD, payload)) as MemoryEntry;
   }
-  return localAwareness<MemoryEntry>(IPC_CHANNELS.AWARENESS_MEMORY_ADD, [{ content, source }]);
+  return localAwareness<MemoryEntry>(IPC_CHANNELS.AWARENESS_MEMORY_ADD, [payload]);
 }
 
 /** `awareness:memoryDelete`：删除用户点名的那一条记忆条目 */
@@ -391,6 +408,102 @@ export async function deleteMemory(id: string): Promise<{ ok: boolean; id: strin
     return (await api.invoke(IPC_CHANNELS.AWARENESS_MEMORY_DELETE, { id })) as { ok: boolean; id: string };
   }
   return localAwareness<{ ok: boolean; id: string }>(IPC_CHANNELS.AWARENESS_MEMORY_DELETE, [{ id }]);
+}
+
+/**
+ * 复核 / 实体页 / 导出导入依赖桌面记忆库或 Mock 本地台账。
+ * 浏览器直连引擎时没有这两者（引擎只读 MEMORY.md），界面据此隐藏这些入口，
+ * 而不是点下去才报错。
+ */
+export function supportsMemoryManagement(): boolean {
+  if (getAPI()) return true;
+  return import.meta.env.VITE_MOCK !== 'false';
+}
+
+/** `awareness:memoryReview`：确认 / 驳回 / 归档 / 恢复（只改状态，正文与证据保留） */
+export async function reviewMemory(id: string, action: MemoryReviewAction): Promise<MemoryEntry> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.AWARENESS_MEMORY_REVIEW, { id, action })) as MemoryEntry;
+  }
+  return localAwareness<MemoryEntry>(IPC_CHANNELS.AWARENESS_MEMORY_REVIEW, [{ id, action }]);
+}
+
+/** `awareness:memoryEntities`：按事实主体聚合的实体页（没有 subject 的摘要不参与） */
+export async function listMemoryEntities(workspaceId?: string): Promise<MemoryEntityPage[]> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.AWARENESS_MEMORY_ENTITIES, {
+      workspaceId: workspaceId ?? null,
+    })) as MemoryEntityPage[];
+  }
+  return localAwareness<MemoryEntityPage[]>(IPC_CHANNELS.AWARENESS_MEMORY_ENTITIES, [
+    { workspaceId: workspaceId ?? null },
+  ]);
+}
+
+/** `awareness:memoryExport`：导出全部记忆为 JSON（落运行目录 exports/） */
+export async function exportMemories(): Promise<MemoryExportResult> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.AWARENESS_MEMORY_EXPORT)) as MemoryExportResult;
+  }
+  return localAwareness<MemoryExportResult>(IPC_CHANNELS.AWARENESS_MEMORY_EXPORT, []);
+}
+
+/** `awareness:memoryImport`：从 JSON 导入（桌面端导入前自动备份，按内容去重） */
+export async function importMemories(json: string): Promise<MemoryImportResult> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.AWARENESS_MEMORY_IMPORT, { json })) as MemoryImportResult;
+  }
+  return localAwareness<MemoryImportResult>(IPC_CHANNELS.AWARENESS_MEMORY_IMPORT, [{ json }]);
+}
+
+/** `awareness:memoryCompact`：归档超出保留条数的旧自动任务摘要（人工与事实条目不动） */
+export async function compactMemories(): Promise<MemoryCompactResult> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.AWARENESS_MEMORY_COMPACT)) as MemoryCompactResult;
+  }
+  return localAwareness<MemoryCompactResult>(IPC_CHANNELS.AWARENESS_MEMORY_COMPACT, []);
+}
+
+/** `awareness:memoryDocSync`：与 MEMORY.md 对账，只导入文件里有、库里没有的条目 */
+export async function syncMemoryDoc(): Promise<MemoryDocSyncResult> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.AWARENESS_MEMORY_DOC_SYNC)) as MemoryDocSyncResult;
+  }
+  return localAwareness<MemoryDocSyncResult>(IPC_CHANNELS.AWARENESS_MEMORY_DOC_SYNC, []);
+}
+
+/** `awareness:memoryExportPackage`：导出 .hmpkg 迁移包（zip：manifest + memories.json） */
+export async function exportMemoryPackage(): Promise<MemoryPackageExportResult> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(
+      IPC_CHANNELS.AWARENESS_MEMORY_EXPORT_PACKAGE,
+    )) as MemoryPackageExportResult;
+  }
+  return localAwareness<MemoryPackageExportResult>(
+    IPC_CHANNELS.AWARENESS_MEMORY_EXPORT_PACKAGE,
+    [],
+  );
+}
+
+/** `awareness:memoryImportPackage`：base64 透传 .hmpkg，校验完整性后导入并强制备份 */
+export async function importMemoryPackage(data: string): Promise<MemoryPackageImportResult> {
+  const api = getAPI();
+  if (api) {
+    return (await api.invoke(IPC_CHANNELS.AWARENESS_MEMORY_IMPORT_PACKAGE, {
+      data,
+    })) as MemoryPackageImportResult;
+  }
+  return localAwareness<MemoryPackageImportResult>(
+    IPC_CHANNELS.AWARENESS_MEMORY_IMPORT_PACKAGE,
+    [{ data }],
+  );
 }
 
 // ── Archive ─────────────────────────────────────────────────
@@ -455,8 +568,7 @@ export async function clearArchived(confirm: string): Promise<boolean> {
     return Boolean((res as { ok?: boolean } | null)?.ok);
   } catch (e) {
     // 确认词不合法：与 Rust 同口径视为「用户未完成确认」，而非异常
-    const msg = e instanceof Error ? e.message : String(e);
-    if (msg.startsWith('ARCHIVE_CONFIRM_REQUIRED')) return false;
+    if (rawErrorText(e).startsWith('ARCHIVE_CONFIRM_REQUIRED')) return false;
     throw e;
   }
 }
@@ -519,7 +631,7 @@ export async function getRemoteDesktopCapabilities(): Promise<RemoteDesktopCapab
       | RemoteDesktopCapabilities
       | null;
     if (r && typeof r === 'object' && !Array.isArray(r)) return r;
-    throw new Error('REMOTE_UNSUPPORTED: 桌面通道没有返回远程桌面能力视图');
+    throw new Error('REMOTE_UNSUPPORTED: 桌面通道没有返回本机画面能力视图');
   }
   return local<RemoteDesktopCapabilities>(IPC_CHANNELS.REMOTE_DESKTOP_CAPABILITIES, []);
 }
@@ -777,6 +889,44 @@ export async function configureImChannel(
     account?: Record<string, string>;
   } | null;
   return res?.account ?? {};
+}
+
+/** `im:loginStart`：生成扫码登录二维码（个人微信）。响应里只有二维码内容与票据，没有凭据 */
+export async function startImLogin(kind: string): Promise<ImLoginStart> {
+  const api = getAPI();
+  if (!api) {
+    throw new Error('IM_ENGINE_UNAVAILABLE: 当前运行通道没有引擎进程，无法生成扫码登录二维码');
+  }
+  const res = (await api.invoke(IPC_CHANNELS.IM_LOGIN_START, { kind })) as Partial<ImLoginStart> | null;
+  if (!res?.ticket || !res?.qrContent) {
+    throw new Error('IM_LOGIN_FAILED: 引擎没有返回可用的二维码');
+  }
+  return {
+    ticket: res.ticket,
+    qrContent: res.qrContent,
+    expiresInSeconds: Number(res.expiresInSeconds ?? 300),
+  };
+}
+
+/** `im:loginPoll`：查一次扫码状态；确认时引擎已落盘并起连接，响应仍不含令牌 */
+export async function pollImLogin(
+  kind: string,
+  ticket: string,
+  verifyCode = '',
+): Promise<ImLoginPoll> {
+  const api = getAPI();
+  if (!api) {
+    throw new Error('IM_ENGINE_UNAVAILABLE: 当前运行通道没有引擎进程，无法查询扫码状态');
+  }
+  const res = (await api.invoke(IPC_CHANNELS.IM_LOGIN_POLL, { kind, ticket, verifyCode })) as
+    | Partial<ImLoginPoll>
+    | null;
+  return {
+    status: String(res?.status ?? 'wait'),
+    message: String(res?.message ?? ''),
+    needVerifyCode: Boolean(res?.needVerifyCode),
+    configured: Boolean(res?.configured),
+  };
 }
 
 /** `im:start` / `im:stop` / `im:forget`：连接开关与解绑，返回引擎给出的新状态 */

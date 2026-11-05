@@ -28,6 +28,42 @@ from aiohttp import web
 
 DEFAULT_APP_TOKEN = "xapp-1-TTFAKE-abcdef123456"
 DEFAULT_BOT_TOKEN = "xoxb-TTFAKE-abcdef123456"
+# 机器人在工作区里的用户 ID：Slack 的 @ 用的是它（不是 B 开头的 bot_id）
+BOT_USER_ID = "U0BOTFAKE"
+
+
+def event_payload(
+    text: str,
+    *,
+    channel: str = "D0123",
+    channel_type: str = "im",
+    user: str = "U0456",
+    ts: str = "",
+    event_type: str = "message",
+    bot_id: str = "",
+    subtype: str = "",
+    authorizations: list | None = None,
+) -> dict:
+    """events_api 的信封正文：字段形状照 Slack 的事件回调文档
+
+    `authorizations` 不给就等价于「这一帧没告诉我们机器人是谁」——引擎必须答不出而不是猜。
+    """
+    event: dict = {
+        "type": event_type,
+        "channel": channel,
+        "channel_type": channel_type,
+        "user": user,
+        "text": text,
+        "ts": ts or f"{time.time():.6f}",
+    }
+    if bot_id:
+        event["bot_id"] = bot_id
+    if subtype:
+        event["subtype"] = subtype
+    payload: dict = {"type": "events_api", "event": event}
+    if authorizations is not None:
+        payload["authorizations"] = authorizations
+    return payload
 
 
 def free_port() -> int:
@@ -37,8 +73,13 @@ def free_port() -> int:
 
 
 class FakeSlack:
-    """第一条 WebSocket 连接跑完整剧本（challenge→用户消息→bot 回声→disconnect），
-    后续连接只保持在线，用来验证引擎在收到 disconnect 后会重新换取连接地址。"""
+    """第一条 WebSocket 连接跑完整剧本（challenge→单聊消息→bot 回声→群里没 @→群里 @ 了
+    机器人→disconnect），后续连接只保持在线，用来验证引擎在收到 disconnect 后会重新换取连接地址。
+
+    事件正文一律走 `event_payload()`：群/单聊与被 @ 的字段（channel_type、
+    authorizations、文本里的 `<@U…>`）都按 Slack 文档的形状给全，
+    引擎侧才有真东西可判，而不是拿一个缺字段的替身验「答不出」这条路。
+    """
 
     def __init__(self, app_token: str = DEFAULT_APP_TOKEN, bot_token: str = DEFAULT_BOT_TOKEN):
         self.app_token = app_token
@@ -102,8 +143,18 @@ class FakeSlack:
         if method == "auth.test":
             if not auth.endswith(self.bot_token):
                 return web.json_response({"ok": False, "error": "invalid_auth"})
+            # 真实 auth.test 同时给 user_id（U 开头，@ 的就是它）与 bot_id（B 开头），
+            # 少给一个字段引擎就会把「@ 机器人」判错，所以这里照真返回的形状给全
             return web.json_response(
-                {"ok": True, "team": "通天测试空间", "team_id": "T1", "user": "tt-bot", "bot_id": "B1"}
+                {
+                    "ok": True,
+                    "team": "通天测试空间",
+                    "team_id": "T1",
+                    "user": "tt-bot",
+                    "user_id": BOT_USER_ID,
+                    "bot_id": "B1",
+                    "app_id": "A1",
+                }
             )
         if method == "apps.connections.open":
             if not auth.endswith(self.app_token):
@@ -126,27 +177,32 @@ class FakeSlack:
 
     # -- Socket Mode 反向连接 --
     async def handle_inject(self, request):
-        """往最近一条在线连接注入一条用户消息，用于实机验证「IM 消息 → 任务 → 回贴」全链路"""
+        """往最近一条在线连接注入一条用户消息，用于实机验证「IM 消息 → 任务 → 回贴」全链路
+
+        可带 `channel`/`channelType`/`user`/`text`/`withAuth`（信封是否带 authorizations）。
+        """
         body = await request.json()
         live = [ws for ws in self.open_ws if not ws.closed]
         if not live:
             return web.json_response({"ok": False, "error": "no_live_socket", "sockets": self.sockets})
         self.injected += 1
         ws = live[-1]
+        channel = str(body.get("channel") or "D0123")
         await ws.send_json(
             {
                 "type": "events_api",
                 "envelope_id": f"env-inject-{self.injected}",
-                "payload": {
-                    "type": "events_api",
-                    "event": {
-                        "type": "message",
-                        "channel": body.get("channel") or "D0123",
-                        "user": body.get("user") or "U0456",
-                        "text": body.get("text") or "",
-                        "ts": f"{time.time():.6f}",
-                    },
-                },
+                "payload": event_payload(
+                    str(body.get("text") or ""),
+                    channel=channel,
+                    channel_type=str(body.get("channelType") or ("im" if channel.startswith("D") else "channel")),
+                    user=str(body.get("user") or "U0456"),
+                    authorizations=(
+                        [{"enterprise_id": None, "team_id": "T1", "user_id": BOT_USER_ID, "is_bot": True}]
+                        if body.get("withAuth", True)
+                        else None
+                    ),
+                ),
                 "accepts_response_payload": False,
                 "retry_attempt": 0,
             }
@@ -179,16 +235,7 @@ class FakeSlack:
             {
                 "type": "events_api",
                 "envelope_id": "env-msg-1",
-                "payload": {
-                    "type": "events_api",
-                    "event": {
-                        "type": "message",
-                        "channel": "D0123",
-                        "user": "U0456",
-                        "text": "帮我把季度总结整理成一页",
-                        "ts": "1700000000.000100",
-                    },
-                },
+                "payload": event_payload("帮我把季度总结整理成一页", ts="1700000000.000100"),
                 "accepts_response_payload": False,
                 "retry_attempt": 0,
             }
@@ -199,16 +246,39 @@ class FakeSlack:
             {
                 "type": "events_api",
                 "envelope_id": "env-bot-echo",
-                "payload": {
-                    "type": "events_api",
-                    "event": {
-                        "type": "message",
-                        "channel": "D0123",
-                        "bot_id": "B1",
-                        "text": "上一轮的回复回声",
-                        "ts": "1700000000.000200",
-                    },
-                },
+                "payload": event_payload(
+                    "上一轮的回复回声", channel_type="im", bot_id="B1", ts="1700000000.000200", user=""
+                ),
+            }
+        )
+        self.acks.append(json.loads(await ws.receive_str()))
+        # 群里没 @ 机器人：消息确实到了（进台账），按群策略不起任务也不回贴
+        await ws.send_json(
+            {
+                "type": "events_api",
+                "envelope_id": "env-group-plain",
+                "payload": event_payload(
+                    "今天例会改到三点",
+                    channel="C0777",
+                    channel_type="channel",
+                    ts="1700000000.000300",
+                    authorizations=[{"team_id": "T1", "user_id": BOT_USER_ID, "is_bot": True}],
+                ),
+            }
+        )
+        self.acks.append(json.loads(await ws.receive_str()))
+        # 群里 @ 了机器人（文本里的 <@U…> 就是 auth.test 给的那个用户 ID）：起任务并回贴
+        await ws.send_json(
+            {
+                "type": "events_api",
+                "envelope_id": "env-group-mention",
+                "payload": event_payload(
+                    f"<@{BOT_USER_ID}> 帮我把这份纪要整理成三条结论",
+                    channel="C0777",
+                    channel_type="channel",
+                    ts="1700000000.000400",
+                    authorizations=[{"team_id": "T1", "user_id": BOT_USER_ID, "is_bot": True}],
+                ),
             }
         )
         self.acks.append(json.loads(await ws.receive_str()))

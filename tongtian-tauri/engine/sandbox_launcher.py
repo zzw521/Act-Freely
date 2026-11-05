@@ -71,11 +71,18 @@ def wrap(
     *,
     workspace: str | None = None,
     keep_env: list[str] | tuple[str, ...] = (),
+    raw_command_line: bool = False,
 ) -> tuple[str, list[str]] | None:
     """返回 (启动器, 启动器参数)；未启用系统隔离时返回 None。
 
     `keep_env` 是用户为这个连接器显式配置的敏感变量名，启动器会保留它们
     （其余 TOKEN / SECRET 一类变量仍会被过滤，避免模型密钥泄进沙箱）。
+
+    `raw_command_line=True` 让启动器把参数**按原文**拼成子进程的命令行，不逐个加引号。
+    只给壳类程序用（`cmd.exe /d /s /c "<整条命令>"`）：这类壳不吃 MSVCRT 的 argv 转义，
+    逐个转义会把 `"` 变成 `\"`，命令 rc=0 却静默没跑（D-48.4c 实测的同一个坑）。
+    隔离本身一档不少——容器令牌、环境过滤、网络能力、Job Object 全部照做，
+    改的只是引号，不是边界。
     """
     exe = launcher()
     if not exe:
@@ -93,5 +100,7 @@ def wrap(
         name = str(name).strip()
         if name:
             argv += ["--allow-env", name]
+    if raw_command_line:
+        argv.append("--raw-command-line")
     argv += ["--", command, *args]
     return exe, argv

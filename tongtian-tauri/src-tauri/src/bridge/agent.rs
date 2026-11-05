@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -36,6 +36,9 @@ const EMIT_CHANNEL_CAPACITY: usize = 1024;
 const CATCHUP_POLL_MS: u64 = 500;
 /// 断线补齐总超时（引擎窗口 10min，桌面侧 30s 轮询预算足够）
 const CATCHUP_TIMEOUT_MS: u64 = 30_000;
+/// SSE 空闲超时：引擎每 15s 发 keepalive，90s 无任何字节视为链路已死，
+/// 否则 stream.next() 会一直挂着，界面停在 loading 也没有任何解释
+const STREAM_IDLE_TIMEOUT_MS: u64 = 90_000;
 
 /// 本机引擎通信的 HTTP client（reqwest::Client 内部 Arc，克隆代价极低）。
 /// 引擎监听 127.0.0.1 随机端口，这类请求必须直连：若跟随「网络代理」设置，
@@ -43,6 +46,26 @@ const CATCHUP_TIMEOUT_MS: u64 = 30_000;
 fn http_client() -> reqwest::Client {
     crate::proxy::loopback_client()
 }
+
+/// 桌面壳与引擎之间的本机令牌（每次启动随机生成）。
+///
+/// 引擎监听 127.0.0.1，但本机其他进程、任意网页都能访问这些端口；没有令牌时
+/// `/api/chat`、`/api/files/*` 等于对全网开放。令牌只注入桌面拉起的引擎，
+/// 浏览器直连/手工启动的引擎没有它，行为保持不变。
+static ENGINE_LOCAL_TOKEN: OnceLock<String> = OnceLock::new();
+
+pub fn engine_local_token() -> &'static str {
+    ENGINE_LOCAL_TOKEN.get_or_init(|| {
+        format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        )
+    })
+}
+
+/// 引擎鉴权头（服务化部署也用同一个头）
+pub const ENGINE_TOKEN_HEADER: &str = "x-tt-engine-token";
 
 /// 前端事件名
 pub const EVENT_CHAT: &str = "chat-event";
@@ -192,6 +215,8 @@ fn endpoint_view(workspace_id: &str, inst: &Instance) -> Value {
         "baseUrl": format!("http://127.0.0.1:{}", inst.port),
         "port": inst.port,
         "status": inst.status,
+        // 渲染层直连引擎时随请求携带；只回给当前桌面壳的窗口
+        "token": engine_local_token(),
     })
 }
 
@@ -201,14 +226,31 @@ pub async fn start_workspace(
     bridge: &BridgeState,
     workspace_id: &str,
 ) -> Result<u16, String> {
-    // 已存在且存活则直接复用
-    {
-        let b = bridge.lock().await;
-        if let Some(inst) = b.instances.get(workspace_id) {
-            if matches!(inst.status, InstanceStatus::Ready | InstanceStatus::Starting | InstanceStatus::Busy) {
+    // 已存在且存活则直接复用；失败态的旧进程先回收，避免同 workspace 起第二个引擎
+    let stale_pid = {
+        let mut b = bridge.lock().await;
+        match b.instances.get(workspace_id) {
+            Some(inst)
+                if matches!(
+                    inst.status,
+                    InstanceStatus::Ready | InstanceStatus::Starting | InstanceStatus::Busy
+                ) =>
+            {
                 return Ok(inst.port);
             }
+            Some(inst) => {
+                let pid = inst.pid;
+                let port = inst.port;
+                b.instances.remove(workspace_id);
+                b.used_ports.remove(&port);
+                Some(pid)
+            }
+            None => None,
         }
+    };
+    if let Some(pid) = stale_pid {
+        log(&format!("reclaiming stale engine for {workspace_id} (pid {pid})"));
+        kill_process_tree(pid);
     }
 
     // 探测 Python 与 Agent 安装
@@ -277,6 +319,12 @@ pub async fn start_workspace(
         // 终端 AI+ 的进程级令牌：只注入引擎，浏览器直连/手工启动的引擎没有它。
         // 是否放行终端请求由桌面端设置另行决定（配置 ≠ 授权）。
         .env("TT_TERMINAL_TOKEN", crate::terminal::engine_token())
+        // 本机执行面的准入令牌：引擎只接受带此令牌的 /api 请求，
+        // 阻止本机其他进程或任意网页直接驱动 Agent / 读写文件。
+        .env("TT_ENGINE_LOCAL_TOKEN", engine_local_token())
+        // 模型配置属主：桌面端以 tongtian.db.model_configs 为唯一权威，
+        // 引擎据此拒绝模型写接口，不会在引擎数据根下长出第二份 models.json。
+        .env("TT_ENGINE_MODEL_STORE", "desktop")
         .envs(proxy_spec.env_vars())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -348,9 +396,14 @@ pub async fn start_workspace(
     }
 
     if !ready {
-        let mut b = bridge.lock().await;
-        if let Some(inst) = b.instances.get_mut(workspace_id) {
-            inst.status = InstanceStatus::Error;
+        // 启动失败/超时：把进程树杀掉再清理实例表，否则失败端口被永久占用，
+        // 用户重试时会再起一个引擎，旧进程变成不可见的孤儿。
+        kill_process_tree(pid);
+        let _ = child.kill().await;
+        {
+            let mut b = bridge.lock().await;
+            b.instances.remove(workspace_id);
+            b.used_ports.remove(&port);
         }
         emit_status(app, workspace_id, InstanceStatus::Error);
         if let Some(status) = early_exit {
@@ -426,6 +479,55 @@ fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// 回收整棵进程树：引擎会再拉起终端、MCP 等子进程，只杀父进程会留下孤儿。
+pub fn kill_process_tree(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        crate::win_console::hide_console(&mut cmd);
+        let _ = cmd.output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+}
+
+/// 停止指定 workspace 的引擎（进程树一并回收）
+pub async fn stop_workspace(bridge: &BridgeState, workspace_id: &str) -> Result<u16, String> {
+    let inst = {
+        let mut b = bridge.lock().await;
+        let inst = b.instances.remove(workspace_id);
+        if let Some(i) = &inst {
+            b.used_ports.remove(&i.port);
+        }
+        inst
+    };
+    let Some(inst) = inst else {
+        return Err(format!("ENGINE_NOT_RUNNING: 工作空间「{workspace_id}」没有运行中的引擎"));
+    };
+    kill_process_tree(inst.pid);
+    Ok(inst.port)
+}
+
+/// 退出时同步回收全部引擎进程（RunEvent::Exit 回调是同步上下文）。
+/// 拿不到锁说明主线程正在等待引擎通信，这时不阻塞退出；子进程随后按父进程退出回收。
+pub fn stop_all_now(bridge: &BridgeState) {
+    let Ok(mut b) = bridge.try_lock() else {
+        return;
+    };
+    for (_, inst) in b.instances.drain() {
+        kill_process_tree(inst.pid);
+    }
+    b.used_ports.clear();
+}
+
 /// 后台巡检循环
 async fn watch_loop(app: &AppHandle, bridge: &BridgeState, workspace_id: &str, pid: u32, port: u16) {
     let mut interval = tokio::time::interval(Duration::from_millis(WATCH_INTERVAL_MS));
@@ -458,22 +560,32 @@ async fn watch_loop(app: &AppHandle, bridge: &BridgeState, workspace_id: &str, p
             let b = bridge.lock().await;
             health_ok(&b.http, port).await
         };
-        let mut b = bridge.lock().await;
-        if let Some(inst) = b.instances.get_mut(workspace_id) {
-            if ok {
-                inst.health_fail_count = 0;
-            } else {
-                inst.health_fail_count += 1;
-                log(&format!(
-                    "health check failed for {workspace_id} ({}/{})",
-                    inst.health_fail_count, HEALTH_CHECK_MAX_FAILURES
-                ));
-                if inst.health_fail_count >= HEALTH_CHECK_MAX_FAILURES {
-                    inst.status = InstanceStatus::Error;
-                    emit_status(app, workspace_id, InstanceStatus::Error);
-                    return;
+        let mut unhealthy = false;
+        {
+            let mut b = bridge.lock().await;
+            if let Some(inst) = b.instances.get_mut(workspace_id) {
+                if ok {
+                    inst.health_fail_count = 0;
+                } else {
+                    inst.health_fail_count += 1;
+                    log(&format!(
+                        "health check failed for {workspace_id} ({}/{})",
+                        inst.health_fail_count, HEALTH_CHECK_MAX_FAILURES
+                    ));
+                    if inst.health_fail_count >= HEALTH_CHECK_MAX_FAILURES {
+                        unhealthy = true;
+                    }
                 }
             }
+        }
+        if unhealthy {
+            // 健康检查连续失败：进程可能卡死，回收后由用户重试（保留 Error 状态供界面提示）
+            kill_process_tree(pid);
+            let mut b = bridge.lock().await;
+            b.used_ports.remove(&port);
+            b.instances.remove(workspace_id);
+            emit_status(app, workspace_id, InstanceStatus::Error);
+            return;
         }
     }
 }
@@ -496,7 +608,7 @@ pub struct P0Context {
     pub privacy: bool,
 }
 
-/// 对话内选择的覆盖项：模型档位、自定义模型、工作目录、上下文历史。
+/// 对话内选择的覆盖项：模型档位、自定义模型、工作目录、上下文历史、文件访问档位。
 /// 由 `chat_submit` 从渲染层参数装配，随提交下发给引擎（缺失的键不写入，
 /// 避免把「本轮没选」误当成「清空引擎会话上已有的设置」）。
 #[derive(Debug, Clone, Default)]
@@ -513,6 +625,9 @@ pub struct SubmitOverrides {
     pub work_dir: Option<String>,
     /// 此前轮次的 user/assistant 历史（保障连续对话上下文）
     pub history: Vec<Value>,
+    /// 本轮的文件访问档位（ask_every_time/auto_approve/full_access）：
+    /// 管「能写到哪、能不能删」，引擎在受理时再校验一次并据此建门禁
+    pub file_permission: Option<String>,
     /// 执行面输入（意识 + 启用技能）；缺省时由 `runtime::build` 装配
     pub runtime: Option<Value>,
 }
@@ -540,6 +655,9 @@ impl SubmitOverrides {
         }
         if !self.history.is_empty() {
             map.insert("history".into(), json!(self.history));
+        }
+        if let Some(fp) = &self.file_permission {
+            map.insert("filePermission".into(), json!(fp));
         }
         if let Some(rt) = &self.runtime {
             map.insert("runtime".into(), rt.clone());
@@ -610,9 +728,12 @@ pub async fn send_message_with_attachments(
         let store = p0.store.clone();
         let raw = attachments.clone();
         let ws = workspace_id.to_string();
-        tokio::task::spawn_blocking(move || super::runtime::build(store.as_deref(), &ws, &raw))
-            .await
-            .map_err(|e| format!("RUNTIME_BUNDLE_PANIC: 执行面输入装配线程异常：{e}"))?
+        let query = goal.to_string();
+        tokio::task::spawn_blocking(move || {
+            super::runtime::build_for_task(store.as_deref(), &ws, &raw, &query)
+        })
+        .await
+        .map_err(|e| format!("RUNTIME_BUNDLE_PANIC: 执行面输入装配线程异常：{e}"))?
     };
     let mut overrides = overrides;
     if overrides.runtime.is_none() {
@@ -734,7 +855,12 @@ async fn fetch_replay(port: u16, task_id: &str, from_seq: u64) -> Vec<super::sse
     let url = format!(
         "http://127.0.0.1:{port}/api/events/replay?task_id={task_id}&from_seq={from_seq}"
     );
-    let Ok(resp) = http_client().get(&url).send().await else {
+    let Ok(resp) = http_client()
+        .get(&url)
+        .header(ENGINE_TOKEN_HEADER, engine_local_token())
+        .send()
+        .await
+    else {
         return Vec::new();
     };
     let Ok(body) = resp.json::<Value>().await else {
@@ -770,6 +896,7 @@ pub async fn cancel_task(
     };
     let resp = http_client()
         .post(format!("http://127.0.0.1:{port}/api/chat/cancel"))
+        .header(ENGINE_TOKEN_HEADER, engine_local_token())
         .json(&json!({ "task_id": task_id }))
         .send()
         .await
@@ -777,6 +904,28 @@ pub async fn cancel_task(
     resp.json::<Value>()
         .await
         .map_err(|e| format!("BRIDGE_CANCEL_PARSE: {e}"))
+}
+
+/// 本任务是否已用满单任务预算（缺陷 D-14.1 的执行面判据）。
+/// 没有配额闸门（隐私/Mock 场景）时恒为 false——不假装拦得住。
+fn task_budget_blocked(p0: &P0Context, task_id: &str) -> bool {
+    p0.quota
+        .as_ref()
+        .map(|gate| gate.task_budget_blocked(task_id))
+        .unwrap_or(false)
+}
+
+/// 按端口通知引擎取消该任务：与 `cancel_task` 同一个端点，
+/// 但这里手上只有端口（流式循环里没有 bridge 状态），失败不影响本地拦停。
+/// `reason` 是成因码（D-14.5）：预算拦停与用户点「停止」以前在引擎侧同一条路，
+/// 界面与检查点只能一律写成「用户取消」；带上码之后引擎的检查点原因跟着真实成因走。
+async fn cancel_engine_task(port: u16, task_id: &str, reason: &str) {
+    let _ = http_client()
+        .post(format!("http://127.0.0.1:{port}/api/chat/cancel"))
+        .header(ENGINE_TOKEN_HEADER, engine_local_token())
+        .json(&json!({ "task_id": task_id, "reason": reason }))
+        .send()
+        .await;
 }
 
 /// 处理解析出的事件：持久化 → gap 修复 → 去重 → 配额计量 → 适配 → 投递 emit 通道
@@ -902,6 +1051,39 @@ fn deliver_parts(ev: &super::sse::AgentEvent) -> (String, String, Vec<String>) {
     )
 }
 
+/// 候选 / 工具写入的统一落库口径：返回给界面的一行说明，失败不中断任务。
+/// 待审开关来自意识画像（PROFILE.json），只对 `source=auto` 生效。
+fn persist_memory_note(
+    store: &crate::store::Store,
+    task_id: &str,
+    candidate: &Value,
+    now_iso: &str,
+) -> String {
+    use crate::store::memories::{PersistOutcome, STATUS_PENDING};
+    let review = crate::awareness::review_enabled(&crate::awareness::dir());
+    match crate::store::memories::persist_candidate(store, task_id, candidate, now_iso, review) {
+        Ok(PersistOutcome::Inserted(row)) => {
+            if row.status == STATUS_PENDING {
+                format!("已加入待审记忆（确认后才参与召回）：{}", row.content)
+            } else {
+                format!("已写入长期记忆：{}", row.content)
+            }
+        }
+        Ok(PersistOutcome::Merged(row)) => format!(
+            "已合并到已有记忆（累计出现 {} 次）：{}",
+            row.occurrences, row.content
+        ),
+        Ok(PersistOutcome::Superseded(row, old)) => format!(
+            "已用新事实替换旧事实（旧事实仍可在归档中查看：{}）：{}",
+            old.content, row.content
+        ),
+        Ok(PersistOutcome::Skipped(reason)) => {
+            format!("本轮未写入长期记忆：{reason}")
+        }
+        Err(err) => format!("长期记忆写入失败：{err}"),
+    }
+}
+
 /// 事件持久化（event_store，24h）+ 模型用量台账 + 配额计量（usage 字段）
 async fn persist_and_meter(
     ev: &super::sse::AgentEvent,
@@ -966,6 +1148,7 @@ async fn persist_and_meter(
                 "network" => crate::security::audit::ACTION_NETWORK_FETCH,
                 "browser" => crate::security::audit::ACTION_BROWSER_ACTION,
                 _ if tool == "run_command" => crate::security::audit::ACTION_EXEC_RUN,
+                _ if tool == "run_shell" => crate::security::audit::ACTION_EXEC_RUN,
                 _ if tool == "fetch_url" => crate::security::audit::ACTION_NETWORK_FETCH,
                 _ if tool.starts_with("browser_") => crate::security::audit::ACTION_BROWSER_ACTION,
                 _ => crate::security::audit::ACTION_NETWORK_FETCH,
@@ -992,6 +1175,32 @@ async fn persist_and_meter(
         }
     }
 
+    // 模型主动调用 memory_save：工具写入同样由 Rust 落库（引擎不写桌面库）。
+    // 与任务收尾候选共用一套去重 / 冲突 / 待审规则，事件里不信任任何归属字段。
+    if ev.kind == "memory_save" && !p0.privacy {
+        if let Some(store) = &p0.store {
+            let now_iso =
+                crate::security::audit::iso8601_utc(crate::bridge::event_store::now_ms() as i64);
+            let note = persist_memory_note(store, task_id, &ev.data, &now_iso);
+            let _ = tx
+                .send(json!({
+                    "type": "step_start",
+                    "stepId": "memory-tool",
+                    "description": note,
+                    "taskId": task_id,
+                }))
+                .await;
+            let _ = tx
+                .send(json!({
+                    "type": "step_done",
+                    "stepId": "memory-tool",
+                    "output": note,
+                    "taskId": task_id,
+                }))
+                .await;
+        }
+    }
+
     // 会话正文落库：事件流只留 24h，交付正文要跨重启可恢复。
     // 隐私模式下不写正文（刷新后本轮对话不会从库里恢复）。
     if ev.kind == "deliver" && !p0.privacy {
@@ -1006,6 +1215,43 @@ async fn persist_and_meter(
                 crate::bridge::event_store::now_ms() as i64,
             ) {
                 eprintln!("[store] deliver persist failed: {e}");
+            }
+            // 跨任务记忆：引擎只上报候选，去重与落库由桌面端完成（引擎不写桌面库）。
+            // 第二期起一次可上报多条（任务摘要 + 规则抽取的事实），逐条落库并合并播报，
+            // 避免「一次任务只记住一句话」。
+            let now_iso =
+                crate::security::audit::iso8601_utc(crate::bridge::event_store::now_ms() as i64);
+            let candidates: Vec<&Value> = if let Some(arr) = ev
+                .data
+                .get("memory_candidates")
+                .and_then(|v| v.as_array())
+            {
+                arr.iter().collect()
+            } else {
+                ev.data.get("memory_candidate").into_iter().collect()
+            };
+            if !candidates.is_empty() {
+                let notes: Vec<String> = candidates
+                    .iter()
+                    .map(|candidate| persist_memory_note(store, task_id, candidate, &now_iso))
+                    .collect();
+                let note = notes.join("；");
+                let _ = tx
+                    .send(json!({
+                        "type": "step_start",
+                        "stepId": "memory-auto",
+                        "description": note,
+                        "taskId": task_id,
+                    }))
+                    .await;
+                let _ = tx
+                    .send(json!({
+                        "type": "step_done",
+                        "stepId": "memory-auto",
+                        "output": note,
+                        "taskId": task_id,
+                    }))
+                    .await;
             }
         }
     }
@@ -1035,6 +1281,7 @@ async fn persist_and_meter(
                 let _ = tx
                     .send(json!({
                         "type": "quota_warning",
+                        "scope": "daily",
                         "level": snap.tier,
                         "action": snap.action,
                         "usedTokens": snap.used_tokens,
@@ -1046,36 +1293,110 @@ async fn persist_and_meter(
                 // 预算恢复/配额重置后按入队 FIFO 回 executing（转移 #26，云端语义，
                 // 本地 local-first 随跨日台账重置自然恢复）
                 if snap.action == "block" {
-                    if let Some(reg) = &p0.registry {
-                        if let Some(record) = reg.get(task_id) {
-                            // 活跃态均可暂停（本地流式执行期间状态为 planning，
-                            // 云端语义下为 executing，两者均对应转移 #17）
-                            let pausable = matches!(
-                                record.status.as_str(),
-                                "queued" | "planning" | "executing" | "delivering"
-                            );
-                            if pausable {
-                                if let Some(updated) = reg.update_status(
-                                    task_id,
-                                    crate::task::status::BUDGET_PAUSED,
-                                    Some("BUDGET_EXHAUSTED"),
-                                ) {
-                                    let _ = tx
-                                        .send(json!({
-                                            "type": "status_change",
-                                            "taskId": task_id,
-                                            "status": updated.status,
-                                            "statusReasonCode": updated.status_reason_code,
-                                        }))
-                                        .await;
-                                }
-                            }
-                        }
-                    }
+                    pause_running_task(
+                        task_id,
+                        p0,
+                        tx,
+                        &format!(
+                            "今日预算已用满（{} / {} Token）：本任务转入预算暂停。\
+                             等下一个 UTC 日自动重置，或在设置 →「模型与用量」调高今日预算，\
+                             然后在任务上点「继续」唤回。",
+                            snap.used_tokens, snap.quota_tokens
+                        ),
+                    )
+                    .await;
                 }
+            }
+            // 单任务级预算（缺陷 D-14.1）：同一条用量既进日额度也进本任务台账。
+            // 上限是按任务算的，所以这里只能拦这一个任务，别的日子/别的任务照常。
+            if let crate::task::quota::TaskBudgetTransition::Exceeded(tsnap) =
+                gate.add_task_usage(task_id, tokens)
+            {
+                let _ = tx
+                    .send(json!({
+                        "type": "quota_warning",
+                        "scope": "task",
+                        "level": tsnap.tier,
+                        "action": tsnap.action,
+                        "usedTokens": tsnap.used_tokens,
+                        "quotaTokens": tsnap.limit_tokens,
+                        "taskId": task_id,
+                    }))
+                    .await;
+                pause_running_task(
+                    task_id,
+                    p0,
+                    tx,
+                    &format!(
+                        "本任务已用满单任务预算（{} / {} Token）：转入预算暂停，\
+                         执行面已停止下一轮模型调用。在设置 →「模型与用量」调高「单任务预算」\
+                         后，点任务上的「继续」从最近一次检查点唤回；不调高也可以直接取消本任务。",
+                        tsnap.used_tokens, tsnap.limit_tokens
+                    ),
+                )
+                .await;
             }
         }
     }
+}
+
+/// 预算用满后的统一收尾：活跃态任务转 budget_paused（转移 #17，成因 BUDGET_EXHAUSTED），
+/// 并把「为什么停了、怎么接着往下走」摊成一条可见的过程说明。
+///
+/// 已是 budget_paused 或已终态的任务不重复甩状态事件——跃迁只在第一次发生时有意义，
+/// 反复甩 status_change 会让界面以为任务在多个状态之间跳。
+pub(crate) async fn pause_running_task(
+    task_id: &str,
+    p0: &P0Context,
+    tx: &tokio::sync::mpsc::Sender<Value>,
+    reason_zh: &str,
+) {
+    let Some(reg) = &p0.registry else { return };
+    let pausable = reg
+        .get(task_id)
+        .map(|record| {
+            // 活跃态均可暂停（本地流式执行期间状态为 planning，
+            // 云端语义下为 executing，两者均对应转移 #17）
+            matches!(
+                record.status.as_str(),
+                "queued" | "planning" | "executing" | "delivering"
+            )
+        })
+        .unwrap_or(false);
+    if !pausable {
+        return;
+    }
+    let Some(updated) = reg.update_status(
+        task_id,
+        crate::task::status::BUDGET_PAUSED,
+        Some("BUDGET_EXHAUSTED"),
+    ) else {
+        return;
+    };
+    let _ = tx
+        .send(json!({
+            "type": "status_change",
+            "taskId": task_id,
+            "status": updated.status,
+            "statusReasonCode": updated.status_reason_code,
+        }))
+        .await;
+    let _ = tx
+        .send(json!({
+            "type": "step_start",
+            "stepId": "budget-pause",
+            "description": reason_zh,
+            "taskId": task_id,
+        }))
+        .await;
+    let _ = tx
+        .send(json!({
+            "type": "step_done",
+            "stepId": "budget-pause",
+            "output": reason_zh,
+            "taskId": task_id,
+        }))
+        .await;
 }
 
 async fn stream_chat(
@@ -1160,6 +1481,7 @@ pub async fn query_checkpoints(
     };
     let resp = http_client()
         .post(format!("http://127.0.0.1:{port}/api/chat/checkpoint/query"))
+        .header(ENGINE_TOKEN_HEADER, engine_local_token())
         .json(&json!({ "task_ids": task_ids }))
         .send()
         .await
@@ -1188,6 +1510,7 @@ async fn stream_post(
     let client = http_client();
     let resp = client
         .post(format!("http://127.0.0.1:{port}{path}"))
+        .header(ENGINE_TOKEN_HEADER, engine_local_token())
         .header("Accept", "text/event-stream")
         .json(&body)
         .send()
@@ -1228,14 +1551,39 @@ async fn stream_post(
     let mut seq_guard = SeqGuard::new();
     let mut saw_done = false;
     let mut stream_broken = false;
+    let mut stream_timed_out = false;
+    let mut budget_stopped = false;
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next = tokio::time::timeout(
+            Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+            stream.next(),
+        )
+        .await;
+        let chunk = match next {
+            Err(_) => {
+                log(&format!("stream idle timeout for {task_id}"));
+                stream_timed_out = true;
+                stream_broken = true;
+                break;
+            }
+            Ok(None) => break,
+            Ok(Some(chunk)) => chunk,
+        };
         match chunk {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes);
                 let events = feed.feed(&text);
                 forward_events(events, &mut seq_guard, &tx, port, task_id, &mut saw_done, &p0)
                     .await;
+                // 单任务预算用满：让引擎停手，不能把「已暂停」的任务继续跑完这一轮。
+                // 计量点在 forward_events 里已把状态转成 budget_paused，这里只负责拦执行面。
+                if !saw_done && task_budget_blocked(&p0, task_id) {
+                    log(&format!("task budget exhausted for {task_id}: cancelling engine stream"));
+                    cancel_engine_task(port, task_id, "BUDGET_TASK_EXCEEDED").await;
+                    budget_stopped = true;
+                    break;
+                }
             }
             Err(e) => {
                 // 断线：转入补齐循环（事件丢失=0 目标，由引擎重放窗口保障）
@@ -1246,13 +1594,14 @@ async fn stream_post(
         }
     }
 
-    if !stream_broken {
+    if !stream_broken && !budget_stopped {
         let rest = feed.finish();
         forward_events(rest, &mut seq_guard, &tx, port, task_id, &mut saw_done, &p0).await;
     }
 
     // 断线且未见 done：轮询重放端点补齐直至 done 或超时（桌面 local-first 降级路径）
-    if stream_broken && !saw_done {
+    // 预算拦停的除外：那是我们主动让引擎停的，再去补齐等于把刚拦掉的下一轮捞回来。
+    if stream_broken && !saw_done && !budget_stopped {
         let deadline = Instant::now() + Duration::from_millis(CATCHUP_TIMEOUT_MS);
         while Instant::now() < deadline && !saw_done {
             tokio::time::sleep(Duration::from_millis(CATCHUP_POLL_MS)).await;
@@ -1268,8 +1617,35 @@ async fn stream_post(
     drop(tx);
     let _ = emitter.await;
 
-    // Agent 未显式发送 done 时兜底，确保前端退出 loading
+    // Agent 未显式发送 done 时兜底，确保前端退出 loading。
+    // 断线补齐也没拿到 done：必须给出可见原因，不能只发一个 done 让界面
+    // 看起来「正常结束」；已取消/已终态的任务除外（那是用户预期内的收尾）。
     if !saw_done {
+        if stream_broken {
+            let settled = p0
+                .registry
+                .as_ref()
+                .and_then(|r| r.get(task_id))
+                .map(|rec| matches!(rec.status.as_str(), "cancelled" | "failed" | "done" | "archived"))
+                .unwrap_or(false);
+            if !settled {
+                let (code, message) = if stream_timed_out {
+                    (
+                        "ENGINE_STREAM_TIMEOUT",
+                        "引擎事件流超过 90 秒没有任何数据：任务可能已卡死，请稍后在任务列表查看或重新提交",
+                    )
+                } else {
+                    (
+                        "ENGINE_STREAM_BROKEN",
+                        "与引擎的事件流中断：任务可能仍在后台执行，请稍后在任务列表查看或重新提交",
+                    )
+                };
+                let _ = app.emit(
+                    EVENT_CHAT,
+                    json!({ "type": "error", "taskId": task_id, "code": code, "message": message }),
+                );
+            }
+        }
         let _ = app.emit(EVENT_CHAT, json!({ "type": "done", "taskId": task_id }));
     }
 
@@ -1340,6 +1716,161 @@ mod p0_tests {
 
         // 后续新提交被阻断（QUOTA_EXCEEDED）
         assert_eq!(gate.check_submit(), Err("QUOTA_EXCEEDED"));
+    }
+
+    /// D-14.1 验收：同一条 usage 既进日额度也进本任务台账；
+    /// 单任务上限只把**这一个**任务转成 budget_paused（转移 #17），别的任务照常。
+    #[tokio::test]
+    async fn test_persist_and_meter_task_budget_pauses_only_the_hit_task() {
+        let registry = Arc::new(TaskRegistry::new());
+        registry.create("t-hot", "default");
+        registry.create("t-cold", "default");
+        registry.update_status("t-hot", crate::task::status::PLANNING, None);
+        registry.update_status("t-cold", crate::task::status::PLANNING, None);
+
+        // 日额度宽裕（100 万），只设单任务上限 100：把两个维度隔开看
+        let gate = Arc::new(QuotaGate::new(None, 1_000_000));
+        gate.set_per_task_limit(100);
+        let p0 = P0Context {
+            events: None,
+            quota: Some(Arc::clone(&gate)),
+            registry: Some(Arc::clone(&registry)),
+            store: None,
+            secure_env: false,
+            privacy: false,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(16);
+
+        let ev = super::super::sse::AgentEvent {
+            kind: "step_done".into(),
+            data: serde_json::json!({
+                "step_id": "s1",
+                "usage": { "promptTokens": 60, "completionTokens": 60 }
+            }),
+            seq: Some(1),
+        };
+        persist_and_meter(&ev, "t-hot", &p0, &tx).await;
+        drop(tx);
+
+        let mut saw_task_warning = false;
+        let mut saw_paused = false;
+        let mut saw_note = false;
+        let mut daily_warning = false;
+        while let Some(msg) = rx.recv().await {
+            match msg.get("type").and_then(|t| t.as_str()) {
+                Some("quota_warning") => {
+                    if msg["scope"] == "task" {
+                        saw_task_warning = true;
+                        assert_eq!(msg["action"], "block");
+                        assert_eq!(msg["usedTokens"], 120);
+                        assert_eq!(msg["quotaTokens"], 100, "上限按单任务口径给出");
+                    } else {
+                        daily_warning = true;
+                    }
+                }
+                Some("status_change") => {
+                    saw_paused = true;
+                    assert_eq!(msg["taskId"], "t-hot");
+                    assert_eq!(msg["status"], "budget_paused");
+                    assert_eq!(msg["statusReasonCode"], "BUDGET_EXHAUSTED");
+                }
+                Some("step_done") => {
+                    if msg["stepId"] == "budget-pause" {
+                        saw_note = true;
+                        let text = msg["output"].as_str().unwrap_or_default();
+                        assert!(text.contains("单任务预算"), "{text}");
+                        assert!(text.contains("继续"), "必须给出唤回方式：{text}");
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_task_warning, "应产出 scope=task 的 quota_warning");
+        assert!(saw_paused, "应产出 status_change(budget_paused)");
+        assert!(saw_note, "拦停原因要作为过程步骤可见");
+        assert!(!daily_warning, "日额度没到档，不该跟着甩预警");
+
+        assert_eq!(
+            registry.get("t-hot").unwrap().status,
+            crate::task::status::BUDGET_PAUSED
+        );
+        // 别的任务不受牵连，新提交也不该被单任务预算挡住
+        assert_eq!(
+            registry.get("t-cold").unwrap().status,
+            crate::task::status::PLANNING
+        );
+        assert!(!gate.task_budget_blocked("t-cold"));
+        assert!(gate.check_submit().is_ok());
+        // 同一笔用量在日台账里也只记一次
+        assert_eq!(gate.snapshot().used_tokens, 120);
+    }
+
+    /// D-14.1：已经暂停的任务不能被同一件事反复甩状态事件（去抖）
+    #[tokio::test]
+    async fn test_task_budget_pause_is_emitted_once() {
+        let registry = Arc::new(TaskRegistry::new());
+        registry.create("t-twice", "default");
+        registry.update_status("t-twice", crate::task::status::EXECUTING, None);
+        let gate = Arc::new(QuotaGate::new(None, 1_000_000));
+        gate.set_per_task_limit(100);
+        let p0 = P0Context {
+            events: None,
+            quota: Some(Arc::clone(&gate)),
+            registry: Some(Arc::clone(&registry)),
+            store: None,
+            secure_env: false,
+            privacy: false,
+        };
+        let usage_ev = |seq: u64| super::super::sse::AgentEvent {
+            kind: "step_done".into(),
+            data: serde_json::json!({
+                "step_id": format!("s{seq}"),
+                "usage": { "promptTokens": 60, "completionTokens": 60 }
+            }),
+            seq: Some(seq),
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(32);
+        persist_and_meter(&usage_ev(1), "t-twice", &p0, &tx).await;
+        // 引擎没立刻停：下一轮用量继续进来
+        persist_and_meter(&usage_ev(2), "t-twice", &p0, &tx).await;
+        drop(tx);
+
+        let mut paused = 0;
+        let mut task_warnings = 0;
+        while let Some(msg) = rx.recv().await {
+            match msg.get("type").and_then(|t| t.as_str()) {
+                Some("status_change") if msg["status"] == "budget_paused" => paused += 1,
+                Some("quota_warning") if msg["scope"] == "task" => task_warnings += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(paused, 1, "状态转移只播报一次，实际用量仍照常累计");
+        assert_eq!(task_warnings, 1, "跨上限只跃迁一次（去抖）");
+        assert_eq!(gate.task_snapshot("t-twice").used_tokens, 240);
+        assert!(gate.task_budget_blocked("t-twice"), "拦停判据持续成立");
+    }
+
+    /// D-14.1：执行面的拦停判据在没有闸门时不能假装「拦住了」
+    #[test]
+    fn test_task_budget_blocked_needs_a_gate() {
+        let free = P0Context::default();
+        assert!(!task_budget_blocked(&free, "t-any"));
+
+        let gate = Arc::new(QuotaGate::new(None, 1_000_000));
+        let with = P0Context {
+            events: None,
+            quota: Some(Arc::clone(&gate)),
+            registry: None,
+            store: None,
+            secure_env: false,
+            privacy: false,
+        };
+        assert!(!task_budget_blocked(&with, "t-any"), "未设上限 = 不限");
+        gate.set_per_task_limit(50);
+        gate.add_task_usage("t-any", 50);
+        assert!(task_budget_blocked(&with, "t-any"));
+        assert!(!task_budget_blocked(&with, "t-other"));
     }
 
     /// P1-5：同一时刻两个 workspace 的实例各占一个端口，端点必须按 workspace 返回
@@ -1438,7 +1969,7 @@ mod p0_tests {
             events.replay("t-priv", 0).is_empty(),
             "隐私模式不应写入可回放事件"
         );
-        let convs = crate::store::messages::list_conversations(&store, None).unwrap();
+        let convs = crate::store::messages::list_conversations(&store, None, None).unwrap();
         assert!(convs.is_empty(), "隐私模式不应写入会话正文：{convs:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1600,6 +2131,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         for (tool, action, target, outcome) in [
             ("run_command", "exec", "python -V", "ok"),
+            ("run_shell", "", "shell（32 字符，sha256:abc）", "failed"),
             ("fetch_url", "network", "https://example.com", "denied"),
             ("browser_click", "browser", "https://example.com/path", "ok"),
             ("browser_type", "browser", "https://example.com/path", "denied"),
@@ -1620,11 +2152,17 @@ mod tests {
         }
 
         let entries = crate::security::audit::query(&store, &Default::default()).unwrap();
-        assert_eq!(entries.len(), 4, "{entries:?}");
+        assert_eq!(entries.len(), 5, "{entries:?}");
         assert!(entries
             .iter()
             .any(|e| e.action == crate::security::audit::ACTION_EXEC_RUN
                 && e.severity == crate::security::audit::SEV_INFO));
+        // 通用 shell 共用 exec_run 动作码；非成功结果降为 warning
+        assert!(entries
+            .iter()
+            .any(|e| e.action == crate::security::audit::ACTION_EXEC_RUN
+                && e.severity == crate::security::audit::SEV_WARNING
+                && e.resource.as_deref().is_some_and(|r| r.contains("sha256:"))));
         assert!(entries
             .iter()
             .any(|e| e.action == crate::security::audit::ACTION_NETWORK_FETCH

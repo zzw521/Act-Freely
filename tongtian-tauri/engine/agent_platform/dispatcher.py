@@ -20,6 +20,8 @@ from .mcp_catalog import McpCatalog, McpCatalogError, McpClientPool
 from .message import AgentMessage, AgentReply
 from .skills import Skill, SkillRegistry
 
+import usage_store as us  # 用量来源标记（引擎目录模块，导入方已把引擎目录加入 sys.path）
+
 MAX_HISTORY_MESSAGES = 10
 
 
@@ -75,12 +77,17 @@ class AgentDispatcher:
         skill, why = self.skills.resolve(message.skill, message.text)
         if skill is None:
             return self._failure(message, "", "SKILL_NOT_FOUND", why, started)
+        # 平台层的调用不经引擎 HTTP 中间件，来源只能按消息通道标记；不标就落成
+        # unknown，与桌面 `model_usage` 合并时无法判断是否重复计数
+        origin_token = us.set_usage_origin(message.channel)
         try:
             runner = self._runner or self._run_engine
             reply = await runner(message, skill)
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
             return self._failure(message, skill.id, "DISPATCH_FAILED", str(exc), started)
+        finally:
+            us.reset_usage_origin(origin_token)
         if why and why not in reply.notes:
             reply.notes.append(why)
         reply.duration_ms = int((time.monotonic() - started) * 1000)

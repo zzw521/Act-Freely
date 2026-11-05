@@ -1,15 +1,24 @@
-"""MCP 工具按需载入（P1 工具效率）
+"""MCP 工具按需载入（P1 工具效率 / D-40 第 5 项后半）
 
 连接器可能有几十个工具。全部注册进 function schema 会一直占着上下文，
 而多数任务只会用到其中一两个。这里不删除工具，而是把它们放进**未激活的工具组**：
 
 * 工具仍然注册，handler 仍然有效，只是默认不出现在模型看到的工具清单里；
 * 模型先调用 `search_tools` 按关键词搜索；
-* 命中后激活对应连接器的工具组，下一轮模型就能看到并直接调用。
+* **只把被检索到的那几个**搬进已激活的 `mcp_equipped` 组，下一轮模型就能看到并直接调用。
 
 刻意只对 MCP 工具生效：内置文件工具、技能、知识库、搜索等是任务的常规入口，
 藏起来只会让模型多绕一步。搜索是词面匹配（ASCII 词 + 中文二元组），
 不是语义检索；没命中就如实告诉模型有哪些分组，不做猜测。
+
+粒度为什么落在「工具」而不是「连接器」：台账的验收口径是「30 个 MCP 工具只加载被检索到的
+schema」，按连接器整组启用意味着搜「发邮件」会把同连接器里建 issue、读 PR 的 schema
+一起拉进上下文——工具越多这个副作用越贵。分组本身仍按连接器建立，因为「哪些工具属于哪个
+连接器」是用户能看懂的归属信息，也是兜底入口 `reset_equipped_tools` 的操作单位。
+
+数量阈值：连接器只有一两个工具时，多花一轮搜索比省下的几个 schema 更贵，所以只有**声明的
+工具总数超过阈值**才走按需载入。阈值判断用的是 Rust 探测缓存里的工具清单（`spec["tools"]`），
+在建立 Agent 之前就能定，提示词与事实不会各说各的。
 """
 
 from __future__ import annotations
@@ -18,9 +27,14 @@ import re
 
 MAX_QUERY_CHARS = 200
 MAX_RESULTS = 12
-MAX_ACTIVATED_GROUPS = 3
 MAX_GROUP_SAMPLES = 3
 MAX_GROUPS_IN_MISS = 8
+# 一次搜索最多启用几个工具：命中面太宽时宁可让模型说得更具体
+MAX_ACTIVATED_TOOLS = 6
+# 声明工具总数超过它才值得「先搜后用」；以内不多等于白绕一轮
+TOOL_LAZY_THRESHOLD = 8
+# 被检索命中的工具搬到这个组：它是激活态的，所以 schema 里只会出现被选中的那几个
+EQUIPPED_GROUP = "mcp_equipped"
 
 _ASCII_TOKEN = re.compile(r"[0-9a-z][0-9a-z._+-]*")
 _CJK_RUN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
@@ -48,6 +62,89 @@ def mcp_server_count(runtime: dict | None) -> int:
     return len(
         [s for s in block if isinstance(s, dict) and str(s.get("serverId") or "").strip()]
     )
+
+
+def _servers(runtime: dict | None) -> list[dict]:
+    """按 attach 的接入口径取本轮真正会被接入的连接器（有 serverId、不超单轮上限）"""
+    block = (runtime or {}).get("mcp") if isinstance(runtime, dict) else None
+    if not isinstance(block, list):
+        return []
+    servers = [s for s in block if isinstance(s, dict) and str(s.get("serverId") or "").strip()]
+    try:
+        import mcp_runtime as mr
+
+        servers = servers[: mr.MAX_MCP_SERVERS]
+    except Exception:  # noqa: BLE001  取不到上限就按全量算，宁可多藏也别少算
+        pass
+    return servers
+
+
+def declared_tool_count(runtime: dict | None) -> int:
+    """Rust 探测缓存里声明的连接器工具总数（探测过才有）。
+
+    没探测到的连接器按 0 计：宁可整组直接载入，也不把「其实有 20 个工具」的连接器
+    藏进一次搜不到的关键词后面。
+    """
+    total = 0
+    for spec in _servers(runtime):
+        tools = spec.get("tools")
+        if isinstance(tools, list):
+            total += len([t for t in tools if isinstance(t, dict)])
+    return total
+
+
+def should_lazy(runtime: dict | None, policy_flag: bool = True) -> bool:
+    """本轮是否真的走按需载入：策略开着 + 声明工具总数超过阈值"""
+    if not policy_flag:
+        return False
+    return declared_tool_count(runtime) > TOOL_LAZY_THRESHOLD
+
+
+def ensure_equipped_group(toolkit) -> str:
+    """建立/复用「已载入」组：它是激活态的，被搬进来的工具才会进 schema"""
+    groups = getattr(toolkit, "groups", {}) or {}
+    if EQUIPPED_GROUP in groups:
+        if not getattr(groups[EQUIPPED_GROUP], "active", False):
+            toolkit.update_tool_groups([EQUIPPED_GROUP], active=True)
+        return EQUIPPED_GROUP
+    toolkit.create_tool_group(
+        EQUIPPED_GROUP,
+        description="本轮被 search_tools 检索命中并已载入上下文的连接器工具",
+        active=True,
+    )
+    return EQUIPPED_GROUP
+
+
+def _is_connector_tool(tool, group: str) -> bool:
+    """只搬连接器的工具：内置文件/技能等都在 basic 组，不属于按需载入的范围"""
+    if group in ("basic", EQUIPPED_GROUP):
+        return group == EQUIPPED_GROUP
+    return group.startswith("mcp_") or getattr(tool, "mcp_name", None) is not None
+
+
+def equip(toolkit, names: list[str]) -> list[str]:
+    """把指定工具搬进已激活组，返回真正搬动的名字（只动 MCP 工具，不动内置）"""
+    tools = getattr(toolkit, "tools", {}) or {}
+    groups = getattr(toolkit, "groups", {}) or {}
+    targets = [
+        name for name in names
+        if name in tools
+        and _is_connector_tool(tools[name], str(getattr(tools[name], "group", "basic") or "basic"))
+        # 已经在别的激活组里（模型用 reset 整组开过）就别再搬了，搬了也白搬
+        and str(getattr(tools[name], "group", "basic")) != EQUIPPED_GROUP
+        and not bool(getattr(groups.get(str(getattr(tools[name], "group", ""))), "active", False))
+    ]
+    if not targets:
+        return []
+    ensure_equipped_group(toolkit)
+    moved: list[str] = []
+    for name in targets:
+        tool = tools[name]
+        if str(getattr(tool, "group", "basic") or "basic") == EQUIPPED_GROUP:
+            continue
+        tool.group = EQUIPPED_GROUP
+        moved.append(name)
+    return moved
 
 
 def ensure_group(toolkit, spec: dict, index: int) -> str:
@@ -112,7 +209,10 @@ def search(toolkit, query: str, limit: int = MAX_RESULTS) -> dict:
         if name in ("search_tools", "reset_equipped_tools"):
             continue
         group = str(getattr(tool, "group", "basic") or "basic")
-        active = group == "basic" or bool(getattr(groups.get(group), "active", False))
+        active = (
+            group in ("basic", EQUIPPED_GROUP)
+            or bool(getattr(groups.get(group), "active", False))
+        )
         score = _score(lowered, tokens, tool, toolkit)
         if score <= 0:
             continue
@@ -120,25 +220,23 @@ def search(toolkit, query: str, limit: int = MAX_RESULTS) -> dict:
             "name": str(getattr(tool, "name", name) or name),
             "description": _tool_description(tool),
             "group": group,
-            "groupLabel": _group_label(toolkit, group) if group != "basic" else "内置工具",
+            "groupLabel": (
+                "内置工具" if group == "basic"
+                else ("已载入" if group == EQUIPPED_GROUP else _group_label(toolkit, group))
+            ),
             "active": active,
             "score": score,
         })
 
     matches.sort(key=lambda m: (-m["score"], m["name"]))
-    to_activate: list[str] = []
-    for item in matches:
-        if item["active"] or item["group"] in to_activate:
-            continue
-        to_activate.append(item["group"])
-        if len(to_activate) >= MAX_ACTIVATED_GROUPS:
-            break
-    if to_activate:
-        toolkit.update_tool_groups(to_activate, active=True)
+    # 只启用被检索到的那几个：整组激活等于「搜一个工具，塞进来一整个连接器」
+    candidates = [m["name"] for m in matches if not m["active"]][: max(1, MAX_ACTIVATED_TOOLS)]
+    activated = equip(toolkit, candidates)
+    activated_set = set(activated)
 
     visible = [
         m for m in matches
-        if m["active"] or m["group"] in to_activate
+        if m["active"] or m["name"] in activated_set
     ][: max(1, min(int(limit or MAX_RESULTS), MAX_RESULTS))]
 
     inactive_groups = [
@@ -149,7 +247,9 @@ def search(toolkit, query: str, limit: int = MAX_RESULTS) -> dict:
     return {
         "query": cleaned,
         "matches": visible,
-        "activatedGroups": to_activate,
+        # 组粒度已不再用于「命中即整组启用」；保留空列表是因为存量口径与说明文字仍读它
+        "activatedGroups": [],
+        "activatedTools": activated,
         "inactiveGroups": inactive_groups,
         "totalMatches": len(matches),
     }
@@ -183,10 +283,11 @@ def _miss_text(toolkit, result: dict) -> str:
 
 def _hit_text(result: dict) -> str:
     lines: list[str] = []
-    if result["activatedGroups"]:
+    activated = result.get("activatedTools") or []
+    if activated:
         lines.append(
-            f"已启用 {len(result['activatedGroups'])} 个连接器分组；"
-            "下列工具从下一轮起可直接调用："
+            f"已按检索结果载入 {len(activated)} 个工具（同连接器里未被命中的工具仍在按需区，"
+            "换关键词可继续启用）；下列工具从下一轮起可直接调用："
         )
     else:
         lines.append("下列工具当前已经可用：")
@@ -198,7 +299,7 @@ def _hit_text(result: dict) -> str:
         lines.append(f"- {item['name']}（{item['groupLabel']}）{suffix}")
     if result["totalMatches"] > len(result["matches"]):
         lines.append(
-            f"另有 {result['totalMatches'] - len(result['matches'])} 个匹配工具未列出，"
+            f"另有 {result['totalMatches'] - len(result['matches'])} 个匹配工具未列出也未载入，"
             "可用更具体的关键词缩小范围。"
         )
     return "\n".join(lines)
@@ -216,8 +317,8 @@ def install(toolkit) -> str:
         """搜索并按需启用连接器工具。
 
         当需要的工具不在当前工具列表中时，先用本工具按关键词搜索。
-        命中后会启用对应连接器分组的全部工具，下一轮即可直接调用。
-        搜索只匹配工具名、描述与连接器名，不是语义检索。
+        命中后**只启用被检索到的那几个**，同连接器里没命中的工具仍然不占上下文；
+        下一轮即可直接调用。搜索只匹配工具名、描述与连接器名，不是语义检索。
 
         Args:
             query (`str`):
@@ -271,12 +372,17 @@ def _install_reset(toolkit, ToolResponse, TextBlock) -> None:
     toolkit.register_tool_function(reset_equipped_tools)
 
 
-def system_hint(server_count: int) -> str:
+def system_hint(server_count: int, tool_count: int = 0) -> str:
+    counts = (
+        f"本轮有 {server_count} 个连接器、{tool_count} 个连接器工具没有直接放进上下文。"
+        if tool_count
+        else f"本轮有 {server_count} 个连接器的工具没有直接放进上下文。"
+    )
     return (
         "\n\n## 连接器工具（按需载入）\n"
-        f"本轮有 {server_count} 个连接器的工具没有直接放进上下文。"
-        "需要这些工具时，先调用 search_tools(query=\"关键词\") 搜索；"
-        "命中后对应连接器的工具会在下一轮变为可调用。"
+        + counts
+        + "需要这些工具时，先调用 search_tools(query=\"关键词\") 搜索；"
+        "命中后**只有被检索到的那几个工具**会在下一轮变为可调用，没命中的同类工具继续不占上下文。"
         "不要凭空调用未出现在工具列表里的工具名；"
         "若误调了未载入的工具，按错误提示调用 reset_equipped_tools 启用对应分组。"
     )

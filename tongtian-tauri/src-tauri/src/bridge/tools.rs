@@ -14,9 +14,24 @@ use serde_json::{json, Value};
 
 /// (工具名, 展示名, 说明) —— 名称必须与 `register_tool_function` 的函数名一致
 pub const BUILTIN_TOOLS: &[(&str, &str, &str)] = &[
+    (
+        "list_directory",
+        "列出目录",
+        "列出目录内的文件与子目录（可限定递归深度与条数）",
+    ),
     ("view_text_file", "读取文件", "读取工作目录内的文本文件（按行返回内容）"),
+    (
+        "read_document",
+        "读取文档",
+        "按路径读取 Word / Excel / PowerPoint / PDF 并抽取正文",
+    ),
     ("write_text_file", "写入文件", "在工作目录内创建或覆盖文本文件"),
     ("insert_text_file", "修改文件", "在工作目录内按行插入或替换文本内容"),
+    (
+        "delete_text_file",
+        "删除文件",
+        "删除单个文件；仅「完全访问」档位放行，删除前先复制进引擎回收目录",
+    ),
 ];
 
 /// 声明清单视图（source 标明来源，界面据此说明它不是实测值）
@@ -76,7 +91,15 @@ pub async fn agent_builtin_tools(
 ) -> Result<Value, String> {
     if let Some(port) = super::agent::any_running_port(bridge.inner()).await {
         let url = format!("http://127.0.0.1:{port}/api/tools");
-        if let Ok(resp) = reqwest::Client::new().get(url).send().await {
+        if let Ok(resp) = crate::proxy::loopback_client()
+            .get(url)
+            .header(
+                super::agent::ENGINE_TOKEN_HEADER,
+                super::agent::engine_local_token(),
+            )
+            .send()
+            .await
+        {
             if let Ok(raw) = resp.json::<Value>().await {
                 if let Some(v) = merge_engine_view(&raw) {
                     return Ok(v);
@@ -123,10 +146,17 @@ mod tests {
         let before = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), before, "工具名重复");
-        // 三个文件工具是引擎当前唯一注册的能力
+        // 六件文件工具是引擎当前唯一常驻注册的能力（删除只在「完全访问」档放行）
         assert_eq!(
             ids,
-            vec!["insert_text_file", "view_text_file", "write_text_file"]
+            vec![
+                "delete_text_file",
+                "insert_text_file",
+                "list_directory",
+                "read_document",
+                "view_text_file",
+                "write_text_file"
+            ]
         );
     }
 

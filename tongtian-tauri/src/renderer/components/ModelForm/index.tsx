@@ -27,6 +27,7 @@ import EditIcon from '@mui/icons-material/Edit';
 import SettingsIcon from '@mui/icons-material/Settings';
 import { ModelConfig, ModelSource, ModelTestReq, ModelTestResp } from '../../../shared/types';
 import { errorTextOf } from '../../../shared/error-messages';
+import { useI18n } from '../../i18n';
 
 interface ModelFormProps {
   initialData?: Partial<ModelConfig>;
@@ -43,6 +44,7 @@ const ModelForm: React.FC<ModelFormProps> = ({
   onCancel,
   isSubmitting,
 }) => {
+  const { t: tr } = useI18n();
   const [formData, setFormData] = useState({
     name: initialData?.name || '',
     source: initialData?.source || ModelSource.OPENAI_COMPAT,
@@ -99,7 +101,7 @@ const ModelForm: React.FC<ModelFormProps> = ({
   return (
     <Box component="form" onSubmit={handleSubmit}>
       {/* 头部标题 */}
-      <Typography variant="h6" fontWeight="bold" sx={{ mb: 3 }}>
+      <Typography id="tt-model-form-title" variant="h6" fontWeight="bold" sx={{ mb: 3 }}>
         {initialData?.id ? '✏️ 编辑模型' : '➕ 添加模型'}
       </Typography>
 
@@ -110,6 +112,7 @@ const ModelForm: React.FC<ModelFormProps> = ({
           action={
             <IconButton
               size="small"
+              aria-label={tr('关闭连接测试结果提示')}
               onClick={() => setTestResult(null)}
             >
               <CancelIcon fontSize="inherit" />
@@ -188,6 +191,7 @@ const ModelForm: React.FC<ModelFormProps> = ({
                 <Tooltip title={showApiKey ? '隐藏' : '显示'}>
                   <IconButton
                     size="small"
+                    aria-label={showApiKey ? tr('隐藏 API Key') : tr('显示 API Key')}
                     onClick={() => setShowApiKey(!showApiKey)}
                   >
                     {showApiKey ? <VisibilityOffIcon fontSize="small" /> : <VisibilityIcon fontSize="small" />}
@@ -226,6 +230,8 @@ const ModelForm: React.FC<ModelFormProps> = ({
           <Chip
             label="🌐 设为全局默认"
             clickable
+            aria-label={tr('设为全局默认模型')}
+            aria-pressed={formData.isDefault}
             color={formData.isDefault ? 'primary' : 'default'}
             onClick={() => setFormData({ ...formData, isDefault: !formData.isDefault })}
             sx={{ flex: 1 }}
@@ -233,6 +239,8 @@ const ModelForm: React.FC<ModelFormProps> = ({
           <Chip
             label="🔒 强制本地模式"
             clickable
+            aria-label={tr('强制本地模式：敏感任务使用本地模型')}
+            aria-pressed={formData.forceLocal}
             color={formData.forceLocal ? 'secondary' : 'default'}
             onClick={() => setFormData({ ...formData, forceLocal: !formData.forceLocal })}
             sx={{ flex: 1 }}

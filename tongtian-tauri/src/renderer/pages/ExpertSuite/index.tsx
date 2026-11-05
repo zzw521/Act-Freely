@@ -64,6 +64,8 @@ import AnalyticsIcon from '@mui/icons-material/Analytics';
 import { marketAPI, pluginAPI, suiteAPI } from '../../lib/api';
 import { bytesToBase64 } from '../../lib/suite-zip';
 import { errorTextOf } from '../../../shared/error-messages';
+import { clickableProps, disclosureProps, anchorMenuProps } from '../../lib/a11y';
+import { useI18n } from '../../i18n';
 import type {
   InstalledSuite,
   PluginTemplate,
@@ -230,16 +232,16 @@ const MOCK_SUITES: CatalogSuite[] = [
 /** 已安装套件的图标按分类取用，未覆盖分类回落套件主色 */
 const CATEGORY_ICON: Record<string, { icon: React.ElementType; color: string }> = {
   财务: { icon: AccountBalanceIcon, color: '#10B981' },
-  律师: { icon: GavelIcon, color: '#8B5CF6' },
+  律师: { icon: GavelIcon, color: 'var(--tt-accent-violet)' },
   产研: { icon: CodeIcon, color: '#06B6D4' },
   市场: { icon: CampaignIcon, color: '#EC4899' },
   销售: { icon: WorkIcon, color: '#F97316' },
-  HR: { icon: BadgeIcon, color: '#3B82F6' },
+  HR: { icon: BadgeIcon, color: 'var(--tt-info)' },
   运营: { icon: GroupsIcon, color: '#14B8A6' },
-  数据分析: { icon: AnalyticsIcon, color: '#6366F1' },
+  数据分析: { icon: AnalyticsIcon, color: 'var(--tt-accent)' },
   供应链: { icon: LocalShippingIcon, color: '#84CC16' },
   设计: { icon: PaletteIcon, color: '#F43F5E' },
-  政务公共: { icon: PublicIcon, color: '#0EA5E9' },
+  政务公共: { icon: PublicIcon, color: 'var(--tt-info)' },
   行政: { icon: InsightsIcon, color: '#A855F7' },
 };
 
@@ -316,6 +318,7 @@ function toMessage(e: unknown): string {
 type SuiteView = 'plaza' | 'installed' | 'experts';
 
 const ExpertSuitePage: React.FC = () => {
+  const { t: tr } = useI18n();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [catalog, setCatalog] = useState<CatalogSuite[]>([]);
@@ -598,7 +601,7 @@ const ExpertSuitePage: React.FC = () => {
       <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 2 }}>
         <Box sx={{ flexGrow: 1, minWidth: 0 }}>
           <Typography variant="h5" sx={{ fontWeight: 700 }}>专家套件</Typography>
-          <Typography sx={{ fontSize: '13px', color: '#6B7280', mt: 0.5 }}>
+          <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-2)', mt: 0.5 }}>
             专家套件是面向角色/行业的工具套件，本地化安装后其指令与正文会随对话提交进入模型执行面；
             专家团队也在本页管理，用来定义负责人与子 Agent 的角色、模型和技能白名单。
           </Typography>
@@ -609,14 +612,14 @@ const ExpertSuitePage: React.FC = () => {
             startIcon={<AddIcon />}
             onClick={(e) => setAddAnchor(e.currentTarget)}
             sx={{
-              bgcolor: '#111827',
+              bgcolor: 'var(--tt-cta-fill)',
               borderRadius: '10px',
               textTransform: 'none',
               fontSize: '13px',
               fontWeight: 600,
               px: 2,
               flexShrink: 0,
-              '&:hover': { bgcolor: '#4F46E5' },
+              '&:hover': { bgcolor: 'var(--tt-cta-fill-hover)' },
             }}
           >
             添加
@@ -652,6 +655,7 @@ const ExpertSuitePage: React.FC = () => {
         }}
       >
         <Box
+          {...clickableProps(handleCreateByChat)}
           onClick={handleCreateByChat}
           sx={{
             display: 'flex',
@@ -669,23 +673,29 @@ const ExpertSuitePage: React.FC = () => {
               width: 30,
               height: 30,
               borderRadius: '9px',
-              background: '#E8F1FF',
+              background: 'var(--tt-chip-info)',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
               flexShrink: 0,
             }}
           >
-            <ChatBubbleOutlineIcon sx={{ fontSize: 16, color: '#3B82F6' }} />
+            <ChatBubbleOutlineIcon sx={{ fontSize: 16, color: 'var(--tt-info)' }} />
           </Box>
           <Box sx={{ minWidth: 0 }}>
-            <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#1F2937' }}>通过对话创建</Typography>
-            <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF', mt: 0.25 }}>
+            <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)' }}>通过对话创建</Typography>
+            <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mt: 0.25 }}>
               创建个性化套件，将保存在本地使用
             </Typography>
           </Box>
         </Box>
         <Box
+          {...clickableProps(() => {
+            setAddAnchor(null);
+            setUploadFile(null);
+            if (fileInputRef.current) fileInputRef.current.value = '';
+            setUploadOpen(true);
+          })}
           onClick={() => {
             setAddAnchor(null);
             setUploadFile(null);
@@ -708,23 +718,24 @@ const ExpertSuitePage: React.FC = () => {
               width: 30,
               height: 30,
               borderRadius: '9px',
-              background: '#F1EBFF',
+              background: 'var(--tt-chip-accent)',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
               flexShrink: 0,
             }}
           >
-            <UploadFileIcon sx={{ fontSize: 16, color: '#8B5CF6' }} />
+            <UploadFileIcon sx={{ fontSize: 16, color: 'var(--tt-accent-violet)' }} />
           </Box>
           <Box sx={{ minWidth: 0 }}>
-            <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#1F2937' }}>上传套件</Typography>
-            <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF', mt: 0.25 }}>
+            <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)' }}>上传套件</Typography>
+            <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mt: 0.25 }}>
               导入专家套件，仅本地化安装
             </Typography>
           </Box>
         </Box>
         <Box
+          {...clickableProps(openSdk)}
           onClick={openSdk}
           sx={{
             display: 'flex',
@@ -742,18 +753,18 @@ const ExpertSuitePage: React.FC = () => {
               width: 30,
               height: 30,
               borderRadius: '9px',
-              background: '#E6F7F4',
+              background: 'var(--tt-chip-teal)',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
               flexShrink: 0,
             }}
           >
-            <CodeIcon sx={{ fontSize: 16, color: '#0D9488' }} />
+            <CodeIcon sx={{ fontSize: 16, color: 'var(--tt-teal)' }} />
           </Box>
           <Box sx={{ minWidth: 0 }}>
-            <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#1F2937' }}>插件 SDK</Typography>
-            <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF', mt: 0.25 }}>
+            <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)' }}>插件 SDK</Typography>
+            <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mt: 0.25 }}>
               生成起始模板，安装前预检插件包
             </Typography>
           </Box>
@@ -793,15 +804,15 @@ const ExpertSuitePage: React.FC = () => {
               gap: 1,
               py: 4,
               borderRadius: '12px',
-              border: dragOver ? '1.5px dashed #8B5CF6' : '1.5px dashed #D1D5DB',
+              border: dragOver ? '1.5px dashed var(--tt-accent-violet)' : '1.5px dashed var(--tt-border)',
               background: dragOver ? 'rgba(139, 92, 246, 0.04)' : '#FAFBFC',
               cursor: 'pointer',
               transition: 'border-color 0.15s ease, background 0.15s ease',
-              '&:hover': { borderColor: '#8B5CF6' },
+              '&:hover': { borderColor: 'var(--tt-accent-violet)' },
             }}
           >
-            <CloudUploadOutlinedIcon sx={{ fontSize: 32, color: uploadFile ? '#8B5CF6' : '#9CA3AF' }} />
-            <Typography sx={{ fontSize: '13px', color: uploadFile ? '#4C1D95' : '#6B7280', fontWeight: uploadFile ? 600 : 400 }}>
+            <CloudUploadOutlinedIcon sx={{ fontSize: 32, color: uploadFile ? 'var(--tt-accent-violet)' : 'var(--tt-text-4)' }} />
+            <Typography sx={{ fontSize: '13px', color: uploadFile ? 'var(--tt-accent-violet)' : 'var(--tt-text-3)', fontWeight: uploadFile ? 600 : 400 }}>
               {uploadFile ? uploadFile.name : '点击或拖拽 .zip 文件到此处'}
             </Typography>
             <input
@@ -815,28 +826,28 @@ const ExpertSuitePage: React.FC = () => {
 
           {/* 格式要求说明（与本地安装通道的校验口径一致） */}
           <Box sx={{ mt: 2 }}>
-            <Typography sx={{ fontSize: '12px', color: '#6B7280', lineHeight: 1.7 }}>
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-2)', lineHeight: 1.7 }}>
               要求：
             </Typography>
-            <Typography sx={{ fontSize: '12px', color: '#9CA3AF', lineHeight: 1.7 }}>
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', lineHeight: 1.7 }}>
               · ZIP 在根目录或一级目录下含 plugin.json（如 .qoder-plugin/plugin.json）
             </Typography>
-            <Typography sx={{ fontSize: '12px', color: '#9CA3AF', lineHeight: 1.7 }}>
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', lineHeight: 1.7 }}>
               · plugin.json 需含 &apos;name&apos; 字段，commands/skills/dataLinks 可选
             </Typography>
-            <Typography sx={{ fontSize: '12px', color: '#9CA3AF', lineHeight: 1.7 }}>
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', lineHeight: 1.7 }}>
               · 指令正文：commands 项里的 content/prompt/body/instructions 或 file，
               也可放 commands/&lt;指令名&gt;.md
             </Typography>
-            <Typography sx={{ fontSize: '12px', color: '#9CA3AF', lineHeight: 1.7 }}>
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', lineHeight: 1.7 }}>
               · 技能：包内任意位置的 SKILL.md 会被扫描为技能（最多 50 个）
             </Typography>
             {rootInfo?.supported ? (
-              <Typography sx={{ fontSize: '12px', color: '#9CA3AF', lineHeight: 1.7 }}>
+              <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', lineHeight: 1.7 }}>
                 · 安装位置：{rootInfo.suitesRoot}（卸载移入 {rootInfo.trashRoot}，不物理删除）
               </Typography>
             ) : (
-              <Typography sx={{ fontSize: '12px', color: '#9CA3AF', lineHeight: 1.7 }}>
+              <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', lineHeight: 1.7 }}>
                 · 当前为浏览器通道：套件包解析与本会话台账可用，不写磁盘目录
               </Typography>
             )}
@@ -849,15 +860,15 @@ const ExpertSuitePage: React.FC = () => {
               disabled={!uploadFile || installing}
               onClick={handleInstallUpload}
               sx={{
-                bgcolor: uploadFile && !installing ? '#111827' : '#E5E7EB',
-                color: uploadFile && !installing ? '#fff' : '#9CA3AF',
+                bgcolor: uploadFile && !installing ? 'var(--tt-accent-fill)' : 'var(--tt-chip-neutral)',
+                color: uploadFile && !installing ? '#fff' : 'var(--tt-text-4)',
                 borderRadius: '10px',
                 textTransform: 'none',
                 fontSize: '13px',
                 fontWeight: 600,
                 px: 3,
-                '&:hover': { bgcolor: '#4F46E5' },
-                '&.Mui-disabled': { bgcolor: '#E5E7EB', color: '#9CA3AF' },
+                '&:hover': { bgcolor: 'var(--tt-accent-fill)' },
+                '&.Mui-disabled': { bgcolor: 'var(--tt-chip-neutral)', color: 'var(--tt-text-4)' },
               }}
             >
               {installing ? '安装中…' : '安装'}
@@ -877,14 +888,14 @@ const ExpertSuitePage: React.FC = () => {
       >
         <DialogTitle sx={{ fontSize: '16px', fontWeight: 700, pb: 1 }}>插件 SDK</DialogTitle>
         <DialogContent sx={{ pt: '8px !important' }}>
-          <Typography sx={{ fontSize: '12.5px', color: '#6B7280', lineHeight: 1.7 }}>
+          <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-2)', lineHeight: 1.7 }}>
             安装前把套件包读懂：模板给出可直接修改的起始文件；预检只读、不落盘、不改动已安装套件。
             本应用只消费 commands 与包内 SKILL.md，清单里的 mcpServers / hooks / agents 等字段会被列出但不会执行。
           </Typography>
 
           {/* 1. 起始模板 */}
           <Box sx={{ mt: 2 }}>
-            <Typography sx={{ fontSize: '13px', fontWeight: 700, color: '#111827' }}>
+            <Typography sx={{ fontSize: '13px', fontWeight: 700, color: 'var(--tt-text-1)' }}>
               1. 起始模板
             </Typography>
             <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', mt: 1 }}>
@@ -910,14 +921,14 @@ const ExpertSuitePage: React.FC = () => {
             {sdkTemplate && (
               <Box sx={{ mt: 1.25 }}>
                 {sdkTemplate.notes.map((n) => (
-                  <Typography key={n} sx={{ fontSize: '11.5px', color: '#9CA3AF', lineHeight: 1.7 }}>
+                  <Typography key={n} sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', lineHeight: 1.7 }}>
                     · {n}
                   </Typography>
                 ))}
                 {sdkTemplate.files.map((f) => (
                   <Box
                     key={f.path}
-                    sx={{ mt: 1, border: '1px solid #EEF0F2', borderRadius: '10px', overflow: 'hidden' }}
+                    sx={{ mt: 1, border: '1px solid var(--tt-border)', borderRadius: '10px', overflow: 'hidden' }}
                   >
                     <Box
                       sx={{
@@ -926,17 +937,18 @@ const ExpertSuitePage: React.FC = () => {
                         gap: 1,
                         px: 1.25,
                         py: 0.6,
-                        background: '#FAFBFC',
-                        borderBottom: '1px solid #EEF0F2',
+                        background: 'var(--tt-surface-2)',
+                        borderBottom: '1px solid var(--tt-border)',
                       }}
                     >
-                      <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#374151', flexGrow: 1, fontFamily: 'monospace' }}>
+                      <Typography sx={{ fontSize: '12px', fontWeight: 600, color: 'var(--tt-text-2)', flexGrow: 1, fontFamily: 'monospace' }}>
                         {f.path}
                       </Typography>
                       <Tooltip title="复制此文件内容">
                         <Box
+                          {...clickableProps(() => void copySdkFile(f.path, f.content), tr('复制文件 {path}', { path: f.path }))}
                           onClick={() => void copySdkFile(f.path, f.content)}
-                          sx={{ display: 'flex', alignItems: 'center', gap: 0.4, cursor: 'pointer', color: '#4F46E5' }}
+                          sx={{ display: 'flex', alignItems: 'center', gap: 0.4, cursor: 'pointer', color: 'var(--tt-accent)' }}
                         >
                           <ContentCopyIcon sx={{ fontSize: 14 }} />
                           <Typography sx={{ fontSize: '11.5px' }}>复制</Typography>
@@ -953,8 +965,8 @@ const ExpertSuitePage: React.FC = () => {
                         overflow: 'auto',
                         fontSize: '11.5px',
                         lineHeight: 1.6,
-                        color: '#374151',
-                        background: '#FFFFFF',
+                        color: 'var(--tt-text-2)',
+                        background: 'var(--tt-chat-code-bg)',
                         whiteSpace: 'pre-wrap',
                         wordBreak: 'break-all',
                       }}
@@ -971,10 +983,10 @@ const ExpertSuitePage: React.FC = () => {
 
           {/* 2. 安装前预检 */}
           <Box>
-            <Typography sx={{ fontSize: '13px', fontWeight: 700, color: '#111827' }}>
+            <Typography sx={{ fontSize: '13px', fontWeight: 700, color: 'var(--tt-text-1)' }}>
               2. 安装前预检
             </Typography>
-            <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF', lineHeight: 1.7, mt: 0.5 }}>
+            <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', lineHeight: 1.7, mt: 0.5 }}>
               读取 ZIP 目录与 plugin.json，逐条说明指令正文来自哪里、哪些字段不会执行、哪些问题会阻断安装。
             </Typography>
             <Box
@@ -987,19 +999,19 @@ const ExpertSuitePage: React.FC = () => {
                 px: 1.5,
                 py: 1.5,
                 borderRadius: '12px',
-                border: '1.5px dashed #D1D5DB',
-                background: '#FAFBFC',
+                border: '1.5px dashed var(--tt-border)',
+                background: 'var(--tt-surface-2)',
                 cursor: sdkValidateBusy ? 'default' : 'pointer',
                 transition: 'border-color 0.15s ease',
-                '&:hover': { borderColor: sdkValidateBusy ? '#D1D5DB' : '#0D9488' },
+                '&:hover': { borderColor: sdkValidateBusy ? 'var(--tt-border)' : 'var(--tt-teal)' },
               }}
             >
               {sdkValidateBusy ? (
-                <CircularProgress size={18} sx={{ color: '#0D9488' }} />
+                <CircularProgress size={18} sx={{ color: 'var(--tt-teal)' }} />
               ) : (
-                <CloudUploadOutlinedIcon sx={{ fontSize: 22, color: sdkFile ? '#0D9488' : '#9CA3AF' }} />
+                <CloudUploadOutlinedIcon sx={{ fontSize: 22, color: sdkFile ? 'var(--tt-teal)' : 'var(--tt-text-4)' }} />
               )}
-              <Typography sx={{ fontSize: '12.5px', color: sdkFile ? '#0F766E' : '#6B7280', flexGrow: 1 }}>
+              <Typography sx={{ fontSize: '12.5px', color: sdkFile ? 'var(--tt-teal)' : 'var(--tt-text-3)', flexGrow: 1 }}>
                 {sdkValidateBusy
                   ? '正在读取插件包…'
                   : sdkFile
@@ -1039,7 +1051,7 @@ const ExpertSuitePage: React.FC = () => {
                 {sdkValidation.errors.length > 0 && (
                   <Box sx={{ mt: 1 }}>
                     {sdkValidation.errors.map((e) => (
-                      <Typography key={e} sx={{ fontSize: '12px', color: '#B91C1C', lineHeight: 1.7 }}>
+                      <Typography key={e} sx={{ fontSize: '12px', color: 'var(--tt-danger)', lineHeight: 1.7 }}>
                         · {e}
                       </Typography>
                     ))}
@@ -1048,7 +1060,7 @@ const ExpertSuitePage: React.FC = () => {
                 {sdkValidation.warnings.length > 0 && (
                   <Box sx={{ mt: 1 }}>
                     {sdkValidation.warnings.map((w) => (
-                      <Typography key={w} sx={{ fontSize: '12px', color: '#B45309', lineHeight: 1.7 }}>
+                      <Typography key={w} sx={{ fontSize: '12px', color: 'var(--tt-warning)', lineHeight: 1.7 }}>
                         · {w}
                       </Typography>
                     ))}
@@ -1056,7 +1068,7 @@ const ExpertSuitePage: React.FC = () => {
                 )}
 
                 {sdkValidation.commands.length > 0 && (
-                  <Box sx={{ mt: 1.25, border: '1px solid #EEF0F2', borderRadius: '10px', overflow: 'hidden' }}>
+                  <Box sx={{ mt: 1.25, border: '1px solid var(--tt-border)', borderRadius: '10px', overflow: 'hidden' }}>
                     {sdkValidation.commands.map((c, i) => {
                       const sourceLabel =
                         c.bodySource === 'content'
@@ -1072,19 +1084,19 @@ const ExpertSuitePage: React.FC = () => {
                           sx={{
                             px: 1.25,
                             py: 0.8,
-                            borderTop: i === 0 ? 'none' : '1px solid #F3F4F6',
+                            borderTop: i === 0 ? 'none' : '1px solid var(--tt-border)',
                             display: 'flex',
                             gap: 1,
                             alignItems: 'baseline',
                           }}
                         >
-                          <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#111827', minWidth: 90 }}>
+                          <Typography sx={{ fontSize: '12px', fontWeight: 600, color: 'var(--tt-text-1)', minWidth: 90 }}>
                             /{c.name}
                           </Typography>
                           <Typography
                             sx={{
                               fontSize: '11.5px',
-                              color: c.bodySource === 'missing' ? '#B45309' : '#6B7280',
+                              color: c.bodySource === 'missing' ? 'var(--tt-warning)' : 'var(--tt-text-3)',
                               flexShrink: 0,
                             }}
                           >
@@ -1093,7 +1105,7 @@ const ExpertSuitePage: React.FC = () => {
                           <Typography
                             sx={{
                               fontSize: '11.5px',
-                              color: c.error ? '#B91C1C' : '#9CA3AF',
+                              color: c.error ? 'var(--tt-danger)' : 'var(--tt-text-4)',
                               flexGrow: 1,
                               minWidth: 0,
                               overflow: 'hidden',
@@ -1110,12 +1122,12 @@ const ExpertSuitePage: React.FC = () => {
                 )}
 
                 {sdkValidation.skillFiles.length > 0 && (
-                  <Typography sx={{ fontSize: '11.5px', color: '#6B7280', mt: 1, lineHeight: 1.7 }}>
+                  <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-2)', mt: 1, lineHeight: 1.7 }}>
                     技能文件：{sdkValidation.skillFiles.join('、')}
                   </Typography>
                 )}
                 {sdkValidation.ignoredFields.length > 0 && (
-                  <Typography sx={{ fontSize: '11.5px', color: '#B45309', mt: 0.5, lineHeight: 1.7 }}>
+                  <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-warning)', mt: 0.5, lineHeight: 1.7 }}>
                     不会执行的清单字段：{sdkValidation.ignoredFields.join(' / ')}
                   </Typography>
                 )}
@@ -1124,7 +1136,7 @@ const ExpertSuitePage: React.FC = () => {
           </Box>
 
           <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mt: 2.5, mb: 1, gap: 1 }}>
-            <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF' }}>
+            <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)' }}>
               预检不写盘；安装仍由同一套校验拒绝坏包。
             </Typography>
             <Box sx={{ display: 'flex', gap: 1, flexShrink: 0 }}>
@@ -1140,15 +1152,15 @@ const ExpertSuitePage: React.FC = () => {
                 disabled={!sdkValidation?.installable}
                 onClick={useCheckedPackage}
                 sx={{
-                  bgcolor: sdkValidation?.installable ? '#111827' : '#E5E7EB',
-                  color: sdkValidation?.installable ? '#fff' : '#9CA3AF',
+                  bgcolor: sdkValidation?.installable ? 'var(--tt-accent-fill)' : 'var(--tt-chip-neutral)',
+                  color: sdkValidation?.installable ? '#fff' : 'var(--tt-text-4)',
                   borderRadius: '10px',
                   textTransform: 'none',
                   fontSize: '13px',
                   fontWeight: 600,
                   px: 2.5,
-                  '&:hover': { bgcolor: '#4F46E5' },
-                  '&.Mui-disabled': { bgcolor: '#E5E7EB', color: '#9CA3AF' },
+                  '&:hover': { bgcolor: 'var(--tt-accent-fill)' },
+                  '&.Mui-disabled': { bgcolor: 'var(--tt-chip-neutral)', color: 'var(--tt-text-4)' },
                 }}
               >
                 用此包继续安装
@@ -1177,7 +1189,7 @@ const ExpertSuitePage: React.FC = () => {
             width: 44,
             height: 44,
             borderRadius: '12px',
-            background: 'linear-gradient(135deg, #10B981 0%, #06B6D4 100%)',
+            background: 'linear-gradient(135deg, #047857 0%, #0E7490 100%)',
             boxShadow: '0 4px 12px rgba(16, 185, 129, 0.3)',
             display: 'flex',
             alignItems: 'center',
@@ -1188,19 +1200,20 @@ const ExpertSuitePage: React.FC = () => {
           <AccountBalanceIcon sx={{ color: '#fff', fontSize: 22 }} />
         </Box>
         <Box sx={{ flexGrow: 1, minWidth: 0 }}>
-          <Typography sx={{ fontSize: '15px', fontWeight: 700, color: '#065F46' }}>金融行业</Typography>
-          <Typography sx={{ fontSize: '12.5px', color: '#4B5563', mt: 0.25 }}>
+          <Typography sx={{ fontSize: '15px', fontWeight: 700, color: 'var(--tt-success)' }}>金融行业</Typography>
+          <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-2)', mt: 0.25 }}>
             风控、研报与合规流程一键接入对话；用套件固化常用模板与数据源。
           </Typography>
         </Box>
         <Tooltip title="跳到新任务对话，预置套件创建提示词">
           <Box
+            {...clickableProps(handleCreateByChat)}
             onClick={handleCreateByChat}
             sx={{
               px: 1.75,
               py: 0.85,
               borderRadius: '10px',
-              background: '#FFFFFF',
+              background: 'var(--tt-chat-code-bg)',
               border: '1px solid rgba(16, 185, 129, 0.25)',
               display: 'flex',
               alignItems: 'center',
@@ -1211,8 +1224,8 @@ const ExpertSuitePage: React.FC = () => {
               '&:hover': { boxShadow: '0 4px 12px rgba(16, 185, 129, 0.18)', transform: 'translateY(-1px)' },
             }}
           >
-            <AddIcon sx={{ fontSize: 15, color: '#059669' }} />
-            <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#059669', whiteSpace: 'nowrap' }}>
+            <AddIcon sx={{ fontSize: 15, color: 'var(--tt-success)' }} />
+            <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-success)', whiteSpace: 'nowrap' }}>
               让任我行帮我创建
             </Typography>
           </Box>
@@ -1220,7 +1233,7 @@ const ExpertSuitePage: React.FC = () => {
       </Box>
 
       {/* 套件广场 / 已安装（已安装数量取注册表真实条数） */}
-      <Box sx={{ display: 'flex', gap: 3, borderBottom: '1px solid #F3F4F6' }}>
+      <Box sx={{ display: 'flex', gap: 3, borderBottom: '1px solid var(--tt-border)' }}>
         {([
           ['plaza', `${catalogSource === 'market' ? '在线市场' : '示例目录'} ${catalog.length}`],
           ['installed', `已安装 ${installedRows.length}`],
@@ -1228,14 +1241,16 @@ const ExpertSuitePage: React.FC = () => {
         ] as const).map(([key, label]) => (
           <Box
             key={key}
+            {...clickableProps(() => changeView(key))}
+            aria-pressed={view === key}
             onClick={() => changeView(key)}
             sx={{
               pb: 1,
               cursor: 'pointer',
-              borderBottom: view === key ? '2px solid #111827' : '2px solid transparent',
+              borderBottom: view === key ? '2px solid var(--tt-text-1)' : '2px solid transparent',
             }}
           >
-            <Typography sx={{ fontSize: '13.5px', fontWeight: view === key ? 700 : 500, color: view === key ? '#111827' : '#6B7280' }}>
+            <Typography sx={{ fontSize: '13.5px', fontWeight: view === key ? 700 : 500, color: view === key ? 'var(--tt-text-1)' : 'var(--tt-text-3)' }}>
               {label}
             </Typography>
           </Box>
@@ -1252,7 +1267,7 @@ const ExpertSuitePage: React.FC = () => {
               sx={{
                 textTransform: 'none',
                 fontSize: '12px',
-                color: '#4F46E5',
+                color: 'var(--tt-accent)',
                 minWidth: 0,
                 px: 1,
               }}
@@ -1265,6 +1280,8 @@ const ExpertSuitePage: React.FC = () => {
             ] as const).map(([key, label]) => (
               <Box
                 key={key}
+                {...clickableProps(() => setSort(key))}
+                aria-pressed={sort === key}
                 onClick={() => setSort(key)}
                 sx={{
                   px: 1.25,
@@ -1276,7 +1293,7 @@ const ExpertSuitePage: React.FC = () => {
                   '&:hover': { background: sort === key ? 'rgba(99, 102, 241, 0.10)' : 'rgba(99, 102, 241, 0.05)' },
                 }}
               >
-                <Typography sx={{ fontSize: '12px', fontWeight: sort === key ? 700 : 500, color: sort === key ? '#4F46E5' : '#6B7280' }}>
+                <Typography sx={{ fontSize: '12px', fontWeight: sort === key ? 700 : 500, color: sort === key ? 'var(--tt-accent)' : 'var(--tt-text-3)' }}>
                   {label}
                 </Typography>
               </Box>
@@ -1284,7 +1301,7 @@ const ExpertSuitePage: React.FC = () => {
           </Box>
         )}
         {view === 'installed' && rootInfo?.supported && (
-          <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF', pb: 0.75, alignSelf: 'flex-end' }}>
+          <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', pb: 0.75, alignSelf: 'flex-end' }}>
             目录：{rootInfo.suitesRoot}
           </Typography>
         )}
@@ -1298,19 +1315,21 @@ const ExpertSuitePage: React.FC = () => {
             return (
               <Box
                 key={c}
+                {...clickableProps(() => setCategory(c))}
+                aria-pressed={active}
                 onClick={() => setCategory(c)}
                 sx={{
                   px: 1.5,
                   py: 0.45,
                   borderRadius: '999px',
                   cursor: 'pointer',
-                  background: active ? '#111827' : '#FFFFFF',
-                  border: active ? '1px solid #111827' : '1px solid #E5E7EB',
+                  background: active ? 'var(--tt-cta-fill)' : 'var(--tt-surface)',
+                  border: active ? '1px solid var(--tt-text-1)' : '1px solid var(--tt-border)',
                   transition: 'all 0.15s ease',
-                  '&:hover': { borderColor: active ? '#111827' : '#9CA3AF' },
+                  '&:hover': { borderColor: active ? 'var(--tt-text-1)' : '#9CA3AF' },
                 }}
               >
-                <Typography sx={{ fontSize: '12px', fontWeight: active ? 600 : 400, color: active ? '#fff' : '#4B5563' }}>
+                <Typography sx={{ fontSize: '12px', fontWeight: active ? 600 : 400, color: active ? 'var(--tt-cta-ink)' : 'var(--tt-text-2)' }}>
                   {c}
                 </Typography>
               </Box>
@@ -1348,7 +1367,7 @@ const ExpertSuitePage: React.FC = () => {
         </Box>
       ) : filtered.length === 0 ? (
         <Box sx={{ p: 6, textAlign: 'center' }}>
-          <Typography sx={{ fontSize: '13px', color: '#9CA3AF' }}>
+          <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-4)' }}>
             {view === 'installed'
               ? '暂无已安装套件，点右上「添加 → 上传套件」导入本地 .zip'
               : catalogSource === 'market'
@@ -1358,7 +1377,7 @@ const ExpertSuitePage: React.FC = () => {
                   : '尚未配置在线套件市场索引；点「市场源」填写地址，或用「添加 → 上传套件」安装本地 .zip'}
           </Typography>
           {view === 'installed' && installedRows.length === 0 && !rootInfo?.supported && (
-            <Typography sx={{ fontSize: '12px', color: '#B5BAC1', mt: 0.75 }}>
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mt: 0.75 }}>
               当前为浏览器通道：安装的套件记在本地台账，不写磁盘目录
             </Typography>
           )}
@@ -1373,10 +1392,10 @@ const ExpertSuitePage: React.FC = () => {
                 sx={{
                   display: 'flex',
                   gap: 2,
-                  border: '1px solid #EEF0F2',
+                  border: '1px solid var(--tt-border)',
                   borderRadius: '14px',
                   p: 2,
-                  background: '#FFFFFF',
+                  background: 'var(--tt-chat-code-bg)',
                   transition: 'box-shadow 0.18s ease, transform 0.15s ease',
                   '&:hover': { boxShadow: '0 6px 20px rgba(15, 23, 42, 0.07)', transform: 'translateY(-1px)' },
                 }}
@@ -1400,13 +1419,13 @@ const ExpertSuitePage: React.FC = () => {
                 {/* 主体 */}
                 <Box sx={{ flexGrow: 1, minWidth: 0 }}>
                   <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1 }}>
-                    <Typography sx={{ fontSize: '14.5px', fontWeight: 700, color: '#111827' }}>{s.name}</Typography>
-                    <Typography sx={{ fontSize: '12px', color: '#9CA3AF' }}>{s.author}</Typography>
+                    <Typography sx={{ fontSize: '14.5px', fontWeight: 700, color: 'var(--tt-text-1)' }}>{s.name}</Typography>
+                    <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>{s.author}</Typography>
                   </Box>
                   <Typography
                     sx={{
                       fontSize: '12.5px',
-                      color: '#6B7280',
+                      color: 'var(--tt-text-2)',
                       mt: 0.5,
                       lineHeight: 1.6,
                       display: '-webkit-box',
@@ -1422,40 +1441,40 @@ const ExpertSuitePage: React.FC = () => {
                   <Box sx={{ display: 'flex', gap: 1.5, mt: 1, flexWrap: 'wrap' }}>
                     {s.source !== 'sample' ? (
                       <>
-                        <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF' }}>{s.skillCount} 个技能</Typography>
+                        <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)' }}>{s.skillCount} 个技能</Typography>
                         {s.commandCount > 0 && (
-                          <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF' }}>{s.commandCount} 个指令</Typography>
+                          <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)' }}>{s.commandCount} 个指令</Typography>
                         )}
                         {s.dataLinkCount > 0 && (
-                          <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF' }}>{s.dataLinkCount} 个数据连接</Typography>
+                          <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)' }}>{s.dataLinkCount} 个数据连接</Typography>
                         )}
                         {s.source === 'market' && (
-                          <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF' }}>
+                          <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)' }}>
                             在线市场 · 数字取索引声明
                           </Typography>
                         )}
                       </>
                     ) : (
-                      <Typography sx={{ fontSize: '11.5px', color: '#B45309' }}>
+                      <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-warning)' }}>
                         示例目录 · 未接入远端套件源
                       </Typography>
                     )}
                     {s.source === 'installed' && s.readable && s.commandNames.length > 0 && (
-                      <Typography sx={{ fontSize: '11.5px', color: '#B45309' }}>
+                      <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-warning)' }}>
                         输入 {s.commandNames.slice(0, 3).map((n) => `/${n}`).join(' ')}
                         {s.commandNames.length > 3 ? ' …' : ''} 可直接调用
                       </Typography>
                     )}
                     {s.source === 'installed' && s.readable && (
-                      <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF' }}>
+                      <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)' }}>
                         {s.fileCount} 个文件 · 安装于 {new Date(s.publishedAt).toLocaleString()}
                       </Typography>
                     )}
                   </Box>
                   {!s.readable && (
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mt: 1 }}>
-                      <WarningAmberIcon sx={{ fontSize: 14, color: '#F59E0B' }} />
-                      <Typography sx={{ fontSize: '11.5px', color: '#B45309' }}>
+                      <WarningAmberIcon sx={{ fontSize: 14, color: 'var(--tt-warning)' }} />
+                      <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-warning)' }}>
                         套件目录 {s.id} 的 manifest.json 读不出，请卸载后重新上传套件包
                       </Typography>
                     </Box>
@@ -1466,12 +1485,13 @@ const ExpertSuitePage: React.FC = () => {
                 <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', justifyContent: 'space-between', flexShrink: 0, gap: 1 }}>
                   {/* 版本号：已安装行读自 plugin.json，市场行读自索引；示例目录的版本是占位，不显示 */}
                   {s.source !== 'sample' && s.version && (
-                    <Typography sx={{ fontSize: '11px', color: '#9CA3AF' }}>{s.version}</Typography>
+                    <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>{s.version}</Typography>
                   )}
                   {s.installed ? (
                     s.source === 'installed' ? (
                       <Tooltip title="卸载：套件目录移入回收位置，不物理删除">
                         <Box
+                          {...clickableProps(() => void handleUninstall(s), tr('卸载套件 {name}', { name: s.name }))}
                           onClick={() => void handleUninstall(s)}
                           sx={{
                             display: 'flex',
@@ -1480,19 +1500,19 @@ const ExpertSuitePage: React.FC = () => {
                             px: 1.25,
                             py: 0.5,
                             borderRadius: '8px',
-                            border: '1px solid #EEF0F2',
+                            border: '1px solid var(--tt-border)',
                             cursor: 'pointer',
                             transition: 'all 0.15s ease',
-                            '&:hover': { borderColor: '#FCA5A5', background: '#FEF2F2' },
+                            '&:hover': { borderColor: 'var(--tt-danger)', background: 'var(--tt-chip-danger)' },
                           }}
                         >
-                          <DeleteOutlineIcon sx={{ fontSize: 15, color: '#6B7280' }} />
-                          <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#6B7280' }}>卸载</Typography>
+                          <DeleteOutlineIcon sx={{ fontSize: 15, color: 'var(--tt-text-2)' }} />
+                          <Typography sx={{ fontSize: '12px', fontWeight: 600, color: 'var(--tt-text-2)' }}>卸载</Typography>
                         </Box>
                       </Tooltip>
                     ) : (
-                      <Box sx={{ px: 1.5, py: 0.5, borderRadius: '8px', background: '#E6F7F4' }}>
-                        <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#0D9488' }}>已安装</Typography>
+                      <Box sx={{ px: 1.5, py: 0.5, borderRadius: '8px', background: 'var(--tt-chip-teal)' }}>
+                        <Typography sx={{ fontSize: '12px', fontWeight: 600, color: 'var(--tt-teal)' }}>已安装</Typography>
                       </Box>
                     )
                   ) : (
@@ -1504,21 +1524,22 @@ const ExpertSuitePage: React.FC = () => {
                       }
                     >
                       <Box
+                        {...clickableProps(() => void handleInstallFromPlaza(s), tr('安装套件 {name}', { name: s.name }))}
                         onClick={() => void handleInstallFromPlaza(s)}
                         sx={{
                           width: 30,
                           height: 30,
                           borderRadius: '9px',
-                          background: '#111827',
+                          background: 'var(--tt-cta-fill)',
                           display: 'flex',
                           alignItems: 'center',
                           justifyContent: 'center',
                           cursor: 'pointer',
                           transition: 'background 0.15s ease, transform 0.12s ease',
-                          '&:hover': { background: '#4F46E5', transform: 'scale(1.06)' },
+                          '&:hover': { background: 'var(--tt-cta-fill-hover)', transform: 'scale(1.06)' },
                         }}
                       >
-                        <AddIcon sx={{ fontSize: 17, color: '#fff' }} />
+                        <AddIcon sx={{ fontSize: 17, color: 'var(--tt-cta-ink)' }} />
                       </Box>
                     </Tooltip>
                   )}

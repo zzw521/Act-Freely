@@ -33,7 +33,8 @@ const chatInput = () => read('../../../src/renderer/components/ChatInput/index.t
 const engineServer = () => read('../../../engine/server.py');
 
 // 渲染层对外只传「档位绑定 + 已保存模型 id」，端点与密钥不再离开后端
-const OVERRIDES = ['modelBinding', 'modelId', 'workDir', 'history'] as const;
+// filePermission 也在这条链上：对话框选了档、引擎却收到空值，等于「每次询问」形同虚设
+const OVERRIDES = ['modelBinding', 'modelId', 'workDir', 'history', 'filePermission'] as const;
 
 // ── 渲染层：三通道都不得丢选择 ──────────────────────────────────
 
@@ -62,7 +63,7 @@ describe('渲染层提交入参透传', () => {
     expect(st).toContain('setChatModelId: (id: string) => set({ chatModelId: id }),');
   });
 
-  it('store 把四项组装成 ChatSubmitReq 交给通道（历史为空时不下发而非下发空值）', () => {
+  it('store 把五项组装成 ChatSubmitReq 交给通道（历史为空时不下发而非下发空值）', () => {
     const src = store();
     expect(src).toContain('modelBinding,');
     expect(src).toContain('modelId,');
@@ -74,7 +75,7 @@ describe('渲染层提交入参透传', () => {
     expect(src).toContain("import { chatModelSelectionOf, modelBaseUrl } from '../lib/chat-models';");
   });
 
-  it('Tauri 通道把四项作为 chat_submit 参数传给 Rust', () => {
+  it('Tauri 通道把五项作为 chat_submit 参数传给 Rust', () => {
     const src = tauriApi();
     const invokeBlock = src.split("invoke('chat_submit'")[1].split("}) as Promise<{ taskId: string }>")[0];
     expect(invokeBlock).toBeDefined();
@@ -83,7 +84,7 @@ describe('渲染层提交入参透传', () => {
     }
   });
 
-  it('引擎直连通道把四项写进 /api/chat 请求体', () => {
+  it('引擎直连通道把五项写进 /api/chat 请求体', () => {
     const src = engineApi();
     const body = src.split("postSSE('/api/chat', {")[1].split('});')[0];
     for (const field of OVERRIDES) {
@@ -124,7 +125,7 @@ describe('重新生成沿用当轮模型', () => {
     expect(src).toContain('[turnIndex]: {');
     expect(src).toContain('modelBinding: modelBinding?.trim() || undefined,');
     expect(src).toContain('modelId: modelId?.trim() || undefined,');
-    const regen = src.split('regenerateTurn: async (')[1].split('resumeTask: async (')[0];
+    const regen = src.split('regenerateTurn: async (')[1].split('resumeTaskFromStep: async (')[0];
     expect(regen).toContain('conv.turnModels[turnIdx] ?? chatModelSelectionOf(get().chatModelId)');
     expect(regen).toContain('modelBinding: model.modelBinding,');
     expect(regen).toContain('modelId: model.modelId,');
@@ -254,6 +255,184 @@ describe('引擎读取覆盖项', () => {
     expect(run).toContain('history = _effective_history(session, history)');
     const review = src.split('async def chat_review')[1].split('\n@app.')[0];
     expect(review).toContain('session.model_binding, session.work_dir, None, session.model_config');
+  });
+});
+
+// ── 文件访问档位：对话框 → 会话台账 → 引擎强制 ────────────────────
+
+describe('文件访问档位（每次询问 / 自动审批 / 完全访问）', () => {
+  const filePermLib = () => read('../../../src/renderer/lib/file-permission.ts');
+  const sandboxRuntime = () => read('../../../engine/sandbox_runtime.py');
+
+  it('档位表只有一份，三档顺序与文案同源', () => {
+    const lib = filePermLib();
+    expect(lib).toContain("id: 'ask_every_time'");
+    expect(lib).toContain("id: 'auto_approve'");
+    expect(lib).toContain("id: 'full_access'");
+    // 只有完全访问是 danger 档：UI 靠这个标记决定是否走红色确认
+    expect(lib).toContain('可以读写工作目录之外的本机路径，并允许删除文件');
+    expect(lib.match(/danger: true/g)).toHaveLength(1);
+    expect(lib).toContain("DEFAULT_FILE_PERMISSION: FilePermissionMode = 'ask_every_time'");
+    // 非法值归一到最保守档，存量脏值不能变成「完全访问」
+    expect(lib).toContain('function normalizeFileMode');
+    // 没确认过的完全访问读回来就降级：绕过弹窗写入台账的路径放不开边界
+    expect(lib).toContain("if (mode === 'full_access' && typeof confirmedAtMs !== 'number')");
+    expect(lib).toContain('return filePermissionAfterConfirm(normalizeFileMode(entry.mode), entry.confirmedAtMs)');
+  });
+
+  it('对话框有档位选择器，且完全访问必须先过红色确认', () => {
+    const input = chatInput();
+    expect(input).toContain('data-file-permission');
+    expect(input).toContain('FILE_PERMISSION_DEFS');
+    expect(input).toContain('file-permission-danger-title');
+    expect(input).toContain("bgcolor: 'var(--tt-danger-fill)'");
+    // danger 档不落库，只进 pending；确认按钮才带 confirmedAtMs
+    expect(input).toContain('if (filePermissionDef(mode).danger)');
+    expect(input).toContain('onFilePermissionChange?.(mode, Date.now())');
+    // 位置：档位选择器在输入卡内工具栏（+ 之后），不在卡片下方那行里
+    const toolbar = input.split('{/* 工具栏')[1].split('{/* 输入框下方')[0];
+    expect(toolbar, '档位选择器应挂在卡片内工具栏').toContain('data-file-permission');
+  });
+
+  it('焦点环不套框：输入卡的信号贴着卡片自身，小控件的环收进边内', () => {
+    const input = chatInput();
+    // 文本控件在 Chromium 里一律命中 :focus-visible，全局那条环落在卡片里面就是「框中框」。
+    // 关键：全局规则的特异性是 (3,0,0)（:is 跟最 specific 的参数走），组件里写
+    // `'& textarea:focus-visible': { outline: 'none' }` 只有 (2,1,0)，压不住它——曾经这样写过，
+    // 用户实机看仍然是蓝框。所以现在走 globals.css 的点名排除，不走特异性对抗。
+    expect(input).toContain('data-tt-ring="container"');
+    expect(input, '不许再用打不赢的特异性对抗全局环').not.toMatch(/textarea:focus-visible['"]?\s*:\s*\{/);
+    // 容器环用随皮肤翻的 --tt-teal（实算对页面底：亮 5.15:1、暗 12.07:1，均 ≥3:1）
+    expect(input).toContain('0 0 0 2px var(--tt-teal)');
+    // 卡片上不许再挂 outline 环：那正是用户嫌的「明显的蓝色框」
+    expect(input).not.toContain('outline: focused ?');
+    expect(input).not.toContain("outlineOffset: '2px'");
+    // 无边框小控件（档位 chip、目录 chip）：环往内收，不再浮出第二个框
+    expect(input.match(/outlineOffset: '-2px'/g)).toHaveLength(2);
+    expect(input.match(/data-tt-ring="self"/g)).toHaveLength(2);
+  });
+
+  it('档位是每会话的，且删除台账与会话归档一起走', () => {
+    const st = store();
+    expect(st).toContain('filePermission: conv.filePermission');
+    expect(st).toContain('getConversationFilePermission(convId) ?? undefined');
+    expect(st).toContain('dropConversationFilePermission');
+    // 提交时用生效档位（会话 > 全局默认 > 最保守档），不是直接读镜像字段
+    expect(st).toContain('resolveFilePermission(convId, settings?.filePermissionDefault)');
+    expect(st).toContain('filePermission: effectiveFilePermission,');
+    // 重新生成/改写不因全局默认而悄悄升档：没记录回到最保守档
+    const regen = st.split('regenerateTurn: async (')[1].split('resumeTaskFromStep: async (')[0];
+    expect(regen).toContain("filePermission: conv.filePermission ?? 'ask_every_time'");
+    // 新任务页还没有会话：选择先进草稿，第一条消息建会话时才落台账（确认时刻一起带上）
+    expect(st).toContain('draftFilePermission: { mode: granted, confirmedAtMs: confirmedAtMs ?? null }');
+    expect(st).toContain('const draft = get().draftFilePermission;');
+    expect(st).toContain('setConversationFilePermission(convId, draft.mode, { confirmedAtMs: draft.confirmedAtMs });');
+    // 草稿只属于「还没会话」的那一刻：新建/切换会话即作废，不会漂进别的会话
+    expect(st.split('newConversation: () => {')[1].split('switchConversation:')[0]).toContain(
+      'draftFilePermission: null',
+    );
+    expect(st).toContain('set({ activeId: id, ...mirrorOf(conv), draftFilePermission: null })');
+  });
+
+  it('设置页有全局默认档位，同样是红色确认后才落库', () => {
+    const page = read('../../../src/renderer/pages/Settings/index.tsx');
+    expect(page).toContain('label="文件访问默认档位"');
+    expect(page).toContain('normalizeFileMode(appSettings.filePermissionDefault)');
+    expect(page).toContain('settings-file-permission-title');
+    expect(page).toContain('if (filePermissionDef(mode).danger)');
+    // 默认档位必须写明「会话选择优先」，否则用户会以为设置页改了就一定生效
+    expect(page).toContain('且优先于这里的默认值');
+  });
+
+  it('引擎在受理时校验档位，非法值拒绝而不是当成缺省', () => {
+    const engine = engineServer();
+    expect(engine).toContain('payload.get("filePermission")');
+    expect(engine).toContain('sr.FILE_PERMISSION_MODES');
+    expect(engine).toContain('FILE_PERMISSION_INVALID');
+    expect(engine).toContain('session.runtime = {**rt, "filePermission": perm_value}');
+  });
+
+  it('强制逻辑按目录边界分档，删除只属于完全访问', () => {
+    const src = sandboxRuntime();
+    expect(src).toContain('def permission_denial');
+    expect(src).toContain('delete_requires_full_access');
+    expect(src).toContain('outside_boundary');
+    expect(src).toContain('hard_deny');
+    // 档位先于「未配置沙箱」的提前返回：没有沙箱块也照样受限
+    expect(src).toContain('def file_denial');
+    expect(src).toContain('DELETING_TOOLS = frozenset({"delete_text_file"})');
+    // 每次询问走本机网关；网关不可用时如实说明而不是静默放行
+    expect(src).toContain('def ask_user');
+    expect(src).toContain('file_permission_ask');
+  });
+
+  it('删除工具进引擎注册表与副作用清单，且先复制进回收目录', () => {
+    const engine = engineServer();
+    expect(engine).toContain('def delete_text_file');
+    expect(engine).toContain('_to_trash');
+    expect(engine).toContain('file_trash_dir');
+    expect(read('../../../engine/data_paths.py')).toContain('FILE_TRASH_DIRNAME');
+    // 副作用工具必须登记进副作用清单，否则续跑会重复删。
+    // #164 起清单只有一处落表（engine/side_effect_registry.py），checkpoint_runtime 与
+    // tool_approval 都从它派生、不再自带成员字面量，所以这里改盯名单本体——
+    // 语义没变：delete_text_file 必须在表里。四张视图的同源校验在
+    // tests/unit/workbench/step-replay.test.ts 与 tests/integration/engine_route_lanes_selftest.py。
+    expect(read('../../../engine/side_effect_registry.py')).toContain('delete_text_file');
+    expect(read('../../../src/shared/step-replay.ts')).toContain('delete_text_file');
+    // 对用户可见的工具说明同样要有它，不能只在引擎里注册
+    expect(read('../../../src/shared/builtin-tools.ts')).toContain('delete_text_file');
+  });
+
+  it('Rust 桥接把档位盖进 runtime 并随提交下发（不是只收下就丢掉）', () => {
+    const rust = rustLib();
+    const fn = rust.split('async fn chat_submit(')[1].split(') -> Result<Value, String>')[0];
+    expect(fn).toContain('file_permission: Option<String>');
+    const body = rust.split('async fn chat_submit(')[1].split('\n}\n')[0];
+    // 显式提交的坏档位拒绝受理；没表态才读全局默认
+    expect(body).toContain('security::file_perm::normalize(raw)?');
+    expect(body).toContain('security::file_perm::read_default(&p0.store)');
+    expect(body).toContain('stamp_file_permission(&mut runtime, &file_permission);');
+    expect(body).toContain('file_permission: Some(file_permission),');
+    // 「每次询问」要的确认网关在审批档位为 off 时也要下发，否则弹不出框
+    expect(rust).toContain('if mode != security::file_perm::DEFAULT_MODE');
+    expect(rust).toContain('askedForFilePermission');
+    const apply = rustAgent().split('fn apply_to(&self, body: &mut Value)')[1].split('\n}\n')[0];
+    expect(apply).toContain('map.insert("filePermission".into()');
+    expect(rustAgent()).toContain('pub file_permission: Option<String>,');
+  });
+
+  it('回环网关为文件档位开门：审批 off 不再顺手拒掉写/删确认', () => {
+    const gate = read('../../../src-tauri/src/bridge/tool_gate.rs');
+    expect(gate).toContain('let is_file_ask = kind == "file_permission"');
+    expect(gate).toContain('mode == "off" && !is_file_ask');
+    // 只有档位真声明「每次询问」才受理，别档来问直接拒（问不出放行，但少一个假框）
+    expect(gate).toContain('FILE_PERMISSION_ASK_NOT_REQUIRED');
+    expect(gate).toContain('tool_approval::confirm_file_action(&description)');
+    expect(gate).toContain('audit::ACTION_FILE_WRITE');
+  });
+
+  it('本地 harness 同一套档位：未确认不写、越界拒绝、删除先备份、续跑沿用', () => {
+    const tools = read('../../../src-tauri/src/harness/tools.rs');
+    const runner = read('../../../src-tauri/src/harness/runner.rs');
+    expect(read('../../../src-tauri/src/security/file_perm.rs')).toContain('delete_requires_full_access');
+    expect(read('../../../src-tauri/src/security/file_perm.rs')).toContain('outside_boundary');
+    expect(read('../../../src-tauri/src/security/file_perm.rs')).toContain('hard_deny');
+    // 默认构造是最保守档：新调用方不显式表态也不会拿到放开的一档
+    expect(tools).toContain('Self::with_permission(base, skills, file_perm::DEFAULT_MODE)');
+    expect(tools).toContain('file_perm::access_denial');
+    expect(tools).toContain('Gate::Ask');
+    expect(tools).toContain('未经用户确认，未执行');
+    expect(tools).toContain('"delete_text_file"');
+    expect(tools).toContain('copy_into_trash_dir');
+    // runner：确认框在 blocking 线程里弹，拒绝与放行都留审计
+    expect(runner).toContain('tool_approval::confirm_file_action');
+    expect(runner).toContain('toolbox.run_after_approval(&call.tool, &args)');
+    // 档位进检查点，续跑不回到全局默认
+    expect(runner).toContain('file_permission: snap');
+    expect(read('../../../src-tauri/src/harness/checkpoint.rs')).toContain(
+      'pub file_permission: String',
+    );
+    expect(rustLib()).toContain('cp.meta.file_permission');
   });
 });
 

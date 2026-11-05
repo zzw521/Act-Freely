@@ -51,12 +51,17 @@ def jwt_encode(payload: dict) -> str:
     return f"{body}.{claims}.{_b64url_encode(sig)}"
 
 
-def jwt_decode(
+def jwt_decode_verbose(
     token: str,
     *,
     issuer: str | None = None,
     audience: str | None = None,
-) -> dict | None:
+) -> tuple[dict | None, str]:
+    """返回 (claims, reason)；reason 为空表示通过。
+
+    换票接口需要区分「过期」与「无效」：前者让客户端先刷新 access token，
+    后者直接要求重新登录。
+    """
     try:
         body, claims, sig = token.split(".")
         signing_input = f"{body}.{claims}".encode("ascii")
@@ -64,24 +69,37 @@ def jwt_decode(
             settings.jwt_secret.encode("utf-8"), signing_input, hashlib.sha256
         ).digest()
         if not hmac.compare_digest(expected, _b64url_decode(sig)):
-            return None
+            return None, "bad_signature"
         payload = json.loads(_b64url_decode(claims))
         if not isinstance(payload, dict):
-            return None
-        if int(payload.get("exp", 0)) < int(time.time()):
-            return None
+            return None, "malformed"
+        exp = payload.get("exp")
+        if not isinstance(exp, (int, float)) or isinstance(exp, bool):
+            return None, "malformed"
+        if int(exp) < int(time.time()):
+            return None, "expired"
         if issuer is not None and payload.get("iss") != issuer:
-            return None
+            return None, "bad_issuer"
         if audience is not None:
             aud = payload.get("aud")
             if isinstance(aud, list):
                 if audience not in aud:
-                    return None
+                    return None, "bad_audience"
             elif aud != audience:
-                return None
-        return payload
+                return None, "bad_audience"
+        return payload, ""
     except Exception:
-        return None
+        return None, "malformed"
+
+
+def jwt_decode(
+    token: str,
+    *,
+    issuer: str | None = None,
+    audience: str | None = None,
+) -> dict | None:
+    payload, reason = jwt_decode_verbose(token, issuer=issuer, audience=audience)
+    return payload if not reason else None
 
 
 # ── 密码哈希 ─────────────────────────────────────────────────

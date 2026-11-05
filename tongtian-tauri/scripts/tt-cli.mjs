@@ -12,7 +12,7 @@
  * - 只支持 http/https，URL 中不得内嵌用户名/密码；
  * - 非回环地址且未设置令牌时，doctor 明确警告，但仍会如实探测（不伪造成功）。
  *
- * 服务化模式下引擎的桌面专属能力不可用：终端 AI+、电脑操控、浏览器 AI+、远程桌面、
+ * 服务化模式下引擎的桌面专属能力不可用：终端 AI+、电脑操控、浏览器 AI+、本机画面、
  * 应用内 Hook/审计视图都依赖 Tauri 桌面壳；CLI 不提供替代实现。
  */
 
@@ -293,7 +293,7 @@ async function cmdDoctor(opts) {
   console.log(`[health] OK v${body.version} (${body.engine})`);
   console.log('[cli] 可用命令：health / chat / doctor');
   console.log(
-    '[boundary] 服务化实例不提供桌面专属能力：终端 AI+、电脑操控、浏览器 AI+、远程桌面、应用内 Hook/审计视图',
+    '[boundary] 服务化实例不提供桌面专属能力：终端 AI+、电脑操控、浏览器 AI+、本机画面、应用内 Hook/审计视图',
   );
   return 0;
 }

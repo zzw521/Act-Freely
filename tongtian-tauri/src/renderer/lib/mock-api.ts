@@ -29,6 +29,7 @@ import { handleLocalSuiteChannel } from './suite-local';
 import { handleLocalMarketChannel } from './market-local';
 import { handleLocalMcpChannel } from './mcp-local';
 import { handleLocalCollabChannel } from './collab-local';
+import { handleLocalSuperagentChannel } from './superagent-local';
 import { assertProxyPatchAcceptable, localProxyStatus } from './proxy-local';
 import { localAutostart } from './system-local';
 import { handleLocalPermissionChannel } from './permissions-local';
@@ -254,7 +255,114 @@ function scheduleExecutionFlow(task: MockTaskState) {
   timeline.forEach(([delay, fire]) => setTimeout(() => { if (!task.cancelled) fire(); }, delay));
 }
 
-// ── ModelHub Mock（内存 CRUD，模拟 SQLite 持久化语义） ──────
+/**
+ * 断点续跑演示剧本：目标里带 [test:failstep] 时走「工具步骤失败 → 检查点 → 单步续跑」。
+ *
+ * 真实检查点只存在于引擎进程（或本机磁盘快照），Mock 没有引擎；这条剧本让 D-15 的
+ * 重试入口、重放预览与勾选确认在无后端的环境里也能被点开验收。
+ * 普通任务不受影响：不下发检查点，resume 依然如实回报 CHECKPOINT_UNAVAILABLE。
+ */
+const MOCK_FAIL_STEP_MARK = '[test:failstep]';
+
+/** 脚本化检查点：只有走完失败剧本的任务才有条目，查询接口据此如实返回 */
+const mockCheckpoints = new Map<string, ChatEvent>();
+
+/** 失败剧本：读→写→写失败，收尾前下发一条 resumable 检查点（与引擎「模型调用前采集」同语义） */
+function scheduleFailStepFlow(task: MockTaskState) {
+  task.status = 'executing';
+  const toolStep = (stepId: string, tool: string, stepType: string) =>
+    emit(seqEvent(task.taskId, {
+      type: 'step_start',
+      stepId,
+      stepType,
+      tool,
+      description: `调用工具: ${tool}`,
+    }));
+  const timeline: Array<[number, () => void]> = [
+    [80, () => emit(seqEvent(task.taskId, { type: 'status_change', status: 'executing' }))],
+    [300, () => toolStep('step-1', 'view_text_file', 'file_read')],
+    [900, () => emit(seqEvent(task.taskId, { type: 'step_done', stepId: 'step-1', output: '读取到 3 份周报底稿' }))],
+    [1100, () => toolStep('step-2', 'write_text_file', 'file_write')],
+    [1700, () => {
+      recordMockUsage(900, 500, task.model);
+      emit(seqEvent(task.taskId, { type: 'step_done', stepId: 'step-2', output: '周报.md 已写入工作区' }));
+    }],
+    [1900, () => toolStep('step-3', 'generate_pptx', 'file_convert')],
+    [2500, () => emit(seqEvent(task.taskId, { type: 'step_failed', stepId: 'step-3', error: '模板渲染超时（Mock 剧本）' }))],
+    [2600, () => {
+      const checkpoint = {
+        type: 'checkpoint',
+        taskId: task.taskId,
+        resumable: true,
+        reason: '执行中断：最后一步工具失败（Mock 剧本，可从检查点续跑）',
+        savedAt: new Date().toISOString(),
+        // Mock 没有进程外持久化，如实标 same-process（界面据此提示「引擎重启后无法恢复」）
+        scope: 'same-process',
+        snapshotMessages: 4,
+        executedTools: 2,
+        skippedDuplicates: 0,
+      };
+      mockCheckpoints.set(task.taskId, checkpoint as unknown as ChatEvent);
+      emit(seqEvent(task.taskId, checkpoint));
+    }],
+    [2700, () => {
+      task.status = 'failed';
+      emit(seqEvent(task.taskId, { type: 'status_change', status: 'failed', statusReasonCode: 'TOOL_FAILED' }));
+    }],
+    [2800, () => emit(seqEvent(task.taskId, { type: 'done' }))],
+    [2850, () => {
+      mockHistory.unshift(task);
+      activeMockTask = null;
+    }],
+  ];
+  timeline.forEach(([delay, fire]) => setTimeout(() => { if (!task.cancelled) fire(); }, delay));
+}
+
+/**
+ * 续跑剧本：已成功的写入步骤按台账不重做，只重放失败的那一步，然后正常收尾。
+ * 检查点用一次即作废（与引擎「续跑成功后被新收尾事件覆盖为不可续跑」一致）。
+ */
+function scheduleResumeFlow(task: MockTaskState) {
+  task.cancelled = false;
+  task.status = 'executing';
+  activeMockTask = task;
+  const timeline: Array<[number, () => void]> = [
+    [80, () => emit(seqEvent(task.taskId, { type: 'status_change', status: 'executing' }))],
+    [300, () => emit(seqEvent(task.taskId, {
+      type: 'step_start',
+      stepId: 'step-3',
+      stepType: 'file_convert',
+      tool: 'generate_pptx',
+      description: '调用工具: generate_pptx',
+    }))],
+    [1100, () => emit(seqEvent(task.taskId, { type: 'step_done', stepId: 'step-3', output: '汇报.pptx 已生成（只重放了失败步骤）' }))],
+    [1400, () => emit(seqEvent(task.taskId, {
+      type: 'deliver',
+      summary: '续跑完成',
+      final_text: '从检查点续跑：前两步没有重做，只重新执行了失败的 generate_pptx。',
+      artifacts: [`${task.sessionDir}/汇报.pptx`],
+    }))],
+    [1600, () => {
+      mockCheckpoints.delete(task.taskId);
+      emit(seqEvent(task.taskId, {
+        type: 'checkpoint',
+        taskId: task.taskId,
+        resumable: false,
+        reason: '检查点已消费：任务已收尾',
+        savedAt: new Date().toISOString(),
+        scope: 'same-process',
+      }));
+    }],
+    [1700, () => emit(seqEvent(task.taskId, { type: 'status_change', status: 'done' }))],
+    [1800, () => {
+      task.status = 'done';
+      emit(seqEvent(task.taskId, { type: 'done' }));
+      activeMockTask = null;
+    }],
+  ];
+  timeline.forEach(([delay, fire]) => setTimeout(() => { if (!task.cancelled) fire(); }, delay));
+}
+
 
 interface MockModel {
   id: string;
@@ -354,6 +462,16 @@ function handleModelChannel(channel: string, arg: unknown): unknown {
   }
   if (channel === 'usage:report') {
     return localReportView(normalizePeriod(arg));
+  }
+  if (channel === 'usage:upload') {
+    // Mock 通道没有真实账号与服务端，不假装上报成功
+    return {
+      uploaded: false,
+      rows: 0,
+      accepted: 0,
+      deviceId: 'mock-device',
+      message: 'Mock 通道不连接账号服务；请用真实账号与 tongtian-server 验证上报',
+    };
   }
   if (channel === 'model:create') {
     const req = (arg ?? {}) as MockModelWrite;
@@ -692,7 +810,7 @@ const mockAPI = {
     console.info('[mock-api] invoke', channel);
     if (channel.startsWith('model:')) return handleModelChannel(channel, args[0]);
     // 用量总览/报表与模型用量同源，交给同一个本地台账处理函数
-    if (channel === 'usage:stats' || channel === 'usage:report') {
+    if (channel === 'usage:stats' || channel === 'usage:report' || channel === 'usage:upload') {
       return handleModelChannel(channel, args[0]);
     }
     if (channel.startsWith('file:')) return handleFileChannel(channel, args);
@@ -750,6 +868,11 @@ const mockAPI = {
     // 项目协作：需要桌面端凭据库与账号服务直连能力，Mock/浏览器通道如实回报不支持
     {
       const local = handleLocalCollabChannel(channel);
+      if (local.handled) return local.value;
+    }
+    // Super-agent 主动候选：事件账本与常驻巡检只在桌面主进程，Mock 通道不编造候选清单
+    {
+      const local = handleLocalSuperagentChannel(channel);
       if (local.handled) return local.value;
     }
     // 意识（画像/能力文件/长期记忆）：浏览器通道无落盘能力，走本地台账（桌面端由 Rust 读写意识目录）
@@ -854,17 +977,27 @@ const mockAPI = {
     const task = activeMockTask ?? mockHistory.find((t) => t.taskId === taskId);
     if (!task) return { ok: false, status: 'TASK_NOT_FOUND' };
     if (action === 'resume') {
+      const scripted = mockCheckpoints.get(taskId);
+      if (scripted && scripted.type === 'checkpoint' && scripted.resumable) {
+        // 只有走过失败剧本的任务才有检查点：按「已成功的写入步骤不重做、只重放失败那一步」演
+        scheduleResumeFlow(task);
+        return { ok: true, status: 'executing' };
+      }
       // Mock 通道不模拟引擎进程内的检查点；明确告知不可用，不伪造恢复成功
       emit(seqEvent(taskId, {
         type: 'error',
         code: 'CHECKPOINT_UNAVAILABLE',
-        message: 'Mock 模式没有真实引擎的检查点，无法续跑（请连接真实引擎验证）',
+        message: 'Mock 模式没有真实引擎的检查点，无法续跑（请连接真实引擎验证，或在任务目标里带 [test:failstep] 走演示剧本）',
       }));
       emit(seqEvent(taskId, { type: 'done' }));
       return { ok: false, status: 'CHECKPOINT_UNAVAILABLE' };
     }
     if (action === 'approve') {
-      scheduleExecutionFlow(task);
+      if (task.title.includes(MOCK_FAIL_STEP_MARK)) {
+        scheduleFailStepFlow(task);
+      } else {
+        scheduleExecutionFlow(task);
+      }
       return { ok: true, status: 'executing' };
     }
     if (action === 'reject') {
@@ -915,8 +1048,15 @@ const mockAPI = {
   },
   /** 重放 Mock：无持久化，返回空窗口（windowExpired 语义） */
   eventReplay: async (taskId: string) => ({ taskId, events: [] }),
-  /** 检查点查询 Mock：没有真实引擎进程，如实返回空（不伪造可续跑入口） */
-  chatCheckpointQuery: async () => ({ checkpoints: {} }),
+  /**
+   * 检查点查询 Mock：只返回失败演示剧本留下的快照，普通任务依然如实返回空
+   * （没有真实引擎进程，不伪造可续跑入口）。
+   */
+  chatCheckpointQuery: async (taskIds: string[] = []) => ({
+    checkpoints: Object.fromEntries(
+      taskIds.filter((id) => mockCheckpoints.has(id)).map((id) => [id, mockCheckpoints.get(id)]),
+    ),
+  }),
   /** 附件暂存 Mock：返回 AttachmentMeta（不落盘） */
   fileStageAttachment: async (srcPath: string, taskId?: string) => {
     const fileName = srcPath.split(/[\\/]/).pop() ?? 'attachment.bin';

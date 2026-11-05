@@ -378,6 +378,8 @@ export function localHooksStatus(): HooksStatus {
     ungranted: commands.filter((c) => !granted.has(c)),
     // 与 Rust list_grants 同口径：返回整本放行台账，不因当前配置筛选而隐藏记录
     grants: localHookGrants(),
+    // 本通道没有沙箱启动器，也没有本机执行网关：绝不能伪装成「脚本会进容器」
+    sandboxed: false,
     gateError: '当前通道没有本机 Hook 执行网关，放行只是意愿记录，脚本不会执行',
   };
 }
@@ -501,7 +503,7 @@ export function captureLocalComputerUseScreen(): never {
   );
 }
 
-// ── 远程桌面（本机画面；浏览器/Mock 通道没有截屏能力） ──────
+// ── 本机画面（本机画面；浏览器/Mock 通道没有截屏能力） ──────
 
 export const REMOTE_SESSION_MAX_MS = 10 * 60 * 1000;
 export const REMOTE_FRAME_INTERVAL_MS = 700;
@@ -524,7 +526,7 @@ export function localRemoteDesktopCapabilities(): RemoteDesktopCapabilities {
     localView: false,
     frameIntervalMs: REMOTE_FRAME_INTERVAL_MS,
     sessionMaxMs: REMOTE_SESSION_MAX_MS,
-    reason: '浏览器/Mock 通道没有系统截屏能力，远程桌面只在 Windows 桌面版可用',
+    reason: '浏览器/Mock 通道没有系统截屏能力，本机画面只在 Windows 桌面版可用',
     crossHost: {
       supported: false,
       reason: '当前版本不做跨主机画面转发；需要中继服务与主机配对，尚未提供',
@@ -538,13 +540,13 @@ export function localRemoteDesktopStatus(): RemoteDesktopSession {
 
 export function startLocalRemoteDesktop(): never {
   throw new Error(
-    'REMOTE_UNSUPPORTED: 当前通道没有本机桌面截屏能力，远程桌面只在 Windows 桌面版可用',
+    'REMOTE_UNSUPPORTED: 当前通道没有本机桌面截屏能力，本机画面只在 Windows 桌面版可用',
   );
 }
 
 export function frameLocalRemoteDesktop(): never {
   throw new Error(
-    'REMOTE_UNSUPPORTED: 当前通道没有本机桌面截屏能力，远程桌面只在 Windows 桌面版可用',
+    'REMOTE_UNSUPPORTED: 当前通道没有本机桌面截屏能力，本机画面只在 Windows 桌面版可用',
   );
 }
 

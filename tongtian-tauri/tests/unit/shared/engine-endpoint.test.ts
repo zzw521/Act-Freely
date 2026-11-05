@@ -106,3 +106,38 @@ describe('源码契约：组件不再写死引擎地址', () => {
     expect(src).toContain("invoke('engine_endpoint'");
   });
 });
+
+/**
+ * 「引擎没起来」这一种失败必须能被程序分辨出来：预览面板据此决定给不给
+ * 「启动引擎并重试」这个真入口。分支只能按码走——文案会被 errorTextOf 改写，
+ * 拿中文当条件就等于把界面文案变成契约。
+ */
+describe('ENGINE_NOT_RUNNING 的分类（按码，不按文案）', () => {
+  it('Rust 裸字符串（桌面壳的真实形态）→ 判为引擎未运行', () => {
+    expect(
+      mod.isEngineNotRunningError('ENGINE_NOT_RUNNING: 工作空间「default」的引擎尚未启动'),
+    ).toBe(true);
+  });
+
+  it('本模块自己抛的 Error 实例 → 同样判为引擎未运行', () => {
+    expect(mod.isEngineNotRunningError(new Error('ENGINE_NOT_RUNNING: Rust 未返回可用的引擎端点'))).toBe(
+      true,
+    );
+  });
+
+  it('端点解析失败与分类同源：拿不到端点时抛出的那个错误就是可重试形态', async () => {
+    win.__TAURI_INTERNALS__ = {};
+    win.tongtianAPI = { invoke: async () => null };
+    const err = await mod.resolveEngineEndpoint('default').then(() => null, (e) => e);
+    expect(mod.isEngineNotRunningError(err)).toBe(true);
+  });
+
+  it.each([
+    ['其它码的裸字符串', 'FILE_NOT_FOUND: C:\\tmp\\a.md'],
+    ['HTTP 层错误', '打开失败（HTTP 502）'],
+    ['空载荷（Rust 侧非字符串拒绝）', ''],
+    ['非字符串载荷', { code: 'ENGINE_NOT_RUNNING' }],
+  ])('%s → 不判为引擎未运行，不许给假按钮', (_label, err) => {
+    expect(mod.isEngineNotRunningError(err)).toBe(false);
+  });
+});

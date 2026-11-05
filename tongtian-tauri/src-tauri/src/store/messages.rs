@@ -28,6 +28,8 @@ pub struct MessageRow {
     pub role: String,
     /// 本轮任务 id（过程明细事件按它在 event_store 里取回）
     pub task_id: String,
+    /// 本轮所属工作区（缺省 default；会话列表按它过滤）
+    pub workspace_id: String,
     pub content: String,
     /// 交付物文件名清单（仅 assistant 行有值）
     pub artifacts: Vec<String>,
@@ -48,6 +50,8 @@ pub struct ConversationRow {
     pub updated_at_ms: i64,
     /// 最近一轮的任务 id（归档标记按它匹配）
     pub last_task_id: String,
+    /// 会话所属工作区（取首轮用户提问的归属）
+    pub workspace_id: String,
 }
 
 fn artifacts_to_json(artifacts: &[String]) -> String {
@@ -58,14 +62,25 @@ fn artifacts_from_json(raw: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
 }
 
+/// 工作区缺省口径与 `tasks.workspace_id` 一致：空值即 default
+fn normalize_workspace(raw: &str) -> String {
+    let v = raw.trim();
+    if v.is_empty() {
+        "default".to_string()
+    } else {
+        v.to_string()
+    }
+}
+
 /// 写入（覆盖同轮同角色的既有正文）
 pub fn put(store: &Store, row: &MessageRow) -> Result<(), String> {
     store.with_conn(|c| {
         c.execute(
-            "INSERT INTO chat_messages (conv_id, turn_index, role, task_id, content, artifacts_json, ts_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO chat_messages (conv_id, turn_index, role, task_id, workspace_id, content, artifacts_json, ts_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(conv_id, turn_index, role) DO UPDATE SET
                 task_id = excluded.task_id,
+                workspace_id = excluded.workspace_id,
                 content = excluded.content,
                 artifacts_json = excluded.artifacts_json,
                 ts_ms = excluded.ts_ms",
@@ -74,6 +89,7 @@ pub fn put(store: &Store, row: &MessageRow) -> Result<(), String> {
                 row.turn_index,
                 row.role,
                 row.task_id,
+                row.workspace_id,
                 row.content,
                 artifacts_to_json(&row.artifacts),
                 row.ts_ms,
@@ -87,6 +103,7 @@ pub fn put(store: &Store, row: &MessageRow) -> Result<(), String> {
 /// 记录一轮的用户提问（提交任务时调用）
 pub fn record_user_goal(
     store: &Store,
+    workspace_id: &str,
     conv_id: &str,
     turn_index: i64,
     task_id: &str,
@@ -100,6 +117,7 @@ pub fn record_user_goal(
             turn_index,
             role: ROLE_USER.to_string(),
             task_id: task_id.to_string(),
+            workspace_id: normalize_workspace(workspace_id),
             content: goal.to_string(),
             artifacts: Vec::new(),
             ts_ms,
@@ -108,10 +126,10 @@ pub fn record_user_goal(
     )
 }
 
-/// 任务 → (conv_id, turn_index) 绑定：取该任务用户行的归属轮次
-fn task_binding(c: &rusqlite::Connection, task_id: &str) -> Result<Option<(String, i64)>, String> {
+/// 任务 → (conv_id, turn_index, workspace_id) 绑定：取该任务用户行的归属轮次
+pub(crate) fn task_binding(c: &rusqlite::Connection, task_id: &str) -> Result<Option<(String, i64, String)>, String> {
     let mut stmt = c
-        .prepare("SELECT conv_id, turn_index FROM chat_messages WHERE task_id = ?1 AND role = ?2 LIMIT 1")
+        .prepare("SELECT conv_id, turn_index, workspace_id FROM chat_messages WHERE task_id = ?1 AND role = ?2 LIMIT 1")
         .map_err(|e| e.to_string())?;
     let mut rows = stmt
         .query(rusqlite::params![task_id, ROLE_USER])
@@ -120,6 +138,7 @@ fn task_binding(c: &rusqlite::Connection, task_id: &str) -> Result<Option<(Strin
         Some(row) => Ok(Some((
             row.get::<_, String>(0).map_err(|e| e.to_string())?,
             row.get::<_, i64>(1).map_err(|e| e.to_string())?,
+            row.get::<_, String>(2).map_err(|e| e.to_string())?,
         ))),
         None => Ok(None),
     }
@@ -146,8 +165,10 @@ pub fn record_assistant_reply(
     } else {
         return Ok(());
     };
-    let (conv_id, turn_index) = store.with_conn(|c| task_binding(c, task_id))?
-        .unwrap_or_else(|| (task_id.to_string(), 0));
+    // 助手行沿用本轮用户行的归属，保证同一会话的所有行工作区一致；
+    // 没有用户行的历史任务回落到 default（与迁移的存量口径相同）。
+    let (conv_id, turn_index, workspace_id) = store.with_conn(|c| task_binding(c, task_id))?
+        .unwrap_or_else(|| (task_id.to_string(), 0, "default".to_string()));
     put(
         store,
         &MessageRow {
@@ -155,6 +176,7 @@ pub fn record_assistant_reply(
             turn_index,
             role: ROLE_ASSISTANT.to_string(),
             task_id: task_id.to_string(),
+            workspace_id,
             content,
             artifacts: artifacts.to_vec(),
             ts_ms,
@@ -231,11 +253,14 @@ pub fn edit_turn(
         return Err("CHAT_EDIT_INVALID_TURN: 轮次不能为负".to_string());
     }
     store.with_conn(|c| {
-        let exists: i64 = c
+        // 编辑只改正文，不改变这轮的工作区归属：先取出原值随写回一起带上
+        let (exists, workspace_id): (i64, String) = c
             .query_row(
-                "SELECT COUNT(*) FROM chat_messages WHERE conv_id = ?1 AND turn_index = ?2 AND role = ?3",
+                "SELECT COUNT(*), COALESCE(MAX(workspace_id), 'default')
+                   FROM chat_messages
+                  WHERE conv_id = ?1 AND turn_index = ?2 AND role = ?3",
                 rusqlite::params![conv_id, turn_index, ROLE_USER],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .map_err(|e| format!("CHAT_EDIT_CHECK_FAILED: {e}"))?;
         if exists == 0 {
@@ -259,14 +284,15 @@ pub fn edit_turn(
         )
         .map_err(|e| format!("CHAT_EDIT_FEEDBACK_FAILED: {e}"))?;
         tx.execute(
-            "INSERT INTO chat_messages (conv_id, turn_index, role, task_id, content, artifacts_json, ts_ms)
-             VALUES (?1, ?2, ?3, '', ?4, '[]', ?5)
+            "INSERT INTO chat_messages (conv_id, turn_index, role, task_id, workspace_id, content, artifacts_json, ts_ms)
+             VALUES (?1, ?2, ?3, '', ?4, ?5, '[]', ?6)
              ON CONFLICT(conv_id, turn_index, role) DO UPDATE SET
                 task_id = '',
+                workspace_id = excluded.workspace_id,
                 content = excluded.content,
                 artifacts_json = '[]',
                 ts_ms = excluded.ts_ms",
-            rusqlite::params![conv_id, turn_index, ROLE_USER, content, ts_ms],
+            rusqlite::params![conv_id, turn_index, ROLE_USER, workspace_id, content, ts_ms],
         )
         .map_err(|e| format!("CHAT_EDIT_SAVE_FAILED: {e}"))?;
         tx.commit().map_err(|e| format!("CHAT_EDIT_COMMIT_FAILED: {e}"))
@@ -282,7 +308,7 @@ pub fn list_by_conv(
     store.with_conn(|c| {
         let mut stmt = c
             .prepare(
-                "SELECT m.conv_id, m.turn_index, m.role, m.task_id, m.content, m.artifacts_json, m.ts_ms,
+                "SELECT m.conv_id, m.turn_index, m.role, m.task_id, m.workspace_id, m.content, m.artifacts_json, m.ts_ms,
                         COALESCE(f.value, '')
                  FROM chat_messages m
                  LEFT JOIN chat_feedback f
@@ -300,10 +326,11 @@ pub fn list_by_conv(
                     turn_index: r.get(1)?,
                     role: r.get(2)?,
                     task_id: r.get(3)?,
-                    content: r.get(4)?,
-                    artifacts: artifacts_from_json(&r.get::<_, String>(5)?),
-                    ts_ms: r.get(6)?,
-                    feedback: r.get::<_, String>(7).unwrap_or_default(),
+                    workspace_id: r.get(4)?,
+                    content: r.get(5)?,
+                    artifacts: artifacts_from_json(&r.get::<_, String>(6)?),
+                    ts_ms: r.get(7)?,
+                    feedback: r.get::<_, String>(8).unwrap_or_default(),
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -321,7 +348,15 @@ pub fn list_by_conv(
 }
 
 /// 会话列表（按最近活跃倒序；正文不落库的会话不会出现，故不伪造条目）
-pub fn list_conversations(store: &Store, limit: Option<usize>) -> Result<Vec<ConversationRow>, String> {
+///
+/// `workspace_id` 为 `Some` 时只返回该工作区的会话；`None`/空串表示全部，
+/// 供侧边栏「全部项目 / 当前项目」两档切换使用（过滤在 SQL 里完成，不截断后再筛）。
+pub fn list_conversations(
+    store: &Store,
+    workspace_id: Option<&str>,
+    limit: Option<usize>,
+) -> Result<Vec<ConversationRow>, String> {
+    let filter = workspace_id.map(str::trim).filter(|s| !s.is_empty());
     let sql = "SELECT c.conv_id,
                       (SELECT m.content FROM chat_messages m
                         WHERE m.conv_id = c.conv_id AND m.role = 'user'
@@ -332,13 +367,17 @@ pub fn list_conversations(store: &Store, limit: Option<usize>) -> Result<Vec<Con
                       MAX(c.ts_ms),
                       (SELECT m.task_id FROM chat_messages m
                         WHERE m.conv_id = c.conv_id AND m.task_id <> ''
-                        ORDER BY m.turn_index DESC LIMIT 1)
+                        ORDER BY m.turn_index DESC LIMIT 1),
+                      COALESCE((SELECT m.workspace_id FROM chat_messages m
+                                 WHERE m.conv_id = c.conv_id AND m.role = 'user'
+                                 ORDER BY m.turn_index ASC LIMIT 1), 'default')
                FROM chat_messages c
+               WHERE (?1 IS NULL OR c.workspace_id = ?1)
                GROUP BY c.conv_id
                ORDER BY MAX(c.ts_ms) DESC";
     store.with_conn(|c| {
         let mut stmt = c.prepare(sql).map_err(|e| e.to_string())?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(rusqlite::params![filter], |r| {
             let goal: String = r.get::<_, String>(1).unwrap_or_default();
             Ok(ConversationRow {
                 conv_id: r.get(0)?,
@@ -348,6 +387,7 @@ pub fn list_conversations(store: &Store, limit: Option<usize>) -> Result<Vec<Con
                 created_at_ms: r.get(3)?,
                 updated_at_ms: r.get(4)?,
                 last_task_id: r.get::<_, String>(5).unwrap_or_default(),
+                workspace_id: r.get::<_, String>(6).unwrap_or_else(|_| "default".to_string()),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -382,7 +422,7 @@ mod tests {
     #[test]
     fn test_record_user_and_reply_roundtrip() {
         let (store, dir) = temp_store("roundtrip");
-        record_user_goal(&store, "conv-1", 0, "task-1", "帮我整理周报", 1000).unwrap();
+        record_user_goal(&store, "default", "conv-1", 0, "task-1", "帮我整理周报", 1000).unwrap();
         record_assistant_reply(&store, "task-1", "本周完成 3 项", "任务完成", &["周报.md".into()], 2000)
             .unwrap();
         let rows = list_by_conv(&store, "conv-1", None).unwrap();
@@ -398,9 +438,9 @@ mod tests {
     #[test]
     fn test_multi_turn_ordering() {
         let (store, dir) = temp_store("turns");
-        record_user_goal(&store, "conv-1", 1, "task-2", "第二轮提问", 3000).unwrap();
+        record_user_goal(&store, "default", "conv-1", 1, "task-2", "第二轮提问", 3000).unwrap();
         record_assistant_reply(&store, "task-2", "第二轮回复", "", &[], 4000).unwrap();
-        record_user_goal(&store, "conv-1", 0, "task-1", "首轮提问", 1000).unwrap();
+        record_user_goal(&store, "default", "conv-1", 0, "task-1", "首轮提问", 1000).unwrap();
         let rows = list_by_conv(&store, "conv-1", None).unwrap();
         // 轮次升序、同轮 user 先于 assistant（乱序写入也要按对话顺序读回）
         assert_eq!(
@@ -415,10 +455,10 @@ mod tests {
     #[test]
     fn test_regenerate_overwrites_same_turn_reply() {
         let (store, dir) = temp_store("regen");
-        record_user_goal(&store, "conv-1", 0, "task-1", "提问", 1000).unwrap();
+        record_user_goal(&store, "default", "conv-1", 0, "task-1", "提问", 1000).unwrap();
         record_assistant_reply(&store, "task-1", "第一版回复", "", &[], 2000).unwrap();
         // 重新生成：同一轮的新任务覆盖本轮回复，不追加第二条
-        record_user_goal(&store, "conv-1", 0, "task-2", "提问", 3000).unwrap();
+        record_user_goal(&store, "default", "conv-1", 0, "task-2", "提问", 3000).unwrap();
         record_assistant_reply(&store, "task-2", "第二版回复", "", &["a.md".into()], 4000).unwrap();
         let rows = list_by_conv(&store, "conv-1", None).unwrap();
         assert_eq!(rows.len(), 2);
@@ -431,7 +471,7 @@ mod tests {
     #[test]
     fn test_reply_falls_back_to_summary_and_skips_empty() {
         let (store, dir) = temp_store("fallback");
-        record_user_goal(&store, "conv-1", 0, "task-1", "提问", 1000).unwrap();
+        record_user_goal(&store, "default", "conv-1", 0, "task-1", "提问", 1000).unwrap();
         // 模型无最终文本时退回摘要，不丢整轮
         record_assistant_reply(&store, "task-1", "   ", "已生成 2 个文件", &[], 2000).unwrap();
         let rows = list_by_conv(&store, "conv-1", None).unwrap();
@@ -460,12 +500,12 @@ mod tests {
     fn test_list_conversations_summary() {
         let (store, dir) = temp_store("convs");
         let long_goal = "通".repeat(80);
-        record_user_goal(&store, "conv-a", 0, &format!("task-a-0"), &long_goal, 1000).unwrap();
+        record_user_goal(&store, "default", "conv-a", 0, &format!("task-a-0"), &long_goal, 1000).unwrap();
         record_assistant_reply(&store, "task-a-0", "A 的回复", "", &[], 2000).unwrap();
-        record_user_goal(&store, "conv-b", 0, "task-b-0", "B 的首轮", 3000).unwrap();
-        record_user_goal(&store, "conv-b", 1, "task-b-1", "B 的第二轮提问很长", 4000).unwrap();
+        record_user_goal(&store, "default", "conv-b", 0, "task-b-0", "B 的首轮", 3000).unwrap();
+        record_user_goal(&store, "default", "conv-b", 1, "task-b-1", "B 的第二轮提问很长", 4000).unwrap();
 
-        let convs = list_conversations(&store, None).unwrap();
+        let convs = list_conversations(&store, None, None).unwrap();
         // 最近活跃倒序：conv-b（4000）先于 conv-a（2000）
         assert_eq!(
             convs.iter().map(|c| c.conv_id.as_str()).collect::<Vec<_>>(),
@@ -479,17 +519,39 @@ mod tests {
         assert_eq!(convs[1].first_goal, "通".repeat(60));
         assert_eq!(convs[0].first_goal, "B 的首轮");
 
-        let limited = list_conversations(&store, Some(1)).unwrap();
+        let limited = list_conversations(&store, None, Some(1)).unwrap();
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].conv_id, "conv-b");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
+    fn test_list_conversations_filters_by_workspace() {
+        let (store, dir) = temp_store("conv-ws");
+        record_user_goal(&store, "ws-a", "conv-a", 0, "task-a", "A 的提问", 1000).unwrap();
+        record_assistant_reply(&store, "task-a", "A 的回复", "", &[], 2000).unwrap();
+        record_user_goal(&store, "ws-b", "conv-b", 0, "task-b", "B 的提问", 3000).unwrap();
+        record_assistant_reply(&store, "task-b", "B 的回复", "", &[], 4000).unwrap();
+
+        // 不过滤：全部；过滤：只留该工作区，且助手行沿用同一归属
+        assert_eq!(list_conversations(&store, None, None).unwrap().len(), 2);
+        let only_a = list_conversations(&store, Some("ws-a"), None).unwrap();
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].conv_id, "conv-a");
+        assert_eq!(only_a[0].workspace_id, "ws-a");
+        let rows = list_by_conv(&store, "conv-b", None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.workspace_id == "ws-b"));
+        // 空串等同不过滤（渲染层「全部项目」档）
+        assert_eq!(list_conversations(&store, Some("  "), None).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_list_by_conv_isolated_between_conversations() {
         let (store, dir) = temp_store("isolate");
-        record_user_goal(&store, "conv-a", 0, "task-a", "A 的提问", 1000).unwrap();
-        record_user_goal(&store, "conv-b", 0, "task-b", "B 的提问", 2000).unwrap();
+        record_user_goal(&store, "default", "conv-a", 0, "task-a", "A 的提问", 1000).unwrap();
+        record_user_goal(&store, "default", "conv-b", 0, "task-b", "B 的提问", 2000).unwrap();
         let rows = list_by_conv(&store, "conv-a", None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].content, "A 的提问");
@@ -520,7 +582,7 @@ mod tests {
         let db = dir.join("t.db");
         {
             let store = Store::open(db.clone()).unwrap();
-            record_user_goal(&store, "conv-1", 0, "task-1", "重启前的提问", 1000).unwrap();
+            record_user_goal(&store, "default", "conv-1", 0, "task-1", "重启前的提问", 1000).unwrap();
         }
         let store2 = Store::open(db).unwrap();
         let rows = list_by_conv(&store2, "conv-1", None).unwrap();
@@ -532,7 +594,7 @@ mod tests {
     #[test]
     fn test_feedback_roundtrip_and_change() {
         let (store, dir) = temp_store("feedback");
-        record_user_goal(&store, "conv-1", 0, "task-1", "提问", 1000).unwrap();
+        record_user_goal(&store, "default", "conv-1", 0, "task-1", "提问", 1000).unwrap();
         record_assistant_reply(&store, "task-1", "回复", "", &[], 2000).unwrap();
         // 未评价：assistant 行为空串，user 行永远不带评价
         let rows = list_by_conv(&store, "conv-1", None).unwrap();
@@ -557,7 +619,7 @@ mod tests {
     #[test]
     fn test_feedback_rejects_unknown_value_and_missing_turn() {
         let (store, dir) = temp_store("feedback-bad");
-        record_user_goal(&store, "conv-1", 0, "task-1", "提问", 1000).unwrap();
+        record_user_goal(&store, "default", "conv-1", 0, "task-1", "提问", 1000).unwrap();
         let err = set_feedback(&store, "conv-1", 0, Some("meh"), 2000).unwrap_err();
         assert!(err.starts_with("CHAT_FEEDBACK_INVALID_VALUE"), "实际错误：{err}");
         // 没有正文的轮次不可评价，避免留下悬空评价
@@ -573,15 +635,15 @@ mod tests {
     #[test]
     fn test_feedback_isolated_between_conversations() {
         let (store, dir) = temp_store("feedback-isolate");
-        record_user_goal(&store, "conv-a", 0, "task-a", "A 的提问", 1000).unwrap();
+        record_user_goal(&store, "default", "conv-a", 0, "task-a", "A 的提问", 1000).unwrap();
         record_assistant_reply(&store, "task-a", "A 的回复", "", &[], 1500).unwrap();
-        record_user_goal(&store, "conv-b", 0, "task-b", "B 的提问", 2000).unwrap();
+        record_user_goal(&store, "default", "conv-b", 0, "task-b", "B 的提问", 2000).unwrap();
         record_assistant_reply(&store, "task-b", "B 的回复", "", &[], 2500).unwrap();
         set_feedback(&store, "conv-b", 0, Some(FEEDBACK_UP), 3000).unwrap();
         assert_eq!(list_by_conv(&store, "conv-a", None).unwrap()[1].feedback, "");
         assert_eq!(list_by_conv(&store, "conv-b", None).unwrap()[1].feedback, FEEDBACK_UP);
         // 重新生成同轮：正文被新任务覆盖，评价按 (会话, 轮次) 归属，仍随本轮回复显示
-        record_user_goal(&store, "conv-b", 0, "task-b2", "B 的提问", 4000).unwrap();
+        record_user_goal(&store, "default", "conv-b", 0, "task-b2", "B 的提问", 4000).unwrap();
         record_assistant_reply(&store, "task-b2", "B 的第二版回复", "", &[], 5000).unwrap();
         let rows = list_by_conv(&store, "conv-b", None).unwrap();
         assert_eq!(rows[1].content, "B 的第二版回复");
@@ -592,11 +654,11 @@ mod tests {
     #[test]
     fn test_edit_turn_truncates_later_turns() {
         let (store, dir) = temp_store("edit-truncate");
-        record_user_goal(&store, "conv-1", 0, "task-0", "首轮提问", 1000).unwrap();
+        record_user_goal(&store, "default", "conv-1", 0, "task-0", "首轮提问", 1000).unwrap();
         record_assistant_reply(&store, "task-0", "首轮回复", "", &["a.md".into()], 2000).unwrap();
-        record_user_goal(&store, "conv-1", 1, "task-1", "第二轮提问", 3000).unwrap();
+        record_user_goal(&store, "default", "conv-1", 1, "task-1", "第二轮提问", 3000).unwrap();
         record_assistant_reply(&store, "task-1", "第二轮回复", "", &[], 4000).unwrap();
-        record_user_goal(&store, "conv-1", 2, "task-2", "第三轮提问", 5000).unwrap();
+        record_user_goal(&store, "default", "conv-1", 2, "task-2", "第三轮提问", 5000).unwrap();
         record_assistant_reply(&store, "task-2", "第三轮回复", "", &[], 6000).unwrap();
         set_feedback(&store, "conv-1", 0, Some(FEEDBACK_UP), 7000).unwrap();
         set_feedback(&store, "conv-1", 1, Some(FEEDBACK_DOWN), 7000).unwrap();
@@ -620,7 +682,7 @@ mod tests {
         assert_eq!(rows[2].feedback, "", "本轮回复已作废，评价随之作废");
         assert_eq!(rows[2].task_id, "", "改后的提问等新任务提交再回填任务 id");
         // 会话摘要仍按首轮提问、轮次数量按现存轮次
-        let convs = list_conversations(&store, None).unwrap();
+        let convs = list_conversations(&store, None, None).unwrap();
         assert_eq!(convs[0].first_goal, "首轮提问");
         assert_eq!(convs[0].turn_count, 2);
         let _ = std::fs::remove_dir_all(&dir);
@@ -629,7 +691,7 @@ mod tests {
     #[test]
     fn test_edit_turn_rejects_bad_input_and_missing_turn() {
         let (store, dir) = temp_store("edit-bad");
-        record_user_goal(&store, "conv-1", 0, "task-0", "提问", 1000).unwrap();
+        record_user_goal(&store, "default", "conv-1", 0, "task-0", "提问", 1000).unwrap();
         let err = edit_turn(&store, "conv-1", 0, "   ", 2000).unwrap_err();
         assert!(err.starts_with("CHAT_EDIT_EMPTY_CONTENT"), "实际错误：{err}");
         let err = edit_turn(&store, "  ", 0, "新提问", 2000).unwrap_err();
@@ -649,9 +711,9 @@ mod tests {
     #[test]
     fn test_edit_turn_isolated_between_conversations() {
         let (store, dir) = temp_store("edit-isolate");
-        record_user_goal(&store, "conv-a", 0, "task-a", "A 的提问", 1000).unwrap();
+        record_user_goal(&store, "default", "conv-a", 0, "task-a", "A 的提问", 1000).unwrap();
         record_assistant_reply(&store, "task-a", "A 的回复", "", &[], 2000).unwrap();
-        record_user_goal(&store, "conv-b", 0, "task-b", "B 的提问", 3000).unwrap();
+        record_user_goal(&store, "default", "conv-b", 0, "task-b", "B 的提问", 3000).unwrap();
         record_assistant_reply(&store, "task-b", "B 的回复", "", &[], 4000).unwrap();
 
         edit_turn(&store, "conv-a", 0, "A 改过的提问", 5000).unwrap();
@@ -676,7 +738,7 @@ mod tests {
         let db = dir.join("t.db");
         {
             let store = Store::open(db.clone()).unwrap();
-            record_user_goal(&store, "conv-1", 0, "task-1", "提问", 1000).unwrap();
+            record_user_goal(&store, "default", "conv-1", 0, "task-1", "提问", 1000).unwrap();
             record_assistant_reply(&store, "task-1", "回复", "", &[], 2000).unwrap();
             set_feedback(&store, "conv-1", 0, Some(FEEDBACK_DOWN), 3000).unwrap();
         }

@@ -1,0 +1,620 @@
+{
+  "python": "3.13.3",
+  "platform": "Windows-11-10.0.26300-SP0",
+  "litellm": "1.106.6",
+  "pydantic": "2.14.1",
+  "fastapi": "0.136.3",
+  "import_seconds": 3.248,
+  "results": [
+    {
+      "case": "openai.chat.nonstream",
+      "required": true,
+      "note": "",
+      "ok": true,
+      "result": {
+        "content": "你好",
+        "usage": {
+          "completion_tokens": 8,
+          "prompt_tokens": 12,
+          "total_tokens": 20,
+          "completion_tokens_details": null,
+          "prompt_tokens_details": null
+        },
+        "model": "fake-openai-model"
+      },
+      "elapsed_ms": 851,
+      "upstream_calls": [
+        {
+          "upstream": "openai",
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "auth": "Bearer fake-key",
+          "body_keys": [
+            "messages",
+            "model"
+          ],
+          "shape": {
+            "message_content_types": [],
+            "tools": false,
+            "tool_choice": null,
+            "stream_options": null
+          }
+        }
+      ]
+    },
+    {
+      "case": "openai.chat.stream",
+      "required": true,
+      "note": "",
+      "ok": true,
+      "result": {
+        "text": "你好",
+        "tool_arguments": "",
+        "finish_reason": "stop",
+        "usage": {
+          "completion_tokens": 8,
+          "prompt_tokens": 12,
+          "total_tokens": 20,
+          "completion_tokens_details": {
+            "accepted_prediction_tokens": null,
+            "audio_tokens": null,
+            "reasoning_tokens": 0,
+            "rejected_prediction_tokens": null,
+            "text_tokens": 8,
+            "image_tokens": null,
+            "video_tokens": null
+          },
+          "prompt_tokens_details": null
+        },
+        "usage_source": "chunks",
+        "chunks": 4
+      },
+      "elapsed_ms": 144,
+      "upstream_calls": [
+        {
+          "upstream": "openai",
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "auth": "Bearer fake-key",
+          "body_keys": [
+            "messages",
+            "model",
+            "stream",
+            "stream_options"
+          ],
+          "shape": {
+            "message_content_types": [],
+            "tools": false,
+            "tool_choice": null,
+            "stream_options": {
+              "include_usage": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "case": "openai.chat.tools",
+      "required": true,
+      "note": "",
+      "ok": true,
+      "result": {
+        "tool_calls": [
+          {
+            "id": "call_fake",
+            "name": "get_weather",
+            "arguments": "{\"city\":\"Beijing\"}"
+          }
+        ],
+        "finish_reason": "tool_calls",
+        "usage": {
+          "completion_tokens": 8,
+          "prompt_tokens": 12,
+          "total_tokens": 20,
+          "completion_tokens_details": null,
+          "prompt_tokens_details": null
+        }
+      },
+      "elapsed_ms": 551,
+      "upstream_calls": [
+        {
+          "upstream": "openai",
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "auth": "Bearer fake-key",
+          "body_keys": [
+            "messages",
+            "model",
+            "tool_choice",
+            "tools"
+          ],
+          "shape": {
+            "message_content_types": [],
+            "tools": true,
+            "tool_choice": "auto",
+            "stream_options": null
+          }
+        }
+      ]
+    },
+    {
+      "case": "openai.chat.tools.stream",
+      "required": true,
+      "note": "",
+      "ok": true,
+      "result": {
+        "text": "",
+        "tool_arguments": "{\"city\":\"Beijing\"}",
+        "finish_reason": "tool_calls",
+        "usage": {
+          "completion_tokens": 8,
+          "prompt_tokens": 12,
+          "total_tokens": 20,
+          "completion_tokens_details": null,
+          "prompt_tokens_details": null
+        },
+        "usage_source": "chunks",
+        "chunks": 5
+      },
+      "elapsed_ms": 11,
+      "upstream_calls": [
+        {
+          "upstream": "openai",
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "auth": "Bearer fake-key",
+          "body_keys": [
+            "messages",
+            "model",
+            "stream",
+            "stream_options",
+            "tools"
+          ],
+          "shape": {
+            "message_content_types": [],
+            "tools": true,
+            "tool_choice": null,
+            "stream_options": {
+              "include_usage": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "case": "openai.chat.vision",
+      "required": true,
+      "note": "",
+      "ok": true,
+      "result": {
+        "content": "你好",
+        "usage": {
+          "completion_tokens": 8,
+          "prompt_tokens": 12,
+          "total_tokens": 20,
+          "completion_tokens_details": null,
+          "prompt_tokens_details": null
+        }
+      },
+      "elapsed_ms": 6,
+      "upstream_calls": [
+        {
+          "upstream": "openai",
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "auth": "Bearer fake-key",
+          "body_keys": [
+            "messages",
+            "model"
+          ],
+          "shape": {
+            "message_content_types": [
+              "text",
+              "image_url"
+            ],
+            "tools": false,
+            "tool_choice": null,
+            "stream_options": null
+          }
+        }
+      ]
+    },
+    {
+      "case": "openai.embeddings",
+      "required": true,
+      "note": "",
+      "ok": true,
+      "result": {
+        "vectors": 1,
+        "dimensions": 3,
+        "usage": {
+          "completion_tokens": 0,
+          "prompt_tokens": 5,
+          "total_tokens": 5,
+          "completion_tokens_details": null,
+          "prompt_tokens_details": null
+        }
+      },
+      "elapsed_ms": 7,
+      "upstream_calls": [
+        {
+          "upstream": "openai",
+          "method": "POST",
+          "path": "/v1/embeddings",
+          "auth": "Bearer fake-key",
+          "body_keys": [
+            "input",
+            "model"
+          ],
+          "shape": {
+            "message_content_types": [],
+            "tools": false,
+            "tool_choice": null,
+            "stream_options": null
+          }
+        }
+      ]
+    },
+    {
+      "case": "openai.token_counter",
+      "required": false,
+      "note": "count_tokens 的 M1 依赖项；失败可退化为上游估算",
+      "ok": true,
+      "result": {
+        "tokens": 9
+      },
+      "elapsed_ms": 1,
+      "upstream_calls": []
+    },
+    {
+      "case": "anthropic.chat.nonstream",
+      "required": true,
+      "note": "",
+      "ok": true,
+      "result": {
+        "content": "你好",
+        "usage": {
+          "completion_tokens": 8,
+          "prompt_tokens": 12,
+          "total_tokens": 20,
+          "completion_tokens_details": {
+            "accepted_prediction_tokens": null,
+            "audio_tokens": null,
+            "reasoning_tokens": 0,
+            "rejected_prediction_tokens": null,
+            "text_tokens": 8,
+            "image_tokens": null,
+            "video_tokens": null
+          },
+          "prompt_tokens_details": {
+            "audio_tokens": null,
+            "cache_write_tokens": 0,
+            "cached_tokens": 0,
+            "text_tokens": 12,
+            "image_tokens": null,
+            "video_tokens": null,
+            "cache_creation_tokens": 0
+          },
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "iterations": null,
+          "inference_geo": null,
+          "speed": null,
+          "service_tier": null
+        },
+        "model": "claude-fake"
+      },
+      "elapsed_ms": 47,
+      "upstream_calls": [
+        {
+          "upstream": "anthropic",
+          "method": "POST",
+          "path": "/v1/messages",
+          "auth": "fake-anthropic-key",
+          "body_keys": [
+            "max_tokens",
+            "messages",
+            "model"
+          ],
+          "shape": {
+            "content_types": [
+              "text"
+            ],
+            "tools": false,
+            "max_tokens": 4096
+          }
+        }
+      ]
+    },
+    {
+      "case": "anthropic.chat.stream",
+      "required": true,
+      "note": "",
+      "ok": true,
+      "result": {
+        "text": "你好",
+        "tool_arguments": "",
+        "finish_reason": "stop",
+        "usage": {
+          "completion_tokens": 8,
+          "prompt_tokens": 12,
+          "total_tokens": 20,
+          "completion_tokens_details": {
+            "accepted_prediction_tokens": null,
+            "audio_tokens": null,
+            "reasoning_tokens": 0,
+            "rejected_prediction_tokens": null,
+            "text_tokens": 8,
+            "image_tokens": null,
+            "video_tokens": null
+          },
+          "prompt_tokens_details": {
+            "audio_tokens": null,
+            "cache_write_tokens": 0,
+            "cached_tokens": 0,
+            "text_tokens": 12,
+            "image_tokens": null,
+            "video_tokens": null,
+            "cache_creation_tokens": 0
+          },
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0
+        },
+        "usage_source": "stream_chunk_builder",
+        "chunks": 2
+      },
+      "elapsed_ms": 15,
+      "upstream_calls": [
+        {
+          "upstream": "anthropic",
+          "method": "POST",
+          "path": "/v1/messages",
+          "auth": "fake-anthropic-key",
+          "body_keys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "stream"
+          ],
+          "shape": {
+            "content_types": [
+              "text"
+            ],
+            "tools": false,
+            "max_tokens": 4096
+          }
+        }
+      ]
+    },
+    {
+      "case": "anthropic.chat.tools",
+      "required": true,
+      "note": "",
+      "ok": true,
+      "result": {
+        "tool_calls": [
+          {
+            "id": "toolu_fake",
+            "name": "get_weather",
+            "arguments": "{\"city\": \"Beijing\"}"
+          }
+        ],
+        "finish_reason": "tool_calls",
+        "usage": {
+          "completion_tokens": 8,
+          "prompt_tokens": 12,
+          "total_tokens": 20,
+          "completion_tokens_details": {
+            "accepted_prediction_tokens": null,
+            "audio_tokens": null,
+            "reasoning_tokens": 0,
+            "rejected_prediction_tokens": null,
+            "text_tokens": 8,
+            "image_tokens": null,
+            "video_tokens": null
+          },
+          "prompt_tokens_details": {
+            "audio_tokens": null,
+            "cache_write_tokens": 0,
+            "cached_tokens": 0,
+            "text_tokens": 12,
+            "image_tokens": null,
+            "video_tokens": null,
+            "cache_creation_tokens": 0
+          },
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "iterations": null,
+          "inference_geo": null,
+          "speed": null,
+          "service_tier": null
+        }
+      },
+      "elapsed_ms": 7,
+      "upstream_calls": [
+        {
+          "upstream": "anthropic",
+          "method": "POST",
+          "path": "/v1/messages",
+          "auth": "fake-anthropic-key",
+          "body_keys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "tools"
+          ],
+          "shape": {
+            "content_types": [
+              "text"
+            ],
+            "tools": true,
+            "max_tokens": 4096
+          }
+        }
+      ]
+    },
+    {
+      "case": "gemini.chat.nonstream",
+      "required": true,
+      "note": "",
+      "ok": true,
+      "result": {
+        "content": "你好",
+        "usage": {
+          "completion_tokens": 8,
+          "prompt_tokens": 12,
+          "total_tokens": 20,
+          "completion_tokens_details": {
+            "accepted_prediction_tokens": null,
+            "audio_tokens": null,
+            "reasoning_tokens": null,
+            "rejected_prediction_tokens": null,
+            "text_tokens": 8,
+            "image_tokens": null,
+            "video_tokens": null
+          },
+          "prompt_tokens_details": {
+            "audio_tokens": null,
+            "cached_tokens": null,
+            "text_tokens": null,
+            "image_tokens": null,
+            "video_tokens": null
+          },
+          "cache_read_input_tokens": null
+        },
+        "model": "gemini-fake"
+      },
+      "elapsed_ms": 12,
+      "upstream_calls": [
+        {
+          "upstream": "gemini",
+          "method": "POST",
+          "path": "/v1beta/models/gemini-fake:generateContent",
+          "auth": "fake-gemini-key",
+          "body_keys": [
+            "contents",
+            "generationConfig"
+          ],
+          "shape": {
+            "part_types": [
+              "text"
+            ],
+            "tools": false
+          }
+        }
+      ]
+    },
+    {
+      "case": "gemini.chat.stream",
+      "required": true,
+      "note": "",
+      "ok": true,
+      "result": {
+        "text": "你好",
+        "tool_arguments": "",
+        "finish_reason": "stop",
+        "usage": {
+          "completion_tokens": 8,
+          "prompt_tokens": 12,
+          "total_tokens": 20,
+          "completion_tokens_details": {
+            "accepted_prediction_tokens": null,
+            "audio_tokens": null,
+            "reasoning_tokens": 0,
+            "rejected_prediction_tokens": null,
+            "text_tokens": 8,
+            "image_tokens": null,
+            "video_tokens": null
+          },
+          "prompt_tokens_details": {
+            "audio_tokens": null,
+            "cached_tokens": null,
+            "text_tokens": null,
+            "image_tokens": null,
+            "video_tokens": null
+          }
+        },
+        "usage_source": "stream_chunk_builder",
+        "chunks": 3
+      },
+      "elapsed_ms": 14,
+      "upstream_calls": [
+        {
+          "upstream": "gemini",
+          "method": "POST",
+          "path": "/v1beta/models/gemini-fake:streamGenerateContent?alt=sse",
+          "auth": "fake-gemini-key",
+          "body_keys": [
+            "contents",
+            "generationConfig"
+          ],
+          "shape": {
+            "part_types": [
+              "text"
+            ],
+            "tools": false
+          }
+        }
+      ]
+    },
+    {
+      "case": "gemini.chat.tools",
+      "required": true,
+      "note": "",
+      "ok": true,
+      "result": {
+        "tool_calls": [
+          {
+            "id": "call_56b64f90f2984a48bfdf6980e3fe",
+            "name": "get_weather",
+            "arguments": "{\"city\": \"Beijing\"}"
+          }
+        ],
+        "finish_reason": "tool_calls",
+        "usage": {
+          "completion_tokens": 8,
+          "prompt_tokens": 12,
+          "total_tokens": 20,
+          "completion_tokens_details": {
+            "accepted_prediction_tokens": null,
+            "audio_tokens": null,
+            "reasoning_tokens": null,
+            "rejected_prediction_tokens": null,
+            "text_tokens": 8,
+            "image_tokens": null,
+            "video_tokens": null
+          },
+          "prompt_tokens_details": {
+            "audio_tokens": null,
+            "cached_tokens": null,
+            "text_tokens": null,
+            "image_tokens": null,
+            "video_tokens": null
+          },
+          "cache_read_input_tokens": null
+        }
+      },
+      "elapsed_ms": 5,
+      "upstream_calls": [
+        {
+          "upstream": "gemini",
+          "method": "POST",
+          "path": "/v1beta/models/gemini-fake:generateContent",
+          "auth": "fake-gemini-key",
+          "body_keys": [
+            "contents",
+            "generationConfig",
+            "tools"
+          ],
+          "shape": {
+            "part_types": [
+              "text"
+            ],
+            "tools": true
+          }
+        }
+      ]
+    }
+  ],
+  "required_failures": []
+}

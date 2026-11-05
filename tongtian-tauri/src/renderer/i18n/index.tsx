@@ -9,7 +9,7 @@
  * - 变量用 `{name}` 占位，避免中英文语序差异时拼接字符串。
  */
 
-import React, { createContext, useContext, useMemo } from 'react';
+import React, { createContext, useContext, useEffect, useMemo } from 'react';
 import { useAppSettings } from '../lib/use-app-settings';
 import { EN_DICT } from './en';
 
@@ -43,6 +43,10 @@ function interpolate(template: string, vars?: Record<string, string | number>): 
 export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [appSettings] = useAppSettings();
   const lang = languageOf(appSettings.language);
+  // 读屏器按 <html lang> 选发音（WCAG 3.1.1）；index.html 里写死的是 zh-CN，切到英文要跟着改
+  useEffect(() => {
+    document.documentElement.lang = lang === 'en' ? 'en' : 'zh-CN';
+  }, [lang]);
   const value = useMemo<I18nValue>(() => {
     const locale = lang === 'en' ? 'en-US' : 'zh-CN';
     return {

@@ -516,6 +516,19 @@ fn candidate_json(store: &Store, m: &ModelConfig) -> Result<Value, String> {
     }))
 }
 
+/// 已保存模型的「画像」：只带判断换没换模型所需的四个字段。
+///
+/// 与 `candidate_json` 的区别是这里**不解析密钥、也不带 baseUrl 之外的接入信息**：
+/// 它只用于把「上一轮用的是哪台模型」这句话如实播报出来，不该成为第二条调用链。
+pub fn profile_json(m: &ModelConfig) -> Value {
+    json!({
+        "modelId": m.id,
+        "displayName": m.name,
+        "modelName": m.model_name.trim(),
+        "contextWindow": if m.context_window > 0 { json!(m.context_window) } else { Value::Null },
+    })
+}
+
 /// 解析本轮要下发给引擎的模型调用配置（显式 id 优先，否则默认模型）。
 ///
 /// 渲染层只传 `modelId`，端点与密钥由 Rust 从 SQLite + keyring 解析，密钥不再经过

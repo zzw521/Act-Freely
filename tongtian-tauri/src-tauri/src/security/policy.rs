@@ -40,7 +40,7 @@ pub struct DomainControl {
 
 /// 沙箱策略（与前端 `SandboxPolicy` 契约一致，附加 updatedAtMs）
 ///
-/// `exec*` / `network*` 是执行授权：默认关闭，旧策略行没有这些键时按关闭处理，
+/// `exec*` / `shell*` / `network*` 是执行授权：默认关闭，旧策略行没有这些键时按关闭处理，
 /// 不能因为反序列化失败就把整份策略判成损坏（那会掩盖已有白名单）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,6 +55,10 @@ pub struct SandboxPolicy {
     pub exec_enabled: bool,
     #[serde(default)]
     pub exec_allowlist: Vec<String>,
+    /// 通用 shell：在受控命令执行之上再显式开启，支持管道/重定向/链式命令。
+    /// 旧策略行没有该键时按关闭处理；开启时 `exec_enabled` 必须同时为真。
+    #[serde(default)]
+    pub shell_enabled: bool,
     #[serde(default)]
     pub network_enabled: bool,
     #[serde(default)]
@@ -296,6 +300,11 @@ pub fn set_sandbox(store: &Store, policy: &SandboxPolicy) -> Result<SandboxPolic
             "POLICY_INVALID_COMMAND: 命令白名单最多 {MAX_EXEC_COMMANDS} 项"
         ));
     }
+    if policy.shell_enabled && !policy.exec_enabled {
+        return Err(
+            "POLICY_INVALID_SHELL: 通用 shell 依赖受控命令执行授权，请先开启命令执行".into(),
+        );
+    }
     let exec_allowlist = normalize_commands(&policy.exec_allowlist);
     if policy.exec_allowlist.iter().any(|c| normalize_command(c).is_none()) {
         return Err(
@@ -321,6 +330,7 @@ pub fn set_sandbox(store: &Store, policy: &SandboxPolicy) -> Result<SandboxPolic
         tool_blocklist: policy.tool_blocklist.clone(),
         exec_enabled: policy.exec_enabled,
         exec_allowlist,
+        shell_enabled: policy.shell_enabled,
         network_enabled: policy.network_enabled,
         network_allowlist,
         max_cpu_percent: policy.max_cpu_percent,
@@ -473,6 +483,7 @@ mod tests {
             tool_blocklist: Vec::new(),
             exec_enabled: false,
             exec_allowlist: Vec::new(),
+            shell_enabled: false,
             network_enabled: false,
             network_allowlist: Vec::new(),
             max_cpu_percent: 50,
@@ -602,11 +613,12 @@ mod tests {
         let mut legacy = serde_json::to_value(sample_sandbox("ws-a")).unwrap();
         legacy.as_object_mut().unwrap().remove("execEnabled");
         legacy.as_object_mut().unwrap().remove("execAllowlist");
+        legacy.as_object_mut().unwrap().remove("shellEnabled");
         legacy.as_object_mut().unwrap().remove("networkEnabled");
         legacy.as_object_mut().unwrap().remove("networkAllowlist");
         put_json(&store, &sandbox_key("ws-a"), &legacy.to_string()).unwrap();
         let read = get_sandbox(&store, "ws-a").unwrap().unwrap();
-        assert!(!read.exec_enabled && !read.network_enabled);
+        assert!(!read.exec_enabled && !read.network_enabled && !read.shell_enabled);
         assert!(read.exec_allowlist.is_empty());
 
         let mut p = sample_sandbox("ws-b");
@@ -620,6 +632,26 @@ mod tests {
         assert_eq!(saved.network_allowlist, vec!["api.example.com", "example.org"]);
         let read = get_sandbox(&store, "ws-b").unwrap().unwrap();
         assert!(read.exec_enabled && read.network_enabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_shell_requires_exec_and_persists() {
+        let (store, dir) = temp_store("sb-shell");
+        // 只开 shell 不开命令执行：拒绝保存，避免绕过第一道授权
+        let mut p = sample_sandbox("ws-shell");
+        p.shell_enabled = true;
+        let err = set_sandbox(&store, &p).unwrap_err();
+        assert!(err.starts_with("POLICY_INVALID_SHELL"), "{err}");
+        assert!(get_sandbox(&store, "ws-shell").unwrap().is_none());
+
+        // 两个开关同时开启：落库并原样读回
+        p.exec_enabled = true;
+        p.exec_allowlist = vec!["python".into()];
+        let saved = set_sandbox(&store, &p).unwrap();
+        assert!(saved.shell_enabled);
+        let read = get_sandbox(&store, "ws-shell").unwrap().unwrap();
+        assert!(read.exec_enabled && read.shell_enabled);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

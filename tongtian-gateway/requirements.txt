@@ -1,0 +1,20 @@
+# M0 Web 栈（控制面同款）
+fastapi==0.136.3
+uvicorn==0.49.0
+pydantic==2.14.1
+# JWKS 与策略拉取（M1.3）
+httpx==0.28.1
+
+# M1 上游适配层。版本由 T0.1 探针锁定，升级前先跑 scripts/spike_litellm.py。
+litellm==1.106.6
+# 厂商密钥 AES-GCM 加密（T1.2）
+cryptography==46.0.5
+# LiteLLM 的 tools 路径会 import mcp；缺失时任何带 tools 的请求都会 ModuleNotFoundError。
+# LiteLLM 声明 mcp>=2.2,<3；2.3.0 才有其引用的 CacheableResult。
+mcp==2.3.0
+# LiteLLM 要求 aiohttp>=3.14.2；国内镜像常滞后，装不上时用官方 PyPI 补这一条。
+aiohttp==3.14.5
+# M5 共享状态（多 worker）；单 worker 不配置 Redis 时不会加载
+redis==8.1.0
+# M6 Postgres 跨主机存储；默认 SQLite 时不加载
+psycopg[binary]==3.2.10

@@ -2,29 +2,46 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import html
 import json
 import logging
+import os
+import hmac
 import re
+import secrets
 import sqlite3
 import threading
 import time
 import urllib.parse
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict
 
+from .audit import write_audit
 from .config import settings
-from .db import now_ms, tx
+from .db import DEFAULT_DEPT_ID, now_ms, tx
 from .errors import ApiError
+from .keys import key_store
+from .orgs import (
+    department_ids,
+    ensure_default_department,
+    ensure_department,
+    memberships,
+    primary_department,
+    replace_memberships,
+)
+from .roles import MANAGEMENT_ROLES, normalize_role, role_label, role_of
 from .security import (
     EMAIL_RE,
     RateLimiter,
     dummy_verify,
     hash_password,
     jwt_decode,
+    jwt_decode_verbose,
     jwt_encode,
     new_code,
     new_session_id,
@@ -38,6 +55,10 @@ router = APIRouter()
 
 CODE_TTL_SECONDS = 5 * 60
 MAX_PENDING_CODES = 10_000
+# 单账号保留的活跃会话上限：登录次数只增不减会让 sessions 表无限膨胀
+MAX_SESSIONS_PER_USER = 20
+# PKCE：桌面端登录发起时带 code_challenge，换 token 时必须出示 code_verifier
+PKCE_CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 ORG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -86,7 +107,22 @@ class QuotaIn(BaseModel):
 class UserClaimsIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
     org: str | None = None
+    role: str | None = None
     quota: QuotaIn | None = None
+    depts: list[str] | None = None
+    primaryDept: str | None = None
+
+
+class DepartmentIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    org: str
+    id: str
+    name: str = ""
+
+
+class DepartmentPatchIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
 
 
 # ── 用户与会话 ───────────────────────────────────────────────
@@ -145,7 +181,18 @@ def _validate_quota(model: QuotaIn) -> dict:
     return quota
 
 
-def profile_of(user: sqlite3.Row | dict) -> dict:
+def _validate_role(raw: str | None) -> str:
+    role = normalize_role(raw)
+    if not role:
+        raise ApiError(
+            400,
+            "INVALID_ROLE",
+            "角色必须是 admin / operator / auditor / user 之一",
+        )
+    return role
+
+
+def profile_of(user: sqlite3.Row | dict, quota: dict | None = None) -> dict:
     def get(key: str) -> Any:
         return user[key] if isinstance(user, sqlite3.Row) else user.get(key)
 
@@ -155,8 +202,10 @@ def profile_of(user: sqlite3.Row | dict) -> dict:
         "email": get("email"),
         "plan": get("plan") or "个人免费版",
         "role": get("role") or "user",
+        "roleLabel": role_label(get("role") or "user"),
         "org": effective_org(user),
-        "quota": effective_quota(user),
+        # 签发路径会传进「两级算完」的值；管理面列表没有 conn，沿用个人/角色口径
+        "quota": dict(quota) if quota else effective_quota(user),
         "mock": False,
     }
 
@@ -219,12 +268,23 @@ def _issue_tokens(conn: sqlite3.Connection, user: sqlite3.Row | dict) -> dict:
     uid = str(_user_value(user, "uid", "") or "")
     role = _user_value(user, "role", "user") or "user"
     session_id = new_session_id()
+    # 组织两级配额（D-23）：声明里的 quota 走「个人覆盖 > 组织成员默认 > 角色缺省」，
+    # 组织开了拦停再把月度值收敛到剩余预算。延迟导入——org_quota 反向依赖本模块。
+    from .org_quota import resolve_member_quota
+
+    resolved = resolve_member_quota(conn, user)
+    if resolved["blocked"]:
+        raise ApiError(
+            403,
+            "ORG_BUDGET_EXCEEDED",
+            str((resolved["reasons"] or ["组织预算已用尽"])[0]),
+        )
     claims = {
         "sub": uid,
         "sid": session_id,
         "role": role,
         "org": effective_org(user),
-        "quota": effective_quota(user),
+        "quota": resolved["quota"],
         "iss": settings.jwt_issuer,
         "aud": settings.jwt_audience,
         "iat": now,
@@ -251,11 +311,29 @@ def _issue_tokens(conn: sqlite3.Connection, user: sqlite3.Row | dict) -> dict:
             now_ms(),
         ),
     )
+    # 清理过期会话，并把同一账号超过上限的旧会话吊销（设备丢失/重复登录不再无限累积）
+    conn.execute("DELETE FROM sessions WHERE expires_at_ms <= ?1", (now_ms(),))
+    conn.execute(
+        "UPDATE sessions SET revoked = 1 WHERE uid = ?1 AND revoked = 0 AND id NOT IN ("
+        "SELECT id FROM sessions WHERE uid = ?1 ORDER BY created_at_ms DESC, id DESC LIMIT ?2)",
+        (uid, MAX_SESSIONS_PER_USER),
+    )
     return {
         "accessToken": access,
         "refreshToken": refresh,
         "expiresIn": settings.access_ttl_seconds,
-        "profile": profile_of(user),
+        # profile 里的 quota 必须与令牌声明一致：两处数字不一样时，桌面显示的限额
+        # 和引擎实际拦停用的限额会各说各话
+        "profile": profile_of(user, resolved["quota"]),
+        "quotaResolution": {
+            "org": resolved["org"],
+            "enforced": resolved["enforced"],
+            "clamped": resolved["clamped"],
+            "source": resolved["source"],
+            "reasons": resolved["reasons"],
+            # 声明是签发时刻的快照：组织预算在此期间被同事故用完不会自动改小本令牌
+            "snapshot": True,
+        },
     }
 
 
@@ -355,6 +433,14 @@ def require_admin(request: Request) -> dict:
     return user
 
 
+def require_gateway_staff(request: Request) -> dict:
+    """网关管理面：平台管理员、网关运维、审计员都可读；写操作由代理按角色拦截。"""
+    user = require_user(request)
+    if role_of(user) not in MANAGEMENT_ROLES:
+        raise ApiError(403, "FORBIDDEN", "需要网关管理或审计权限")
+    return user
+
+
 def ensure_admin() -> bool:
     """按环境变量引导管理员；已存在的账号只提升角色，不改密码/昵称（保护存量数据）。"""
     if not settings.admin_email and not settings.admin_password:
@@ -386,7 +472,7 @@ def ensure_admin() -> bool:
 # ── 一次性授权码（内存） ────────────────────────────────────
 
 
-def issue_code(uid: str, state: str, redirect_uri: str) -> str:
+def issue_code(uid: str, state: str, redirect_uri: str, code_challenge: str = "") -> str:
     code = new_code()
     now = time.time()
     with _codes_lock:
@@ -398,19 +484,34 @@ def issue_code(uid: str, state: str, redirect_uri: str) -> str:
             "uid": uid,
             "state": state,
             "redirect_uri": redirect_uri,
+            "code_challenge": code_challenge,
             "expires_at": now + CODE_TTL_SECONDS,
         }
     return code
 
 
-def consume_code(code: str, state: str) -> dict | None:
+def _pkce_challenge(verifier: str) -> str:
+    """S256：BASE64URL(SHA256(verifier))，去掉 padding（RFC 7636）"""
+    digest = hashlib.sha256(verifier.encode("ascii", "ignore")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def consume_code(code: str, state: str, code_verifier: str = "") -> dict | None:
     with _codes_lock:
         entry = _codes.get(code)
         if entry is None or entry["expires_at"] < time.time():
             _codes.pop(code, None)
             return None
-        if entry["state"] != state:
+        if not hmac.compare_digest(str(entry["state"]), state):
             return None
+        challenge = str(entry.get("code_challenge") or "")
+        if challenge:
+            if not code_verifier or not hmac.compare_digest(
+                challenge, _pkce_challenge(code_verifier)
+            ):
+                # 校验失败也作废：避免对同一个 code 反复试 verifier
+                _codes.pop(code, None)
+                return None
         _codes.pop(code, None)
         return entry
 
@@ -501,22 +602,254 @@ def api_v1_logout(payload: LogoutIn):
 
 @router.get("/api/v1/auth/me")
 def api_v1_me(user: dict = Depends(require_user)):
-    return {"ok": True, "profile": profile_of(user)}
+    profile = profile_of(user)
+    with tx() as conn:
+        profile["depts"] = memberships(conn, user["uid"], effective_org(user))
+    return {"ok": True, "profile": profile}
+
+
+# ── 公钥与网关短票（M1.3） ─────────────────────────────────
+
+
+def _bearer_token(request: Request) -> str:
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("bearer "):
+        return ""
+    return header[7:].strip()
+
+
+@router.get("/.well-known/jwks.json")
+def well_known_jwks():
+    return JSONResponse(
+        key_store().jwks(),
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
+@router.post("/api/v1/auth/gateway-token")
+async def api_gateway_token(request: Request):
+    token = _bearer_token(request)
+    if not token:
+        raise ApiError(401, "AUTH_REQUIRED", "缺少 access token")
+    payload, reason = jwt_decode_verbose(
+        token,
+        issuer=settings.jwt_issuer,
+        audience=settings.jwt_audience,
+    )
+    if reason == "expired":
+        raise ApiError(401, "TOKEN_EXPIRED", "access token 已过期，请先刷新")
+    if reason or payload is None:
+        raise ApiError(401, "AUTH_REQUIRED", "access token 无效")
+    if payload.get("type") != "access":
+        raise ApiError(401, "AUTH_REQUIRED", "仅接受 access token")
+    uid = str(payload.get("sub") or "")
+    sid = str(payload.get("sid") or "")
+    if not uid or not sid:
+        raise ApiError(401, "AUTH_REQUIRED", "access token 缺少会话绑定")
+    user = find_user_by_session(sid, uid)
+    if user is None:
+        raise ApiError(401, "AUTH_REQUIRED", "会话不存在或已吊销")
+    if int(user["session_revoked"] or 0) or int(user["session_expires_at_ms"] or 0) <= now_ms():
+        raise ApiError(401, "AUTH_REQUIRED", "会话已失效，请重新登录")
+    if (payload.get("role") or "user") != (user["role"] or "user"):
+        raise ApiError(401, "AUTH_REQUIRED", "账号权限已变更，请重新登录")
+    if str(payload.get("org") or "") != effective_org(user):
+        raise ApiError(401, "AUTH_REQUIRED", "账号组织已变更，请重新登录")
+
+    ip = _client_ip(request)
+    allowed_ip, retry_ip = _login_limiter.check(f"gateway-token:ip:{ip}", 120, 60)
+    allowed_user, retry_user = _login_limiter.check(f"gateway-token:{ip}:{uid}", 60, 60)
+    if not allowed_ip or not allowed_user:
+        retry = max(retry_ip, retry_user, 1)
+        raise ApiError(
+            429,
+            "RATE_LIMITED",
+            f"换票过于频繁，请 {retry} 秒后再试",
+            headers={"Retry-After": str(retry)},
+        )
+
+    body: dict[str, Any] = {}
+    raw = await request.body()
+    if raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            raise ApiError(400, "INVALID_REQUEST", "请求体需为 JSON 对象") from None
+        if not isinstance(parsed, dict):
+            raise ApiError(400, "INVALID_REQUEST", "请求体需为 JSON 对象")
+        body = parsed
+    requested = ""
+    if "dept" in body:
+        if not isinstance(body["dept"], str):
+            raise ApiError(400, "INVALID_REQUEST", "dept 需为字符串")
+        requested = body["dept"].strip()
+
+    tenant = str(user["org_id"] or "").strip()
+    if not tenant:
+        raise ApiError(403, "FORBIDDEN", "个人账号没有组织，不能换取网关令牌")
+    with tx() as conn:
+        depts = [item["id"] for item in memberships(conn, uid, tenant)]
+    if not depts:
+        raise ApiError(403, "FORBIDDEN", "账号未分配部门，不能换取网关令牌")
+    if requested:
+        if requested not in depts:
+            raise ApiError(403, "FORBIDDEN", "无权使用该部门")
+        dept = requested
+    else:
+        with tx() as conn:
+            dept = primary_department(conn, uid, tenant) or depts[0]
+
+    now = int(time.time())
+    access_exp = int(payload["exp"])
+    exp = min(now + settings.gateway_token_ttl_seconds, access_exp)
+    if exp <= now:
+        raise ApiError(401, "TOKEN_EXPIRED", "access token 已过期，请先刷新")
+    role = str(user["role"] or "user")
+    claims = {
+        "sub": uid,
+        "sid": sid,
+        "tenant": tenant,
+        "dept": dept,
+        "depts": depts,
+        "roles": [role],
+        "org": tenant,
+        "role": role,
+        "iss": settings.jwt_issuer,
+        "aud": settings.gateway_audience,
+        "type": "access",
+        "iat": now,
+        "exp": exp,
+        "jti": f"gt-{secrets.token_hex(8)}",
+    }
+    token = key_store().sign(claims)
+    return JSONResponse(
+        {
+            "ok": True,
+            "token": token,
+            "tokenType": "Bearer",
+            "expiresIn": exp - now,
+            "expiresAt": exp,
+            "tenant": tenant,
+            "dept": dept,
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get("/api/v1/admin/departments")
+def api_admin_departments(
+    org: str = Query(""),
+    _admin: dict = Depends(require_admin),
+):
+    org_id = _normalize_org(org)
+    with tx() as conn:
+        if org_id:
+            rows = conn.execute(
+                "SELECT d.org_id, d.id, d.name, d.created_at_ms, "
+                "(SELECT COUNT(*) FROM user_departments ud "
+                " WHERE ud.org_id = d.org_id AND ud.dept_id = d.id) AS members "
+                "FROM departments d WHERE d.org_id = ?1 ORDER BY d.name, d.id",
+                (org_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT d.org_id, d.id, d.name, d.created_at_ms, "
+                "(SELECT COUNT(*) FROM user_departments ud "
+                " WHERE ud.org_id = d.org_id AND ud.dept_id = d.id) AS members "
+                "FROM departments d ORDER BY d.org_id, d.name, d.id"
+            ).fetchall()
+    return {
+        "ok": True,
+        "departments": [
+            {
+                "org": row["org_id"],
+                "id": row["id"],
+                "name": row["name"],
+                "members": row["members"],
+                "createdAtMs": row["created_at_ms"],
+            }
+            for row in rows
+        ],
+    }
+
+
+@router.post("/api/v1/admin/departments", status_code=201)
+def api_admin_create_department(
+    payload: DepartmentIn,
+    _admin: dict = Depends(require_admin),
+):
+    org_id = _normalize_org(payload.org)
+    if not org_id:
+        raise ApiError(400, "INVALID_ORG", "缺少组织标识")
+    dept_id = payload.id.strip().lower()
+    if not ORG_RE.match(dept_id):
+        raise ApiError(400, "INVALID_DEPARTMENT", "部门标识需为 1~64 位小写字母、数字、下划线或连字符")
+    name = payload.name.strip() or dept_id
+    if len(name) > 64 or CONTROL_RE.search(name):
+        raise ApiError(400, "INVALID_DEPARTMENT", "部门名称不合法")
+    with tx() as conn:
+        ensure_department(conn, org_id, dept_id, name)
+        row = conn.execute(
+            "SELECT org_id, id, name, created_at_ms FROM departments "
+            "WHERE org_id = ?1 AND id = ?2",
+            (org_id, dept_id),
+        ).fetchone()
+    return {
+        "ok": True,
+        "department": {
+            "org": row["org_id"],
+            "id": row["id"],
+            "name": row["name"],
+            "createdAtMs": row["created_at_ms"],
+        },
+    }
+
+
+@router.patch("/api/v1/admin/departments/{org}/{dept}")
+def api_admin_rename_department(
+    org: str,
+    dept: str,
+    payload: DepartmentPatchIn,
+    _admin: dict = Depends(require_admin),
+):
+    org_id = _normalize_org(org)
+    dept_id = dept.strip().lower()
+    if not org_id or not ORG_RE.match(dept_id):
+        raise ApiError(400, "INVALID_DEPARTMENT", "部门标识不合法")
+    name = payload.name.strip()
+    if not name or len(name) > 64 or CONTROL_RE.search(name):
+        raise ApiError(400, "INVALID_DEPARTMENT", "部门名称需为 1~64 个字符且不含控制字符")
+    with tx() as conn:
+        row = conn.execute(
+            "SELECT org_id, id FROM departments WHERE org_id = ?1 AND id = ?2",
+            (org_id, dept_id),
+        ).fetchone()
+        if row is None:
+            raise ApiError(404, "DEPARTMENT_NOT_FOUND", "部门不存在")
+        conn.execute(
+            "UPDATE departments SET name = ?1 WHERE org_id = ?2 AND id = ?3",
+            (name, org_id, dept_id),
+        )
+    # 部门名不在 JWT claims 里，改名不需要吊销会话；成员变动才需要重新登录
+    return {"ok": True, "department": {"org": org_id, "id": dept_id, "name": name}}
 
 
 @router.patch("/api/v1/admin/users/{uid}")
 def api_admin_patch_user(
     uid: str,
     payload: UserClaimsIn,
-    _admin: dict = Depends(require_admin),
+    admin: dict = Depends(require_admin),
 ):
     if not payload.model_fields_set:
-        raise ApiError(400, "NOTHING_TO_UPDATE", "请至少提供 org 或 quota")
+        raise ApiError(
+            400, "NOTHING_TO_UPDATE", "请至少提供 org、role、quota、depts 或 primaryDept"
+        )
     with tx() as conn:
         row = conn.execute("SELECT * FROM users WHERE uid = ?1", (uid,)).fetchone()
         if row is None:
             raise ApiError(404, "USER_NOT_FOUND", "用户不存在")
-        org = row["org_id"]
+        old_org = str(row["org_id"] or "")
+        org = old_org
         if "org" in payload.model_fields_set:
             org = _normalize_org(payload.org)
         quota_json = row["quota_json"]
@@ -526,21 +859,131 @@ def api_admin_patch_user(
                 if payload.quota is None
                 else json.dumps(_validate_quota(payload.quota), separators=(",", ":"))
             )
+        old_role = str(row["role"] or "user")
+        role = old_role
+        if "role" in payload.model_fields_set:
+            role = _validate_role(payload.role)
+            if uid == str(admin.get("uid") or "") and role != old_role:
+                raise ApiError(400, "SELF_ROLE_CHANGE", "不能修改自己的角色，请让其他管理员操作")
         conn.execute(
-            "UPDATE users SET org_id = ?1, quota_json = ?2 WHERE uid = ?3",
-            (org, quota_json, uid),
+            "UPDATE users SET org_id = ?1, quota_json = ?2, role = ?3 WHERE uid = ?4",
+            (org, quota_json, role, uid),
         )
-        # 声明是签发时刻的快照：改组织/配额后必须让旧令牌立即失效，否则旧声明继续生效
+        if role != old_role:
+            write_audit(
+                conn,
+                actor=str(admin.get("uid") or "admin"),
+                action="user.role",
+                object=uid,
+                payload={"before": old_role, "after": role},
+                before={"role": old_role},
+                after={"role": role},
+            )
+        if org != old_org:
+            conn.execute(
+                "DELETE FROM user_departments WHERE uid = ?1 AND org_id = ?2",
+                (uid, old_org),
+            )
+            if org:
+                ensure_default_department(conn, org)
+                replace_memberships(conn, uid, org, [DEFAULT_DEPT_ID], DEFAULT_DEPT_ID)
+
+        if "depts" in payload.model_fields_set or "primaryDept" in payload.model_fields_set:
+            if not org:
+                raise ApiError(400, "INVALID_ORG", "个人账号没有组织，不能分配部门")
+            known = department_ids(conn, org)
+            current = [item["id"] for item in memberships(conn, uid, org)]
+            if "depts" in payload.model_fields_set:
+                wanted: list[str] = []
+                for item in payload.depts or []:
+                    dept_id = str(item or "").strip().lower()
+                    if not dept_id:
+                        continue
+                    if dept_id not in known:
+                        raise ApiError(400, "UNKNOWN_DEPARTMENT", f"部门不存在：{dept_id}")
+                    if dept_id not in wanted:
+                        wanted.append(dept_id)
+            else:
+                wanted = current
+            primary = (
+                str(payload.primaryDept or "").strip().lower()
+                if "primaryDept" in payload.model_fields_set
+                else ""
+            )
+            if primary and primary not in wanted:
+                raise ApiError(400, "INVALID_DEPARTMENT", "主部门必须在成员部门内")
+            if not primary:
+                existing = primary_department(conn, uid, org)
+                primary = existing if existing in wanted else (wanted[0] if wanted else "")
+            replace_memberships(conn, uid, org, wanted, primary)
+
+        # 声明是签发时刻的快照：改组织/部门/配额后必须让旧令牌立即失效，否则旧声明继续生效
         cur = conn.execute(
             "UPDATE sessions SET revoked = 1 WHERE uid = ?1 AND revoked = 0 AND expires_at_ms > ?2",
             (uid, now_ms()),
         )
         updated = conn.execute("SELECT * FROM users WHERE uid = ?1", (uid,)).fetchone()
-        return {
-            "ok": True,
-            "profile": profile_of(updated),
-            "sessionsRevoked": cur.rowcount,
-        }
+        profile = profile_of(updated)
+        profile["depts"] = memberships(conn, uid, effective_org(updated))
+    return {
+        "ok": True,
+        "profile": profile,
+        "sessionsRevoked": cur.rowcount,
+    }
+
+
+@router.get("/api/v1/admin/users")
+def api_admin_users(
+    q: str = Query(""),
+    page: int = Query(1),
+    pageSize: int = Query(20),
+    _admin: dict = Depends(require_admin),
+):
+    q = (q or "").strip()
+    if len(q) > 100:
+        raise ApiError(400, "INVALID_QUERY", "搜索词不能超过 100 字")
+    page = max(1, page)
+    page_size = min(100, max(1, pageSize))
+    where_sql = ""
+    params: list[Any] = []
+    if q:
+        where_sql = " WHERE instr(lower(email), ?1) > 0 OR instr(lower(nickname), ?1) > 0"
+        params.append(q.lower())
+    with tx() as conn:
+        total = conn.execute("SELECT COUNT(*) AS n FROM users" + where_sql, params).fetchone()["n"]
+        rows = conn.execute(
+            "SELECT uid, email, nickname, role, plan, org_id, created_at_ms FROM users"
+            + where_sql
+            + " ORDER BY created_at_ms DESC, rowid DESC LIMIT ? OFFSET ?",
+            [*params, page_size, (page - 1) * page_size],
+        ).fetchall()
+        cards = []
+        for row in rows:
+            org = row["org_id"] or f"personal-{row['uid']}"
+            members = memberships(conn, row["uid"], org) if row["org_id"] else []
+            cards.append(
+                {
+                    "uid": row["uid"],
+                    "email": row["email"],
+                    "nickname": row["nickname"],
+                    "role": row["role"],
+                    "plan": row["plan"],
+                    "org": org,
+                    "depts": members,
+                    "primaryDept": next(
+                        (item["id"] for item in members if item["primary"]), ""
+                    ),
+                    "createdAtMs": row["created_at_ms"],
+                }
+            )
+    return {
+        "ok": True,
+        "users": cards,
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
+        "hasMore": page * page_size < total,
+    }
 
 
 @router.post("/api/v1/admin/users/{uid}/revoke-sessions")
@@ -554,6 +997,33 @@ def api_admin_revoke_sessions(uid: str, _admin: dict = Depends(require_admin)):
             (uid, now_ms()),
         )
         return {"ok": True, "revoked": cur.rowcount}
+
+
+# ── 引擎令牌吊销内省 ─────────────────────────────────────────
+# 引擎默认只按 JWT 的 exp 失效（最长 15 分钟窗口）。开启内省后，引擎带共享令牌
+# 来这里查某 sid 是否仍有效，把「删除用户 / 强制下线」的生效窗口压到缓存 TTL 内。
+# 共享令牌取自 TT_ENGINE_INTROSPECT_TOKEN；未配置时端点关闭（返回 404），
+# 引擎侧对不可达按放行处理，离线与桌面模式行为不变。
+
+
+@router.get("/api/v1/engine/introspect")
+def api_engine_introspect(request: Request, sub: str = "", sid: str = ""):
+    expected = os.environ.get("TT_ENGINE_INTROSPECT_TOKEN", "").strip()
+    got = (request.headers.get("x-tt-engine-introspect") or "").strip()
+    if not expected:
+        raise ApiError(404, "INTROSPECT_DISABLED", "未启用引擎令牌内省")
+    if not got or not hmac.compare_digest(expected, got):
+        raise ApiError(401, "INTROSPECT_UNAUTHORIZED", "内省令牌无效")
+    if not sub or not sid:
+        raise ApiError(400, "INVALID_INTROSPECT_QUERY", "sub 与 sid 必填")
+    user = find_user_by_session(sid, sub)
+    if user is None:
+        return {"ok": True, "active": False, "reason": "session_not_found"}
+    if int(user["session_revoked"] or 0):
+        return {"ok": True, "active": False, "reason": "session_revoked"}
+    if int(user["session_expires_at_ms"] or 0) <= now_ms():
+        return {"ok": True, "active": False, "reason": "session_expired"}
+    return {"ok": True, "active": True}
 
 
 # ── 网页登录/注册（loopback 回跳） ──────────────────────────
@@ -622,26 +1092,38 @@ def _page(
     )
 
 
-def _hidden_fields(state: str, redirect_uri: str) -> str:
+def _hidden_fields(state: str, redirect_uri: str, code_challenge: str = "") -> str:
+    challenge = (
+        f'<input type="hidden" name="code_challenge" value="{html.escape(code_challenge, quote=True)}">'
+        if code_challenge
+        else ""
+    )
     return (
         f'<input type="hidden" name="state" value="{html.escape(state, quote=True)}">'
         f'<input type="hidden" name="redirect_uri" value="{html.escape(redirect_uri, quote=True)}">'
+        f"{challenge}"
     )
 
 
-def _switch_link(path: str, state: str, redirect_uri: str) -> str:
-    query = urllib.parse.urlencode({"state": state, "redirect_uri": redirect_uri})
+def _switch_link(path: str, state: str, redirect_uri: str, code_challenge: str = "") -> str:
+    params = {"state": state, "redirect_uri": redirect_uri}
+    if code_challenge:
+        params["code_challenge"] = code_challenge
+        params["code_challenge_method"] = "S256"
+    query = urllib.parse.urlencode(params)
     return html.escape(f"{path}?{query}", quote=True)
 
 
-def _login_page(state: str, redirect_uri: str, error: str = "", status: int = 200) -> HTMLResponse:
+def _login_page(
+    state: str, redirect_uri: str, error: str = "", status: int = 200, code_challenge: str = ""
+) -> HTMLResponse:
     err = f'<div class="error">{html.escape(error)}</div>' if error else ""
-    link = _switch_link("/auth/register", state, redirect_uri)
+    link = _switch_link("/auth/register", state, redirect_uri, code_challenge)
     return _page(
         "登录",
         f"""<h2>登录账号</h2><div class="sub">在浏览器完成验证后，将自动返回通天办公桌面端</div>
 <form method="post" action="/api/auth/login">
-  {_hidden_fields(state, redirect_uri)}
+  {_hidden_fields(state, redirect_uri, code_challenge)}
   <label>邮箱</label><input type="email" name="email" required placeholder="you@example.com">
   <label>密码</label><input type="password" name="password" required placeholder="请输入密码">
   <button class="btn" type="submit">登 录</button>{err}
@@ -652,14 +1134,16 @@ def _login_page(state: str, redirect_uri: str, error: str = "", status: int = 20
     )
 
 
-def _register_page(state: str, redirect_uri: str, error: str = "", status: int = 200) -> HTMLResponse:
+def _register_page(
+    state: str, redirect_uri: str, error: str = "", status: int = 200, code_challenge: str = ""
+) -> HTMLResponse:
     err = f'<div class="error">{html.escape(error)}</div>' if error else ""
-    link = _switch_link("/auth/login", state, redirect_uri)
+    link = _switch_link("/auth/login", state, redirect_uri, code_challenge)
     return _page(
         "注册",
         f"""<h2>注册账号</h2><div class="sub">注册成功后自动登录，并返回通天办公桌面端</div>
 <form method="post" action="/api/auth/register">
-  {_hidden_fields(state, redirect_uri)}
+  {_hidden_fields(state, redirect_uri, code_challenge)}
   <label>昵称</label><input type="text" name="nickname" required maxlength="24" placeholder="怎么称呼你">
   <label>邮箱</label><input type="email" name="email" required placeholder="you@example.com">
   <label>密码</label><input type="password" name="password" required minlength="8" placeholder="至少 8 位">
@@ -726,14 +1210,20 @@ async def _form(request: Request) -> dict[str, str]:
     return {key: values[0] if values else "" for key, values in parsed.items()}
 
 
+def _clean_challenge(raw: str) -> str:
+    """只接受合法的 S256 challenge；空串表示旧客户端（不带 PKCE）。"""
+    challenge = (raw or "").strip()
+    return challenge if PKCE_CHALLENGE_RE.match(challenge) else ""
+
+
 @router.get("/auth/login", response_class=HTMLResponse)
-def page_login(state: str = "", redirect_uri: str = ""):
-    return _login_page(state, redirect_uri)
+def page_login(state: str = "", redirect_uri: str = "", code_challenge: str = ""):
+    return _login_page(state, redirect_uri, code_challenge=_clean_challenge(code_challenge))
 
 
 @router.get("/auth/register", response_class=HTMLResponse)
-def page_register(state: str = "", redirect_uri: str = ""):
-    return _register_page(state, redirect_uri)
+def page_register(state: str = "", redirect_uri: str = "", code_challenge: str = ""):
+    return _register_page(state, redirect_uri, code_challenge=_clean_challenge(code_challenge))
 
 
 @router.post("/api/auth/register")
@@ -744,9 +1234,10 @@ async def legacy_register(request: Request):
     confirm = form.get("confirm", "")
     state = form.get("state", "")
     redirect_uri = form.get("redirect_uri", "")
+    code_challenge = _clean_challenge(form.get("code_challenge", ""))
 
     def fail(message: str, status: int = 400) -> HTMLResponse:
-        return _register_page(state, redirect_uri, message, status)
+        return _register_page(state, redirect_uri, message, status, code_challenge)
 
     if not settings.allow_registration:
         return fail("当前服务未开放注册", 403)
@@ -773,7 +1264,7 @@ async def legacy_register(request: Request):
     except ApiError as exc:
         return fail(exc.message, exc.status)
 
-    code = issue_code(user["uid"], state, redirect_uri)
+    code = issue_code(user["uid"], state, redirect_uri, code_challenge)
     return RedirectResponse(_append_code(redirect_uri, code, state), status_code=302)
 
 
@@ -784,9 +1275,10 @@ async def legacy_login(request: Request):
     password = form.get("password", "")
     state = form.get("state", "")
     redirect_uri = form.get("redirect_uri", "")
+    code_challenge = _clean_challenge(form.get("code_challenge", ""))
 
     def fail(message: str, status: int = 401) -> HTMLResponse:
-        return _login_page(state, redirect_uri, message, status)
+        return _login_page(state, redirect_uri, message, status, code_challenge)
 
     if not _loopback_redirect(redirect_uri):
         return fail("回调地址非法（仅允许本机回跳）", 400)
@@ -801,7 +1293,7 @@ async def legacy_login(request: Request):
         return fail(exc.message, exc.status)
     _login_limiter.reset(key)
 
-    code = issue_code(user["uid"], state, redirect_uri)
+    code = issue_code(user["uid"], state, redirect_uri, code_challenge)
     return RedirectResponse(_append_code(redirect_uri, code, state), status_code=302)
 
 
@@ -818,9 +1310,12 @@ async def legacy_exchange(request: Request):
         raise ApiError(400, "INVALID_JSON", "请求体需为 JSON 对象")
     code = body.get("code", "")
     state = body.get("state", "")
+    verifier = body.get("codeVerifier", body.get("code_verifier", ""))
     if not isinstance(code, str) or not isinstance(state, str) or not code or not state:
         raise ApiError(400, "INVALID_CODE", "缺少 code/state")
-    entry = consume_code(code, state)
+    if verifier is not None and not isinstance(verifier, str):
+        raise ApiError(400, "INVALID_CODE", "codeVerifier 需为字符串")
+    entry = consume_code(code, state, verifier or "")
     if entry is None:
         raise ApiError(400, "INVALID_CODE", "授权码无效、已过期或 state 不匹配")
     user = find_user_by_uid(entry["uid"])

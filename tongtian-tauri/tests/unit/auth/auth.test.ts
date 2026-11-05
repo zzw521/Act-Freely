@@ -148,7 +148,9 @@ describe('useAuthStore', () => {
     expect(ok).toBe(false);
     const s = useAuthStore.getState();
     expect(s.loggedIn).toBe(false);
-    expect(s.error).toContain('AUTH_LOGIN_TIMEOUT');
+    expect(s.error).toContain('等待登录超时');
+    // D-20：错误码不再裸奔到界面（Rust 的详情仍随文案带出）
+    expect(s.error).not.toContain('AUTH_LOGIN_TIMEOUT');
     expect(s.busy).toBe(false);
 
     win.tongtianAPI = saved;

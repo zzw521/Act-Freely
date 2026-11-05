@@ -235,6 +235,162 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX IF NOT EXISTS idx_model_usage_cost_day ON model_usage_cost (day);
     "#,
+    // ── V13：会话归属工作区（侧边栏按项目看） ──
+    // 增量变更：只给 chat_messages 追加一列 + 索引，V1~V12 的存量行统一落到 default，
+    // 与 tasks.workspace_id 的缺省口径一致；不重建表、不改主键。
+    r#"
+    ALTER TABLE chat_messages ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'default';
+    CREATE INDEX IF NOT EXISTS idx_chat_messages_workspace ON chat_messages (workspace_id, ts_ms DESC);
+    "#,
+    // ── V14：跨任务长期记忆（D-35 第一阶段：结构化存储 + 去重 + 按项目检索） ──
+    // 增量变更：只新增表与索引。content_hash 与归属组成唯一键，重复任务合并为一行
+    // 并累加 occurrences，而不是继续往 MEMORY.md 里追加重复行。
+    // 来源（task_id / conv_id）留在行内，记忆可追溯到具体任务；删除只删这一行。
+    r#"
+    CREATE TABLE IF NOT EXISTS memories (
+        id            TEXT PRIMARY KEY,
+        scope         TEXT NOT NULL DEFAULT 'global',   -- global / workspace
+        workspace_id  TEXT NOT NULL DEFAULT '',         -- scope=workspace 时为工作区 id；global 为空串
+        kind          TEXT NOT NULL DEFAULT 'fact',     -- task / fact / preference / decision
+        content       TEXT NOT NULL,
+        content_hash  TEXT NOT NULL,
+        source        TEXT NOT NULL DEFAULT 'manual',   -- auto / manual / reflection
+        conv_id       TEXT,
+        task_id       TEXT,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL,
+        last_used_at  TEXT,
+        use_count     INTEGER NOT NULL DEFAULT 0,
+        occurrences   INTEGER NOT NULL DEFAULT 1,
+        UNIQUE (scope, workspace_id, content_hash)
+    );
+    CREATE INDEX IF NOT EXISTS idx_memories_scope_time ON memories (scope, workspace_id, updated_at DESC);
+    "#,
+    // ── V15：记忆复核、冲突软退休与结构化事实（D-35 第二阶段） ──
+    // 增量变更：只给 memories 追加列与索引，V14 存量行默认全部 active，
+    // 原有「写入即生效」行为不变；status=pending 只会在用户打开「写入前待审」后出现。
+    // subject/predicate/object 是 AtomCard 等价物的最小字段：事实冲突时旧行不物理删除，
+    // 只置为 archived 并记 superseded_by，证据链仍可追溯。
+    r#"
+    ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active';   -- active / pending / archived
+    ALTER TABLE memories ADD COLUMN reviewed_at TEXT;
+    ALTER TABLE memories ADD COLUMN superseded_by TEXT;
+    ALTER TABLE memories ADD COLUMN subject TEXT NOT NULL DEFAULT '';
+    ALTER TABLE memories ADD COLUMN predicate TEXT NOT NULL DEFAULT '';
+    ALTER TABLE memories ADD COLUMN object TEXT NOT NULL DEFAULT '';
+    ALTER TABLE memories ADD COLUMN confidence REAL NOT NULL DEFAULT 1;
+    CREATE INDEX IF NOT EXISTS idx_memories_status ON memories (status, scope, workspace_id, updated_at DESC);
+    "#,
+    // ── V16：常驻事件入口与授权层（D-46 第一段：账本 + 幂等游标 + 版本化策略 + 判定留痕） ──
+    // 增量变更：只新增四张 sa_ 前缀表，不动任何存量表；本段只做「记账与判定」，
+    // 不产生任何自动执行，因此这里没有工单表、没有副作用队列（那是 D-47 / D-48 的位置）。
+    //
+    // 语义对齐 dsh-superagent-prototype 的四条纪律（证据见 docs/Super-agent-对标DSH.md 附录 D）：
+    // - sa_sources：每个事件入口实例自己持读取位置（cursor 只前进），enabled 默认 0，
+    //   装好不等于开跑；重启后从库里的游标续读，因此历史事件不会被重放成新工作。
+    // - sa_triggers：事件是不可变事实，UNIQUE (source_id, external_id) 是幂等单位，
+    //   同一条事件重复投递（断线补拉重叠、重连重放）只落一行。
+    //   正文按上限截断存本地，不写日志；来源提供的 actor / kind / 是否点名是判定输入，
+    //   正文只参与规则匹配，不当指令。
+    // - sa_policy：策略是一等公民且版本化，一次变更一行，digest 用于「内容没变不新增版本」；
+    //   accept_mode 三档 off / observe / auto，默认 observe（研判照做、零自动执行）。
+    // - sa_decisions：判定与研判留痕，UNIQUE (trigger_id, policy_version) 保证
+    //   同一策略下不重复判定；策略变更后允许按新版本重判，旧判定不删、可追溯。
+    r#"
+    CREATE TABLE IF NOT EXISTS sa_sources (
+        id             TEXT PRIMARY KEY,
+        kind           TEXT NOT NULL,                        -- project_event / schedule / condition / workspace_file / im_inbound
+        instance       TEXT NOT NULL DEFAULT '',             -- 同一 kind 下的具体实例（项目 id / 目录 / 会话）
+        label          TEXT NOT NULL DEFAULT '',
+        enabled        INTEGER NOT NULL DEFAULT 0,           -- 默认关闭：登记不等于开跑
+        cursor         INTEGER NOT NULL DEFAULT 0,           -- 读取位置，只前进
+        config         TEXT NOT NULL DEFAULT '{}',           -- 监听范围等实例级配置（不含任何凭据）
+        last_error     TEXT,
+        created_at_ms  INTEGER NOT NULL,
+        updated_at_ms  INTEGER NOT NULL,
+        UNIQUE (kind, instance)
+    );
+    CREATE INDEX IF NOT EXISTS idx_sa_sources_enabled ON sa_sources (enabled, kind);
+    CREATE TABLE IF NOT EXISTS sa_triggers (
+        id              TEXT PRIMARY KEY,
+        source_id       TEXT NOT NULL,
+        external_id     TEXT NOT NULL,                       -- 上游给的事件 id（项目事件用 seq）
+        kind            TEXT NOT NULL DEFAULT '',            -- 上游事件类型，如 task.commented
+        text            TEXT NOT NULL,
+        actor           TEXT NOT NULL DEFAULT '',            -- 来源声明的发起人（可信字段）
+        thread_key      TEXT NOT NULL DEFAULT '',            -- 同一会话/线程键，研判串行化用
+        addressed_agent INTEGER NOT NULL DEFAULT 0,          -- 来源事实：是否点名/回复了本应用
+        source_seq      INTEGER NOT NULL DEFAULT 0,
+        arrived_at_ms   INTEGER NOT NULL,
+        payload         TEXT NOT NULL DEFAULT '{}',          -- 原始结构（截断后），供研判与界面回看
+        UNIQUE (source_id, external_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_sa_triggers_arrived ON sa_triggers (arrived_at_ms DESC);
+    CREATE INDEX IF NOT EXISTS idx_sa_triggers_thread ON sa_triggers (thread_key, arrived_at_ms DESC);
+    CREATE TABLE IF NOT EXISTS sa_policy (
+        version        INTEGER PRIMARY KEY,
+        doc            TEXT NOT NULL,                        -- JSON：accept_mode + 每入口许可名单 + 规则
+        digest         TEXT NOT NULL,                        -- doc 规范化后的 sha256，变更判定用
+        source         TEXT NOT NULL DEFAULT 'default',      -- default / user / import
+        created_at_ms  INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS sa_decisions (
+        id              TEXT PRIMARY KEY,
+        trigger_id      TEXT NOT NULL,
+        policy_version  INTEGER NOT NULL,
+        strength        TEXT NOT NULL,                       -- explicit / inferred / not_admitted
+        outcome         TEXT NOT NULL,                       -- admitted / would_accept / not_admitted / mode_off
+        would_accept    INTEGER NOT NULL DEFAULT 0,          -- observe 模式的阳性只记这一列，不执行
+        basis           TEXT NOT NULL DEFAULT '',
+        matched_rules   TEXT NOT NULL DEFAULT '[]',
+        reason          TEXT NOT NULL DEFAULT '',
+        decided_at_ms   INTEGER NOT NULL,
+        UNIQUE (trigger_id, policy_version)
+    );
+    CREATE INDEX IF NOT EXISTS idx_sa_decisions_time ON sa_decisions (decided_at_ms DESC);
+    "#,
+    // ── V17：判定行加上第二层（模型研判）的留痕列（D-46 §实现方案第 4 条：gate 与研判分离）──
+    // 增量变更：只给 sa_decisions 加列，存量判定行保持原值（空串 = 这一条没做过模型研判）。
+    // 为什么加列而不是新表：一条判定最多跟一份研判结论（同一 trigger + 同一策略版本），
+    // 拆两张表就要靠 join 才能回答「这条候选的研判结论是什么」，而界面与导出都要成对读它们。
+    // 模型研判只写结论与依据，不写工单、不写执行状态——那仍然是 D-47 / D-48 的位置。
+    r#"
+    ALTER TABLE sa_decisions ADD COLUMN assess_status TEXT NOT NULL DEFAULT '';   -- ''=未研判；库里只会出现 done / failed（blocked 与 unavailable 只进巡检摘要，不写库）
+    ALTER TABLE sa_decisions ADD COLUMN assess_verdict TEXT NOT NULL DEFAULT '';   -- worth / not_worth / unsure
+    ALTER TABLE sa_decisions ADD COLUMN assess_reason TEXT NOT NULL DEFAULT '';    -- 模型给的理由（截断）
+    ALTER TABLE sa_decisions ADD COLUMN assess_model TEXT NOT NULL DEFAULT '';     -- 用哪个模型判的（可复核）
+    ALTER TABLE sa_decisions ADD COLUMN assess_tokens INTEGER NOT NULL DEFAULT 0;  -- 这次研判的 token 合计（计量口径）
+    ALTER TABLE sa_decisions ADD COLUMN assess_error TEXT NOT NULL DEFAULT '';     -- 失败原因，中文，不含凭据
+    ALTER TABLE sa_decisions ADD COLUMN assessed_at_ms INTEGER NOT NULL DEFAULT 0; -- 判定时刻（也当第二层的当日预算分子用）
+    CREATE INDEX IF NOT EXISTS idx_sa_decisions_assessed ON sa_decisions (assessed_at_ms DESC);
+    "#,
+    // ── V18：把「候选排在哪个策略版本的研判队列里」从 gate 的判定版本里分出来 ──
+    // 为什么要多这一列：`policy_version` 的含义是「这一条判定依据哪一版策略给出」，它是留痕，
+    // 任何时候都不该被改写——改了就没人能回答「当时是按什么规则判的」。但第二层的队列在 V17
+    // 直接挂在 `policy_version` 上，于是策略一升版，老候选就和当前版本对不上号，
+    // 既不会被视为「已判」，也永远不会再被研判：它们孤悬在账本里，只是界面上看不见。
+    // DSH 的口径是「策略变更 → 在跑的研判作废、候选重排队」，这里用队列键实现同一件事：
+    // 升版时只挪 `assess_queue_version`，判定版本原样留着。
+    // 已经判过的行（done / failed）不重排：结论留着可追溯，重判等于为同一个判断再花一次模型钱。
+    // 增量变更：只加列并回填存量行的队列键，不动任何判定与研判结论。
+    r#"
+    ALTER TABLE sa_decisions ADD COLUMN assess_queue_version INTEGER NOT NULL DEFAULT 0;  -- 这一行现在排在哪个策略版本的研判队列里（与 policy_version 分开：前者是待办，后者是留痕）
+    ALTER TABLE sa_decisions ADD COLUMN requeued_at_ms INTEGER NOT NULL DEFAULT 0;        -- 因策略升版被重排的时刻；0 = 从没被重排过
+    UPDATE sa_decisions SET assess_queue_version = policy_version WHERE assess_queue_version = 0;
+    CREATE INDEX IF NOT EXISTS idx_sa_decisions_assess_queue ON sa_decisions (assess_queue_version, assess_status);
+    "#,
+    // ── V19：定时任务补「间隔」与「一次性」两种调度（D-30） ──
+    // 增量变更：只给 scheduled_tasks 追加两列，V1~V18 表与存量行不受影响。
+    // 存量行的两列都是 NULL：四种周期频率（hourly/daily/weekly/monthly）本来就不读它们，
+    // `next_run_at_ms` 的算法也未变，旧任务行为完全一致。
+    // 为什么不复用 time_of_day 表达间隔：把「每 2 小时」写成 hourly 会让界面显示一个
+    // 并不会按它触发的时刻；一次性任务同理，绝对时刻必须由调度器与界面读同一份事实。
+    // 一次性任务的「执行后自动停用」写在 task::schedule::advance_next（触发前就地停用），
+    // 不新增列：enabled=0 + next_run_at_ms=NULL 已经是这件事的完整事实。
+    r#"
+    ALTER TABLE scheduled_tasks ADD COLUMN interval_minutes INTEGER;   -- 仅 freq=interval；分钟数（1..10080）
+    ALTER TABLE scheduled_tasks ADD COLUMN run_at_ms INTEGER;          -- 仅 freq=once；UTC 毫秒绝对时刻
+    "#,
 ];
 
 /// 执行所有尚未应用的迁移
@@ -287,12 +443,13 @@ mod tests {
                  ('model_configs','tasks','settings_kv','schema_version','audit_logs',\
                  'security_policies','model_usage','scheduled_tasks','schedule_runs',\
                  'hook_configs','connector_states','archived_tasks','mcp_servers','chat_messages',\
-                 'chat_feedback','hook_grants','model_usage_cost')",
+                 'chat_feedback','hook_grants','model_usage_cost','memories',\
+                 'sa_sources','sa_triggers','sa_policy','sa_decisions')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 17);
+        assert_eq!(count, 22);
     }
 
     /// 增量升级：老库（仅 V1）升级到 V2 后，存量数据必须完好（开发规范：禁止覆盖存量数据）
@@ -663,8 +820,331 @@ mod tests {
         assert_eq!(max_v, MIGRATIONS.len() as i64);
     }
 
+    /// 增量升级：V15 老库升级到 V16 后，存量记忆与会话必须完好，四张 sa_ 表为空
     #[test]
-    fn test_run_idempotent() {        let conn = mem_conn();
+    fn test_v16_upgrade_preserves_existing_rows() {
+        let conn = mem_conn();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        // 模拟只跑过 V1~V15 的历史库
+        for sql in MIGRATIONS.iter().take(15) {
+            conn.execute_batch(sql).unwrap();
+        }
+        let versions: Vec<String> = (1..=15).map(|v| format!("({v}, datetime('now'))")).collect();
+        conn.execute_batch(&format!(
+            "INSERT INTO schema_version (version, applied_at) VALUES {};",
+            versions.join(", ")
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memories (id, scope, workspace_id, kind, content, content_hash, source, created_at, updated_at) \
+             VALUES ('mem-v15', 'global', '', 'fact', '存量事实', 'h-v15', 'manual', '2026-11-01', '2026-11-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_messages (conv_id, turn_index, role, task_id, content, ts_ms) \
+             VALUES ('conv-v15', 0, 'user', 'task-v15', '存量提问', 1000)",
+            [],
+        )
+        .unwrap();
+
+        run(&conn).unwrap();
+
+        let content: String = conn
+            .query_row("SELECT content FROM memories WHERE id='mem-v15'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(content, "存量事实", "存量长期记忆不得被清理");
+        let msgs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chat_messages WHERE conv_id='conv-v15'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msgs, 1, "存量会话正文不得被清理");
+        for table in ["sa_sources", "sa_triggers", "sa_policy", "sa_decisions"] {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0, "新表 {table} 初始应为空（不伪造历史事件与判定）");
+        }
+        // 游标与幂等键必须在建表时就有，否则升级后的老库会重复接单
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM pragma_table_info('sa_triggers') UNION ALL \
+                 SELECT name FROM pragma_table_info('sa_sources')",
+            )
+            .unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for need in ["external_id", "source_id", "cursor"] {
+            assert!(cols.iter().any(|c| c == need), "缺关键列 {need}：{cols:?}");
+        }
+        let max_v: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(max_v, MIGRATIONS.len() as i64);
+    }
+
+    /// 增量升级：V16 老库（判定行还没有第二层留痕列）升到 V17 后，存量判定必须完好，
+    /// 新列以「未研判」的空值出现——不能把历史判定当成已经做过模型研判。
+    #[test]
+    fn test_v17_adds_assessment_columns_without_touching_existing_decisions() {
+        let conn = mem_conn();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        for sql in MIGRATIONS.iter().take(16) {
+            conn.execute_batch(sql).unwrap();
+        }
+        let versions: Vec<String> = (1..=16).map(|v| format!("({v}, datetime('now'))")).collect();
+        conn.execute_batch(&format!(
+            "INSERT INTO schema_version (version, applied_at) VALUES {};",
+            versions.join(", ")
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sa_decisions (id, trigger_id, policy_version, strength, outcome, \
+             would_accept, basis, matched_rules, reason, decided_at_ms) \
+             VALUES ('dec-v16', 'trg-1', 1, 'inferred', 'would_accept', 1, '规则 review', '[]', \
+             '命中启用规则', 1730000000000)",
+            [],
+        )
+        .unwrap();
+
+        run(&conn).unwrap();
+
+        let reason: String = conn
+            .query_row("SELECT reason FROM sa_decisions WHERE id='dec-v16'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(reason, "命中启用规则", "加列不得动存量判定");
+        let (status, verdict, tokens, assessed_at): (String, String, i64, i64) = conn
+            .query_row(
+                "SELECT assess_status, assess_verdict, assess_tokens, assessed_at_ms \
+                 FROM sa_decisions WHERE id='dec-v16'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), verdict.as_str()), ("", ""), "历史判定初始必须是未研判");
+        assert_eq!((tokens, assessed_at), (0, 0));
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('sa_decisions')")
+            .unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for need in [
+            "assess_status",
+            "assess_verdict",
+            "assess_reason",
+            "assess_model",
+            "assess_tokens",
+            "assess_error",
+            "assessed_at_ms",
+        ] {
+            assert!(cols.iter().any(|c| c == need), "缺关键列 {need}：{cols:?}");
+        }
+        let max_v: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(max_v, MIGRATIONS.len() as i64);
+    }
+
+    /// 增量升级：V17 老库（候选队列直接挂在判定版本上）升到 V18 后，
+    /// 队列键回填成各自的 `policy_version`，而判定版本、研判结论、留痕时刻一律不动。
+    /// 这一条测的是「分列不能改历史」：升版重排队是运行期动作，不是迁移期动作。
+    #[test]
+    fn test_v18_splits_queue_key_from_gate_version_without_rewriting_history() {
+        let conn = mem_conn();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        for sql in MIGRATIONS.iter().take(17) {
+            conn.execute_batch(sql).unwrap();
+        }
+        let versions: Vec<String> = (1..=17).map(|v| format!("({v}, datetime('now'))")).collect();
+        conn.execute_batch(&format!(
+            "INSERT INTO schema_version (version, applied_at) VALUES {};",
+            versions.join(", ")
+        ))
+        .unwrap();
+        // 三种存量行：待研判的阳性、已判完的阳性、阴性留痕
+        conn.execute_batch(
+            "INSERT INTO sa_decisions (id, trigger_id, policy_version, strength, outcome, \
+             would_accept, basis, matched_rules, reason, decided_at_ms) \
+             VALUES \
+             ('dec-pending', 'trg-1', 3, 'explicit', 'would_accept', 1, '点名指派', '[]', '直接指派', 1730000001000), \
+             ('dec-judged',  'trg-2', 2, 'inferred', 'would_accept', 1, '规则 review', '[]', '命中启用规则', 1730000002000), \
+             ('dec-nope',    'trg-3', 1, 'not_admitted', 'not_admitted', 0, '', '[]', '名单外', 1730000003000); \
+             UPDATE sa_decisions SET assess_status='done', assess_verdict='worth', \
+                    assess_reason='上下文里正开着', assess_model='某模型', assess_tokens=1234, \
+                    assessed_at_ms=1730000009000 WHERE id='dec-judged';",
+        )
+        .unwrap();
+
+        run(&conn).unwrap();
+
+        // 存量行的队列键回填成自己的判定版本，重排时刻保持 0（迁移不制造「已经重排过」的假象）
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, policy_version, assess_queue_version, requeued_at_ms, assess_status, \
+                        assess_verdict, assess_tokens, reason FROM sa_decisions ORDER BY id",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, String>(7)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        for (id, gate_version, queue_version, requeued, status, verdict, tokens, reason) in rows {
+            assert_eq!(
+                queue_version, gate_version,
+                "存量行 {id} 的队列键要回填成自己的判定版本"
+            );
+            assert_eq!(requeued, 0, "迁移不该把存量候选标成已重排：{id}");
+            match id.as_str() {
+                "dec-judged" => {
+                    assert_eq!((status.as_str(), verdict.as_str()), ("done", "worth"));
+                    assert_eq!(tokens, 1234, "已花的 token 不能被迁移抹掉");
+                    assert_eq!(reason, "命中启用规则");
+                }
+                "dec-pending" => {
+                    assert_eq!(status, "", "待研判的行升级后仍是未研判");
+                    assert_eq!(reason, "直接指派");
+                }
+                _ => {
+                    assert_eq!(status, "");
+                    assert_eq!(reason, "名单外", "阴性留痕同样不许动");
+                }
+            }
+        }
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_sa_decisions_assess_queue'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1, "队列查询要有索引：策略版本 × 是否已判");
+        assert_eq!(
+            conn.query_row("SELECT MAX(version) FROM schema_version", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            MIGRATIONS.len() as i64
+        );
+    }
+
+    /// 增量升级：V18 老库（定时任务还没有「间隔/一次性」两列）升到 V19 后，存量任务与
+    /// 存量执行记录必须原样可用。两列以 NULL 出现而不是 0：四种周期频率本来就不读它们，
+    /// 而 0 会被读成「每 0 分钟」这种既非法又看起来像配置的值。
+    /// 迁移也**不许**顺手重算任何老任务的 `next_run_at_ms` 或启停状态。
+    #[test]
+    fn test_v19_adds_schedule_columns_without_touching_existing_tasks() {
+        let conn = mem_conn();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        // 模拟只跑过 V1~V18 的历史库
+        for sql in MIGRATIONS.iter().take(18) {
+            conn.execute_batch(sql).unwrap();
+        }
+        let versions: Vec<String> = (1..=18).map(|v| format!("({v}, datetime('now'))")).collect();
+        conn.execute_batch(&format!(
+            "INSERT INTO schema_version (version, applied_at) VALUES {};",
+            versions.join(", ")
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scheduled_tasks (schedule_id, name, description, freq, time_of_day, \
+             weekday, enabled, workspace_id, created_at_ms, updated_at_ms, next_run_at_ms, \
+             last_run_at_ms, last_status) \
+             VALUES ('sched-old', '每日舆情', '存量任务', 'daily', '08:00', NULL, 1, 'brand', \
+             1000, 1000, 2000, 900, 'succeeded')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schedule_runs (run_id, schedule_id, task_id, started_at_ms, \
+             finished_at_ms, status, summary) \
+             VALUES ('run-old', 'sched-old', 'task-old', 900, 950, 'succeeded', '存量执行')",
+            [],
+        )
+        .unwrap();
+
+        run(&conn).unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, freq, time_of_day, enabled, next_run_at_ms, last_status, \
+                        interval_minutes, run_at_ms FROM scheduled_tasks \
+                 WHERE schedule_id = 'sched-old'",
+            )
+            .unwrap();
+        let row = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
+                ))
+            })
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.0, "每日舆情", "存量任务名不得被迁移改写");
+        assert_eq!(
+            (row.1.as_str(), row.2.as_str(), row.3),
+            ("daily", "08:00", 1),
+            "频率/时刻/启停三件事原样保留"
+        );
+        assert_eq!(row.4, 2000, "存量下次执行时间不得被迁移重算");
+        assert_eq!(row.5, "succeeded", "上次执行状态是历史事实，迁移无权刷新");
+        assert_eq!(row.6, None, "老任务的间隔列必须是 NULL，不能是 0");
+        assert_eq!(row.7, None, "老任务的一次性时刻列必须是 NULL");
+
+        let runs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schedule_runs WHERE run_id = 'run-old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 1, "存量执行记录不得被升级清掉");
+        let max_v: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(max_v, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn test_run_idempotent() {
+        let conn = mem_conn();
         run(&conn).unwrap();
         run(&conn).unwrap(); // 二次执行不报错、不重复插入版本
         let versions: i64 = conn

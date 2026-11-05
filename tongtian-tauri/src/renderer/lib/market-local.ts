@@ -42,9 +42,27 @@ export function handleLocalMarketChannel(channel: string, args: unknown[]): Loca
       return { handled: true, value: unsupportedList() };
     case 'market:trustGet':
       return { handled: true, value: { supported: false, publishers: [] } };
+    case 'market:updateCheck':
+      // 浏览器通道没有本机清单与落盘能力：如实回报不支持，不编造「已检查」
+      return {
+        handled: true,
+        value: {
+          supported: false,
+          checkedAtMs: 0,
+          sourcesConfigured: 0,
+          errors: ['MARKET_UNSUPPORTED: 当前通道没有市场清单与下载能力'],
+          items: [],
+          summary: { updateAvailable: 0, revoked: 0, delisted: 0, disabledApplied: 0 },
+        },
+      };
+    case 'market:installedList':
+      return { handled: true, value: { supported: false, items: [], lastCheckAtMs: null } };
     case 'market:configSet':
     case 'market:skillInstall':
     case 'market:suiteInstall':
+    case 'market:skillUpgrade':
+    case 'market:suiteUpgrade':
+    case 'market:upgradeAll':
     case 'market:trustAdd':
     case 'market:trustRemove':
       return {

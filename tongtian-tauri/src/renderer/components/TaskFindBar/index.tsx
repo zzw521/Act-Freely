@@ -94,13 +94,13 @@ const TaskFindBar: React.FC<TaskFindBarProps> = ({ messages, turnEvents, onClose
       <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-3)', minWidth: 52, textAlign: 'center' }}>
         {query.trim() ? (matches.length ? `${cursor + 1} / ${matches.length} 处` : '0 处') : `${turns.length} 轮对话`}
       </Typography>
-      <IconButton size="small" onClick={() => step(-1)} disabled={!matches.length} sx={{ color: 'var(--tt-text-3)' }}>
+      <IconButton size="small" aria-label="上一处匹配" onClick={() => step(-1)} disabled={!matches.length} sx={{ color: 'var(--tt-text-3)' }}>
         <KeyboardArrowUpIcon sx={{ fontSize: 16 }} />
       </IconButton>
-      <IconButton size="small" onClick={() => step(1)} disabled={!matches.length} sx={{ color: 'var(--tt-text-3)' }}>
+      <IconButton size="small" aria-label="下一处匹配" onClick={() => step(1)} disabled={!matches.length} sx={{ color: 'var(--tt-text-3)' }}>
         <KeyboardArrowDownIcon sx={{ fontSize: 16 }} />
       </IconButton>
-      <IconButton size="small" onClick={onClose} sx={{ color: 'var(--tt-text-3)' }}>
+      <IconButton size="small" aria-label="关闭查找" onClick={onClose} sx={{ color: 'var(--tt-text-3)' }}>
         <CloseIcon sx={{ fontSize: 15 }} />
       </IconButton>
     </Box>

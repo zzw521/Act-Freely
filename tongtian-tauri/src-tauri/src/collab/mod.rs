@@ -23,6 +23,12 @@ use crate::auth::service as auth_service;
 use crate::store::Store;
 use crate::P0Services;
 
+/// 项目事件订阅（缺陷 D-06）：把服务端 SSE 流转成桌面事件，替掉 10 秒轮询
+pub mod watch;
+
+/// 工单桥（缺陷 D-47）：服务端工单层的 14 个端点逐一映射成桌面命令
+pub mod tickets;
+
 const MAX_BASE_LEN: usize = 2048;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -49,7 +55,7 @@ fn host_is_loopback(url: &reqwest::Url) -> bool {
 }
 
 /// 归一协作服务地址：远程 HTTPS、本机回环可 HTTP、拒绝内嵌凭据与查询串
-fn normalize_base(raw: &str) -> Result<String, String> {
+pub(crate) fn normalize_base(raw: &str) -> Result<String, String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err(invalid_base("未配置协作服务地址"));
@@ -86,7 +92,18 @@ fn normalize_base(raw: &str) -> Result<String, String> {
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
-fn client_for_base(base: &str) -> Result<reqwest::Client, String> {
+pub(crate) fn client_for_base(base: &str) -> Result<reqwest::Client, String> {
+    build_client(base, Some(REQUEST_TIMEOUT))
+}
+
+/// SSE 专用：只设连接超时，不设整请求超时。
+/// reqwest 的 `.timeout()` 覆盖整个响应体，长连接会在 30 秒被自己掐断；
+/// 事件流的静默判定交给订阅侧的看门狗（45 秒），别由客户端超时代劳。
+pub(crate) fn stream_client_for_base(base: &str) -> Result<reqwest::Client, String> {
+    build_client(base, None)
+}
+
+fn build_client(base: &str, total_timeout: Option<Duration>) -> Result<reqwest::Client, String> {
     let local = reqwest::Url::parse(base)
         .map(|url| host_is_loopback(&url))
         .unwrap_or(false);
@@ -94,8 +111,11 @@ fn client_for_base(base: &str) -> Result<reqwest::Client, String> {
         // 不让 302 把带 token 的请求带去别的地址
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
         .user_agent("TongTianOffice-Collab/1.0");
+    let builder = match total_timeout {
+        Some(timeout) => builder.timeout(timeout),
+        None => builder,
+    };
     let builder = if local {
         builder.no_proxy()
     } else {
@@ -108,7 +128,7 @@ fn client_for_base(base: &str) -> Result<reqwest::Client, String> {
 
 // ── 错误映射 ────────────────────────────────────────────────────
 
-fn network_reason(err: &reqwest::Error) -> &'static str {
+pub(crate) fn network_reason(err: &reqwest::Error) -> &'static str {
     if err.is_timeout() {
         "连接或读取超时"
     } else if err.is_connect() {
@@ -130,7 +150,7 @@ fn server_error(status: u16, body: &Value) -> String {
 }
 
 /// 发出请求；401 时用注入的刷新器换一次 token 再试，最多两次
-async fn request_with<Fut>(
+pub(crate) async fn request_with<Fut>(
     base: &str,
     method: reqwest::Method,
     path: &str,
@@ -176,7 +196,7 @@ where
     Err("COLLAB_AUTH_EXPIRED: 登录态已失效，请重新登录".to_string())
 }
 
-async fn request(
+pub(crate) async fn request(
     store: &Store,
     method: reqwest::Method,
     path: &str,
@@ -194,7 +214,7 @@ async fn request(
     .await
 }
 
-fn project_path(project_id: &str) -> String {
+pub(crate) fn project_path(project_id: &str) -> String {
     format!("/api/v1/projects/{project_id}")
 }
 

@@ -101,13 +101,13 @@ const LocalModelDetect: React.FC<LocalModelDetectProps> = ({ existing, onAdded }
   const busy = detecting || adding !== null;
 
   return (
-    <Box sx={{ bgcolor: '#FFFFFF', border: '1px solid #E5E7EB', borderRadius: '14px', p: 3, mb: 2 }}>
+    <Box sx={{ bgcolor: 'var(--tt-surface)', border: '1px solid var(--tt-border)', borderRadius: '14px', p: 3, mb: 2 }}>
       <Box sx={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 2 }}>
         <Box sx={{ minWidth: 0 }}>
-          <Typography sx={{ fontSize: '15px', fontWeight: 600, color: '#111827' }}>
+          <Typography sx={{ fontSize: '15px', fontWeight: 600, color: 'var(--tt-text-1)' }}>
             本地模型（Ollama）
           </Typography>
-          <Typography sx={{ fontSize: '12px', color: '#6B7280', mt: 0.5, lineHeight: 1.7 }}>
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-2)', mt: 0.5, lineHeight: 1.7 }}>
             自动检测本机已下载的模型。检测只访问本机回环地址，不会出网；连不上会如实说明，不会假装检测成功。
           </Typography>
         </Box>
@@ -121,11 +121,11 @@ const LocalModelDetect: React.FC<LocalModelDetectProps> = ({ existing, onAdded }
             flexShrink: 0,
             borderRadius: '10px',
             px: 2,
-            color: '#374151',
-            border: '1px solid #E5E7EB',
+            color: 'var(--tt-text-2)',
+            border: '1px solid var(--tt-border)',
             fontSize: '13px',
             fontWeight: 600,
-            '&:hover': { background: '#F9FAFB', border: '1px solid #D1D5DB' },
+            '&:hover': { background: 'var(--tt-surface-2)', border: '1px solid var(--tt-border)' },
           }}
         >
           {detecting ? '检测中…' : '检测本机 Ollama'}
@@ -160,14 +160,14 @@ const LocalModelDetect: React.FC<LocalModelDetectProps> = ({ existing, onAdded }
       {result && result.available && (
         <Box sx={{ mt: 2 }}>
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
-            <CheckCircleOutlineIcon sx={{ fontSize: 16, color: '#16A34A' }} />
-            <Typography sx={{ fontSize: '12px', color: '#166534' }}>
+            <CheckCircleOutlineIcon sx={{ fontSize: 16, color: 'var(--tt-success)' }} />
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-success)' }}>
               已连接 {result.endpoint}（{result.latencyMs}ms）
             </Typography>
             <Chip
               label={`${result.models.length} 个模型`}
               size="small"
-              sx={{ height: 18, fontSize: '10px', bgcolor: '#DCFCE7', color: '#166534' }}
+              sx={{ height: 18, fontSize: '10px', bgcolor: 'var(--tt-chip-success)', color: 'var(--tt-success)' }}
             />
           </Box>
 
@@ -187,7 +187,7 @@ const LocalModelDetect: React.FC<LocalModelDetectProps> = ({ existing, onAdded }
                       alignItems: 'center',
                       gap: 1.5,
                       py: 1.2,
-                      borderTop: '1px solid #F3F4F6',
+                      borderTop: '1px solid var(--tt-border)',
                     }}
                   >
                     <Box sx={{ flexGrow: 1, minWidth: 0 }}>
@@ -195,7 +195,7 @@ const LocalModelDetect: React.FC<LocalModelDetectProps> = ({ existing, onAdded }
                         sx={{
                           fontSize: '13.5px',
                           fontWeight: 600,
-                          color: '#111827',
+                          color: 'var(--tt-text-1)',
                           fontFamily: 'Consolas, monospace',
                           overflow: 'hidden',
                           textOverflow: 'ellipsis',
@@ -205,7 +205,7 @@ const LocalModelDetect: React.FC<LocalModelDetectProps> = ({ existing, onAdded }
                       >
                         {m.name}
                       </Typography>
-                      <Typography sx={{ fontSize: '11px', color: '#9CA3AF' }}>
+                      <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
                         {formatSize(m.sizeBytes)} · 上下文窗口默认 4096，可在模型编辑中调整
                       </Typography>
                     </Box>
@@ -213,7 +213,7 @@ const LocalModelDetect: React.FC<LocalModelDetectProps> = ({ existing, onAdded }
                       <Chip
                         label="已添加"
                         size="small"
-                        sx={{ height: 22, fontSize: '11px', bgcolor: '#F3F4F6', color: '#6B7280' }}
+                        sx={{ height: 22, fontSize: '11px', bgcolor: 'var(--tt-chip-neutral)', color: 'var(--tt-text-2)' }}
                       />
                     ) : (
                       <Button

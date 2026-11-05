@@ -11,7 +11,9 @@
 
 import { create } from 'zustand';
 import type { ImChannelView, ImSession } from '../../shared/contracts';
+import { errorTextOf } from '../../shared/error-messages';
 import { getImChannels } from '../lib/alignment-api';
+import { ensureEngineStarted } from '../lib/engine-endpoint';
 
 /** IM 渠道标识：由引擎清单下发，前端不穷举 */
 export type ImChannelSource = string;
@@ -21,9 +23,10 @@ const FALLBACK_META = { label: 'IM 频道', color: '#94A3B8' };
 /** 已知渠道的展示色；引擎新增渠道时自动落到中性色，不需要前端同步改表 */
 const KNOWN_META: Record<string, { label: string; color: string }> = {
   dingtalk: { label: '钉钉', color: '#3B82F6' },
-  feishu: { label: '飞书', color: '#8B5CF6' },
+  feishu: { label: '飞书', color: 'var(--tt-accent-violet)' },
   wecom: { label: '企业微信', color: '#10B981' },
   wechat: { label: '微信', color: '#22C55E' },
+  yuanbao: { label: '腾讯元宝', color: '#0EA5E9' },
   slack: { label: 'Slack', color: '#611F69' },
 };
 
@@ -59,7 +62,13 @@ interface ImChannelState {
   /** 最近一次拉取失败的原始错误（`CODE: detail`），页面用 errorTextOf 展示 */
   error: string;
 
-  loadSessions: () => Promise<void>;
+  /**
+   * 拉取频道清单与会话台账。
+   * `startWorkspaceId` 非空时先确保该工作空间的引擎已启动（幂等）：
+   * IM 页直接打开时不能指望用户先发一条消息把引擎拉起来。
+   * 侧边栏的常驻刷新不传这个参数，避免每次轮询都碰引擎生命周期。
+   */
+  loadSessions: (startWorkspaceId?: string) => Promise<void>;
 }
 
 function toSessionRows(sessions: ImSession[]): ChannelSession[] {
@@ -82,10 +91,18 @@ export const useImChannelStore = create<ImChannelState>((set, get) => ({
   loaded: false,
   error: '',
 
-  loadSessions: async () => {
+  loadSessions: async (startWorkspaceId) => {
     const my = ++seq;
     set({ loading: true });
     try {
+      if (startWorkspaceId) {
+        // 启动失败不在这里另造错误：紧接着的 im:channels 会给出引擎侧的真实原因
+        try {
+          await ensureEngineStarted(startWorkspaceId);
+        } catch {
+          /* 由下面的 getImChannels 如实回报不可用 */
+        }
+      }
       const snap = await getImChannels();
       if (my !== seq) return;
       set({
@@ -101,7 +118,7 @@ export const useImChannelStore = create<ImChannelState>((set, get) => ({
       set({
         loading: false,
         loaded: true,
-        error: err instanceof Error ? err.message : String(err),
+        error: errorTextOf(err, 'IM 频道状态读取失败'),
       });
     }
   },

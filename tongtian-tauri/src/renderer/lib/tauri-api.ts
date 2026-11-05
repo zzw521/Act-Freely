@@ -13,8 +13,12 @@ import type {
   AuthLoginResp,
   AuthProfile,
   AuthStatus,
+  CollabEvent,
+  CollabWatchStateEvent,
+  SuperagentPumpSummary,
 } from '../../shared/contracts';
 import { IPC_CHANNELS } from '../../shared/contracts';
+import { laneDispatchOf } from '../../shared/ipc-lanes';
 import { EventStreamGuard } from './event-stream-guard';
 
 /** 以 serverId 为唯一入参的 MCP 通道 → Rust command 名 */
@@ -41,9 +45,37 @@ export function isTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
 
+/**
+ * 订阅一个 Tauri 事件通道，返回取消函数。
+ * 覆盖「监听器还没注册上组件就卸载了」的情况：那时 to() 一到就立刻反注册。
+ */
+function subscribeEvent<T>(name: string, callback: (payload: T) => void): () => void {
+  let disposed = false;
+  let unlisten: (() => void) | undefined;
+  listen<T>(name, (e) => {
+    if (!disposed) callback(e.payload);
+  }).then((un) => {
+    if (disposed) {
+      un();
+    } else {
+      unlisten = un;
+    }
+  });
+  return () => {
+    disposed = true;
+    unlisten?.();
+  };
+}
+
 export const tauriAPI = {
   // ── 通用 IPC 接口 ──────────────────────────────────────
   invoke: async (channel: string, ...args: unknown[]): Promise<unknown> => {
+    // #164 IPC 车道：车道通道走单点分派。窗口加命令只改 contracts_<lane>.ts 与
+    // src-tauri/src/ipc/<lane>.rs，不必再打开本文件逐条加 `if`（没有 git，抢同一行就是静默覆盖）。
+    const laneDispatch = laneDispatchOf(channel);
+    if (laneDispatch) {
+      return invoke(laneDispatch.command, { method: laneDispatch.method, payload: args[0] ?? null });
+    }
     if (channel === 'system:info') {
       return invoke('system_info');
     }
@@ -53,11 +85,21 @@ export const tauriAPI = {
         workspaceId: (args[0] as string | undefined) ?? null,
       });
     }
+    // 按需拉起引擎：只给必须由引擎承载、且由**用户主动点**的地方用（IM 频道页与产物预览
+    // 的「启动引擎并重试」），命令侧已做幂等复用
+    if (channel === IPC_CHANNELS.ENGINE_START) {
+      return invoke('agent_start_workspace', {
+        workspaceId: (args[0] as string | undefined) || 'default',
+      });
+    }
     if (channel === 'chat:history') {
       return invoke('chat_history', { limit: args[0] as number | undefined });
     }
     if (channel === 'chat:conversations') {
-      return invoke('chat_conversations', { limit: args[0] as number | undefined });
+      return invoke('chat_conversations', {
+        limit: args[0] as number | undefined,
+        workspaceId: (args[1] as string | undefined) || null,
+      });
     }
     if (channel === 'chat:messages') {
       return invoke('chat_messages', {
@@ -125,6 +167,9 @@ export const tauriAPI = {
     }
     if (channel === 'usage:report') {
       return invoke('usage_report', { period: args[0] as string });
+    }
+    if (channel === 'usage:upload') {
+      return invoke('usage_upload');
     }
     if (channel === 'settings:get') return invoke('settings_get');
     // 设置页以对象 patch 整体提交：逐键落库并触发系统行为联动（保持唤醒等）
@@ -246,6 +291,244 @@ export const tauriAPI = {
         artifacts: req.artifacts ?? [],
         machine: req.machine ?? '',
         status: req.status ?? 'review',
+      });
+    }
+    // 项目事件订阅（缺陷 D-06）：游标取页面当前快照的 seq，快照之后的变更都从流里来
+    if (channel === 'collab:watchStart') {
+      const req = (args[0] ?? {}) as { projectId?: string; sinceSeq?: number };
+      return invoke('collab_watch_start', {
+        projectId: req.projectId ?? '',
+        sinceSeq: req.sinceSeq ?? 0,
+      });
+    }
+    if (channel === 'collab:watchStop') {
+      const req = (args[0] ?? {}) as { projectId?: string };
+      return invoke('collab_watch_stop', { projectId: req.projectId ?? '' });
+    }
+    if (channel === 'collab:watchStatus') {
+      return invoke('collab_watch_status');
+    }
+    // ── 工单层（缺陷 D-47 · 无授权工作单元与待人工状态机）──
+    // 桥接命令在 Rust 侧 collab/tickets.rs；参数名按 Tauri v2 的 camelCase→snake_case 对齐。
+    if (channel === 'collab:ticketMyTickets') {
+      const req = (args[0] ?? {}) as { needsHuman?: boolean; limit?: number };
+      return invoke('collab_ticket_my_tickets', {
+        needsHuman: req.needsHuman ?? null,
+        limit: req.limit ?? null,
+      });
+    }
+    if (channel === 'collab:ticketList') {
+      const req = (args[0] ?? {}) as { projectId?: string; stage?: string | null; limit?: number };
+      return invoke('collab_ticket_list', {
+        projectId: req.projectId ?? '',
+        stage: req.stage ?? null,
+        limit: req.limit ?? null,
+      });
+    }
+    if (channel === 'collab:ticketDetail') {
+      const req = (args[0] ?? {}) as { projectId?: string; ticketId?: string };
+      return invoke('collab_ticket_detail', {
+        projectId: req.projectId ?? '',
+        ticketId: req.ticketId ?? '',
+      });
+    }
+    if (channel === 'collab:ticketCreate') {
+      const req = (args[0] ?? {}) as { projectId?: string; input?: unknown };
+      return invoke('collab_ticket_create', {
+        projectId: req.projectId ?? '',
+        input: req.input ?? {},
+      });
+    }
+    if (channel === 'collab:ticketSubscribe') {
+      const req = (args[0] ?? {}) as {
+        projectId?: string;
+        ticketId?: string;
+        targetRef?: string;
+        targetKind?: string;
+      };
+      return invoke('collab_ticket_subscribe', {
+        projectId: req.projectId ?? '',
+        ticketId: req.ticketId ?? '',
+        targetRef: req.targetRef ?? '',
+        targetKind: req.targetKind ?? null,
+      });
+    }
+    if (channel === 'collab:ticketClaim') {
+      const req = (args[0] ?? {}) as { projectId?: string; ticketId?: string; input?: unknown };
+      return invoke('collab_ticket_claim', {
+        projectId: req.projectId ?? '',
+        ticketId: req.ticketId ?? '',
+        input: req.input ?? {},
+      });
+    }
+    if (channel === 'collab:ticketEndAssignment') {
+      const req = (args[0] ?? {}) as {
+        projectId?: string;
+        ticketId?: string;
+        assignmentId?: string;
+        status?: string;
+        exitReason?: string;
+      };
+      return invoke('collab_ticket_end_assignment', {
+        projectId: req.projectId ?? '',
+        ticketId: req.ticketId ?? '',
+        assignmentId: req.assignmentId ?? '',
+        status: req.status ?? 'finished',
+        exitReason: req.exitReason ?? null,
+      });
+    }
+    if (channel === 'collab:ticketReport') {
+      const req = (args[0] ?? {}) as { projectId?: string; ticketId?: string; input?: unknown };
+      return invoke('collab_ticket_report', {
+        projectId: req.projectId ?? '',
+        ticketId: req.ticketId ?? '',
+        input: req.input ?? {},
+      });
+    }
+    if (channel === 'collab:ticketHandback') {
+      const req = (args[0] ?? {}) as {
+        projectId?: string;
+        ticketId?: string;
+        assignmentId?: string;
+        reason?: string;
+        requested?: string;
+      };
+      return invoke('collab_ticket_handback', {
+        projectId: req.projectId ?? '',
+        ticketId: req.ticketId ?? '',
+        assignmentId: req.assignmentId ?? '',
+        reason: req.reason ?? '',
+        requested: req.requested ?? '',
+      });
+    }
+    if (channel === 'collab:ticketAnswer') {
+      const req = (args[0] ?? {}) as {
+        projectId?: string;
+        ticketId?: string;
+        attentionId?: string;
+        answer?: string;
+      };
+      return invoke('collab_ticket_answer', {
+        projectId: req.projectId ?? '',
+        ticketId: req.ticketId ?? '',
+        attentionId: req.attentionId ?? '',
+        answer: req.answer ?? '',
+      });
+    }
+    if (channel === 'collab:ticketAccept') {
+      const req = (args[0] ?? {}) as {
+        projectId?: string;
+        ticketId?: string;
+        accept?: boolean;
+        note?: string;
+      };
+      return invoke('collab_ticket_accept', {
+        projectId: req.projectId ?? '',
+        ticketId: req.ticketId ?? '',
+        accept: req.accept ?? true,
+        note: req.note ?? null,
+      });
+    }
+    if (channel === 'collab:ticketAmend') {
+      const req = (args[0] ?? {}) as {
+        projectId?: string;
+        ticketId?: string;
+        brief?: string;
+        scope?: string;
+        outOfScope?: string;
+        reason?: string;
+      };
+      return invoke('collab_ticket_amend', {
+        projectId: req.projectId ?? '',
+        ticketId: req.ticketId ?? '',
+        brief: req.brief ?? '',
+        scope: req.scope ?? null,
+        outOfScope: req.outOfScope ?? null,
+        reason: req.reason ?? null,
+      });
+    }
+    if (channel === 'collab:ticketStop') {
+      const req = (args[0] ?? {}) as { projectId?: string; ticketId?: string; reason?: string };
+      return invoke('collab_ticket_stop', {
+        projectId: req.projectId ?? '',
+        ticketId: req.ticketId ?? '',
+        reason: req.reason ?? null,
+      });
+    }
+    if (channel === 'collab:ticketMarkRead') {
+      const req = (args[0] ?? {}) as {
+        projectId?: string;
+        ticketId?: string;
+        assignmentId?: string;
+        eventSeq?: number;
+      };
+      return invoke('collab_ticket_mark_read', {
+        projectId: req.projectId ?? '',
+        ticketId: req.ticketId ?? '',
+        assignmentId: req.assignmentId ?? '',
+        eventSeq: req.eventSeq ?? 0,
+      });
+    }
+    // ── Super-agent 主动候选（缺陷 D-46 · 影子段）──
+    // 命令名与参数名都按 Rust 的 snake_case/camelCase 对齐；显示名由 Rust 一并给（见 superagent/mod.rs）
+    if (channel === IPC_CHANNELS.SUPERAGENT_STATS) {
+      return invoke('superagent_stats');
+    }
+    if (channel === IPC_CHANNELS.SUPERAGENT_LIST_SOURCES) {
+      return invoke('superagent_list_sources');
+    }
+    if (channel === IPC_CHANNELS.SUPERAGENT_REGISTER_SOURCE) {
+      const req = (args[0] ?? {}) as {
+        kind?: string;
+        instance?: string;
+        label?: string;
+        config?: Record<string, unknown>;
+      };
+      return invoke('superagent_register_source', {
+        kind: req.kind ?? '',
+        instance: req.instance ?? '',
+        label: req.label ?? '',
+        config: req.config ?? {},
+      });
+    }
+    if (channel === IPC_CHANNELS.SUPERAGENT_SET_SOURCE_ENABLED) {
+      const req = (args[0] ?? {}) as { sourceId?: string; enabled?: boolean };
+      return invoke('superagent_set_source_enabled', {
+        sourceId: req.sourceId ?? '',
+        enabled: req.enabled === true,
+      });
+    }
+    if (channel === IPC_CHANNELS.SUPERAGENT_LIST_CANDIDATES) {
+      return invoke('superagent_list_candidates', { limit: (args[0] as number | undefined) ?? null });
+    }
+    if (channel === IPC_CHANNELS.SUPERAGENT_LIST_DECISIONS) {
+      return invoke('superagent_list_decisions', { limit: (args[0] as number | undefined) ?? null });
+    }
+    if (channel === IPC_CHANNELS.SUPERAGENT_LIST_TRIGGERS) {
+      return invoke('superagent_list_triggers', { limit: (args[0] as number | undefined) ?? null });
+    }
+    if (channel === IPC_CHANNELS.SUPERAGENT_GET_TRIGGER) {
+      return invoke('superagent_get_trigger', { triggerId: (args[0] as string) ?? '' });
+    }
+    if (channel === IPC_CHANNELS.SUPERAGENT_GET_POLICY) {
+      return invoke('superagent_get_policy');
+    }
+    if (channel === IPC_CHANNELS.SUPERAGENT_SAVE_POLICY) {
+      return invoke('superagent_save_policy', { doc: args[0] });
+    }
+    if (channel === IPC_CHANNELS.SUPERAGENT_POLICY_VERSIONS) {
+      return invoke('superagent_policy_versions', { limit: (args[0] as number | undefined) ?? null });
+    }
+    if (channel === IPC_CHANNELS.SUPERAGENT_PUMP_NOW) {
+      return invoke('superagent_pump_now');
+    }
+    if (channel === IPC_CHANNELS.SUPERAGENT_ASSESS_NOW) {
+      // 只有 limit 可传（这一轮最多判几条）；预算与配额闸门都在 Rust 侧，前端传不进去
+      return invoke('superagent_assess_now', { limit: (args[0] as number | undefined) ?? null });
+    }
+    if (channel === IPC_CHANNELS.SUPERAGENT_EXPORT_CANDIDATES) {
+      return invoke('superagent_export_candidates', {
+        format: (args[0] as string | undefined) ?? null,
       });
     }
     // ── 安全与治理（PRD §4.7） ──
@@ -372,6 +655,18 @@ export const tauriAPI = {
     if (channel === 'market:trustGet') return invoke('market_trust_get');
     if (channel === 'market:trustAdd') return invoke('market_trust_add', { req: args[0] });
     if (channel === 'market:trustRemove') return invoke('market_trust_remove', { req: args[0] });
+    if (channel === 'market:updateCheck') return invoke('market_update_check');
+    if (channel === 'market:installedList') return invoke('market_installed_list');
+    // 升级走与安装同一条校验链，只传 itemId：下载地址仍由 Rust 重新拉索引取得
+    if (channel === 'market:skillUpgrade') {
+      const req = (args[0] ?? {}) as { itemId?: string; id?: string };
+      return invoke('market_skill_upgrade', { req: { itemId: req.itemId ?? req.id ?? '' } });
+    }
+    if (channel === 'market:suiteUpgrade') {
+      const req = (args[0] ?? {}) as { itemId?: string; id?: string };
+      return invoke('market_suite_upgrade', { req: { itemId: req.itemId ?? req.id ?? '' } });
+    }
+    if (channel === 'market:upgradeAll') return invoke('market_upgrade_all');
     // ── MCP 连接器（配置落 SQLite mcp_servers，连接由 Rust 发起真实握手） ──
     if (channel === 'mcp:listServers') return invoke('mcp_list_servers');
     if (channel === 'mcp:addServer') return invoke('mcp_add_server', { req: args[0] });
@@ -525,10 +820,11 @@ export const tauriAPI = {
     // ── 本地知识库（knowledge_*：目录是事实来源；删除为软删除） ──
     if (channel === 'knowledge:list') return invoke('knowledge_list');
     if (channel === 'knowledge:create') {
-      const req = (args[0] ?? {}) as { name?: string; description?: string };
+      const req = (args[0] ?? {}) as { name?: string; description?: string; scope?: string };
       return invoke('knowledge_create', {
         name: req.name ?? '',
         description: req.description ?? null,
+        scope: req.scope ?? null,
       });
     }
     if (channel === 'knowledge:update') {
@@ -537,12 +833,14 @@ export const tauriAPI = {
         name?: string;
         description?: string;
         enabled?: boolean;
+        scope?: string;
       };
       return invoke('knowledge_update', {
         kbId: req.kbId ?? '',
         name: req.name ?? null,
         description: req.description ?? null,
         enabled: req.enabled ?? null,
+        scope: req.scope ?? null,
       });
     }
     if (channel === 'knowledge:delete') {
@@ -586,17 +884,44 @@ export const tauriAPI = {
     // ── 意识（awareness_*：画像 + 四个能力文件 + 长期记忆条目，落盘 ~/.tongtianwork/awareness/main） ──
     if (channel === 'awareness:get') return invoke('awareness_get');
     if (channel === 'awareness:update') return invoke('awareness_update', { patch: args[0] ?? {} });
-    if (channel === 'awareness:memories') return invoke('awareness_memories');
+    if (channel === 'awareness:memories') return invoke('memory_list');
     if (channel === 'awareness:memoryAdd') {
-      const req = (args[0] ?? {}) as { content?: string; source?: string };
-      return invoke('awareness_memory_add', {
+      const req = (args[0] ?? {}) as {
+        content?: string;
+        source?: string;
+        scope?: string;
+        workspaceId?: string;
+      };
+      return invoke('memory_add', {
         content: req.content ?? '',
         source: req.source ?? null,
+        scope: req.scope ?? null,
+        workspaceId: req.workspaceId ?? null,
       });
     }
     if (channel === 'awareness:memoryDelete') {
       const req = (args[0] ?? {}) as { id?: string };
-      return invoke('awareness_memory_delete', { id: req.id ?? '' });
+      return invoke('memory_delete', { id: req.id ?? '' });
+    }
+    if (channel === 'awareness:memoryReview') {
+      const req = (args[0] ?? {}) as { id?: string; action?: string };
+      return invoke('memory_review', { id: req.id ?? '', action: req.action ?? '' });
+    }
+    if (channel === 'awareness:memoryEntities') {
+      const req = (args[0] ?? {}) as { workspaceId?: string | null };
+      return invoke('memory_entities', { workspaceId: req.workspaceId ?? null });
+    }
+    if (channel === 'awareness:memoryExport') return invoke('memory_export');
+    if (channel === 'awareness:memoryImport') {
+      const req = (args[0] ?? {}) as { json?: string };
+      return invoke('memory_import', { json: req.json ?? '' });
+    }
+    if (channel === 'awareness:memoryCompact') return invoke('memory_compact');
+    if (channel === 'awareness:memoryDocSync') return invoke('memory_doc_sync');
+    if (channel === 'awareness:memoryExportPackage') return invoke('memory_export_package');
+    if (channel === 'awareness:memoryImportPackage') {
+      const req = (args[0] ?? {}) as { data?: string };
+      return invoke('memory_import_package', { data: req.data ?? '' });
     }
     // ── IM 频道（im_*：Rust 代理引擎 /api/im/*，长连接只在引擎进程里） ──
     if (channel === 'im:channels') return invoke('im_channels');
@@ -605,6 +930,17 @@ export const tauriAPI = {
       return invoke('im_configure', {
         kind: req.kind ?? '',
         credentials: req.credentials ?? {},
+      });
+    }
+    if (channel === 'im:loginStart') {
+      return invoke('im_login_start', { kind: String((args[0] as { kind?: string })?.kind ?? '') });
+    }
+    if (channel === 'im:loginPoll') {
+      const req = (args[0] ?? {}) as { kind?: string; ticket?: string; verifyCode?: string };
+      return invoke('im_login_poll', {
+        kind: req.kind ?? '',
+        ticket: req.ticket ?? '',
+        verifyCode: req.verifyCode ?? '',
       });
     }
     if (channel === 'im:start') return invoke('im_start', { kind: String((args[0] as { kind?: string })?.kind ?? '') });
@@ -650,9 +986,13 @@ export const tauriAPI = {
       // 只传模型 id，密钥由 Rust 从 keyring 补齐后随引擎请求下发。
       modelBinding: req.modelBinding,
       modelId: req.modelId,
+      // 上一轮用的模型 id：换模型时执行面要说清「历史仍带着、只是重新编码」
+      previousModelId: req.previousModelId,
       // 本轮负责人专家：只传注册表 id，提示词与模型绑定由 Rust/引擎解析
       expertId: req.expertId,
       workDir: req.workDir,
+      // 文件访问档位：与 workDir 成对下发，Rust 拿它决定能写到哪、能不能删（缺省最保守档）
+      filePermission: req.filePermission,
       history: req.history,
     }) as Promise<{ taskId: string }>;
   },
@@ -678,6 +1018,10 @@ export const tauriAPI = {
   /** 附件暂存（交互补设计 §3.1） */
   fileStageAttachment: (srcPath: string, taskId?: string, workspaceId?: string): Promise<Record<string, unknown>> =>
     invoke('file_stage_attachment', { srcPath, taskId, workspaceId }) as Promise<Record<string, unknown>>,
+
+  /** 文件夹附件暂存：递归复制受支持的文件，返回逐文件 AttachmentMeta */
+  fileStageFolder: (srcPath: string, taskId?: string, workspaceId?: string): Promise<Record<string, unknown>[]> =>
+    invoke('file_stage_folder', { srcPath, taskId, workspaceId }) as Promise<Record<string, unknown>[]>,
 
   // ── 三层架构演进 P0 新增 command ──────────────────
   /** 取消任务（转移 #3/#8/#19/#23/#28 → cancelled） */
@@ -716,6 +1060,21 @@ export const tauriAPI = {
       unlisten?.();
     };
   },
+
+  /** 订阅项目事件（缺陷 D-06：Rust 侧订阅账号服务的事件流后转发，替代 10 秒轮询） */
+  onCollabEvent: (callback: (event: CollabEvent) => void): (() => void) =>
+    subscribeEvent<CollabEvent>('collab-event', callback),
+
+  /** 订阅项目事件订阅自身的状态（streaming / degraded / closed / stopped…） */
+  onCollabWatchState: (callback: (event: CollabWatchStateEvent) => void): (() => void) =>
+    subscribeEvent<CollabWatchStateEvent>('collab-watch-state', callback),
+
+  /**
+   * 订阅后台巡检摘要（缺陷 D-46）。
+   * 只在「有事发生」时投：新事件入账、新候选、或某个入口报错；空转不打扰界面。
+   */
+  onSuperagentEvent: (callback: (summary: SuperagentPumpSummary) => void): (() => void) =>
+    subscribeEvent<SuperagentPumpSummary>('superagent-event', callback),
 
   // ── Auth（账号与登录态 · 网页验证登录 Loopback 方案） ──────
   /** 登录态视图（settings_kv profile + keyring token） */

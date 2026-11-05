@@ -23,6 +23,7 @@ pub mod audit;
 pub mod classify;
 pub mod compliance;
 pub mod environment;
+pub mod file_perm;
 pub mod permissions;
 pub mod pii;
 pub mod policy;
@@ -143,11 +144,13 @@ pub async fn sandbox_policy_set(
         audit::SEV_INFO,
         &format!("sandbox:{}", stored.workspace_id),
         &format!(
-            "沙箱策略更新：级别={} CPU≤{}% 内存≤{}MB 写盘≤{}MB/s",
+            "沙箱策略更新：级别={} CPU≤{}% 内存≤{}MB 写盘≤{}MB/s 命令执行={} 通用shell={}",
             stored.execution_level,
             stored.max_cpu_percent,
             stored.max_memory_mb,
-            stored.max_disk_write_mbps
+            stored.max_disk_write_mbps,
+            if stored.exec_enabled { "开" } else { "关" },
+            if stored.shell_enabled { "开" } else { "关" }
         ),
     );
     Ok(serde_json::to_value(stored).unwrap_or(Value::Null))

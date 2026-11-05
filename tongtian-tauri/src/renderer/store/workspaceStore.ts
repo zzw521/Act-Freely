@@ -10,6 +10,7 @@ import { create } from 'zustand';
 import { IPC_CHANNELS } from '../../shared/contracts';
 import type { WorkspaceInfo } from '../../shared/contracts';
 import { DEFAULT_WORKSPACE } from '../lib/workspace-local';
+import { errorTextOf } from '../../shared/error-messages';
 
 export const DEFAULT_WORKSPACE_ID = DEFAULT_WORKSPACE;
 const ACTIVE_WORKSPACE_KEY = 'tt:active-workspace';
@@ -82,7 +83,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     } catch (e) {
       set({
         loading: false,
-        error: e instanceof Error ? e.message : String(e),
+        error: errorTextOf(e, '工作区列表读取失败'),
       });
       throw e;
     }

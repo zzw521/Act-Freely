@@ -301,6 +301,38 @@ def main() -> None:
               wrong_body.get("available") is False
               and "没有 models 数组" in str(wrong_body.get("error") or ""),
               wrong.text[:300])
+
+        # 9 ── 属主守卫：桌面端拉起时引擎只读，不再写第二份 models.json
+        prev_owner = os.environ.get("TT_ENGINE_MODEL_STORE")
+        os.environ["TT_ENGINE_MODEL_STORE"] = "desktop"
+        try:
+            read_ok = client.get("/api/models")
+            check("属主守卫：桌面模式下读取仍可用", read_ok.status_code == 200, read_ok.text[:200])
+            for path, payload in (
+                ("/api/models", {"name": "守卫新增", "source": "openai_compat",
+                                 "baseUrl": "https://guard.example/v1", "modelName": "guard"}),
+                ("/api/models/update", {"id": "any", "name": "守卫更新"}),
+                ("/api/models/delete", {"id": "any"}),
+                ("/api/models/default", {"id": "any"}),
+                ("/api/models/config", {"models": []}),
+            ):
+                blocked = client.post(path, json=payload)
+                check(f"属主守卫：{path} 在桌面模式被拒绝（409 MODEL_STORE_DESKTOP_OWNED）",
+                      blocked.status_code == 409
+                      and blocked.json().get("code") == "MODEL_STORE_DESKTOP_OWNED",
+                      blocked.text[:200])
+        finally:
+            if prev_owner is None:
+                os.environ.pop("TT_ENGINE_MODEL_STORE", None)
+            else:
+                os.environ["TT_ENGINE_MODEL_STORE"] = prev_owner
+        reopened = client.post("/api/models", json={
+            "name": "浏览器直连模型",
+            "source": "openai_compat",
+            "baseUrl": "https://browser.example/v1",
+            "modelName": "browser",
+        })
+        check("属主守卫：撤销标记后浏览器直连仍可新增", reopened.status_code == 200, reopened.text[:200])
     finally:
         for server in (ollama_server, not_ollama_server):
             if server is not None:

@@ -62,6 +62,8 @@ pub async fn open_task_window(
         .inner_size(1100.0, 780.0)
         .min_inner_size(720.0, 520.0)
         .center()
+        .on_navigation(crate::system::navigation::allow_navigation)
+        .on_new_window(crate::system::navigation::new_window)
         .build()
         .map_err(|e| format!("TASK_WINDOW_CREATE_FAILED: {e}"))?;
     let _ = window.set_focus();

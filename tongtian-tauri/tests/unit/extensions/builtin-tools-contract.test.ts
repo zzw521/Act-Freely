@@ -6,7 +6,8 @@
  * （「命令执行：在本地运行 Shell / CMD / PowerShell 命令」尤其危险）。
  *
  * 现在清单只有一处事实来源（引擎 Toolkit 注册表），三处声明必须逐条对齐：
- *   engine/server.py 的 register_tool_function(...)
+ *   engine/server.py 的 register_tool_function(...)（常驻六件）
+ *   engine/toolkit_lanes.py + engine/toolkit_<domain>.py（模式作用域件与授权件：#164 接缝）
  *   src-tauri/src/bridge/tools.rs 的 BUILTIN_TOOLS
  *   src/shared/builtin-tools.ts 的 DECLARED_BUILTIN_TOOLS
  * 本文件同时锁住通道接线与页面渲染，防止又退回写死的卡片。
@@ -23,6 +24,9 @@ function read(rel: string): string {
 }
 
 const engine = () => read('../../../engine/server.py');
+const toolkitLanes = () => read('../../../engine/toolkit_lanes.py');
+const toolkitArtifact = () => read('../../../engine/toolkit_artifact.py');
+const toolkitExec = () => read('../../../engine/toolkit_exec.py');
 const rustTools = () => read('../../../src-tauri/src/bridge/tools.rs');
 const rustLib = () => read('../../../src-tauri/src/lib.rs');
 const page = () => read('../../../src/renderer/pages/Extensions/index.tsx');
@@ -32,10 +36,12 @@ const mockApi = () => read('../../../src/renderer/lib/mock-api.ts');
 const libApi = () => read('../../../src/renderer/lib/api.ts');
 
 /**
- * 模式作用域工具：只在对应工作台模式下注册，不属于「常驻内置工具」清单。
- * generate_pptx 仅幻灯片模式出现（见下方专项断言），UI 的常驻清单不列它。
+ * 条件注册工具：只在对应工作台模式下注册，不属于「常驻内置工具」清单。
+ * generate_pptx 仅幻灯片模式出现；generate_xlsx / generate_docx（D-33）仅通用与写作模式出现。
+ * 这三件都不进常驻清单——本文件末尾要求 harness 为清单里的每个工具给出实现，
+ * 而 Office 产物生成在 Rust 侧没有实现，写进去就是界面上多一条空头承诺。
  */
-const MODE_SCOPED_TOOLS = ['generate_pptx'] as const;
+const MODE_SCOPED_TOOLS = ['generate_pptx', 'generate_xlsx', 'generate_docx'] as const;
 
 /** 引擎里真正常驻注册的工具函数名（排除模式作用域工具） */
 function engineRegisteredTools(): string[] {
@@ -52,9 +58,12 @@ function rustDeclaredTools(): string[] {
 }
 
 describe('三处清单逐条对齐（漂移即红）', () => {
-  it('引擎注册表就是三个文件工具，且没有别的', () => {
+  it('引擎注册表就是六个文件工具，且没有别的', () => {
     expect(engineRegisteredTools().sort()).toEqual([
+      'delete_text_file',
       'insert_text_file',
+      'list_directory',
+      'read_document',
       'view_text_file',
       'write_text_file',
     ]);
@@ -74,14 +83,31 @@ describe('三处清单逐条对齐（漂移即红）', () => {
   });
 
   it('幻灯片工具只在幻灯片模式注册（不冒充常驻内置工具）', () => {
+    // #164 之后条件注册不在 server.py 里内联：开关集中在 toolkit_lanes.SWITCH_BOARD，
+    // 注册动作在 toolkit_artifact.register()。契约要锁的仍是同一件事——
+    // 「只有挂着模式开关的分支才注册，常驻清单不因此变胖」。
     const body = engine().split('def build_toolkit')[1].split('\ndef ')[0];
-    // 必须挂在 if slides: 分支下，不能在函数体顶层无条件注册
-    expect(body).toMatch(/if slides:\s*\n\s*toolkit\.register_tool_function\(generate_pptx\)/);
-    const topLevel = body
-      .split('\n')
-      .filter((line) => /^    toolkit\.register_tool_function\(/.test(line))
-      .join('\n');
-    expect(topLevel).not.toContain('generate_pptx');
+    expect(body, 'build_toolkit 里不许再内联注册模式作用域工具').not.toMatch(
+      /register_tool_function\((?:generate_\w+|self\._\w+_tool)\)/,
+    );
+    expect(toolkitArtifact()).toMatch(/if ctx\.slides:\s*\n\s*ctx\.toolkit\.register_tool_function\(ctx\.tool\("generate_pptx"\)\)/);
+    expect(toolkitLanes()).toMatch(/"artifact": \("slides", "office"\)/);
+  });
+
+  it('办公产物工具只在通用/写作模式注册（同上，且默认装配里不出现）', () => {
+    expect(toolkitArtifact()).toMatch(
+      /if ctx\.office:\s*\n\s*ctx\.toolkit\.register_tool_function\(ctx\.tool\("generate_xlsx"\)\)\s*\n\s*ctx\.toolkit\.register_tool_function\(ctx\.tool\("generate_docx"\)\)/,
+    );
+    // 默认值必须是关：build_toolkit 的两处默认调用（/api/tools 与本文件的清单口径）
+    // 一旦把 office 缺省打开，常驻清单就会凭空多出两件 Rust 没实现的东西
+    expect(engine()).toMatch(/def build_toolkit\([^)]*office: bool = False/);
+    expect(engine()).toContain('office=rc.normalize_mode(mode) in ("general", "writing")');
+    // 开关全为假时车道必须一件都不注册——这条由运行时判定，不靠测试事后追
+    expect(toolkitLanes()).toContain('这会把没有 Rust 实现的能力塞进常驻清单');
+    // 授权工具同理：grants 未授权时 exec 车道必须空手
+    expect(engine()).toMatch(/if grants is not None:/);
+    expect(toolkitExec()).toMatch(/if ctx\.grants is not None:\s*\n\s*ctx\.grants\.install\(/);
+    expect(toolkitLanes()).toMatch(/"exec": \("grants",\)/);
   });
 });
 
@@ -112,6 +138,15 @@ describe('通道接线：清单要么实测、要么标明是声明值', () => {
     expect(src).toContain('@app.get("/api/tools")');
     expect(src).toContain('toolkit.tools.items()');
     expect(src).toContain('TOOLS_LIST_FAILED');
+  });
+
+  it('默认执行面（本地 harness）也实现了清单里的每个工具', () => {
+    // 普通对话默认走本地 harness；它少实现一个，界面上的「内置工具」就是空头承诺
+    const src = read('../../../src-tauri/src/harness/tools.rs');
+    for (const id of DECLARED_BUILTIN_TOOLS.map((t) => t.id)) {
+      expect(src, `harness 未声明 ${id}`).toContain(`"name": "${id}"`);
+      expect(src, `harness 未分发 ${id}`).toContain(`"${id}" => ToolRun {`);
+    }
   });
 });
 

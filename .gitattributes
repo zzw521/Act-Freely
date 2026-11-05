@@ -1,0 +1,54 @@
+# 换行符与文本属性。配合 core.autocrlf=input：入库统一 LF，检出保持 LF。
+# 本仓库当前工作区文件是 CRLF（zip 下载遗留），规则只影响入库内容与后续检出。
+
+# 默认：自动识别文本，入库归一为 LF
+* text=auto eol=lf
+
+# 必须 LF：shell 脚本要在 Linux/macOS 与 Git Bash 下执行，CRLF 会报 bad interpreter
+*.sh text eol=lf
+*.py text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.rs text eol=lf
+*.mjs text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.xml text eol=lf
+.gitignore text eol=lf
+.qoderignore text eol=lf
+
+# 必须 CRLF：Windows 批处理/PowerShell 对 LF 的 shebang 与 here-string 处理不稳
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制：禁止换行转换与文本 diff
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.icns binary
+*.db binary
+*.sqlite binary
+*.rtf binary
+
+# 本机运行时与随包二进制（.gitignore 已覆盖，这里兜底防止误 add）
+*.exe binary
+*.dll binary
+*.pyd binary
+*.lib binary
+*.zip binary
+*.gz binary
+*.wxs binary
+
+# diff 友好：锁定文件按最小上下文显示
+package-lock.json -diff
+pnpm-lock.yaml -diff

@@ -11,7 +11,8 @@
     <title>任我行</title>
     <link rel="icon" type="image/x-icon" href="./favicon.ico" />
   </head>
-  <body class="bg-surface text-gray-900 antialiased">
+  <!-- 底色不写死：亮暗与皮肤由 theme/bootstrap 在首帧前落到 <html> 的 data-* 上 -->
+  <body>
     <div id="root"></div>
     <script type="module" src="./main.tsx"></script>
   </body>

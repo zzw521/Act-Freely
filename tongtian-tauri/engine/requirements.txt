@@ -6,6 +6,15 @@ fastapi==0.136.3
 uvicorn==0.49.0
 agentscope==1.0.20
 
+# agentscope 1.0.x 的 MCP 客户端按 mcp 1.x 的 API 写死（from mcp.client.streamable_http
+# import streamablehttp_client）。mcp 2.x 删掉了这个符号，不钉版本时 pip 会装到 2.x，
+# 引擎在 import agentscope 那一步就 ImportError（本机 venv 与容器里都会复现）。
+mcp==1.26.0
+
+# agentscope 只声明了 sqlalchemy 本体，asyncio 扩展所需的 greenlet 不会自动装；
+# 缺它时导入期直接抛 "SQLAlchemy asyncio module requires greenlet"。
+greenlet==3.3.2
+
 # 上下文压缩的 token 计数（OpenAITokenCounter 实际依赖 tiktoken 分词表）。
 # 此前只是 agentscope 的传递依赖；引擎现在显式构造计数器，缺包会让压缩不可用。
 tiktoken==0.12.0
@@ -20,6 +29,14 @@ python-multipart==0.0.9
 # 幻灯片模式生成真实 .pptx（generate_pptx 工具）：基于 python-pptx 写 Open XML，
 # 不依赖本机 Office。缺失时工具会如实报「未安装」，而不是产出改名后的假 pptx。
 python-pptx==1.0.2
+
+# 按路径读文档正文（read_document 工具）：Word / Excel / PDF 解析。
+# 附件链路已由 Rust 抽取正文；这三个包补的是「模型自己按路径读」的场景，
+# 避免把 .docx/.xlsx/.pdf 当文本读成乱码。均为纯 Python 包（lxml 已随 agentscope 存在）。
+python-docx==1.1.2
+openpyxl==3.1.5
+et_xmlfile==2.0.0
+pypdf==5.9.0
 
 # Slack Socket Mode 长连接：引擎侧直接用 aiohttp 的 WebSocket 客户端
 # （Rust 侧离线依赖树里没有任何 WS crate，只能放在引擎进程里跑）。

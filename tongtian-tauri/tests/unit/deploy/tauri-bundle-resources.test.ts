@@ -1,10 +1,14 @@
 /**
- * 打包资源契约：引擎必须以整目录随包分发
+ * 打包资源契约：引擎必须整目录随包分发
  *
  * 背景：安装包曾只映射 engine/server.py 与 requirements.txt，其余顶层模块
  * （im_channels 等）全部漏带，安装后引擎启动即 ModuleNotFoundError，
  * 桌面端只能看到「健康检查超时（30s）」这种与真因无关的报错。
  * 因此这里锁死资源配置形态，防止再退回逐文件映射。
+ *
+ * 现在映射的是构建期生成的 `staged-engine` 干净副本：整目录复制引擎，
+ * 但排除 __pycache__ / *.pyc（实测打包中途有外部 Python 进程写入缓存，
+ * 直接映射 ../engine 会把字节码一起打进安装包）。
  */
 
 import { describe, it, expect } from 'vitest';
@@ -25,8 +29,9 @@ const conf = readJson<TauriConf>('../../../src-tauri/tauri.conf.json');
 const resources = conf.bundle.resources;
 
 describe('tauri.conf.json 打包资源', () => {
-  it('引擎整目录随包（不是逐文件映射）', () => {
-    expect(resources['../engine']).toBe('engine');
+  it('引擎整目录随包（映射构建期生成的干净副本）', () => {
+    expect(resources['staged-engine']).toBe('engine');
+    expect(resources['../engine']).toBeUndefined();
   });
 
   it('不再出现按引擎文件逐个映射的条目', () => {
@@ -34,6 +39,17 @@ describe('tauri.conf.json 打包资源', () => {
       /\/engine\/[^/]+\.py$/.test(src),
     );
     expect(engineFiles).toEqual([]);
+  });
+
+  it('构建先跑 stage-engine 生成副本，且排除字节码缓存', () => {
+    const pkg = readJson<{ scripts: Record<string, string> }>('../../../package.json');
+    expect(pkg.scripts.build).toContain('node scripts/stage-engine.mjs');
+
+    const stage = readFileSync(new URL('../../../scripts/stage-engine.mjs', import.meta.url), 'utf8');
+    expect(stage).toContain('__pycache__');
+    expect(stage).toContain("endsWith('.pyc')");
+    expect(stage).toContain("'engine'");
+    expect(stage).toContain("'staged-engine'");
   });
 
   it('保留随包 Python 与 mock agent 脚本', () => {

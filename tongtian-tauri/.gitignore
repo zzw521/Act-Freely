@@ -17,3 +17,6 @@ src-tauri/target/
 __pycache__/
 auth-server/auth.db
 
+# 引擎虚拟环境（scripts/prepare-python.sh 的 vendor/ 另有忽略规则）
+.venv/
+

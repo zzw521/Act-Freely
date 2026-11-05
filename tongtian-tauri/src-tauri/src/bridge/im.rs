@@ -53,10 +53,16 @@ async fn call(bridge: &BridgeState, method: &str, path: String, body: Option<Val
     };
     let url = format!("http://127.0.0.1:{port}{path}");
     let client = crate::proxy::loopback_client();
+    let token = super::agent::engine_local_token();
     let resp = match method {
-        "GET" => client.get(&url).send().await,
+        "GET" => client
+            .get(&url)
+            .header(super::agent::ENGINE_TOKEN_HEADER, token)
+            .send()
+            .await,
         _ => client
             .post(&url)
+            .header(super::agent::ENGINE_TOKEN_HEADER, token)
             .json(&body.unwrap_or_else(|| json!({})))
             .send()
             .await,
@@ -94,6 +100,52 @@ pub async fn im_configure(
         Some(json!({ "credentials": creds })),
     )
     .await
+}
+
+/// 扫码登录第一步（`im:loginStart`）：引擎生成二维码
+///
+/// 二维码内容是服务端给的字符串，由界面本地渲染成图；登录令牌只在确认那一帧
+/// 由引擎落盘，这条命令的响应里没有任何凭据。
+#[tauri::command]
+pub async fn im_login_start(kind: String, bridge: tauri::State<'_, BridgeState>) -> Result<Value, String> {
+    let kind = validate_kind(&kind)?;
+    call(
+        bridge.inner(),
+        "POST",
+        format!("/api/im/{kind}/login/start"),
+        None,
+    )
+    .await
+}
+
+/// 扫码登录第二步（`im:loginPoll`）：查一次扫码状态
+///
+/// 这一跳要等腾讯服务端的长轮询（最长 35 秒），所以不能和普通状态查询共用超时假设。
+#[tauri::command]
+pub async fn im_login_poll(
+    kind: String,
+    ticket: String,
+    verify_code: Option<String>,
+    bridge: tauri::State<'_, BridgeState>,
+) -> Result<Value, String> {
+    let kind = validate_kind(&kind)?;
+    let ticket = validate_ticket(&ticket)?;
+    call(
+        bridge.inner(),
+        "POST",
+        format!("/api/im/{kind}/login/poll"),
+        Some(json!({ "ticket": ticket, "verifyCode": verify_code.unwrap_or_default() })),
+    )
+    .await
+}
+
+/// 票据为空就不要发请求：引擎会返回同码，但桌面端先挡掉能少一次出网
+fn validate_ticket(ticket: &str) -> Result<&str, String> {
+    let ticket = ticket.trim();
+    if ticket.is_empty() {
+        return Err("IM_LOGIN_TICKET_MISSING: 未提供二维码票据".into());
+    }
+    Ok(ticket)
 }
 
 #[tauri::command]
@@ -232,6 +284,17 @@ mod tests {
     fn success_payload_passes_through() {
         let raw = json!({ "ok": true, "channels": [{ "kind": "slack" }] });
         assert_eq!(engine_outcome(200, &raw).unwrap(), raw);
+    }
+
+    #[test]
+    fn login_ticket_must_not_be_empty() {
+        assert_eq!(validate_ticket(" tkt-1 ").unwrap(), "tkt-1");
+        for bad in ["", "   "] {
+            assert_eq!(
+                validate_ticket(bad).unwrap_err(),
+                "IM_LOGIN_TICKET_MISSING: 未提供二维码票据"
+            );
+        }
     }
 
     #[test]

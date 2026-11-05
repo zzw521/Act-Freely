@@ -1,0 +1,61 @@
+{
+	admin off
+	auto_https off
+	persist_config off
+	grace_period 5s
+}
+
+# 80 只做跳转，不承载业务
+:80 {
+	redir https://{host}{uri} 301
+}
+
+:443 {
+	tls /etc/caddy/tls/server.crt /etc/caddy/tls/server.key
+
+	# 反面教材：给 SSE 开压缩会把事件攒在压缩缓冲区里，首包与分块节奏全废。
+	# 这里显式把流式路径排除在压缩之外；静态资源照常压缩。
+	@compressible {
+		not path /api/chat /api/chat/* /api/events /api/events/*
+	}
+	encode @compressible zstd gzip {
+		minimum_length 1024
+	}
+
+	header {
+		Strict-Transport-Security "max-age=15768000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+
+	# SSE 主通道（对话事件流）与事件重放：必须逐块立刻下发
+	@sse {
+		path /api/chat /api/chat/* /api/events /api/events/*
+	}
+
+	handle @sse {
+		reverse_proxy engine:18000 {
+			# -1 = 收到就刷，不等内部缓冲攒满
+			flush_interval -1
+			# 单条响应允许无限长；引擎每 15 秒发一次 `: keepalive` 注释行
+			stream_timeout 0
+
+			transport http {
+				# 上游读/写超时放开，否则静默的模型调用会被代理先掐断
+				read_timeout 0
+				write_timeout 0
+				dial_timeout 10s
+			}
+		}
+	}
+
+	# 其余 /api/*、静态前端与 /health：引擎自己托管，代理只做转发
+	handle {
+		reverse_proxy engine:18000 {
+			transport http {
+				dial_timeout 10s
+				read_timeout 300s
+			}
+		}
+	}
+}

@@ -80,7 +80,7 @@ const EngineTokenDialog: React.FC = () => {
         />
         <Typography sx={{ fontSize: 12, color: 'text.secondary', mt: 1.5 }}>
           选择「稍后」后，本次页面会话不再自动弹窗；刷新页面可重新输入。服务化模式下
-          终端、电脑操控、浏览器 AI+、远程桌面、应用内 Hook 与审计视图等桌面专属能力不可用。
+          终端、电脑操控、浏览器 AI+、本机画面、应用内 Hook 与审计视图等桌面专属能力不可用。
         </Typography>
       </DialogContent>
       <DialogActions sx={{ px: 3, pb: 2 }}>

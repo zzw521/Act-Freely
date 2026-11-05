@@ -1,5 +1,5 @@
 /**
- * 远程桌面契约测试（#78）
+ * 本机画面契约测试（#78）
  *
  * 锁定四件事：
  * - 5 个通道在 contracts、Tauri 适配、Rust invoke_handler 三处一致；
@@ -29,7 +29,7 @@ const appRoutes = () => read('../../../src/renderer/App.tsx');
 const sidebar = () => read('../../../src/renderer/components/Layout/Sidebar.tsx');
 const settingsPage = () => read('../../../src/renderer/pages/Settings/index.tsx');
 
-describe('远程桌面通道与 command 接线', () => {
+describe('本机画面通道与 command 接线', () => {
   it('通道名固定', () => {
     expect(IPC_CHANNELS.REMOTE_DESKTOP_CAPABILITIES).toBe('remote:capabilities');
     expect(IPC_CHANNELS.REMOTE_DESKTOP_STATUS).toBe('remote:status');
@@ -59,7 +59,7 @@ describe('远程桌面通道与 command 接线', () => {
     expect(rustRemote()).toContain('ACTION_REMOTE_SESSION');
     expect(rustRemote()).toContain('开始本机桌面实时画面');
     expect(rustRemote()).toContain('结束本机桌面实时画面');
-    expect(rustRemote()).toContain('远程桌面会话到期自动结束');
+    expect(rustRemote()).toContain('本机画面会话到期自动结束');
   });
 });
 
@@ -118,7 +118,7 @@ describe('REMOTE_* 错误码都有中文文案', () => {
   });
 });
 
-describe('浏览器/Mock 通道的远程桌面能力视图', () => {
+describe('浏览器/Mock 通道的本机画面能力视图', () => {
   (globalThis as Record<string, unknown>).window =
     (globalThis as Record<string, unknown>).window ?? {};
 
@@ -167,11 +167,11 @@ describe('浏览器/Mock 通道的远程桌面能力视图', () => {
 });
 
 describe('页面与导航可达', () => {
-  it('远程桌面作为设置执行能力分区可达，旧路由重定向', () => {
+  it('本机画面作为设置执行能力分区可达，旧路由重定向', () => {
     expect(appRoutes()).toContain('<Route path="/remote-desktop" element={<Navigate to="/settings?s=remote-desktop" replace />} />');
     expect(sidebar()).not.toContain("path: '/remote-desktop'");
     const settings = settingsPage();
-    expect(settings).toContain("{ id: 'remote-desktop', label: '远程桌面'");
+    expect(settings).toContain("{ id: 'remote-desktop', label: '本机画面'");
     expect(settings).toContain('return <RemoteDesktopPanel />;');
   });
 

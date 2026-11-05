@@ -174,10 +174,28 @@ pub fn wrap_for_spawn(
     args: &[String],
     keep_env: &[String],
 ) -> Result<Option<(PathBuf, Vec<String>)>, String> {
+    wrap_for_spawn_extra(program, args, &[], keep_env)
+}
+
+/// 同 `wrap_for_spawn`，但允许调用方补充只读目录。
+///
+/// Hook 的脚本参数未必在首位（`python -u check.py`），由调用方按命令行语义补齐；
+/// 补充项仍然只是只读授权，不改变「没有工作区 ⇒ 只有沙箱临时目录可写」。
+pub fn wrap_for_spawn_extra(
+    program: &str,
+    args: &[String],
+    extra_read_dirs: &[PathBuf],
+    keep_env: &[String],
+) -> Result<Option<(PathBuf, Vec<String>)>, String> {
     let Some(cfg) = active() else {
         return Ok(None);
     };
-    let read_dirs = read_dirs_for(program, args);
+    let mut read_dirs = read_dirs_for(program, args);
+    for dir in extra_read_dirs {
+        if !read_dirs.contains(dir) {
+            read_dirs.push(dir.clone());
+        }
+    }
     wrap_argv(program, args, None, cfg.network, &read_dirs, keep_env).map(Some)
 }
 

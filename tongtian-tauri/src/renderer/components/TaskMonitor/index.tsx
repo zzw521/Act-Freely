@@ -34,6 +34,7 @@ import ArtifactCard from '../ArtifactCard';
 import { FilePreviewBody, useFileContent } from '../FilePreview';
 import ResizeHandle from '../Layout/ResizeHandle';
 import { useI18n } from '../../i18n';
+import { clickableProps, disclosureProps } from '../../lib/a11y';
 
 /** 面板宽度常量（预览需要更宽的视口） */
 const MONITOR_WIDTH_NORMAL = 320;
@@ -97,20 +98,21 @@ const LedgerFooter: React.FC<{
   if (failed) {
     return (
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mt: 0.5 }}>
-        <Typography sx={{ fontSize: '12px', color: '#B45309' }}>{failedText}</Typography>
+        <Typography sx={{ fontSize: '12px', color: 'var(--tt-warning)' }}>{failedText}</Typography>
         <Box
+          {...clickableProps(onRetry, tr('重试该步骤'))}
           onClick={onRetry}
           sx={{ display: 'flex', alignItems: 'center', gap: 0.25, cursor: 'pointer' }}
         >
-          <RefreshIcon sx={{ fontSize: 13, color: '#0D9488' }} />
-          <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#0D9488' }}>{tr('重试')}</Typography>
+          <RefreshIcon sx={{ fontSize: 13, color: 'var(--tt-teal)' }} />
+          <Typography sx={{ fontSize: '12px', fontWeight: 600, color: 'var(--tt-teal)' }}>{tr('重试')}</Typography>
         </Box>
       </Box>
     );
   }
   if (loading) {
     return (
-      <Typography sx={{ fontSize: '12px', color: '#9CA3AF', mt: 0.5 }}>{tr('正在读取清单…')}</Typography>
+      <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mt: 0.5 }}>{tr('正在读取清单…')}</Typography>
     );
   }
   return null;
@@ -139,6 +141,7 @@ const Section: React.FC<{
       }}
     >
       <Box
+        {...disclosureProps(open, () => setOpen(!open), title)}
         onClick={() => setOpen(!open)}
         sx={{
           display: 'flex',
@@ -190,13 +193,13 @@ const Section: React.FC<{
 const stepIcon = (status: StepStatus) => {
   switch (status) {
     case StepStatus.SUCCESS:
-      return <CheckCircleIcon sx={{ fontSize: 15, color: '#10B981' }} />;
+      return <CheckCircleIcon sx={{ fontSize: 15, color: 'var(--tt-success)' }} />;
     case StepStatus.FAILED:
-      return <CancelIcon sx={{ fontSize: 15, color: '#EF4444' }} />;
+      return <CancelIcon sx={{ fontSize: 15, color: 'var(--tt-danger)' }} />;
     case StepStatus.RUNNING:
-      return <PendingIcon sx={{ fontSize: 15, color: '#F59E0B' }} />;
+      return <PendingIcon sx={{ fontSize: 15, color: 'var(--tt-warning)' }} />;
     default:
-      return <PendingIcon sx={{ fontSize: 15, color: '#D1D5DB' }} />;
+      return <PendingIcon sx={{ fontSize: 15, color: 'var(--tt-text-4)' }} />;
   }
 };
 
@@ -292,7 +295,7 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
           {previewPath ? (
             <>
               <Tooltip title={tr('返回任务')}>
-                <IconButton size="small" onClick={onPreviewClose} sx={{ color: 'var(--tt-text-3)' }}>
+                <IconButton size="small" aria-label={tr('返回任务')} onClick={onPreviewClose} sx={{ color: 'var(--tt-text-3)' }}>
                   <ArrowBackIcon sx={{ fontSize: 18 }} />
                 </IconButton>
               </Tooltip>
@@ -311,12 +314,12 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
                 {previewName}
               </Typography>
               <Tooltip title={tr('用系统默认应用打开')}>
-                <IconButton size="small" onClick={() => void handleOpenExternal()} sx={{ color: '#9CA3AF' }}>
+                <IconButton size="small" aria-label={tr('用系统默认应用打开')} onClick={() => void handleOpenExternal()} sx={{ color: 'var(--tt-text-4)' }}>
                   <OpenInNewIcon sx={{ fontSize: 16 }} />
                 </IconButton>
               </Tooltip>
               <Tooltip title={tr('关闭面板')}>
-                <IconButton size="small" onClick={() => onHide?.()} sx={{ color: '#9CA3AF' }}>
+                <IconButton size="small" aria-label={tr('关闭面板')} onClick={() => onHide?.()} sx={{ color: 'var(--tt-text-4)' }}>
                   <CloseIcon sx={{ fontSize: 17 }} />
                 </IconButton>
               </Tooltip>
@@ -340,14 +343,15 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
               <Tooltip title={isWide ? tr('还原面板宽度') : tr('放大面板宽度')}>
                 <IconButton
                   size="small"
-                  sx={{ color: '#9CA3AF' }}
+                  aria-label={isWide ? tr('还原面板宽度') : tr('放大面板宽度')}
+                  sx={{ color: 'var(--tt-text-4)' }}
                   onClick={() => setWidth(isWide ? MONITOR_WIDTH_NORMAL : MONITOR_WIDTH_WIDE)}
                 >
                   {isWide ? <CloseFullscreenIcon sx={{ fontSize: 16 }} /> : <OpenInFullIcon sx={{ fontSize: 15 }} />}
                 </IconButton>
               </Tooltip>
               <Tooltip title={tr('关闭面板')}>
-                <IconButton size="small" sx={{ color: '#9CA3AF' }} onClick={() => onHide?.()}>
+                <IconButton size="small" aria-label={tr('关闭面板')} sx={{ color: 'var(--tt-text-4)' }} onClick={() => onHide?.()}>
                   <CloseIcon sx={{ fontSize: 17 }} />
                 </IconButton>
               </Tooltip>
@@ -416,7 +420,12 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
                 background: 'var(--tt-surface)',
               }}
             >
-              <FilePreviewBody state={preview.state} data={preview.data} errMsg={preview.errMsg} />
+              <FilePreviewBody
+                state={preview.state}
+                data={preview.data}
+                errMsg={preview.errMsg}
+                engine={preview.engineAction}
+              />
             </Box>
           </Box>
         ) : tab === 'canvas' && canvas ? (
@@ -457,10 +466,10 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
               defaultOpen={steps.length > 0}
             >
               {steps.length === 0 ? (
-                <Typography sx={{ fontSize: '12px', color: '#9CA3AF' }}>{tr('暂无计划步骤')}</Typography>
+                <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>{tr('暂无计划步骤')}</Typography>
               ) : (
                 <>
-                  <Typography sx={{ fontSize: '11px', color: '#9CA3AF', mb: 0.75 }}>
+                  <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)', mb: 0.75 }}>
                     {tr('已完成 {done}/{total}', { done: doneCount, total: steps.length })}
                   </Typography>
                   {steps.map((s) => (
@@ -522,7 +531,7 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
               defaultOpen={fileOps.length > 0}
             >
               {fileOps.length === 0 ? (
-                <Typography sx={{ fontSize: '12px', color: '#9CA3AF' }}>{tr('暂无产物')}</Typography>
+                <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>{tr('暂无产物')}</Typography>
               ) : (
                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
                   {fileOps.map((f) => (
@@ -550,11 +559,12 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
             >
               {skills && skills.length === 0 ? (
                 <Box
+                  {...clickableProps(() => navigate('/extensions?tab=skills'), tr('尚未安装技能，去技能页安装'))}
                   onClick={() => navigate('/extensions?tab=skills')}
                   sx={{ display: 'flex', alignItems: 'center', gap: 0.5, cursor: 'pointer' }}
                 >
-                  <Typography sx={{ fontSize: '12px', color: '#9CA3AF' }}>{tr('尚未安装技能，')}</Typography>
-                  <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#0D9488' }}>{tr('去技能页安装')}</Typography>
+                  <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>{tr('尚未安装技能，')}</Typography>
+                  <Typography sx={{ fontSize: '12px', fontWeight: 600, color: 'var(--tt-teal)' }}>{tr('去技能页安装')}</Typography>
                 </Box>
               ) : skills ? (
                 <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
@@ -568,15 +578,15 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
                           maxWidth: '100%',
                           fontSize: '11.5px',
                           height: 22,
-                          bgcolor: s.enabled ? '#E6F7F4' : '#F3F4F6',
-                          color: s.enabled ? '#0D9488' : '#6B7280',
+                          bgcolor: s.enabled ? 'var(--tt-chip-teal)' : 'var(--tt-chip-neutral)',
+                          color: s.enabled ? 'var(--tt-teal)' : 'var(--tt-text-3)',
                         }}
                       />
                     </Tooltip>
                   ))}
                 </Box>
               ) : (
-                <Typography sx={{ fontSize: '12px', color: '#9CA3AF' }}>{tr('技能清单暂不可用')}</Typography>
+                <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>{tr('技能清单暂不可用')}</Typography>
               )}
               <LedgerFooter
                 loading={!skills && !failed.skills}
@@ -594,11 +604,12 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
             >
               {servers && servers.length === 0 ? (
                 <Box
+                  {...clickableProps(() => navigate('/extensions?tab=connectors'), tr('尚未登记连接器，去连接器页添加'))}
                   onClick={() => navigate('/extensions?tab=connectors')}
                   sx={{ display: 'flex', alignItems: 'center', gap: 0.5, cursor: 'pointer' }}
                 >
-                  <Typography sx={{ fontSize: '12px', color: '#9CA3AF' }}>{tr('尚未登记连接器，')}</Typography>
-                  <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#0D9488' }}>{tr('去连接器页添加')}</Typography>
+                  <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>{tr('尚未登记连接器，')}</Typography>
+                  <Typography sx={{ fontSize: '12px', fontWeight: 600, color: 'var(--tt-teal)' }}>{tr('去连接器页添加')}</Typography>
                 </Box>
               ) : servers ? (
                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.25 }}>
@@ -615,10 +626,10 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
                           fontWeight: 600,
                           color:
                             s.status === 'connected'
-                              ? '#0D9488'
+                              ? 'var(--tt-teal)'
                               : s.status === 'failed'
-                                ? '#B45309'
-                                : '#9CA3AF',
+                                ? 'var(--tt-warning)'
+                                : 'var(--tt-text-4)',
                         }}
                       >
                         {s.status === 'connected'
@@ -631,7 +642,7 @@ const TaskMonitor: React.FC<TaskMonitorProps> = ({
                   ))}
                 </Box>
               ) : (
-                <Typography sx={{ fontSize: '12px', color: '#9CA3AF' }}>{tr('连接器清单暂不可用')}</Typography>
+                <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>{tr('连接器清单暂不可用')}</Typography>
               )}
               <LedgerFooter
                 loading={!servers && !failed.servers}

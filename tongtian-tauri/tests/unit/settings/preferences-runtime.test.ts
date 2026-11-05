@@ -1,7 +1,7 @@
 /**
  * 偏好设置的运行时归属（禁止「能点、能保存、实际不动」）
  *
- * 语言 / 界面风格 / 对话字体 / 对话宽度 / 预览方式 / 提示词建议 / 工具块默认展开
+ * 语言 / 界面风格 / 界面密度 / 对话字体 / 对话宽度 / 预览方式 / 提示词建议 / 工具块默认展开
  * 都已从禁用占位改为真实消费方。本文件逐项锁定「设置写哪里 → 谁在读」，
  * 防止后续改动把消费方删掉、只留下一个会保存的开关。
  */
@@ -16,6 +16,7 @@ function read(rel: string): string {
 
 const settings = () => read('../../../src/renderer/pages/Settings/index.tsx');
 const themedApp = () => read('../../../src/renderer/theme/ThemedApp.tsx');
+const bootstrap = () => read('../../../src/renderer/theme/bootstrap.ts');
 const globalsCss = () => read('../../../src/renderer/styles/globals.css');
 const workbench = () => read('../../../src/renderer/pages/Workbench/index.tsx');
 const chatInput = () => read('../../../src/renderer/components/ChatInput/index.tsx');
@@ -32,16 +33,17 @@ describe('界面风格与对话字体', () => {
   });
 
   it('四套皮肤映射为根节点 data-ui-style，CSS 用属性选择器真正换肤', () => {
-    const tsx = themedApp();
+    // 档位映射与落盘动作都在 theme/bootstrap（首帧引导与 ThemedApp 共用同一份）
+    const boot = bootstrap();
     for (const [stored, attr] of [
       ['默认', 'default'],
       ['玻璃', 'glass'],
       ['经典', 'classic'],
       ['羊皮纸', 'parchment'],
     ]) {
-      expect(tsx).toContain(`${stored}: '${attr}'`);
+      expect(boot).toContain(`${stored}: '${attr}'`);
     }
-    expect(tsx).toContain("document.documentElement.setAttribute('data-ui-style'");
+    expect(boot).toContain("root.setAttribute('data-ui-style'");
     const css = globalsCss();
     for (const attr of ['glass', 'classic', 'parchment']) {
       expect(css).toContain(`html[data-ui-style='${attr}']`);
@@ -50,11 +52,36 @@ describe('界面风格与对话字体', () => {
     expect(css).toContain("html[data-theme='dark'][data-ui-style='glass']");
   });
 
-  it('衬线字体写 data-chat-font，只作用于对话正文与输入', () => {
+  it('界面密度同时驱动 MUI 的 spacing 因子与根节点 data-density', () => {
+    const src = settings();
+    expect(src).toContain("prefs.set({ density: v })");
+    expect(src).toContain("options={['标准', '紧凑', '宽松']}");
+    // 存 localStorage（与主题亮暗同一份偏好），不是组件 state
+    const store = read('../../../src/renderer/stores/usePreferenceStore.ts');
+    expect(store).toContain("density: '标准'");
+    expect(store).toContain('JSON.stringify({ theme, density,');
+    // 谁在读：主题工厂 + 根节点属性
     const tsx = themedApp();
-    expect(tsx).toContain("无衬线: 'sans'");
-    expect(tsx).toContain("衬线: 'serif'");
-    expect(tsx).toContain("document.documentElement.setAttribute('data-chat-font'");
+    expect(tsx).toContain('createAppTheme(mode, density)');
+    expect(tsx).toContain('applyDocumentTheme({ mode, uiStyle, density, chatFont })');
+    const boot = bootstrap();
+    expect(boot).toContain("root.setAttribute('data-density'");
+    expect(boot).toContain("标准: 'standard'");
+    expect(boot).toContain("紧凑: 'compact'");
+    expect(boot).toContain("宽松: 'roomy'");
+    const theme = read('../../../src/renderer/theme/theme.ts');
+    expect(theme).toContain('spacing: 4 * scale');
+    // CSS 侧：密度真的改变了不吃 theme.spacing 的那部分
+    const css = globalsCss();
+    expect(css).toContain("html[data-density='compact']");
+    expect(css).toContain('calc(0.4em * var(--tt-density-scale))');
+  });
+
+  it('衬线字体写 data-chat-font，只作用于对话正文与输入', () => {
+    const boot = bootstrap();
+    expect(boot).toContain("无衬线: 'sans'");
+    expect(boot).toContain("衬线: 'serif'");
+    expect(boot).toContain("root.setAttribute('data-chat-font'");
     const css = globalsCss();
     expect(css).toContain("html[data-chat-font='serif']");
     expect(css).toContain('--tt-chat-font');

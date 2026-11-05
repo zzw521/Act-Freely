@@ -6,6 +6,7 @@
 
 use serde_json::{json, Value};
 
+use crate::harness::provider;
 use crate::harness::tools::Skill;
 
 const MAX_AWARENESS_FILE_CHARS: usize = 6000;
@@ -24,13 +25,16 @@ const AWARENESS_SECTIONS: [(&str, &str); 4] = [
 const BASE_PROMPT: &str = "你是“通天办公”AI 工作助手，运行在用户的本地电脑上。
 
 工作方式:
-1. 分析用户目标，必要时先查看相关文件再动手
-2. 使用工具完成任务（读取/写入/修改文件；需要某技能时先取技能正文）
+1. 分析用户目标，必要时先列目录、查看相关文件再动手
+2. 使用工具完成任务（列目录、读取/写入/修改文件、抽取 Word/Excel/PPT/PDF 正文；需要某技能时先取技能正文）
 3. 涉及删除或覆盖文件前务必谨慎，优先保留原内容
 4. 完成后用简洁中文总结做了什么、产出了哪些文件
 
 约束:
-- 只在当前工作目录范围内操作文件
+- 文件操作遵循本轮文件访问档位与工具说明：允许的范围内可直接操作，被拒绝时如实说明原因
+- 不清楚目录里有什么时先调用 list_directory，再挑文件读取；不确定文件是文本还是文档时看扩展名
+- 读取有分页预算（正文默认 4000、上限 8000 字符，目录清单默认 20、上限 50 项）：
+  返回值末尾会写明还剩多少、带哪个参数接着读，需要更多就翻页，不要把整篇塞进上下文
 - 用户要求创建/生成/保存文件时，必须调用文件写入工具真实写入，禁止仅在回复中声称已写入
 - 声称任何文件操作完成前，必须先确认对应工具调用已成功执行
 ";
@@ -269,34 +273,38 @@ pub fn system_prompt(runtime: &Value, mode: &str, work_dir: &std::path::Path) ->
         skills_prompt(&skills)
     );
     prompt.push_str(mode_prompt(mode_of(mode)));
-    prompt.push_str(&format!(
-        "\n\n## 工作目录\n本轮所有文件操作都限定在：{}\n",
-        work_dir.display()
-    ));
+    // 档位决定「能不能出目录」，提示词必须与工具声明的可写范围一致，
+    // 否则「完全访问」下模型仍会按旧提示自我设限、拒绝用户明确要求的目录外文件
+    let tier = crate::security::file_perm::normalize_or_default(
+        runtime
+            .get(crate::security::file_perm::RUNTIME_KEY)
+            .and_then(|v| v.as_str()),
+    );
+    let scope = if crate::security::file_perm::allows_outside(&tier) {
+        format!(
+            "本轮文件访问档位为「{}」：工作目录为 {}；目录外的普通本机路径也可按用户指示访问，\
+             家目录、系统关键目录与应用数据目录仍会被拒绝。",
+            crate::security::file_perm::label(&tier),
+            work_dir.display()
+        )
+    } else {
+        format!(
+            "本轮所有文件操作都限定在：{}（档位「{}」，越界会被拒绝）",
+            work_dir.display(),
+            crate::security::file_perm::label(&tier)
+        )
+    };
+    prompt.push_str(&format!("\n\n## 工作目录\n{scope}\n"));
     (prompt, notes)
 }
 
-/// 历史轮次（截断口径与引擎一致：最近 20 条，单条 600 字）。
-pub fn history_messages(history: &[Value]) -> Vec<Value> {
-    let start = history.len().saturating_sub(MAX_HISTORY_ITEMS);
-    history[start..]
-        .iter()
-        .filter_map(|h| {
-            let mut content = h.get("content").and_then(|v| v.as_str())?.trim().to_string();
-            if content.is_empty() {
-                return None;
-            }
-            if content.chars().count() > MAX_HISTORY_ITEM_CHARS {
-                content = content.chars().take(MAX_HISTORY_ITEM_CHARS).collect::<String>()
-                    + "…（已截断）";
-            }
-            let role = match h.get("role").and_then(|v| v.as_str()) {
-                Some("assistant") => "assistant",
-                _ => "user",
-            };
-            Some(json!({ "role": role, "content": content }))
-        })
-        .collect()
+/// 历史轮次重新编码（截断口径与引擎一致：最近 20 条，单条 600 字）。
+///
+/// 逐条的编码（多模态分段展平、非法角色归一、空正文跳过）由
+/// `provider::encode_history` 完成；返回的第二个数组是「哪几条没带上、
+/// 哪几条被改写」的说明，调用方要摊成可见步骤——换模型时不许静默丢话。
+pub fn history_encoding(history: &[Value]) -> (Vec<Value>, Vec<String>) {
+    provider::encode_history(history, MAX_HISTORY_ITEMS, MAX_HISTORY_ITEM_CHARS)
 }
 
 /// 附件正文 + 未进入模型的说明（只认 Rust 抽取好的 text；图片本地 harness 不下发）。
@@ -512,12 +520,51 @@ mod tests {
         let history: Vec<Value> = (0..25)
             .map(|i| json!({"role": if i % 2 == 0 { "user" } else { "assistant" }, "content": format!("t{i}")}))
             .collect();
-        let out = history_messages(&history);
+        let (out, notes) = history_encoding(&history);
         assert_eq!(out.len(), 20);
         assert_eq!(out[0]["content"], "t5");
+        // 超出「最近 20 条」的部分要如实说，不能假装都带上了
+        assert!(notes.iter().any(|n| n.contains("更早的 5 条历史")), "{notes:?}");
         let long = json!([{ "role": "user", "content": "字".repeat(700) }]);
-        let out = history_messages(long.as_array().unwrap());
+        let (out, notes) = history_encoding(long.as_array().unwrap());
         assert!(out[0]["content"].as_str().unwrap().ends_with("（已截断）"));
+        assert!(notes.iter().any(|n| n.contains("单条 600 字")), "{notes:?}");
+    }
+
+    #[test]
+    fn test_history_caps_match_engine() {
+        // 引擎 server.py 的预填充口径是「最近 20 条、单条 600 字」，
+        // 接收上限 40 条（_normalize_history）；两侧任何一侧改动都要同步另一侧。
+        assert_eq!(MAX_HISTORY_ITEMS, 20);
+        assert_eq!(MAX_HISTORY_ITEM_CHARS, 600);
+        assert_eq!(provider::MAX_CANONICAL_HISTORY_ITEMS, 40);
+    }
+
+    #[test]
+    fn test_history_encoding_reports_what_was_not_carried() {
+        let history = vec![
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "带图片的一问"},
+                {"type": "image_url", "image_url": {"url": "data:..."}}
+            ]}),
+            json!({"role": "assistant", "content": "答"}),
+        ];
+        let (msgs, notes) = history_encoding(&history);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["content"], "带图片的一问");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert!(notes.iter().any(|n| n.contains("图片")), "{notes:?}");
+        // 交给端点的条目只有 role/content：分段、附件引用这些形状不外溢
+        for msg in &msgs {
+            let mut keys: Vec<String> = msg
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort();
+            assert_eq!(keys, vec!["content".to_string(), "role".to_string()], "{msg}");
+        }
     }
 
     #[test]

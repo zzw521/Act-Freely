@@ -8,6 +8,7 @@
 - 技能/套件发布、版本发布、检索、分类、下载与 SHA-256 校验；
 - MCP 配置发布与校验（拒绝密钥值字段、非法传输方式）；
 - 超大请求体拒绝、包文件损坏检测；
+- 用量上报幂等入库与「桌面为主、引擎按来源补入」的合并视图（缺陷 D-43）；
 - 收藏、管理员推荐、我的发布、分页；
 - 演示数据幂等写入；
 - 登录限流。
@@ -125,9 +126,12 @@ def http(
     token: str | None = None,
     raw: bytes | None = None,
     content_type: str | None = None,
+    extra_headers: dict | None = None,
 ):
     url = BASE + path
     headers: dict[str, str] = {}
+    if extra_headers:
+        headers.update(extra_headers)
     data: bytes | None = None
     if json_body is not None:
         data = json.dumps(json_body, ensure_ascii=False).encode("utf-8")
@@ -223,6 +227,12 @@ def test_public():
     check("根路径返回文档入口", status == 200 and payload(body).get("docs") == "/docs")
     status, _, _ = http("GET", "/docs")
     check("Swagger UI 可访问", status == 200)
+    status, headers, body = http("GET", "/ui/")
+    check("Web 控制台可访问", status == 200 and "通天办公" in body.decode("utf-8"))
+    check(
+        "控制台 CSP",
+        "default-src 'self'" in headers.get("Content-Security-Policy", ""),
+    )
 
     for item_type, expected in (("skill", "效率"), ("suite", "律师"), ("mcp", "开发")):
         status, _, body = http("GET", f"/api/v1/categories?type={item_type}")
@@ -324,6 +334,27 @@ def test_auth():
     )
     admin = payload(body)
     check("管理员登录", status == 200 and admin["profile"].get("role") == "admin")
+
+    status, _, body = http("GET", "/api/v1/admin/users", token=admin["accessToken"])
+    users = payload(body)
+    check("管理员可查看用户列表", status == 200 and users.get("total", 0) >= 2)
+    expected_fields = {
+        "uid", "email", "nickname", "role", "plan", "org",
+        "depts", "primaryDept", "createdAtMs",
+    }
+    check(
+        "用户列表字段最小化",
+        all(set(row) == expected_fields for row in users.get("users", [])),
+    )
+    status, _, body = http("GET", "/api/v1/admin/users", token=access_a2)
+    check("普通用户无权查看用户列表", status == 403 and payload(body).get("code") == "FORBIDDEN")
+    status, _, body = http(
+        "GET",
+        "/api/v1/admin/users?q=" + urllib.parse.quote(email_a),
+        token=admin["accessToken"],
+    )
+    found = [row["email"] for row in payload(body).get("users", [])]
+    check("用户列表支持搜索", status == 200 and found == [email_a], str(found))
 
     conn = sqlite3.connect(os.path.join(_TMP, "market.db"))
     conn.row_factory = sqlite3.Row
@@ -607,6 +638,72 @@ def test_auth_claims(ctx):
     )
     status, _, _ = http("GET", "/api/v1/auth/me", token=last_access)
     check("清空后旧令牌失效", status == 401)
+
+
+def test_engine_introspect(ctx):
+    print("\n[引擎令牌吊销内省]")
+    stamp = int(time.time() * 1000) % 1_000_000
+    email = f"introspect{stamp}@test.local"
+    # 未启用（无共享令牌）→ 404，引擎侧对不可达按放行处理
+    os.environ.pop("TT_ENGINE_INTROSPECT_TOKEN", None)
+    status, _, body = http(
+        "GET", "/api/v1/engine/introspect?sub=x&sid=y",
+        extra_headers={"x-tt-engine-introspect": "whatever"},
+    )
+    check("未启用内省 → 404", status == 404 and payload(body).get("code") == "INTROSPECT_DISABLED")
+
+    os.environ["TT_ENGINE_INTROSPECT_TOKEN"] = "it-selftest-secret"
+    # 令牌错误 → 401
+    status, _, body = http(
+        "GET", "/api/v1/engine/introspect?sub=x&sid=y",
+        extra_headers={"x-tt-engine-introspect": "wrong"},
+    )
+    check("内省令牌错误 → 401", status == 401 and payload(body).get("code") == "INTROSPECT_UNAUTHORIZED")
+    # 缺少令牌头 → 401
+    status, _, _ = http("GET", "/api/v1/engine/introspect?sub=x&sid=y")
+    check("缺少内省令牌头 → 401", status == 401)
+    # sub/sid 缺失 → 400
+    status, _, body = http(
+        "GET", "/api/v1/engine/introspect?sub=&sid=",
+        extra_headers={"x-tt-engine-introspect": "it-selftest-secret"},
+    )
+    check("sub/sid 缺失 → 400", status == 400 and payload(body).get("code") == "INVALID_INTROSPECT_QUERY")
+
+    hdr = {"x-tt-engine-introspect": "it-selftest-secret"}
+    # 有效会话 → active=true（先注册再登录，自包含）
+    status, _, body = http(
+        "POST", "/api/v1/auth/register",
+        json_body={"email": email, "password": "secret123"},
+    )
+    check("内省测试用户注册", status == 201)
+    status, _, body = http(
+        "POST", "/api/v1/auth/login",
+        json_body={"email": email, "password": "secret123"},
+    )
+    live_access = payload(body)["accessToken"]
+    live = security.jwt_decode(live_access)
+    status, _, body = http(
+        "GET", f"/api/v1/engine/introspect?sub={live['sub']}&sid={live['sid']}",
+        extra_headers=hdr,
+    )
+    check("有效会话内省 active=true", status == 200 and payload(body).get("active") is True)
+
+    # 强制下线该用户全部会话 → active=false（吊销可被引擎即时内省，无需等 exp）
+    status, _, _ = http(
+        "POST", f"/api/v1/admin/users/{live['sub']}/revoke-sessions", token=ctx["admin_access"]
+    )
+    check("强制下线成功", status == 200)
+    status, _, body = http(
+        "GET", f"/api/v1/engine/introspect?sub={live['sub']}&sid={live['sid']}",
+        extra_headers=hdr,
+    )
+    check(
+        "已吊销会话内省 active=false",
+        status == 200 and payload(body).get("active") is False
+        and payload(body).get("reason") == "session_revoked",
+        payload(body),
+    )
+    os.environ.pop("TT_ENGINE_INTROSPECT_TOKEN", None)
 
 
 def test_skill_market(ctx):
@@ -949,11 +1046,44 @@ def test_seed(ctx):
     after_first = totals()
     seed.seed_demo()
     after_second = totals()
-    check("演示技能 +2", after_first["skills"] == before["skills"] + 2)
-    check("演示套件 +2", after_first["suites"] == before["suites"] + 2)
-    check("演示 MCP +3", after_first["mcp"] == before["mcp"] + 3)
+    counts = seed.SEED_COUNTS
+    check(
+        "演示技能按清单写入",
+        after_first["skills"] == before["skills"] + counts["skill"],
+        f"期望 +{counts['skill']}，实际 +{after_first['skills'] - before['skills']}",
+    )
+    check(
+        "演示套件按清单写入",
+        after_first["suites"] == before["suites"] + counts["suite"],
+        f"期望 +{counts['suite']}，实际 +{after_first['suites'] - before['suites']}",
+    )
+    check(
+        "演示 MCP 按清单写入",
+        after_first["mcp"] == before["mcp"] + counts["mcp"],
+        f"期望 +{counts['mcp']}，实际 +{after_first['mcp'] - before['mcp']}",
+    )
     check("重复执行不新增", after_second == after_first)
-    check("演示数据总量", after_first == {"skills": 3, "suites": 3, "mcp": 5})
+    check(
+        "演示数据总量",
+        after_first
+        == {
+            "skills": before["skills"] + counts["skill"],
+            "suites": before["suites"] + counts["suite"],
+            "mcp": before["mcp"] + counts["mcp"],
+        },
+        str(after_first),
+    )
+
+    # 演示数据的目标是「打开就有内容的市场」：每个分类都必须有条目
+    for item_type in ("skill", "suite", "mcp"):
+        status, _, body = http("GET", f"/api/v1/categories?type={item_type}")
+        categories = payload(body).get("categories", [])
+        empty = [row["name"] for row in categories if row.get("count", 0) == 0]
+        check(
+            f"演示数据覆盖 {item_type} 全部 {len(categories)} 个分类",
+            status == 200 and categories and not empty,
+            f"空分类：{empty}",
+        )
 
     status, _, body = http(
         "POST", "/api/v1/auth/login",
@@ -962,14 +1092,31 @@ def test_seed(ctx):
     check("演示账号可登录", status == 200 and payload(body)["profile"]["nickname"] == seed.DEMO_NICKNAME)
     demo_access = payload(body)["accessToken"]
     status, _, body = http("GET", "/api/v1/me/items?pageSize=100", token=demo_access)
-    check("演示账号拥有 7 个条目", status == 200 and payload(body).get("total") == 7)
+    check(
+        "演示账号拥有全部演示条目",
+        status == 200 and payload(body).get("total") == sum(counts.values()),
+        f"实际 {payload(body).get('total')}，期望 {sum(counts.values())}",
+    )
 
+    total_skills = after_first["skills"]
     status, _, body = http("GET", "/api/v1/skills?pageSize=2&page=1&sort=name")
     first_page = payload(body)
-    check("分页第一页", status == 200 and len(first_page["items"]) == 2 and first_page["hasMore"] is True)
+    check(
+        "分页第一页",
+        status == 200 and len(first_page["items"]) == 2 and first_page["hasMore"] is (total_skills > 2),
+    )
     status, _, body = http("GET", "/api/v1/skills?pageSize=2&page=2&sort=name")
     second_page = payload(body)
-    check("分页第二页", status == 200 and len(second_page["items"]) == 1 and second_page["hasMore"] is False)
+    check(
+        "分页第二页",
+        status == 200 and len(second_page["items"]) == min(2, max(0, total_skills - 2))
+        and second_page["hasMore"] is (total_skills > 4),
+    )
+
+    # 取自公开库的演示技能必须随包带着许可与出处，否则不予收录
+    status, _, body = http("GET", "/api/v1/skills/copywriting")
+    files = payload(body).get("item", {}).get("packageInfo", {}).get("files", [])
+    check("公开库技能随包许可与出处", status == 200 and "LICENSE.txt" in files and "SOURCE.txt" in files, str(files))
 
 
 def test_market_revoke(ctx):
@@ -1458,6 +1605,934 @@ def test_project_events(ctx):
         resp.close()
 
 
+def sse_cursor(project_id: str, token: str) -> int:
+    """当前项目事件水位：订阅要从这个 seq 之后起步，才量得到「新写入」而不是历史补拉。"""
+    status, _, body = http("GET", f"/api/v1/projects/{project_id}/events?since=0", token=token)
+    if status != 200:
+        raise AssertionError(f"读取事件水位失败 {status}")
+    return int(payload(body).get("cursor", 0))
+
+
+def drain_until(resp, kind: str, limit: int = 6):
+    """读到指定类型的事件为止，返回 (事件, 之前顺带读到的类型)。顺带的通常是上一轮的补拉。"""
+    seen = []
+    for _ in range(limit):
+        ev = read_sse_event(resp, timeout_seconds=6.0)
+        if ev is None:
+            return None, seen
+        if ev[0] == "message":
+            if ev[1].get("kind") == kind:
+                return ev[1], seen
+            seen.append(ev[1].get("kind"))
+        elif ev[0] == "closed":
+            return None, seen + ["closed:" + str(ev[1].get("reason"))]
+    return None, seen
+
+
+def test_project_events_realtime(ctx):
+    """D-06 服务端侧验收：两人同时操作 1 秒内可见、断线期间不丢事件、被移出项目时流明确结束。
+
+    三条都直接对应桌面端订阅桥要依赖的语义，所以在这里钉死，不留到界面层再发现。
+    """
+    print("\n[项目事件流·实时与找回]")
+    stamp = int(time.time() * 1000)
+    owner = register_user(f"rt-owner-{stamp}@test.local", "实时所有者")
+    member = register_user(f"rt-member-{stamp}@test.local", "实时成员")
+    owner_access, member_access = owner["accessToken"], member["accessToken"]
+    member_uid = member["profile"]["uid"]
+
+    status, _, body = http(
+        "POST", "/api/v1/projects", json_body={"name": "实时演练"}, token=owner_access
+    )
+    project_id = payload(body).get("project", {}).get("id", "")
+    check("实时：创建项目", status == 201 and project_id.startswith("prj-"))
+
+    status, _, body = http(
+        "POST", f"/api/v1/projects/{project_id}/invites",
+        json_body={"email": member["profile"]["email"], "role": "member"}, token=owner_access,
+    )
+    invite_code = payload(body).get("inviteCode", "")
+    status, _, body = http(
+        "POST", "/api/v1/projects/invites/accept",
+        json_body={"token": invite_code}, token=member_access,
+    )
+    check("实时：成员加入项目", status == 200 and payload(body)["project"]["myRole"] == "member")
+
+    status, _, body = http(
+        "POST", f"/api/v1/projects/{project_id}/tasks",
+        json_body={"title": "实时任务"}, token=owner_access,
+    )
+    task_id = payload(body).get("task", {}).get("id", "")
+    check("实时：创建任务", status == 201 and task_id)
+
+    # ① 1 秒内同步：成员挂着流（从当前水位之后起步），所有者在本机写入，
+    #    测「写入返回 → 对端收到」的墙钟延迟。用 since=0 订阅会先把历史事件补拉下来，
+    #    量到的就不是这一次写入，所以必须先取水再订阅。
+    baseline = sse_cursor(project_id, member_access)
+    resp = open_sse(
+        f"/api/v1/projects/{project_id}/events/stream?since={baseline}", member_access
+    )
+    delivered = baseline
+    try:
+        ready = read_sse_event(resp)
+        check(
+            "实时：成员订阅就绪且游标等于水位",
+            ready is not None
+            and ready[0] == "ready"
+            and ready[1].get("cursor") == baseline,
+            str(ready),
+        )
+        started = time.perf_counter()
+        status, _, _ = http(
+            "POST", f"/api/v1/projects/{project_id}/tasks/{task_id}/comments",
+            json_body={"body": "跨机器评论"}, token=owner_access,
+        )
+        check("实时：所有者评论写入成功", status == 201)
+        pushed, skipped = drain_until(resp, "task.commented")
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        check(
+            "实时：成员收到评论事件" + (f"（顺带 {skipped}）" if skipped else ""),
+            pushed is not None,
+            str(pushed),
+        )
+        check(
+            f"实时：对端 1 秒内可见（实测 {latency_ms:.0f}ms）",
+            latency_ms <= 1000.0,
+            f"实测 {latency_ms:.0f}ms，超过 1 秒验收线",
+        )
+        delivered = int(pushed["seq"])
+    finally:
+        resp.close()
+
+    # ② 断线期间不丢：关闭流后写两条，用最后已交付游标重连补齐，与增量接口逐条对齐
+    status, _, _ = http(
+        "PATCH", f"/api/v1/projects/{project_id}/tasks/{task_id}",
+        json_body={"version": 1, "status": "doing"}, token=owner_access,
+    )
+    check("断线：改任务状态成功", status == 200)
+    status, _, _ = http(
+        "POST", f"/api/v1/projects/{project_id}/tasks/{task_id}/comments",
+        json_body={"body": "断线期间的评论"}, token=member_access,
+    )
+    check("断线：成员评论成功", status == 201)
+
+    resp2 = open_sse(
+        f"/api/v1/projects/{project_id}/events/stream?since={delivered}", member_access
+    )
+    backfill = []
+    try:
+        ready2 = read_sse_event(resp2)
+        check(
+            "断线：重连 ready 回带请求游标",
+            ready2 is not None and ready2[0] == "ready" and ready2[1].get("cursor") == delivered,
+            str(ready2),
+        )
+        while len(backfill) < 2:
+            ev = read_sse_event(resp2, timeout_seconds=5.0)
+            if ev is None:
+                break
+            if ev[0] == "message":
+                backfill.append(ev[1])
+    finally:
+        resp2.close()
+    check(
+        "断线：重连补齐断线期间的两条事件",
+        [event["kind"] for event in backfill] == ["task.updated", "task.commented"],
+        str([event["kind"] for event in backfill]),
+    )
+    seqs = [int(event["seq"]) for event in backfill]
+    check("断线：补齐事件 seq 严格递增且晚于断线点", all(s > delivered for s in seqs) and seqs == sorted(seqs), str(seqs))
+    status, _, body = http(
+        "GET", f"/api/v1/projects/{project_id}/events?since={delivered}", token=member_access
+    )
+    rest_seqs = [int(event["seq"]) for event in payload(body).get("events", [])]
+    check("断线：流补拉与增量接口一致（不丢也不重）", seqs == rest_seqs, f"流 {seqs} 接口 {rest_seqs}")
+
+    # ③ 被移出项目：流以 closed(membership) 明确结束，客户端不该再无限重连
+    cursor = seqs[-1] if seqs else delivered
+    resp3 = open_sse(
+        f"/api/v1/projects/{project_id}/events/stream?since={cursor}", member_access
+    )
+    try:
+        status, _, _ = http(
+            "POST",
+            f"/api/v1/projects/{project_id}/members/{member_uid}/remove",
+            token=owner_access,
+        )
+        check("移出：所有者移除成员成功", status == 200)
+        # 移除本身也是一条事件：它会先于 closed 到达（服务端在同一轮扫描里读到），
+        # 所以这里读到 closed 为止，而不是假定 closed 是第一条
+        closed = None
+        seen = []
+        for _ in range(6):
+            ev = read_sse_event(resp3, timeout_seconds=6.0)
+            if ev is None:
+                break
+            if ev[0] == "message":
+                seen.append(ev[1].get("kind"))
+            elif ev[0] == "closed":
+                closed = ev[1]
+                break
+        check(
+            "移出：成员流收到 closed 并点名原因",
+            closed is not None and closed.get("reason") == "membership",
+            str(closed),
+        )
+        # 实测语义：_read_events 先查成员资格再读事件，所以「移除自己」这条事件
+        # 不会经流下发——closed 就是对端能拿到的唯一信号，界面必须据此提示，
+        # 不能等着看 member.removed 才知道自己出局了
+        check("移出：移除事件本身不经流下发（closed 是唯一信号）",
+              "member.removed" not in seen, str(seen))
+        eof = False
+        for _ in range(4):
+            if resp3.readline() == b"":
+                eof = True
+                break
+        check("移出：closed 之后连接即结束", eof)
+    finally:
+        resp3.close()
+
+
+def create_agent_ticket(project_id: str, token: str, **extra) -> tuple[int, dict]:
+    body = {
+        "title": "整理本周数据并出图",
+        "detail": "每周一要一张趋势图",
+        "brief": "读仓库内的 csv，出本周趋势图",
+        "scope": "只读仓库内文件；产物写到工单目录",
+        "outOfScope": "不碰生产库；不发消息给任何人",
+        "intensity": "explicit",
+    }
+    body.update(extra)
+    status, _, resp = http(
+        "POST", f"/api/v1/projects/{project_id}/tickets", json_body=body, token=token
+    )
+    return status, payload(resp)
+
+
+def test_agent_tickets(ctx):
+    """D-47 工单层验收：交回 / 待人工判定 / 停止是唯一撤权 / 跨端 1 秒一致。
+
+    四条对应缺陷文档里的验收 ①②③④，另外钉住三条状态机纪律：
+    授权正文不可变（改范围=吊销+新增一版）、续跑前重新校验授权、订阅扇出只补视野。
+    """
+    print("\n[工单层 D-47]")
+    stamp = int(time.time() * 1000)
+    owner = register_user(f"tk-owner-{stamp}@test.local", "工单所有者")
+    worker = register_user(f"tk-worker-{stamp}@test.local", "工单执行体")
+    outsider = register_user(f"tk-outside-{stamp}@test.local", "工单局外人")
+    owner_access, worker_access = owner["accessToken"], worker["accessToken"]
+
+    status, _, body = http(
+        "POST", "/api/v1/projects", json_body={"name": "工单演练"}, token=owner_access
+    )
+    project_id = payload(body).get("project", {}).get("id", "")
+    check("工单：创建项目", status == 201 and project_id.startswith("prj-"))
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/invites",
+        json_body={"email": worker["profile"]["email"], "role": "member"},
+        token=owner_access,
+    )
+    code = payload(body).get("inviteCode", "")
+    status, _, body = http(
+        "POST",
+        "/api/v1/projects/invites/accept",
+        json_body={"token": code},
+        token=worker_access,
+    )
+    check("工单：执行体账号加入项目", status == 200)
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tasks",
+        json_body={"title": "订阅源任务"},
+        token=owner_access,
+    )
+    source_task_id = payload(body).get("task", {}).get("id", "")
+    check("工单：准备订阅源任务", status == 201 and source_task_id)
+
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets",
+        json_body={"title": "局外人试试", "brief": "不该开工"},
+        token=outsider["accessToken"],
+    )
+    check(
+        "工单：非成员不能建单（按不存在处理）",
+        status == 404 and payload(body).get("code") == "PROJECT_NOT_FOUND",
+    )
+
+    # ① 建单：工单与首份授权一起落，输入还没交付所以不是"等人"
+    status, data = create_agent_ticket(
+        project_id, owner_access, subscribeTaskId=source_task_id
+    )
+    ticket = data.get("ticket", {})
+    mandate = data.get("mandate", {})
+    ticket_id = ticket.get("id", "")
+    check("工单：建单 201 且 id 合规", status == 201 and ticket_id.startswith("atk-"))
+    check("工单：初始 stage 是输入未交付", ticket.get("stage") == "input_undelivered")
+    check("工单：输入未交付不算等人", ticket.get("needsHuman") is False)
+    check("工单：首份授权生效中", mandate.get("status") == "active" and mandate.get("seq") == 1)
+    check("工单：授权正文带摘要", len(str(mandate.get("digest", ""))) == 64)
+    check("工单：订阅随建单建立", data.get("subscription") is not None)
+    check("工单：建单写了事件游标", int(data.get("seq", 0)) >= 1)
+
+    status, data = create_agent_ticket(project_id, owner_access, intensity="inferred")
+    check(
+        "工单：推断授权必须写明依据",
+        status == 400 and data.get("code") == "AGENT_TICKET_INVALID_INPUT",
+    )
+
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/reports",
+        json_body={"kind": "progress", "summary": "没人领取就报告"},
+        token=worker_access,
+    )
+    check(
+        "工单：没有在跑的执行体时报告无处可归",
+        status == 409 and payload(body).get("code") == "AGENT_ASSIGNMENT_NOT_FOUND",
+    )
+
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/assignments",
+        json_body={"mandateId": mandate["id"], "expectedMandateDigest": "0" * 64},
+        token=worker_access,
+    )
+    check(
+        "工单：续跑前重校验授权正文（摘要对不上就拒）",
+        status == 409 and payload(body).get("code") == "AGENT_MANDATE_CHANGED",
+    )
+
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/assignments",
+        json_body={
+            "mandateId": mandate["id"],
+            "expectedMandateDigest": mandate["digest"],
+            "workerId": "worker-本周数据",
+            "workspaceKind": "isolated",
+            "workspaceRef": f"ticket-workers/{ticket_id}",
+            "machine": "pc-a",
+            "recoveryNote": "先看目录与 git 历史，再决定是否重做外部动作",
+        },
+        token=worker_access,
+    )
+    first = payload(body)
+    assignment_id = first.get("assignment", {}).get("id", "")
+    check("工单：执行体领取成功", status == 201 and assignment_id.startswith("asg-"))
+    check("工单：领取后进入在跑", first.get("ticket", {}).get("stage") == "working")
+    check("工单：恢复注记随绑定落账", "git 历史" in str(first["assignment"].get("recoveryNote")))
+    check(
+        "工单：一个授权不能开两个执行体",
+        http(
+            "POST",
+            f"/api/v1/projects/{project_id}/tickets/{ticket_id}/assignments",
+            json_body={"mandateId": mandate["id"]},
+            token=worker_access,
+        )[0]
+        == 409,
+    )
+
+    # ② 待人工只由结构化字段判定：progress 不产生问题，waiting 必须带问题
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/reports",
+        json_body={"assignmentId": assignment_id, "kind": "progress", "summary": "读完 3 个文件"},
+        token=worker_access,
+    )
+    progress = payload(body)
+    check("工单：进展报告不产生待人工", status == 201 and progress.get("attentionId") is None)
+    check("工单：进展报告留在在跑", progress.get("ticket", {}).get("stage") == "working")
+
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/reports",
+        json_body={"assignmentId": assignment_id, "kind": "waiting", "summary": "在等人"},
+        token=worker_access,
+    )
+    check(
+        "工单：等人必须写明等什么，不从正文猜",
+        status == 400
+        and payload(body).get("code") == "AGENT_ATTENTION_QUESTION_REQUIRED",
+    )
+
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/reports",
+        json_body={
+            "assignmentId": assignment_id,
+            "kind": "waiting",
+            "summary": "时间范围不明",
+            "question": "要最近 7 天还是本周？",
+            "options": ["最近 7 天", "本周一到现在"],
+        },
+        token=worker_access,
+    )
+    waiting = payload(body)
+    check(
+        "工单：waiting 让工单进入等你回答",
+        status == 201 and waiting.get("ticket", {}).get("stage") == "awaiting_answer",
+    )
+    check("工单：等你回答算需要人", waiting.get("ticket", {}).get("needsHuman") is True)
+    attention_id = waiting.get("attentionId", "")
+    check("工单：结构化问题带候选项落账", bool(attention_id))
+
+    status, _, body = http("GET", "/api/v1/agent/tickets", token=owner_access)
+    mine = payload(body).get("tickets", [])
+    listed = next((item for item in mine if item.get("id") == ticket_id), None)
+    check("工单：等你的工单列表里有这一单", status == 200 and listed is not None)
+    check(
+        "工单：列表带出要问的那个问题",
+        listed is not None
+        and listed.get("attention", {}).get("question") == "要最近 7 天还是本周？",
+    )
+
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/attentions/{attention_id}/answer",
+        json_body={"answer": "本周一到现在"},
+        token=owner_access,
+    )
+    answered = payload(body)
+    check(
+        "工单：人回答后继续在跑的执行体",
+        status == 200 and answered.get("ticket", {}).get("stage") == "working",
+    )
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/attentions/{attention_id}/answer",
+        json_body={"answer": "再答一次"},
+        token=owner_access,
+    )
+    check(
+        "工单：同一问题不能答两次",
+        status == 409 and payload(body).get("code") == "AGENT_ATTENTION_NOT_OPEN",
+    )
+
+    # ① 超出范围交回，而不是自己顺手做掉；一张工单只交回一次
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/handback",
+        json_body={
+            "assignmentId": assignment_id,
+            "reason": "csv 里没有本周数据，需要连生产库",
+            "requested": "允许只读生产库的 orders 表",
+        },
+        token=worker_access,
+    )
+    handed = payload(body)
+    check("工单：超范围交回 201", status == 201 and handed.get("attentionId"))
+    check("工单：交回后进等你回答", handed.get("ticket", {}).get("stage") == "awaiting_answer")
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/handback",
+        json_body={"assignmentId": assignment_id, "reason": "还是想要生产库", "requested": "再问一次"},
+        token=worker_access,
+    )
+    check(
+        "工单：交回只问一次，不让人重复处理同一件事",
+        status == 409 and payload(body).get("code") == "AGENT_HANDBACK_DONE",
+    )
+
+    # 人决定扩大范围：授权正文不被改写，吊销旧的、插新的一版
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/mandate/amend",
+        json_body={
+            "brief": "读仓库 csv 出本周趋势图，必要时只读生产库 orders 表",
+            "scope": "只读；产物写工单目录",
+            "reason": "按交回扩大范围",
+        },
+        token=owner_access,
+    )
+    amended = payload(body)
+    new_mandate = amended.get("mandate", {})
+    check(
+        "工单：改授权新增一版而不是改写",
+        status == 200 and new_mandate.get("seq") == 2,
+        f"{status} {json.dumps(new_mandate, ensure_ascii=False)[:200]} {amended.get('message', '')}",
+    )
+    check("工单：改授权后退回排队", amended.get("ticket", {}).get("stage") == "queued")
+    check(
+        "工单：改授权换了正文摘要",
+        new_mandate.get("digest") != mandate.get("digest"),
+    )
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/assignments",
+        json_body={"mandateId": mandate["id"]},
+        token=worker_access,
+    )
+    check(
+        "工单：按旧授权不能再开工",
+        status == 409 and payload(body).get("code") == "AGENT_MANDATE_SUPERSEDED",
+    )
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/reports",
+        json_body={"assignmentId": assignment_id, "kind": "progress", "summary": "旧执行体还想报"},
+        token=worker_access,
+    )
+    check(
+        "工单：改授权后旧执行体的报告不再改变状态",
+        status == 409 and payload(body).get("code") == "AGENT_ASSIGNMENT_STALE",
+    )
+
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/mandate/amend",
+        json_body={"brief": "执行体自己扩范围"},
+        token=worker_access,
+    )
+    check(
+        "工单：改授权只能由人（创建者或管理员）做",
+        status == 403 and payload(body).get("code") == "AGENT_TICKET_FORBIDDEN",
+    )
+
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/assignments",
+        json_body={
+            "mandateId": new_mandate["id"],
+            "expectedMandateDigest": new_mandate["digest"],
+            "workerId": "worker-本周数据-2",
+        },
+        token=worker_access,
+    )
+    second = payload(body)
+    second_assignment = second.get("assignment", {}).get("id", "")
+    check("工单：按新授权重新领取", status == 201 and second.get("ticket", {}).get("stage") == "working")
+    check("工单：执行体序号往后排", second["assignment"].get("seq") == 2)
+
+    # D-48.3 的服务端一侧：已读事实按步骤落账，重复落账不会记两次
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/assignments/{second_assignment}"
+        f"/read-step?eventSeq=4242",
+        token=worker_access,
+    )
+    first_read = payload(body)
+    check("工单：已读事实可落账", status == 200 and first_read.get("already") is False)
+    check("工单：落账后 assignment 带步骤", len(first_read["assignment"].get("readSteps", [])) == 1)
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/assignments/{second_assignment}"
+        f"/read-step?eventSeq=4242",
+        token=worker_access,
+    )
+    again_read = payload(body)
+    check(
+        "工单：同一号消息不重复记已读",
+        status == 200 and again_read.get("already") is True
+        and len(again_read["assignment"].get("readSteps", [])) == 1,
+    )
+
+    # ④ 两端 1 秒内一致：所有者挂着订阅流，看执行体那一侧的报告何时到达
+    baseline = sse_cursor(project_id, owner_access)
+    resp = open_sse(
+        f"/api/v1/projects/{project_id}/events/stream?since={baseline}", owner_access
+    )
+    try:
+        ready = read_sse_event(resp)
+        check("工单实时：所有者订阅就绪", ready is not None and ready[0] == "ready")
+        started = time.perf_counter()
+        status, _, body = http(
+            "POST",
+            f"/api/v1/projects/{project_id}/tickets/{ticket_id}/reports",
+            json_body={
+                "assignmentId": second_assignment,
+                "kind": "ready",
+                "summary": "图出好了，请验收",
+                "artifacts": ["week-trend.png"],
+            },
+            token=worker_access,
+        )
+        check("工单实时：执行体报告 ready 成功", status == 201)
+        pushed, skipped = drain_until(resp, "agent.report.created")
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        check(
+            "工单实时：另一端收到 agent.report.created"
+            + (f"（顺带 {skipped}）" if skipped else ""),
+            pushed is not None,
+            str(pushed),
+        )
+        check(
+            f"工单实时：1 秒内一致（实测 {latency_ms:.0f}ms）",
+            latency_ms <= 1000.0,
+            f"实测 {latency_ms:.0f}ms，超过 1 秒验收线",
+        )
+        check(
+            "工单实时：推过来的事件带工单视图与 stage",
+            pushed is not None
+            and pushed.get("kind") == "agent.report.created"
+            and pushed.get("payload", {}).get("ticket", {}).get("id") == ticket_id
+            and pushed["payload"]["ticket"].get("stage") == "awaiting_review",
+            str(pushed),
+        )
+    finally:
+        resp.close()
+
+    # 「只有 ready 让工单进入待评审」由下面的详情断言证明：stage 是 awaiting_review，
+    # 且这一时刻唯一的开放问题 kind 是 review（不是 answer）
+    status, _, body = http(
+        "GET",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}",
+        token=owner_access,
+    )
+    detail = payload(body)
+    check("工单详情可读", status == 200 and detail["ticket"]["stage"] == "awaiting_review")
+    open_attentions = [item for item in detail.get("attentions", []) if item["status"] == "open"]
+    check(
+        "工单：待评审的开放问题是 review 而不是 answer",
+        len(open_attentions) == 1 and open_attentions[0]["kind"] == "review",
+        str(open_attentions),
+    )
+    check("工单：报告里产物只留文件名", detail.get("reports", [])[-1].get("artifacts") == ["week-trend.png"])
+
+    # 扇出：订阅建立之后新到的消息才作为上下文；游标只前进，第二次读不再重复给
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tasks/{source_task_id}/comments",
+        json_body={"body": "顺便看下上季度的对比"},
+        token=owner_access,
+    )
+    check("工单扇出：源任务新评论写入", status == 201)
+    status, _, body = http(
+        "GET",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}",
+        token=owner_access,
+    )
+    contexts = payload(body).get("contexts", [])
+    check("工单扇出：新到的消息作为上下文交给工单", len(contexts) == 1 and contexts[0]["kind"] == "task.commented")
+    status, _, body = http(
+        "GET",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}",
+        token=owner_access,
+    )
+    check(
+        "工单扇出：同一条不重复给（游标只前进）",
+        payload(body).get("contexts", []) == [],
+    )
+    status, _, body = http(
+        "GET",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}",
+        token=owner_access,
+    )
+    check(
+        "工单扇出：不给新授权（stage 仍是待评审）",
+        payload(body).get("ticket", {}).get("stage") == "awaiting_review",
+    )
+
+    # 验收不通过：退回排队，授权范围照旧
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/accept",
+        json_body={"accept": False, "note": "坐标轴看不清"},
+        token=owner_access,
+    )
+    rejected = payload(body)
+    check("工单：退回重做不吊销授权", status == 200 and rejected.get("ticket", {}).get("stage") == "queued")
+    status, _, body = http(
+        "GET",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}",
+        token=owner_access,
+    )
+    check(
+        "工单：退回时把在跑的执行体结束掉",
+        payload(body).get("assignments", [{}])[0].get("status") == "dropped",
+    )
+
+    # blocked / failed 才出现在「等人处理」；dropped 只是回合结束，不算等人
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/assignments",
+        json_body={"mandateId": new_mandate["id"]},
+        token=worker_access,
+    )
+    third_assignment = payload(body).get("assignment", {}).get("id", "")
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/reports",
+        json_body={
+            "assignmentId": third_assignment,
+            "kind": "failed",
+            "summary": "跑挂了：生产库连不上",
+        },
+        token=worker_access,
+    )
+    failed = payload(body)
+    check("工单：failed 落到等人处理", status == 201 and failed.get("ticket", {}).get("stage") == "blocked")
+    check("工单：failed 也算需要人", failed.get("ticket", {}).get("needsHuman") is True)
+    status, _, body = http("GET", "/api/v1/agent/tickets", token=owner_access)
+    listed = next(
+        (item for item in payload(body).get("tickets", []) if item.get("id") == ticket_id), None
+    )
+    check("工单：等人处理出现在等你的工单里", listed is not None and listed.get("stage") == "blocked")
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/reports",
+        json_body={
+            "assignmentId": third_assignment,
+            "kind": "dropped",
+            "summary": "这一回合结束，后台作业还在跑",
+        },
+        token=worker_access,
+    )
+    dropped = payload(body)
+    check(
+        "工单：dropped 只是回合结束，不算等人",
+        status == 201 and dropped.get("ticket", {}).get("stage") == "idle"
+        and dropped.get("ticket", {}).get("needsHuman") is False,
+    )
+
+    # ③ 停止是唯一撤权：执行体停不掉自己的工单，人停了之后一切写入被拒
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/stop",
+        json_body={"reason": "执行体自己不想干了"},
+        token=worker_access,
+    )
+    check(
+        "工单：停止只能由人做（创建者或项目管理员）",
+        status == 403 and payload(body).get("code") == "AGENT_TICKET_FORBIDDEN",
+    )
+    status, _, body = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/stop",
+        json_body={"reason": "人不放心这次改动"},
+        token=owner_access,
+    )
+    stopped = payload(body)
+    check("工单：人停止成功", status == 200 and stopped.get("ticket", {}).get("stage") == "closed")
+    check("工单：停止写进 closed_reason", "人不放心" in str(stopped["ticket"].get("closedReason")))
+    status, _, body = http(
+        "GET",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}",
+        token=owner_access,
+    )
+    detail = payload(body)
+    check(
+        "工单：停止即吊销授权（当前没有生效授权）",
+        status == 200 and detail.get("mandate") is None,
+    )
+    check(
+        "工单：停止把在跑的执行体标成 lost",
+        detail.get("assignments", [{}])[0].get("status") == "lost",
+    )
+    check(
+        "工单：停止撤回所有开放问题",
+        all(item["status"] != "open" for item in detail.get("attentions", [])),
+    )
+    for label, path, body_json in (
+        ("报告", "reports", {"assignmentId": third_assignment, "kind": "progress", "summary": "还想报"}),
+        ("交回", "handback", {"assignmentId": third_assignment, "reason": "r", "requested": "q"}),
+        ("改授权", "mandate/amend", {"brief": "b"}),
+    ):
+        status, _, resp = http(
+            "POST",
+            f"/api/v1/projects/{project_id}/tickets/{ticket_id}/{path}",
+            json_body=body_json,
+            token=owner_access,
+        )
+        check(
+            f"工单：停止后不再收任何输入（{label}）",
+            status == 409 and payload(resp).get("code") == "AGENT_TICKET_CLOSED",
+            str(payload(resp)),
+        )
+    status, _, resp = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/assignments",
+        json_body={"mandateId": new_mandate["id"]},
+        token=worker_access,
+    )
+    check(
+        "工单：停止后不能重新领取",
+        status == 409 and payload(resp).get("code") == "AGENT_TICKET_CLOSED",
+    )
+    status, _, resp = http(
+        "POST",
+        f"/api/v1/projects/{project_id}/tickets/{ticket_id}/stop",
+        json_body={"reason": "再停一次"},
+        token=owner_access,
+    )
+    check("工单：停止不能停两次", status == 409 and payload(resp).get("code") == "AGENT_TICKET_CLOSED")
+
+    # 已收口的工单不该再出现在「等你的工单」
+    status, _, body = http("GET", "/api/v1/agent/tickets", token=owner_access)
+    check(
+        "工单：已收口不占等你的版面",
+        status == 200
+        and all(item.get("id") != ticket_id for item in payload(body).get("tickets", [])),
+    )
+
+
+def test_usage_report(ctx):
+    print("\n[用量上报与合并视图]")
+    stamp = int(time.time() * 1000)
+    user = register_user(f"usage-{stamp}@test.local", "用量用户")
+    access = user["accessToken"]
+    uid = user["profile"]["uid"]
+    outsider = register_user(f"usage-out-{stamp}@test.local", "用量局外人")
+    outsider_uid = outsider["profile"]["uid"]
+    admin = ctx["admin_access"]
+
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    month = today[:7]
+    # 40 天前必然落在本月之外（月份最长 31 天），用它验证跨月过滤
+    last_month_day = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 40 * 86400))
+    now_ms_value = int(time.time() * 1000)
+
+    def usage_row(model, day, origin, pt, ct, calls, **extra):
+        row = {
+            "sub": uid,
+            "modelName": model,
+            "day": day,
+            "origin": origin,
+            "promptTokens": pt,
+            "completionTokens": ct,
+            "tokensUsed": pt + ct,
+            "calls": calls,
+        }
+        row.update(extra)
+        return row
+
+    desktop_rows = [
+        usage_row("qwen-plus", today, "desktop", 1000, 500, 3,
+                  pricedCalls=2, unpricedCalls=1, latencyMsTotal=3000, latencySamples=3,
+                  costs={"CNY": 1080}, lastUsedAtMs=now_ms_value),
+        usage_row("qwen-max", today, "desktop", 200, 100, 2, unpricedCalls=2),
+    ]
+    engine_rows = [
+        # 桌面通道：同一批调用桌面已记，合并视图必须排除
+        usage_row("qwen-plus", today, "desktop", 1000, 500, 3),
+        usage_row("qwen-plus", today, "im", 40, 10, 2,
+                  pricedCalls=2, latencyMsTotal=300, latencySamples=2, costs={"CNY": 40}),
+        usage_row("qwen-plus", today, "unknown", 7, 7, 1, unpricedCalls=1),
+        usage_row("qwen-max", last_month_day, "web", 10, 5, 1, unpricedCalls=1),
+    ]
+
+    status, _, body = http("POST", "/api/v1/usage/report", json_body={
+        "source": "engine", "deviceId": "pc-1", "rows": engine_rows})
+    check("未登录不能上报用量", status == 401 and payload(body).get("code") == "AUTH_REQUIRED")
+
+    status, _, body = http("POST", "/api/v1/usage/report", token=access, json_body={
+        "source": "kafka", "deviceId": "pc-1", "rows": engine_rows})
+    check("未知来源被拒", status == 400 and payload(body).get("code") == "USAGE_INVALID_SOURCE")
+
+    bad = dict(engine_rows[0], tokensUsed=1)
+    status, _, body = http("POST", "/api/v1/usage/report", token=access, json_body={
+        "source": "engine", "deviceId": "pc-1", "rows": [bad]})
+    check("tokensUsed 与 prompt+completion 不一致被拒",
+          status == 400 and payload(body).get("code") == "USAGE_TOKENS_MISMATCH")
+    status, _, body = http("POST", "/api/v1/usage/report", token=access, json_body={
+        "source": "engine", "deviceId": "pc-1", "rows": [dict(engine_rows[0], day="2026/10/01")]})
+    check("day 非 yyyy-mm-dd 被拒",
+          status == 400 and payload(body).get("code") == "USAGE_INVALID_ROW")
+
+    status, _, body = http("POST", "/api/v1/usage/report", token=access, json_body={
+        "source": "engine", "deviceId": "pc-1",
+        "rows": [dict(engine_rows[1], sub=outsider_uid)]})
+    check("不能替他人上报",
+          status == 403 and payload(body).get("code") == "USAGE_SCOPE_DENIED")
+
+    def report(source, rows, device="pc-1", token=access):
+        return http("POST", "/api/v1/usage/report", token=token, json_body={
+            "source": source, "deviceId": device, "schemaVersion": 1, "rows": rows})
+
+    status, _, body = report("engine", engine_rows)
+    check("引擎台账上报入库", status == 200 and payload(body).get("accepted") == 4, str(payload(body)))
+    status, _, body = report("desktop", desktop_rows)
+    check("桌面台账上报入库", status == 200 and payload(body).get("accepted") == 2)
+
+    def me(period="total", token=access):
+        status, _, body = http("GET", f"/api/v1/usage/me?period={period}", token=token)
+        return status, payload(body)
+
+    status, view = me()
+    check("查询本人合并视图", status == 200 and view.get("period") == "total")
+    totals = view["totals"]
+    check("桌面为主：引擎 desktop 行不重复计数",
+          totals["promptTokens"] == 1257 and totals["completionTokens"] == 622
+          and totals["tokensUsed"] == 1879 and totals["calls"] == 9,
+          json.dumps(totals, ensure_ascii=False))
+    check("引擎补入桌面没有的通道（im/web/unknown）",
+          [item["modelName"] for item in view["models"]] == ["qwen-plus", "qwen-max"]
+          and view["models"][0]["tokensUsed"] == 1564)
+    check("平均耗时向下取整（与桌面/引擎同口径）",
+          totals["avgLatencyMs"] == 660 and totals["latencySamples"] == 5)
+    check("成本按币种合并、未计价单独计数",
+          totals["costs"] == [{"currency": "CNY", "micros": 1120}]
+          and totals["pricedCalls"] == 4 and totals["unpricedCalls"] == 5)
+    check("来源披露：排除数、未标记数、上报端数",
+          view["sources"]["engineDedupedRows"] == 1
+          and view["sources"]["engineDedupedTokens"] == 1500
+          and view["sources"]["desktopRows"] == 2
+          and view["sources"]["engineRows"] == 3
+          and view["sources"]["unattributedTokens"] == 14
+          and view["sources"]["reporters"] == 2,
+          json.dumps(view["sources"], ensure_ascii=False))
+
+    report("engine", engine_rows)
+    report("desktop", desktop_rows)
+    _, again = me()
+    check("重复上报幂等（累计值覆盖，不重复计数）",
+          again["totals"] == totals and again["sources"] == view["sources"],
+          json.dumps(again["totals"], ensure_ascii=False))
+
+    _, monthly = me("monthly")
+    check("本月视图排除跨月行",
+          monthly["totals"]["tokensUsed"] == 1864
+          and all(item["day"].startswith(month) for item in monthly["days"]))
+    _, daily = me("daily")
+    check("当日视图只含今日",
+          daily["days"] and all(item["day"] == today for item in daily["days"]))
+    check("趋势与明细与汇总三块自洽",
+          sum(item["tokensUsed"] for item in monthly["days"])
+          == sum(item["tokensUsed"] for item in monthly["models"])
+          == monthly["totals"]["tokensUsed"])
+    status, _, body = http("GET", "/api/v1/usage/me?period=hourly", token=access)
+    check("非法周期拒绝而不是降级",
+          status == 400 and payload(body).get("code") == "USAGE_INVALID_PERIOD")
+
+    report("engine", [usage_row("qwen-plus", today, "im", 40, 10, 2,
+                               pricedCalls=2, latencyMsTotal=300, latencySamples=2,
+                               costs={"CNY": 40})], device="pc-2")
+    _, second_device = me()
+    check("多设备各算一份，不互相覆盖",
+          second_device["totals"]["tokensUsed"] == 1879 + 50
+          and second_device["sources"]["reporters"] == 3)
+
+    status, _, body = http("GET", f"/api/v1/usage/users/{outsider_uid}", token=access)
+    check("普通用户不能查他人用量", status == 403)
+    status, _, body = http("GET", f"/api/v1/usage/users/{uid}?period=total", token=admin)
+    admin_view = payload(body)
+    check("管理员按用户查询与本人视图同口径",
+          status == 200 and admin_view["totals"] == second_device["totals"])
+    status, _, body = http("GET", "/api/v1/usage/me")
+    check("未登录不能查询", status == 401 and payload(body).get("code") == "AUTH_REQUIRED")
+
+    fresh = register_user(f"usage-empty-{stamp}@test.local", "空台账用户")
+    _, empty = me("monthly", token=fresh["accessToken"])
+    check("无用量时返回零值而不是伪造第一名/耗时/成本",
+          empty["totals"]["tokensUsed"] == 0 and empty["totals"]["activeModels"] == 0
+          and empty["totals"]["avgLatencyMs"] is None and empty["totals"]["costs"] == []
+          and empty["models"] == [] and empty["days"] == [])
+
+    conn = sqlite3.connect(os.path.join(_TMP, "market.db"))
+    conn.row_factory = sqlite3.Row
+    stored = conn.execute(
+        "SELECT origin, COUNT(*) AS n FROM usage_rollup WHERE sub = ?1 GROUP BY origin",
+        (uid,),
+    ).fetchall()
+    rows_in_db = conn.execute("SELECT COUNT(*) AS n FROM usage_rollup").fetchone()["n"]
+    conn.close()
+    check("桌面行的 origin 统一写成 desktop",
+          {row["origin"] for row in stored if row["origin"] != ""} <=
+          {"desktop", "im", "web", "unknown", "cli", "schedule"})
+    check("上报行只落服务端自己的库（重复上报不新增行）", rows_in_db == 7, str(rows_in_db))
+
+
 def test_rate_limit():
     print("\n[登录限流]")
     email = f"ghost{int(time.time())}@test.local"
@@ -1482,6 +2557,7 @@ def run():
         ctx = test_auth()
         ctx.update(test_legacy_web_login())
         test_auth_claims(ctx)
+        test_engine_introspect(ctx)
         test_skill_market(ctx)
         ctx["skill_id"] = "weekly-digest"
         ctx.update(test_suite_market(ctx))
@@ -1490,6 +2566,9 @@ def run():
         test_my_items(ctx)
         test_projects(ctx)
         test_project_events(ctx)
+        test_project_events_realtime(ctx)
+        test_agent_tickets(ctx)
+        test_usage_report(ctx)
         test_seed(ctx)
         test_market_revoke(ctx)
         test_rate_limit()

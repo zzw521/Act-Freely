@@ -193,6 +193,7 @@ const FilePanel: React.FC<FilePanelProps> = ({ fileOps, onDownload, onRevealInFo
                 <Tooltip title="下载">
                   <IconButton
                     size="small"
+                    aria-label="下载"
                     onClick={(e) => {
                       e.stopPropagation();
                       onDownload(op);
@@ -225,6 +226,7 @@ const FilePanel: React.FC<FilePanelProps> = ({ fileOps, onDownload, onRevealInFo
                     <Tooltip title="在文件夹中显示">
                       <IconButton
                         size="small"
+                        aria-label="在文件夹中显示"
                         onClick={() => onRevealInFolder(op)}
                       >
                         <FolderIcon fontSize="small" />

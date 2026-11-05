@@ -67,7 +67,9 @@ def main() -> None:
             # mode/images 是后续接入的工作台模式与视觉输入，替身一并接收
             assert isinstance(context, str), "计划上下文必须是字符串"
             assert isinstance(mode, str), "工作台模式必须是字符串"
-            return ([{"step_id": "step-1", "name": goal[:10], "description": goal}], None)
+            # 真实现返回 (steps, usage, route_switches)（计划阶段的模型故障转移清单），
+            # 替身没有模型可转，第三个值给空清单
+            return ([{"step_id": "step-1", "name": goal[:10], "description": goal}], None, [])
 
         engine_server._generate_plan = fake_plan
         client = TestClient(engine_server.app)
@@ -202,13 +204,18 @@ def main() -> None:
         check("modelId：提交返回 200 且产出计划", id_resp.status_code == 200 and b"event: plan" in id_resp.content,
               id_resp.text[:200])
         id_session = engine_server._TASK_SESSIONS.get(id_task)
+        # 会话里的 model_config 现在还带 contextWindow / prices / fallbacks 等条目字段
+        # （压缩窗口与故障转移要用），这里只钉「端点与密钥按所选条目落进会话」这一件事
+        id_config = getattr(id_session, "model_config", None) or {}
         check("modelId：解析出端点与密钥并落到会话",
-              id_session is not None and id_session.model_config == {
-                  "baseUrl": "https://models.example/v1",
-                  "apiKey": "sk-selftest-secret",
-                  "modelName": "selftest-model",
-                  "source": "openai_compat",
-              }, str(getattr(id_session, "model_config", None)))
+              id_session is not None and all(
+                  id_config.get(key) == value for key, value in {
+                      "baseUrl": "https://models.example/v1",
+                      "apiKey": "sk-selftest-secret",
+                      "modelName": "selftest-model",
+                      "source": "openai_compat",
+                  }.items()
+              ), str(id_config))
         check("modelId：会话记住所选条目 id（approve 重跑沿用）",
               id_session is not None and id_session.model_id == model_id)
 

@@ -15,9 +15,12 @@
 import type { BuiltinTool } from './contracts';
 
 export const DECLARED_BUILTIN_TOOLS: BuiltinTool[] = [
+  { id: 'list_directory', name: '列出目录', desc: '列出目录内的文件与子目录（可限定递归深度与条数）', source: 'builtin' },
   { id: 'view_text_file', name: '读取文件', desc: '读取工作目录内的文本文件（按行返回内容）', source: 'builtin' },
+  { id: 'read_document', name: '读取文档', desc: '按路径读取 Word / Excel / PowerPoint / PDF 并抽取正文', source: 'builtin' },
   { id: 'write_text_file', name: '写入文件', desc: '在工作目录内创建或覆盖文本文件', source: 'builtin' },
   { id: 'insert_text_file', name: '修改文件', desc: '在工作目录内按行插入或替换文本内容', source: 'builtin' },
+  { id: 'delete_text_file', name: '删除文件', desc: '删除单个文件；仅「完全访问」档位放行，删除前先复制进引擎回收目录', source: 'builtin' },
 ];
 
 /** 声明清单视图（source 标明这不是实测值） */

@@ -35,7 +35,6 @@ const libApi = () => read('../../../src/renderer/lib/api.ts');
 const store = () => read('../../../src/renderer/store/securityStore.ts');
 const panel = () => read('../../../src/renderer/components/CompliancePanel/index.tsx');
 const securityPage = () => read('../../../src/renderer/pages/Security/index.tsx');
-const topBar = () => read('../../../src/renderer/components/Layout/TopBar.tsx');
 const appStore = () => read('../../../src/renderer/stores/useAppStore.ts');
 const mainLayout = () => read('../../../src/renderer/components/Layout/MainLayout.tsx');
 const workbenchStore = () => read('../../../src/renderer/store/workbenchStore.ts');
@@ -229,16 +228,17 @@ describe('UI 消费与假状态清理', () => {
     expect(src).toContain('loadCompliance()');
   });
 
-  it('顶栏假开关状态已删除，改为读合规通道', () => {
+  it('合规硬开关只剩合规面板一处实现，写入中/加载中的开关不许再点', () => {
     expect(appStore()).not.toContain('hardSwitchOff');
     expect(appStore()).not.toContain('toggleHardSwitch');
     expect(appStore()).not.toContain('setHardSwitchOff');
-    const src = topBar();
-    expect(src).not.toContain('hardSwitchOff');
-    expect(src).toContain('useSecurityStore((s) => s.compliance)');
+    const src = panel();
+    expect(src).toContain('const hardSwitchOn = Boolean(compliance?.hardSwitchEnabled);');
     expect(src).toContain('updateCompliance({ hardSwitchEnabled: !hardSwitchOn })');
-    // 未加载时不谎报状态
-    expect(src).toContain('合规状态未知');
+    // 状态来自合规通道，加载中或写入中不给点，避免把「还没读到」当「正常模式」切下去
+    expect(src).toContain('disabled={pending || complianceLoading}');
+    // 死代码顶栏（第二份开关 UI）已整文件删除，Layout 不再导出它
+    expect(read('../../../src/renderer/components/Layout/index.ts')).not.toContain('TopBar');
   });
 
   it('全局通知有了真实渲染点（showNotification 不再是无人消费的状态）', () => {

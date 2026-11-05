@@ -7,6 +7,8 @@
 - **在线专家套件市场**：套件包发布、版本管理、指令解析、检索与下载。
 - **MCP 插件市场**：MCP 连接器配置的发布、版本管理与分发（服务端只登记配置，不接触密钥值）。
 - **项目协作**：项目、成员与角色、一次性邀请、共享任务、评论、结果回报与快照同步（只同步文本与产物文件名，不同步文件内容、对话或凭据）。
+- **Web 控制台**：`/ui/` 自带纯静态市场浏览与管理员控制台，无需单独部署前端。
+- **网关治理与审计**：管理角色（admin/operator/auditor）、网关管理代理读写分离、管理审计哈希链（分页/验链/NDJSON 导出）。
 
 技术栈：FastAPI + SQLite（WAL）+ 本地文件存储。除运行依赖外，不依赖外部数据库、对象存储或消息队列。
 
@@ -33,6 +35,7 @@ bash init.sh
 | 入口 | 地址 |
 | --- | --- |
 | 服务根路径 | `http://127.0.0.1:8000/` |
+| Web 控制台 | `http://127.0.0.1:8000/ui/` |
 | Swagger UI | `http://127.0.0.1:8000/docs` |
 | OpenAPI | `http://127.0.0.1:8000/openapi.json` |
 | 健康检查 | `http://127.0.0.1:8000/health` |
@@ -44,7 +47,16 @@ bash init.sh
 
 - 演示发布账号：`demo@tongtian.local`
 - 密码：优先取 `TT_DEMO_PASSWORD`；未设置时随机生成，**仅在首次创建时打印一次**
-- 演示内容：2 个技能、2 个专家套件、3 个 MCP 连接器
+- 演示内容：当前 12 个技能、13 个专家套件、9 个 MCP 连接器（清单见 `app/seed.py` 的
+  `SKILL_SEEDS` / `SUITE_SEEDS` / `_mcp_seeds()`，条目数由 `seed.SEED_COUNTS` 导出并被
+  端到端测试校验），按 `app/catalog.py` 的分类口径把每个分类都铺上条目
+- 技能正文放在 `app/demo_skills/<slug>/`：其中 10 条取自公开技能库
+  [skills.sh](https://skills.sh/) 上的开源仓库（MIT / Apache-2.0），整目录镜像、未作改写，
+  随包 `LICENSE.txt` 与 `SOURCE.txt` 记录来源仓库、上游路径、提交号与获取时间；
+  `weekly-report`、`meeting-minutes` 为通天办公原创演示内容。中文摘要与分类是服务端发布
+  参数，不属于上游内容
+- MCP 配置取自真实存在的 npm 包或已连通验证的远程端点；凭据只登记键名与说明，值由客户端
+  保存，服务端不落盘
 
 不想要演示数据：在 `.env` 中设置 `TT_SEED_DEMO=false`，或使用全新数据目录。
 
@@ -68,6 +80,17 @@ bash init.sh
 | `TT_AUTH_AUDIENCE` | `tongtian-engine` | JWT `aud`；引擎侧按此值校验 |
 | `TT_ACCESS_TTL_SECONDS` | `900` | access token 有效期（15 分钟） |
 | `TT_REFRESH_TTL_SECONDS` | `2592000` | refresh token 有效期（30 天） |
+| `TT_GATEWAY_AUDIENCE` | `tongtian-gateway` | 网关短期票的 `aud`；只给网关，引擎不接受 |
+| `TT_GATEWAY_TOKEN_TTL_SECONDS` | `900` | 网关短期票上限；实际取 `min(now+该值, access 的 exp)` |
+| `TT_GATEWAY_SERVICE_TOKEN` | 空 | 网关服务令牌：拉策略与批量上报用量共用；未配置时相关接口返回 503 |
+| `TT_GATEWAY_ADMIN_URL` | 空 | 网关管理 API 地址；`/api/v1/admin/gateway/*` 的转发目标，未配置时代理返回 503 |
+| `TT_GATEWAY_ADMIN_TOKEN` | 空 | 代理转发时补上的 `X-TT-Admin-Token`；只留在服务端进程环境，不进浏览器 |
+| `TT_GATEWAY_ADMIN_CLIENT_CERT` | 空 | 管理面启用 mTLS 时，控制面访问 `https://` 网关管理 API 的客户端证书路径 |
+| `TT_GATEWAY_ADMIN_CLIENT_KEY` | 空 | 上述证书的私钥路径；仅服务账号可读 |
+| `TT_GATEWAY_ADMIN_CA` | 空 | 校验网关/入口证书的 CA 文件；留空使用系统信任库 |
+| `TT_GATEWAY_PROXY_TIMEOUT_SECONDS` | `10` | 管理代理连网关的连接/读取超时 |
+| `TT_GATEWAY_USAGE_RETENTION_DAYS` | `30` | 网关用量判重键 `(gatewayId, requestId)` 的保留天数 |
+| `TT_SERVER_JWT_KEY_MAX_AGE_SECONDS` | `2592000` | RS256 签名密钥最长使用时长，到期轮换（JWKS 保留新旧两把） |
 | `TT_ALLOW_REGISTRATION` | `true` | 关闭后注册接口返回 403 |
 | `TT_CORS_ORIGINS` | `*` | 逗号分隔的来源列表 |
 | `TT_TRUST_PROXY` | `false` | 仅当位于可信反向代理后时开启，用于读取 `X-Forwarded-For` |
@@ -184,7 +207,19 @@ TT_AUTH_SERVER_URL=https://auth.example.com bash init.sh
 
 - 远程地址必须 HTTPS，本机回环允许 HTTP；桌面端在打开浏览器前会探活 `/health`，并要求 `service=tongtian-server`，服务未启动会直接给出可操作的错误，而不是打开一个连不上的登录页；
 - `TT_AUTH_MOCK=true` 仍是离线开发开关：直接模拟登录，不连接服务端；
-- `tongtian-tauri/auth-server/`（默认 `127.0.0.1:18080`）是历史过渡实现，已不在默认链路上。
+- `tongtian-tauri/auth-server/`（历史 `127.0.0.1:18080`）已退役：不在任何启动脚本里，直接运行会被退役守卫拒绝；它的 `auth.db` 是第二份账号库，账号数据只存在本服务的 `data/market.db`。
+
+### 3.4 Web 控制台（/ui）
+
+服务端自带一个纯静态的轻量控制台（`app/web/`，原生 HTML/CSS/JS，无构建步骤），直接调用前文的 API：
+
+- **市场浏览**：技能 / 专家套件 / MCP 的分类、搜索、排序、分页，条目详情、README、版本下载、收藏与 MCP 配置查看/复制；
+- **账号**：页面内登录/注册，access token 过期时用 refresh token 自动续期；令牌只存 `sessionStorage`，关闭标签页即失效；
+- **管理员控制台**：推荐位开关、版本撤销/恢复、用户列表搜索与强制下线、审计与哈希链校验、模型网关、组织与部门。未登录或以普通用户登录时导航栏只有「市场」，「管理控制台」入口需以 `admin` / `operator` / `auditor` 登录后才会出现；管理员账号由 `TT_ADMIN_EMAIL` / `TT_ADMIN_PASSWORD` 初始化（本机 Docker 见 `tongtian-server/.env`）。
+- **模型网关**（管理员）：网关健康与用量上报队列、provider 与密钥（新建后只显示 `last4`，明文只在创建响应里出现一次）、CLI API Key 签发/列表/吊销（明文只显示一次，吊销立即失效）、当月配额快照与调整、网关本地用量、租户策略读写；页面所有请求都走 `/api/v1/admin/gateway/*` 代理，浏览器永远拿不到网关管理令牌。
+- **组织与部门**（管理员）：新建/改名部门、把成员分配进部门；改动会吊销该用户会话，需重新登录才能拿到新 claims，页面会明确提示这一点。
+
+访问 `http://127.0.0.1:8000/ui/`。页面由 `GET /ui/*` 提供，响应附带严格 CSP（`default-src 'self'`），所有用户内容按纯文本渲染，避免注入。
 
 ---
 
@@ -461,6 +496,163 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/mcp \
 - 所有查询都是快照 + `seq`；实时更新走 SSE（`events/stream`），断线后按 `since` / `Last-Event-ID` 补拉，可回退到 10 秒轮询。
 - SSE 需要 `Authorization: Bearer` 头；浏览器 `EventSource` 不能自定义请求头时，客户端应使用 fetch 流式读取，或改用增量事件接口。
 
+### 4.8 模型用量上报与合并视图
+
+桌面端与引擎各自有本地台账（桌面 `tongtian.db` 的 `model_usage` 表、引擎 `usage/model-usage.jsonl`）。服务化部署时客户端把**已经累计好的行**按报文推上来，服务端只接收与聚合，不读取任何客户端库文件。
+
+| 方法 | 路径 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| `POST` | `/api/v1/usage/report` | 登录（非管理员只能上报本人 `sub`） | 接收客户端累计好的用量行，按主键幂等入库 `usage_rollup` |
+| `POST` | `/api/v1/gateway/usage` | 网关服务令牌 | 接收网关的批量事件，按 `(gatewayId, requestId)` 幂等并入按日台账 |
+| `GET` | `/api/v1/usage/me?period=daily\|monthly\|total` | 登录 | 本人合并视图：`totals` / `models` / `days` / `sources` |
+| `GET` | `/api/v1/usage/users/{sub}?period=…` | 管理员 | 同一份合并视图，按用户查询（与 `/me` 同一算法） |
+| `GET` | `/api/v1/admin/usage/departments?period=…[&org=]` | 管理员 | 部门维度汇总，行过滤与 `/users/{sub}` 完全一致 |
+
+上报报文（字段名与引擎 `GET /api/usage/export` 的导出行、桌面契约同名，无需改名）：
+
+```json
+{
+  "source": "engine",
+  "deviceId": "engine-1",
+  "schemaVersion": 1,
+  "rows": [{
+    "sub": "uid-xxx", "org": "org-a", "modelName": "qwen-plus", "day": "2026-10-29",
+    "origin": "im", "promptTokens": 40, "completionTokens": 10, "tokensUsed": 50,
+    "calls": 2, "pricedCalls": 1, "unpricedCalls": 1,
+    "latencyMsTotal": 300, "latencySamples": 2, "costs": [{ "currency": "CNY", "micros": 1080 }],
+    "lastUsedAtMs": 1793241291839
+  }]
+}
+```
+
+约束：
+
+- **不重复计数**：桌面行按 `source: "desktop"` 上报；引擎台账里明确标记为 `origin: "desktop"` 的样本（同一批调用被两边记到）在合并视图里排除，排除的数量与 token 在 `sources.engineDeduped*` 里披露。
+- **不静默丢数据**：`web` / `im` / `cli` / `schedule` 的调用桌面根本没记，原样补入；没有来源标记的归入 `unknown`，照常计入总量并在 `sources.unattributedTokens` 单列。
+- **幂等**：来的是累计值，按 `(source, deviceId, sub, modelName, day, origin)` 覆盖；同一账号的多台设备各算一份，互不覆盖。
+- **不伪造指标**：`tokensUsed` 必须等于 `prompt + completion`，否则整批拒绝（`USAGE_TOKENS_MISMATCH`）；没有延迟样本时 `avgLatencyMs` 为 `null`，没有单价的调用只计入 `unpricedCalls`，不写成 0 元；平均耗时一律向下取整，与桌面 Rust、引擎三处同口径。
+- 周期只接受 `daily` / `monthly` / `total`（UTC 日/月），非法值返回 `400 USAGE_INVALID_PERIOD` 而不是降级成全量。
+- 单次上报不超过 2000 行；跨层数值一致性由客户端仓库的 `tongtian-tauri/tests/integration/engine_usage_report_selftest.py` 端到端验证。
+- **经网关的调用只算一次**：`source=gateway` 的行计入合并视图并计入 `sources.gatewayRows`；客户端把同一批调用按 `origin=gateway` 再报一遍时，这些行被排除，数量与 token 在 `sources.gatewayDedupedRows/Tokens` 披露；BYOK 直连（`source=desktop`）照常计入 `desktopRows`，不受网关账本影响。
+
+#### 网关批量上报（M1.4）
+
+网关是经网关调用的唯一事实来源：本地 `usage_events` 落库后由后台线程每 5 秒推一批（单批最多 200 条），控制面按 `(gatewayId, requestId)` 判重后并入 `usage_rollup`（`source=gateway`、`origin=gateway`）。
+
+```json
+{
+  "contractVersion": "gateway-contract.v1",
+  "gatewayId": "gw-local-01",
+  "batchId": "batch_3f2a…",
+  "events": [{
+    "requestId": "req_…", "tenantId": "acme", "departmentId": "dept-eng", "userId": "uid-xxx",
+    "origin": "gateway", "protocol": "openai", "model": "qwen-plus", "modelAlias": "auto",
+    "promptTokens": 12, "completionTokens": 8, "totalTokens": 20,
+    "cost": "0.000028", "currency": "USD", "priceVersion": "2026-10",
+    "latencyMs": 812, "status": "ok", "stream": false, "estimated": false,
+    "startedAt": 1793241291027, "finishedAt": 1793241291839
+  }]
+}
+```
+
+- 鉴权与拉策略共用同一个服务令牌（`TT_GATEWAY_SERVICE_TOKEN`，常量时间比较）；未配置 503，令牌错误 401。
+- 响应只回 `{ok, accepted, duplicates}`：重放同一批不增长台账，部分重复的批次只计入新行。
+- 整批校验：任一行不合法（`origin` 不是 `gateway`、`totalTokens` 与 prompt+completion 不符、契约版本不认识、单批超过 1000 条等）整批 `400` 拒绝，不写半批——写半批会让网关以为整批失败而重传，两边账目长期对不上。
+- 事件只带计量字段，不含 prompt/response；判重键保留 `TT_GATEWAY_USAGE_RETENTION_DAYS`（默认 30 天）后清理，网关重启后补报同一 `requestId` 在保留期内仍判重。
+
+#### 部门用量报表
+
+`GET /api/v1/admin/usage/departments?period=daily|monthly|total[&org=]` 按 `(org, dept)` 汇总，行过滤与 `/api/v1/usage/users/{sub}` 用同一套规则（同样排除 `origin=gateway` 的客户端副本与引擎 `desktop` 重复样本），因此逐部门相加等于逐用户相加。每行给 `tokensUsed`、`calls`、`avgLatencyMs`、`pricedCalls`/`unpricedCalls`、`costs`、`users`、`models`，未分配部门的行名为「未分配」。
+
+### 4.9 组织、部门与网关身份
+
+网关只接受控制面签发的 RS256 短期票，不再信任客户端自签的开发令牌。链路：登录拿 HS256 access token → 换票拿 RS256 网关票 → 带票调用网关。
+
+#### JWKS 与换票
+
+| 方法 | 路径 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/.well-known/jwks.json` | 无 | 当前与上一把 RS256 公钥；`Cache-Control: max-age=300` |
+| `POST` | `/api/v1/auth/gateway-token` | access token | 换取网关闭环短期票 |
+
+换票请求体可带 `{"dept": "dept-sales"}`（缺省取主部门）。响应：
+
+```json
+{
+  "ok": true,
+  "token": "<RS256 JWT>",
+  "expiresAt": 1761826500,
+  "expiresIn": 900,
+  "tenant": "acme",
+  "dept": "dept-sales"
+}
+```
+
+- 票据 claims：`sub/sid/tenant/org/dept/depts/roles/role/iss/aud/iat/exp`；`aud` 只有 `TT_GATEWAY_AUDIENCE`。
+- 有效期 `exp = min(now + TT_GATEWAY_TOKEN_TTL_SECONDS, access 的 exp)`；不提供 refresh，过期后用 access token 重新换。
+- 只接受 `type=access` 且会话未吊销的令牌；个人账号（无组织）→ 403，组织内无部门 → 403，指定部门不在成员内 → 403。
+- 响应 `Cache-Control: no-store`；每用户每分钟限流 60 次。
+- 签名密钥落盘在 `{data_dir}/keys/jwt-rs256-<kid>.pem`，`index.json` 记录当前 `kid`；重启复用，超过 `TT_SERVER_JWT_KEY_MAX_AGE_SECONDS` 轮换，旧钥在 JWKS 中保留到下一次轮换。
+
+#### 组织与部门（管理员）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/v1/admin/departments` | 新建部门：`{org, id, name}`；`id` 需匹配 `^[a-z0-9][a-z0-9_-]{0,63}$` |
+| `GET` | `/api/v1/admin/departments?org=` | 组织下的部门 |
+| `PATCH` | `/api/v1/admin/users/{uid}` | 支持 `org`、`depts`（数组，`null` 清空）、`primaryDept` |
+
+- 注册后的个人账号默认没有组织；管理员分配 `org` 后自动加入 `dept-default`（默认部门）。
+- 改 `org`/`depts` 会吊销该用户全部会话，需要重新登录才能拿到新 claims。
+- 同一部门 `id` 在不同组织下互不影响。
+
+#### 网关策略
+
+| 方法 | 路径 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/api/v1/gateway/policy?tenant=` | 服务令牌 | 网关拉取；`ETag`=`"policyVersion"`，`If-None-Match` 命中返回 304 |
+| `GET` | `/api/v1/admin/gateway/policies` | 管理员 | 已配置策略的租户与版本 |
+| `GET` | `/api/v1/admin/gateway/policy/{tenant}` | 管理员 | 单租户策略详情 |
+| `PUT` | `/api/v1/admin/gateway/policy/{tenant}` | 管理员 | 保存策略，服务端校验 `PolicyDocument` 并自增版本 |
+
+- 服务令牌缺失时接口返回 `503 AUTH_UNAVAILABLE`，令牌错误返回 `401 AUTH_REQUIRED`（常量时间比较）。
+- 未配置策略的租户返回 `404 POLICY_NOT_FOUND`；网关据此直接拒绝请求（403），不会使用旧缓存。
+- 策略结构以网关仓库 [CONTRACT.md](../tongtian-gateway/CONTRACT.md) §5 为准。
+
+#### 网关管理代理（M1.4，M2/M3/M4 增补）
+
+浏览器只与控制面打交道：`/api/v1/admin/gateway/*` 用管理角色 JWT 鉴权，服务端补上 `X-TT-Admin-Token`、`X-TT-Admin-Actor`（操作人 `uid`）与 `X-TT-Admin-Roles`（调用者角色；部门范围运维再带 `X-TT-Admin-Depts`/`X-TT-Admin-Tenant`）后转发到网关 `/gateway/v1/admin/*`，网关管理令牌因此永不进浏览器、不进页面源码。
+
+- 读操作（GET）允许 admin / operator / auditor；写操作（POST/PUT/PATCH/DELETE）只允许 admin / operator；普通用户读 `403`，审计员写 `403 FORBIDDEN` 且不会发往网关。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/v1/admin/gateway/health` | 网关健康、策略版本、provider 数量、上报队列与审计外送状态 |
+| `GET` `POST` `PATCH` `DELETE` | `/api/v1/admin/gateway/providers…` | provider 与密钥管理（密钥只在创建/轮换响应里出现一次） |
+| `GET` `POST` `DELETE` | `/api/v1/admin/gateway/api-keys…` | CLI API Key 签发/列表/吊销（明文只在 201 响应里出现一次，列表无明文与哈希） |
+| `POST` | `/api/v1/admin/gateway/api-keys/{id}/rotate` | 轮换 Key（同一 keyId、新 secret，旧 secret 立即失效） |
+| `GET` `POST` | `/api/v1/admin/gateway/audit…` | 网关审计分页/验链/NDJSON 导出（审计员可读） |
+| `GET` | `/api/v1/admin/gateway/usage?tenant=&dept=&sub=&model=&period=` | 网关本地账本聚合 |
+| `GET` `PATCH` | `/api/v1/admin/gateway/quotas…` | 配额快照与当月额度调整（主体 `tenant:dept:sub`，部门级用 `*`） |
+
+- 转发规则是加法：路径穿越（`.`/`..`/反斜杠）→ `400`，请求体上限 2MB → `413`，连不上 → `502 GATEWAY_ADMIN_UNREACHABLE`，超时 → `504 GATEWAY_ADMIN_TIMEOUT`，未配置地址或令牌 → `503`；网关自身的 4xx 管理错误信封原样透传给页面。
+- 网关管理面启用 mTLS 时：`TT_GATEWAY_ADMIN_URL` 用 `https://` 并配置 `TT_GATEWAY_ADMIN_CLIENT_CERT/KEY/CA`；证书/私钥不可读 → `503 GATEWAY_ADMIN_TLS_CONFIG`，握手失败 → `502 GATEWAY_ADMIN_TLS_ERROR`。私钥只在服务端进程环境使用。
+- 未登录 `401`、无管理角色 `403` 由 `require_gateway_staff` 挡在转发之前；审计员的写操作在控制面就被拦下。所有响应带 `Cache-Control: no-store`。
+- 写操作（POST/PUT/PATCH/DELETE）落控制面审计 `action=gateway.admin`，请求体按脱敏规则写入（密钥字段只留 `***`），网关侧同时记自己的审计。
+
+#### 管理审计（M4.3）
+
+控制面把管理动作写入 `admin_audit` 哈希链（`entry_hash = sha256(prev_hash\n at_ms\n actor\n actor_role\n action\n object\n before_json\n after_json)`，首条 `prev_hash` 为 64 个 0），并提供只读接口：
+
+| 方法 | 路径 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/api/v1/admin/audit?after=&limit=` | admin/operator/auditor | 按 `id` 游标分页，返回 `entries` / `nextAfter` / `headHash` |
+| `GET` | `/api/v1/admin/audit/verify` | admin/operator/auditor | 全链复算；篡改或断链时 `brokenAt` 指向首条异常行 |
+| `GET` | `/api/v1/admin/audit/export?after=&limit=` | admin/operator/auditor | NDJSON，响应头 `X-TT-Audit-Head` / `X-TT-Audit-Next`，`no-store` |
+
+- 审计只记动作、对象与脱敏后的前后值（`secret`/`token`/`password`/`authorization` 等替换为 `***`，超过 4KB 标注截断），不保存登录令牌与密钥明文。
+- 查询审计本身不写审计；角色变更写 `user.role`，网关代理写操作写 `gateway.admin`。
+
 ## 5. 管理员
 
 通过环境变量引导管理员（启动时执行）：
@@ -469,6 +661,15 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/mcp \
 TT_ADMIN_EMAIL=admin@example.com
 TT_ADMIN_PASSWORD=change-me-please
 ```
+
+用户列表（管理员）：
+
+```http
+GET /api/v1/admin/users?q=&page=1&pageSize=20
+Authorization: Bearer <admin access token>
+```
+
+返回 `uid`/`email`/`nickname`/`role`/`plan`/`org`/`createdAtMs`，不包含密码哈希；`q` 按邮箱或昵称模糊匹配（最长 100 字），普通用户返回 403。
 
 推荐条目：
 
@@ -517,6 +718,21 @@ Content-Type: application/json
 - 普通用户默认 `{monthlyTokens: 100000, concurrentTasks: 2}`，管理员默认 `{monthlyTokens: 2000000, concurrentTasks: 8}`；
 - 至少提供 `org` 或 `quota` 之一，否则返回 `400 NOTHING_TO_UPDATE`；
 - 修改成功后吊销该用户全部活跃会话，响应返回 `sessionsRevoked`；旧令牌立即失效，重新登录后携带新声明。
+
+管理角色（管理员，M4.2）：
+
+```http
+PATCH /api/v1/admin/users/{uid}
+Authorization: Bearer <admin access token>
+Content-Type: application/json
+
+{"role": "operator"}
+```
+
+- `role` 只接受 `admin` / `operator` / `auditor` / `user`；非法值返回 `400 INVALID_ROLE`；
+- 管理员不能修改自己的角色（`400 SELF_ROLE_CHANGE`），避免误降权把自己锁在门外；
+- 角色写入 JWT 快照，变更后吊销该账号全部会话（响应 `sessionsRevoked`），旧令牌立即失效；
+- 角色变更写审计 `user.role`（前后值 + 操作人）。网关管理代理按角色区分只读/可写，见 §4.9。
 
 强制下线（管理员）：
 
@@ -597,8 +813,12 @@ storage/
 
 ```bash
 cd tongtian-server
-python tests/test_units.py     # 71 项单元断言
-python tests/test_server.py    # 267 项全链路断言
+python tests/test_units.py         # 76 项单元断言
+python tests/test_server.py        # 306 项全链路断言
+python tests/test_identity.py      # 71 项身份与策略断言（JWKS/换票/组织部门/策略分发）
+python tests/test_gateway_usage.py # 35 项网关用量接收断言（幂等批量、合并视图、部门报表、保留期清理）
+python tests/test_gateway_admin.py # 28 项网关管理代理断言（鉴权、透传、审计脱敏、路径校验）
+python tests/test_m4_audit.py      # 22 项 M4 审计哈希链断言（分页、验链、导出、角色边界、篡改定位）
 ```
 
 覆盖范围：
@@ -606,6 +826,11 @@ python tests/test_server.py    # 267 项全链路断言
 - JWT 签名/过期、PBKDF2、标识归一、ZIP 路径穿越/软链接/条目上限、frontmatter、套件命令解析、限流、增量补列；
 - 注册/登录/刷新轮换/退出、v1 与 legacy 接口、loopback 网页登录、授权码一次性；
 - 令牌声明（`iss`/`aud`/`sid`/`org`/`quota`）、会话绑定吊销、管理员改声明与强制下线；
+- 用量上报幂等入库、按 JWT 到人的合并视图（引擎 `desktop` 样本去重、`unknown` 单列披露、多设备互不覆盖）；
+- 网关批量上报的 `(gatewayId, requestId)` 幂等（重放、部分重复、整批拒绝）、合并视图的 `gatewayRows`/`gatewayDedupedRows` 口径、部门报表与逐用户明细同源、判重键 30 天清理；
+- 管理代理：未登录 401 / 非管理员 403 / 未配置 503、路径穿越与体积上限、网关错误信封透传、审计脱敏（密钥只留 `***`）、`no-store`；
+- M4 管理审计：角色变更入链、游标分页、全链验链、篡改定位、NDJSON 导出与头哈希、审计员可读 / 普通用户 403、未登录 401；
+- JWKS 形状、换票（部门选择、主部门兜底、无组织/无部门拒绝、会话吊销、`no-store`）、RS256 轮换、组织/部门管理、策略服务令牌与 ETag/304；
 - 技能/套件发布、版本、检索、分类、下载与 SHA-256；
 - 包文件被篡改（体积不一致）时下载返回 `PACKAGE_CORRUPTED`；
 - MCP 配置校验与密钥值拒绝；
@@ -617,7 +842,47 @@ python tests/test_server.py    # 267 项全链路断言
 
 ## 9. 部署与安全
 
-### 9.1 单进程要求
+### 9.1 容器部署（Docker Compose）
+
+镜像固定单进程运行（`--workers 1`），只持久化 `/data`（SQLite 与包文件），以非 root 用户启动，并内置 `GET /health` 健康检查。
+
+```bash
+cd tongtian-server
+cp .env.example .env
+# 生成 JWT 密钥写入 .env（生产模式会校验密钥非默认且不短于 16 字符）
+SECRET="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+sed -i "s|^TT_SERVER_JWT_SECRET=.*|TT_SERVER_JWT_SECRET=${SECRET}|" .env
+sed -i "s|^TT_SERVER_ENV=.*|TT_SERVER_ENV=production|" .env
+
+docker compose up -d --build
+docker compose ps                    # STATUS 显示 healthy 即就绪
+curl -s http://127.0.0.1:8000/health
+```
+
+Compose 直接读取同目录 `.env`，常用变量如下：
+
+| 变量 | 容器默认 | 作用 |
+| --- | --- | --- |
+| `TT_SERVER_BIND` | `127.0.0.1` | 宿主机绑定地址；直接对外时改为 `0.0.0.0`，更推荐放在反向代理后面 |
+| `TT_SERVER_PORT` | `8000` | 容器监听与宿主机发布端口 |
+| `TT_SERVER_ENV` | `production` | 生产模式，密钥缺失或过短会拒绝启动 |
+| `TT_SEED_DEMO` | `false` | 首次启动时写入演示技能/套件数据 |
+
+- 数据卷 `tongtian-server-data` 挂载到 `/data`，`docker compose down` 不会删除；只有 `down -v` 才会连数据库和包文件一起删除。
+- 仅修改 `.env` 时执行 `docker compose up -d`；代码更新后执行 `docker compose up -d --build`。
+- 备份与恢复见 9.5，容器内数据目录为 `/data`。
+- 不使用 Compose 时：
+
+```bash
+docker build -t tongtian-server:0.1.0 .
+docker run -d --name tongtian-server -p 127.0.0.1:8000:8000 \
+  -e TT_SERVER_ENV=production \
+  -e TT_SERVER_JWT_SECRET="$SECRET" \
+  -v tongtian-server-data:/data \
+  tongtian-server:0.1.0
+```
+
+### 9.2 单进程要求
 
 一次性授权码与限流器位于进程内存，因此：
 
@@ -625,7 +890,7 @@ python tests/test_server.py    # 267 项全链路断言
 - 多节点部署前，需要把授权码与限流迁移到 Redis 等共享存储；
 - 重启会丢失未完成的一次性授权码（用户重新登录即可）。
 
-### 9.2 生产配置
+### 9.3 生产配置
 
 ```bash
 export TT_SERVER_ENV=production
@@ -644,7 +909,7 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
 
 生产环境若仍使用开发默认 JWT 密钥，或密钥短于 16 个字符，应用会拒绝启动。非 multipart 的 JSON/表单请求体超过 2MB 会被直接拒绝（413）；multipart 上传由 ZIP 体积与解压上限单独约束。
 
-### 9.3 TLS 与反向代理
+### 9.4 TLS 与反向代理
 
 服务本身不处理 TLS，建议放在 Caddy/Nginx 之后：
 
@@ -664,17 +929,17 @@ server {
 
 `TT_TRUST_PROXY=true` 时才会读取 `X-Forwarded-For`；不要在不可信网络直接暴露并开启该选项，否则限流可被伪造请求头绕过。
 
-### 9.4 备份
+### 9.5 备份
 
 - 备份 `storage/market.db` 时使用 SQLite 在线备份或先做 WAL checkpoint，避免只拷贝主文件导致不一致；
 - 备份 `storage/packages/` 与数据库保持同一时间点；
 - 恢复后校验包文件大小与数据库登记的 SHA-256。
 
-### 9.5 当前边界
+### 9.6 当前边界
 
 - 未实现邮箱验证、找回密码、第三方 OAuth、支付与套餐计费；
 - 未内置病毒扫描、内容审核与举报流程；
-- 不支持多租户/组织隔离，所有条目共享一个公共市场；
+- 组织/部门只用于身份与网关策略；市场条目仍共享一个公共市场，未按组织隔离；
 - 未实现对象存储与多节点一致性；
 - 桌面端市场页面目前仍使用本地目录/模拟数据；本服务端提供 API，客户端接入需要额外的页面与安装链路改造（见下节）；
 - 技能市场安装：桌面端目前只支持本地 `SKILL.md` 安装，接入市场 ZIP 需要客户端补充解包与落盘逻辑；套件安装已支持 `zipBase64`，MCP 已有 `mcp_add` 命令，接入成本更低。
@@ -706,19 +971,39 @@ server {
 ```text
 tongtian-server/
 ├── app/
-│   ├── auth.py        # 账号、会话、网页登录、legacy 兼容接口
+│   ├── auth.py        # 账号、会话、网页登录、legacy 兼容接口、JWKS、换票、部门/用户/角色管理
+│   ├── audit.py       # 管理审计写入、脱敏、分页、验链与 NDJSON 导出
+│   ├── audit_api.py   # /api/v1/admin/audit* 只读接口
+│   ├── audit_chain.py # 审计哈希链规范化、摘要与存量回填
+│   ├── roles.py       # 管理角色常量与读写判定
 │   ├── catalog.py     # 市场类型与分类
 │   ├── config.py      # 环境变量配置
 │   ├── db.py          # SQLite 建表与事务
 │   ├── errors.py      # 统一业务错误
+│   ├── gateway_admin.py   # /api/v1/admin/gateway/* 管理代理：补管理令牌、透传、审计脱敏
+│   ├── gateway_policy.py # 网关策略校验、按组织存储与 ETag/304 分发
+│   ├── gateway_usage.py  # 网关批量用量接收（幂等）、部门用量报表
+│   ├── keys.py        # RS256 签名密钥生成、持久化、轮换与 JWKS
 │   ├── main.py        # FastAPI 装配、异常格式、启动检查
 │   ├── market.py      # 市场发布、检索、下载、收藏、推荐
+│   ├── orgs.py        # 组织与部门
 │   ├── packages.py    # ZIP 校验与 SKILL.md/plugin.json 解析
 │   ├── security.py    # JWT、密码、标识、限流
-│   └── seed.py        # 幂等演示数据
+│   ├── seed.py        # 幂等演示数据
+│   ├── usage.py       # 用量上报入库与「桌面为主、引擎补入、网关为准」的合并视图
+│   └── web/           # 纯静态 Web 控制台（index.html / app.js / styles.css）
+├── docker/
+│   └── healthcheck.py # 容器健康检查
 ├── tests/
+│   ├── test_identity.py
+│   ├── test_gateway_admin.py
+│   ├── test_gateway_usage.py
+│   ├── test_m4_audit.py
 │   ├── test_units.py
 │   └── test_server.py
+├── Dockerfile
+├── docker-compose.yml
+├── .dockerignore
 ├── init.sh
 ├── requirements.txt
 ├── .env.example

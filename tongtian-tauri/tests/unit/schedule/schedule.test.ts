@@ -142,12 +142,191 @@ describe('parseNaturalSchedule：一句话 → 表单字段', () => {
     expect(() => sched.parseNaturalSchedule('每天24:00 不允许')).toThrow(/SCHEDULE_PARSE_TIME/);
   });
 
+  it('间隔任务：每 N 小时/分钟/天换算成步长，句中的时刻只作说明（D-30）', () => {
+    const p = sched.parseNaturalSchedule('每2小时同步一次数据');
+    expect(p.freq).toBe('interval');
+    expect(p.intervalMinutes).toBe(120);
+    // 间隔任务没有时刻锚点：timeOfDay 留 00:00，不能显示一个并不会按它触发的时刻
+    expect(p.timeOfDay).toBe('00:00');
+    expect(p.name).toBe('同步一次数据');
+    expect(p.preview).toBe('每 2 小时执行一次');
+
+    expect(sched.parseNaturalSchedule('每隔30分钟检查').intervalMinutes).toBe(30);
+    // 中文数字 + 「小时带余数分钟」：30 分属于步长，不是时刻
+    expect(sched.parseNaturalSchedule('每隔两小时30分巡检').intervalMinutes).toBe(150);
+    // 每 N 天换算成分钟步长，上限一周正好 10080 分钟
+    const d = sched.parseNaturalSchedule('每3天备份一次');
+    expect(d.intervalMinutes).toBe(3 * 1440);
+    expect(d.preview).toBe('每 3 天执行一次');
+    expect(sched.parseNaturalSchedule('每7天清理一次').intervalMinutes).toBe(10080);
+
+    // 「每小时」「每天」没被间隔抢走
+    expect(sched.parseNaturalSchedule('每小时第30分清理缓存').freq).toBe('hourly');
+    expect(sched.parseNaturalSchedule('每天上午9点汇总').freq).toBe('daily');
+
+    const q = sched.parseNaturalSchedule('每2小时上午9点巡检一次');
+    expect(q.timeOfDay).toBe('00:00');
+    expect(q.note).toContain('不按固定时刻触发');
+  });
+
+  it('一次性任务：相对日 / 绝对日期 / 缺省年份各有明确口径（D-30）', () => {
+    // 基准取 12:00 UTC：本地日与 UTC 日一致，「明天」不会被时区挪一天
+    const NOON = BASE + 12 * HOUR;
+    const parsed = sched.parseNaturalSchedule('明天上午9点给客户发报价', NOON);
+    expect(parsed.freq).toBe('once');
+    expect(parsed.runDate).toBe('2026-03-06');
+    expect(parsed.runDateRelative).toBe(true);
+    expect(parsed.timeOfDay).toBe('09:00');
+    expect(parsed.name).toBe('给客户发报价');
+    expect(parsed.note).toBeNull();
+    expect(parsed.preview).toBe('2026-03-06 09:00 执行一次（本地时间，确认后落库）');
+
+    const iso = sched.parseNaturalSchedule('2026-11-05 15:30 盯大盘', NOON);
+    expect(iso.runDate).toBe('2026-11-05');
+    expect(iso.runDateRelative).toBe(false);
+    expect(iso.timeOfDay).toBe('15:30');
+
+    // 中文月日：本年未过用本年，已过顺延一年并如实说明
+    expect(sched.parseNaturalSchedule('3月8日晚上8点复盘', NOON).runDate).toBe('2026-03-08');
+    const rolled = sched.parseNaturalSchedule('2月1日早上7点报名', NOON);
+    expect(rolled.runDate).toBe('2027-02-01');
+    expect(rolled.note).toContain('未写年份');
+
+    // 今天 / 后天 / 下周三（基准周四是 03-05）
+    expect(sched.parseNaturalSchedule('今天下午3点开周会', NOON).runDate).toBe('2026-03-05');
+    expect(sched.parseNaturalSchedule('后天早上8点取件', NOON).runDate).toBe('2026-03-07');
+    const next = sched.parseNaturalSchedule('下周三下午2点对齐', NOON);
+    expect(next.freq).toBe('once');
+    expect(next.runDate).toBe('2026-03-11');
+    expect(next.runDateRelative).toBe(true);
+
+    // 写死年份却已过期 / 根本不存在的日期：拒，不排一个永远不会到点的任务
+    expect(() => sched.parseNaturalSchedule('2025-12-31 10:00 交年度总结', NOON)).toThrow(
+      /SCHEDULE_INVALID_TIME/,
+    );
+    expect(() => sched.parseNaturalSchedule('2026-02-30 提交材料', NOON)).toThrow(
+      /SCHEDULE_PARSE_FAILED/,
+    );
+  });
+
+  it('周期说法 + 具体日期：保留周期并把日期回显在提示里（不偷偷改成只跑一次）', () => {
+    const p = sched.parseNaturalSchedule('每周五 3月6日 下午3点对账', BASE + 12 * HOUR);
+    expect(p.freq).toBe('weekly');
+    expect(p.weekday).toBe(5);
+    expect(p.runDate).toBeNull();
+    expect(p.note).toContain('已按周期任务处理');
+  });
+
+  it('一次性没写时刻补 09:00 并说明；一句里多个时刻如实说明取了哪一个', () => {
+    const p = sched.parseNaturalSchedule('明天整理归档材料', BASE + 12 * HOUR);
+    expect(p.freq).toBe('once');
+    expect(p.timeOfDay).toBe('09:00');
+    expect(p.note).toContain('已按 09:00');
+
+    const q = sched.parseNaturalSchedule('每天 9 点和 15 点播报股价');
+    expect(q.freq).toBe('daily');
+    expect(q.timeOfDay).toBe('09:00');
+    expect(q.note).toContain('识别到多个时刻');
+    expect(q.note).toContain('15 点');
+  });
+
   it('不支持的间隔/日期与缺失时刻如实拒绝（不猜一个值）', () => {
-    expect(() => sched.parseNaturalSchedule('每2小时同步一次')).toThrow(/SCHEDULE_UNSUPPORTED_FREQ/);
-    expect(() => sched.parseNaturalSchedule('每隔30分钟检查')).toThrow(/SCHEDULE_UNSUPPORTED_FREQ/);
+    // 「每 N 周」两种口径都不成立：既不猜成每周，也不猜成 7 天间隔
+    expect(() => sched.parseNaturalSchedule('每2周出一份报告')).toThrow(/SCHEDULE_UNSUPPORTED_FREQ/);
+    expect(() => sched.parseNaturalSchedule('每隔两周轮休')).toThrow(/SCHEDULE_UNSUPPORTED_FREQ/);
     expect(() => sched.parseNaturalSchedule('每月15号发工资')).toThrow(/SCHEDULE_UNSUPPORTED_DAY/);
     expect(() => sched.parseNaturalSchedule('每天汇总舆情')).toThrow(/SCHEDULE_PARSE_NO_TIME/);
     expect(() => sched.parseNaturalSchedule('   ')).toThrow(/SCHEDULE_PARSE_EMPTY/);
+    // 越界间隔同样拒，而不是悄悄夹到一个合法值上
+    expect(() => sched.parseNaturalSchedule('每0分钟看一次')).toThrow(/SCHEDULE_INVALID_FREQ/);
+    expect(() => sched.parseNaturalSchedule('每20000分钟看一次')).toThrow(/SCHEDULE_INVALID_FREQ/);
+    expect(() => sched.parseNaturalSchedule('每8天归档一次')).toThrow(/SCHEDULE_INVALID_FREQ/);
+  });
+
+  it('预览文案（buildPreview）覆盖六种频率：界面先预览再落库', () => {
+    expect(sched.buildPreview('hourly', '00:30')).toBe('每小时第 30 分执行');
+    expect(sched.buildPreview('daily', '09:00')).toBe('每天 09:00 执行');
+    // 与 Rust `build_preview` 逐字同口径：星期标签自带「周」，不再拼「每周」前缀
+    expect(sched.buildPreview('weekly', '08:00', 3)).toBe('周三 08:00 执行');
+    expect(sched.buildPreview('monthly', '07:30')).toBe('每月 1 日 07:30 执行');
+    expect(sched.buildPreview('interval', '00:00', null, 30)).toBe('每 30 分钟执行一次');
+    expect(sched.buildPreview('interval', '00:00', null, 150)).toBe('每 2 小时 30 分钟执行一次');
+    expect(sched.buildPreview('interval', '00:00', null, 2880)).toBe('每 2 天执行一次');
+    expect(sched.buildPreview('once', '09:00', null, null, '2026-03-06')).toBe(
+      '2026-03-06 09:00 执行一次（本地时间，确认后落库）',
+    );
+  });
+});
+
+// ── 下次执行时间（间隔/一次性）与本地日期换算 ──────────────────
+
+describe('nextRunAtMsFull：间隔与一次性（与 Rust 同口径）', () => {
+  it('interval：从 after 起算一个步长；缺步长不排期，也不退回每天', () => {
+    expect(sched.nextRunAtMsFull('interval', '00:00', null, 45, null, BASE)).toBe(
+      BASE + 45 * 60_000,
+    );
+    expect(sched.nextRunAtMsFull('interval', '00:00', null, null, null, BASE)).toBeNull();
+    expect(sched.nextRunAtMsFull('interval', '00:00', null, 0, null, BASE)).toBeNull();
+  });
+
+  it('once：未到点给原时刻，过点返回 null（绝不复活成周期任务）', () => {
+    expect(sched.nextRunAtMsFull('once', '09:00', null, null, BASE + HOUR, BASE)).toBe(
+      BASE + HOUR,
+    );
+    expect(sched.nextRunAtMsFull('once', '09:00', null, null, BASE, BASE)).toBeNull();
+    expect(sched.nextRunAtMsFull('once', '09:00', null, null, null, BASE)).toBeNull();
+  });
+
+  it('四种周期频率仍走 nextRunAtMs（与 Rust 同一分支）', () => {
+    expect(sched.nextRunAtMsFull('daily', '08:00', null, null, null, BASE)).toBe(BASE + 8 * HOUR);
+    expect(sched.nextRunAtMsFull('weekly', '09:00', 1, null, null, BASE)).toBe(
+      BASE + 4 * DAY + 9 * HOUR,
+    );
+  });
+});
+
+describe('相对日期重锚与本地日期换算', () => {
+  it('本地日与 UTC 日一致时平移为零；绝对日期不参与重锚', () => {
+    const NOON = BASE + 12 * HOUR;
+    expect(sched.reanchorRelativeRunDate('2026-03-06', NOON)).toBe('2026-03-06');
+    expect(sched.reanchorRelativeRunDate(null, NOON)).toBeNull();
+    // 解析给出的相对日期，重锚后仍是同一天（同一时区口径）
+    const parsed = sched.parseNaturalSchedule('明天上午9点开会', NOON);
+    expect(sched.reanchorRelativeRunDate(parsed.runDate, NOON)).toBe(parsed.runDate);
+  });
+
+  it('跨 UTC/本地日边界时只平移天数差，「距今 N 天」的含义不变', () => {
+    // UTC 23:00 在东八区已是次日：UTC 口径的「明天」= 03-05，
+    // 重锚应得到本地日历上的次日（期望值由本地日算出，任何时区都自洽）
+    const late = Date.UTC(2026, 2, 4, 23, 0, 0);
+    const local = new Date(late);
+    const localTomorrow = Date.UTC(local.getFullYear(), local.getMonth(), local.getDate() + 1, 12);
+    expect(sched.reanchorRelativeRunDate('2026-03-05', late)).toBe(
+      sched.localDateFromMs(localTomorrow),
+    );
+  });
+
+  it('localRunDateToUtcMs：本地日期时刻 → 绝对时刻，非法日期如实拒', () => {
+    expect(sched.localRunDateToUtcMs('2026-03-06', '09:00')).toBe(
+      new Date(2026, 2, 6, 9, 0, 0, 0).getTime(),
+    );
+    expect(() => sched.localRunDateToUtcMs('2026-02-30', '09:00')).toThrow(/SCHEDULE_INVALID_TIME/);
+    expect(() => sched.localRunDateToUtcMs('', '09:00')).toThrow(/SCHEDULE_INVALID_TIME/);
+    expect(() => sched.localRunDateToUtcMs('2026-03-06', '')).toThrow(/SCHEDULE_INVALID_TIME/);
+  });
+
+  it('间隔单位换算：分钟/小时/天互推，越界即拒（不夹值）', () => {
+    expect(sched.intervalToMinutes(30, 'minutes')).toBe(30);
+    expect(sched.intervalToMinutes(2, 'hours')).toBe(120);
+    expect(sched.intervalToMinutes(3, 'days')).toBe(4320);
+    expect(() => sched.intervalToMinutes(8, 'days')).toThrow(/SCHEDULE_INVALID_FREQ/);
+    expect(() => sched.intervalToMinutes(0, 'minutes')).toThrow(/SCHEDULE_INVALID_FREQ/);
+    expect(() => sched.intervalToMinutes(1.5, 'hours')).toThrow(/SCHEDULE_INVALID_FREQ/);
+    expect(sched.minutesToIntervalParts(4320)).toEqual({ value: 3, unit: 'days' });
+    expect(sched.minutesToIntervalParts(120)).toEqual({ value: 2, unit: 'hours' });
+    expect(sched.minutesToIntervalParts(45)).toEqual({ value: 45, unit: 'minutes' });
+    // 除不尽小时就退回分钟，不显示一个「2.5 小时」这种回不去的值
+    expect(sched.minutesToIntervalParts(150)).toEqual({ value: 150, unit: 'minutes' });
   });
 });
 
@@ -249,9 +428,17 @@ describe('本地时区换算：界面按本地录入/呈现，落库统一 UTC',
   it('describeSchedule 按本地时刻描述各频率', () => {
     const utc = sched.localToUtcTime('09:00', at);
     expect(sched.describeSchedule('daily', utc, null)).toBe('每天 09:00');
-    expect(sched.describeSchedule('weekly', utc, 1)).toBe('每周周一 09:00');
+    // 「周三」这类标签自带「周」前缀，拼出来必须是「每周一」而不是「每周周一」
+    expect(sched.describeSchedule('weekly', utc, 1)).toBe('每周一 09:00');
+    expect(sched.describeSchedule('weekly', utc, 3)).toBe('每周三 09:00');
     expect(sched.describeSchedule('monthly', utc, null)).toBe('每月 1 日 09:00');
     expect(sched.describeSchedule('hourly', utc, null)).toBe('每小时第 0 分');
+    // D-30：间隔与一次性
+    expect(sched.describeSchedule('interval', '00:00', null, 45)).toBe('每 45 分钟');
+    expect(sched.describeSchedule('interval', '00:00', null, 150)).toBe('每 2 小时 30 分钟');
+    expect(sched.describeSchedule('interval', '00:00', null, 2880)).toBe('每 2 天');
+    expect(sched.describeSchedule('once', '00:00', null, null, null)).toBe('待指定时刻执行一次');
+    expect(sched.describeSchedule('once', '09:00', null, null, at.getTime())).toContain('执行一次');
   });
 
   it('formatLocalDateTime 输出本地 y/m/d H:M', () => {
@@ -689,9 +876,16 @@ describe('useScheduleStore：真实通道（不再是 toast 假创建）', () =>
     expect(parsed.timeOfDay).toBe('09:00');
     expect(parsed.name).toBe('生成周报');
 
-    await expect(useScheduleStore.getState().parse('每2小时同步')).rejects.toThrow(
+    // D-30：「每 2 小时」不再被拒，解析成间隔任务（无时刻锚点）
+    const every2h = await useScheduleStore.getState().parse('每2小时同步');
+    expect(every2h.freq).toBe('interval');
+    expect(every2h.intervalMinutes).toBe(120);
+    expect(every2h.timeOfDay).toBe('00:00');
+
+    await expect(useScheduleStore.getState().parse('每2周出一份报告')).rejects.toThrow(
       /SCHEDULE_UNSUPPORTED_FREQ/,
     );
+    await expect(useScheduleStore.getState().parse('')).rejects.toThrow(/SCHEDULE_PARSE_EMPTY/);
   });
 
   it('保持唤醒：只读回实际状态，浏览器通道如实标记未生效', async () => {

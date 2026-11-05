@@ -22,6 +22,7 @@ import Sidebar from './Sidebar';
 import ResizeHandle from './ResizeHandle';
 import TaskSearchDialog from '../TaskSearchDialog';
 import QuickPickDialog from '../QuickPickDialog';
+import { useI18n } from '../../i18n';
 import { useAppStore } from '../../stores/useAppStore';
 import { useBrandingStore } from '../../stores/useBrandingStore';
 import { useAppShortcuts } from '../../lib/use-app-shortcuts';
@@ -36,6 +37,7 @@ const PageLoader: React.FC = () => (
 
 const MainLayout: React.FC = () => {
   const theme = useTheme();
+  const { t: tr } = useI18n();
   const isMobile = useMediaQuery(theme.breakpoints.down('md'));
   // 窄屏默认收起可手动展开；桌面端折叠状态放在 store，Ctrl+\ 快捷键与折叠按钮共用同一份
   const [open, setOpen] = useState(true);
@@ -76,6 +78,10 @@ const MainLayout: React.FC = () => {
 
   return (
     <Box sx={{ display: 'flex', height: '100vh', overflow: 'hidden', background: theme.palette.background.default }}>
+      {/* 键盘用户第一下 Tab 就能跳过整列导航（WCAG 2.4.1），样式见 globals.css .tt-skip-link */}
+      <a className="tt-skip-link" href="#tt-main">
+        {tr('跳到主要内容')}
+      </a>
       {/* 侧边栏（右边界可拖拽调宽）；独立任务窗口不显示 */}
       {!isPopupWindow && (
         <Box sx={{ position: 'relative', height: '100%', flexShrink: 0 }}>
@@ -94,6 +100,7 @@ const MainLayout: React.FC = () => {
 
       {/* 内容区域（全高，页面自带头部与内边距） */}
       <Box
+        id="tt-main"
         component="main"
         sx={{
           flexGrow: 1,

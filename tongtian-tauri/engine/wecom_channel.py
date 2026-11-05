@@ -154,6 +154,14 @@ class WeComAibotChannel(ImChannel):
         ),
     )
 
+    # 企业微信 aibot 的附件（image/file/video 的 aeskey + AES-256-CBC 解密）本通道没接，
+    # 「正在输入」平台侧也没有对应动作，所以走框架默认的三句中文关闭原因。
+    mention_note = (
+        "群/单聊取自回调体的 chattype（官方字段）；「有没有 @ 我」按官方口径推定——"
+        "群里只有 @ 机器人才会推送回调，所以收到群回调就当被 @。这是文档口径不是帧字段，"
+        "真机未验收，界面请把它读成「按平台推送规则推定」"
+    )
+
     def __init__(self):
         self._ws: ClientWebSocketResponse | None = None
         self._hb_task: asyncio.Task | None = None
@@ -378,7 +386,27 @@ class WeComAibotChannel(ImChannel):
             conversation_id=conversation_id,
             user_id=str((body.get("from") or {}).get("userid") or ""),
             message_id=msgid,
+            is_group=self._is_group(body),
+            mentioned_me=self._mentioned(body),
         )
+
+    @staticmethod
+    def _is_group(body: dict) -> bool:
+        """群聊判定与 `_conversation_of` 同源：官方回调体里只有 `chattype` 这一个形状字段"""
+        return str(body.get("chattype") or "") == "group"
+
+    @staticmethod
+    def _mentioned(body: dict) -> bool | None:
+        """群里这条是不是 @ 了机器人：按官方推送口径回答，帧里没有对应字段
+
+        官方《智能机器人接收消息回调》口径是「群里只有 @ 机器人才会推送回调」，
+        所以收到群回调就等于被 @。这是**文档口径而不是帧事实**——真机没验过之前，
+        `mention_note` 里必须把这一层说出来，界面不许把它画成「协议保证」。
+        单聊没有 @ 这回事（策略走 dmActivation），如实答 None。
+        """
+        if str(body.get("chattype") or "") != "group":
+            return None
+        return True
 
     @staticmethod
     def _conversation_of(body: dict) -> str:

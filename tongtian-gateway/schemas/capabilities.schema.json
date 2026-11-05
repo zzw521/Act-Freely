@@ -1,0 +1,204 @@
+{
+  "$defs": {
+    "GatewayFeatures": {
+      "properties": {
+        "stream": {
+          "title": "Stream",
+          "type": "boolean"
+        },
+        "tools": {
+          "title": "Tools",
+          "type": "boolean"
+        },
+        "vision": {
+          "title": "Vision",
+          "type": "boolean"
+        },
+        "embeddings": {
+          "title": "Embeddings",
+          "type": "boolean"
+        },
+        "countTokens": {
+          "title": "Counttokens",
+          "type": "boolean"
+        },
+        "promptCaching": {
+          "title": "Promptcaching",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "stream",
+        "tools",
+        "vision",
+        "embeddings",
+        "countTokens",
+        "promptCaching"
+      ],
+      "title": "GatewayFeatures",
+      "type": "object"
+    },
+    "GatewayLimits": {
+      "properties": {
+        "maxRequestBytes": {
+          "exclusiveMinimum": 0,
+          "title": "Maxrequestbytes",
+          "type": "integer"
+        },
+        "maxOutputTokens": {
+          "exclusiveMinimum": 0,
+          "title": "Maxoutputtokens",
+          "type": "integer"
+        },
+        "upstreamTimeoutSeconds": {
+          "exclusiveMinimum": 0,
+          "title": "Upstreamtimeoutseconds",
+          "type": "integer"
+        },
+        "streamIdleTimeoutSeconds": {
+          "exclusiveMinimum": 0,
+          "title": "Streamidletimeoutseconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "maxRequestBytes",
+        "maxOutputTokens",
+        "upstreamTimeoutSeconds",
+        "streamIdleTimeoutSeconds"
+      ],
+      "title": "GatewayLimits",
+      "type": "object"
+    },
+    "ProtocolSurface": {
+      "properties": {
+        "name": {
+          "enum": [
+            "openai",
+            "anthropic",
+            "gemini"
+          ],
+          "title": "Name",
+          "type": "string"
+        },
+        "endpoints": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Endpoints",
+          "type": "array"
+        },
+        "stream": {
+          "default": false,
+          "title": "Stream",
+          "type": "boolean"
+        },
+        "tools": {
+          "default": false,
+          "title": "Tools",
+          "type": "boolean"
+        },
+        "vision": {
+          "default": false,
+          "title": "Vision",
+          "type": "boolean"
+        },
+        "embeddings": {
+          "default": false,
+          "title": "Embeddings",
+          "type": "boolean"
+        },
+        "testedAt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Testedat"
+        },
+        "note": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Note"
+        }
+      },
+      "required": [
+        "name",
+        "endpoints"
+      ],
+      "title": "ProtocolSurface",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "contractVersion": {
+      "default": "gateway-contract.v1",
+      "title": "Contractversion",
+      "type": "string"
+    },
+    "gatewayVersion": {
+      "title": "Gatewayversion",
+      "type": "string"
+    },
+    "gatewayId": {
+      "title": "Gatewayid",
+      "type": "string"
+    },
+    "protocols": {
+      "items": {
+        "$ref": "#/$defs/ProtocolSurface"
+      },
+      "title": "Protocols",
+      "type": "array"
+    },
+    "features": {
+      "$ref": "#/$defs/GatewayFeatures"
+    },
+    "providers": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Providers",
+      "type": "array"
+    },
+    "limits": {
+      "$ref": "#/$defs/GatewayLimits"
+    },
+    "policyVersion": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Policyversion"
+    }
+  },
+  "required": [
+    "gatewayVersion",
+    "gatewayId",
+    "protocols",
+    "features",
+    "providers",
+    "limits"
+  ],
+  "title": "Capabilities",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tongtian.local/schemas/capabilities.schema.json"
+}

@@ -25,10 +25,10 @@ What makes it different from a plain chat client:
 - **Task execution and replay**: the agent streams plan / step / deliver events; SSE events carry a monotonic `seq` and support reconnection replay. Task monitor and canvas are paginated, and send/stop is a single button.
 - **Experts, skills and marketplace**: expert suites, skill packs and MCP connectors can be searched, downloaded and bookmarked from the online marketplace; installs are statically scanned for risk and publisher signatures can be verified.
 - **Knowledge, memory and awareness**: the local knowledge base supports ranking and title recall; `SOUL.md` / `WORK_MANUAL.md` / `USER_PROFILE.md` / `MEMORY.md` define collaboration style and long-term memory.
-- **Execution surface**: terminal (including ACP), browser use, computer use, remote desktop, scheduled tasks and hooks — tool and file access are constrained by workspace sandbox policies. On Windows you can additionally turn on system isolation, which runs terminal, MCP stdio and ACP child processes inside an AppContainer so that out-of-bounds writes and data-root secret reads are refused by the OS; hooks and macOS / Linux remain inside the policy sandbox.
+- **Execution surface**: terminal (including ACP), browser use, computer use, remote desktop, scheduled tasks and hooks — tool and file access are constrained by workspace sandbox policies. On Windows you can additionally turn on system isolation, which runs terminal, MCP stdio, ACP and hook child processes inside an AppContainer so that out-of-bounds writes and data-root secret reads are refused by the OS (the hook part is wired up but not yet accepted on a real machine); macOS / Linux remain inside the policy sandbox.
 - **Model hub**: multiple model profiles, per-task routing and failover, cost / latency ledger; zero-config detection of a local Ollama installation.
 - **Accounts and security**: loopback web-verified login, OS keychain for secrets, tool grants and approvals, privacy guard, static risk scanning.
-- **IM channels**: Slack, DingTalk, WeCom and Feishu long connections; validated only against local fake servers so far — real enterprise credentials and online behavior are unverified.
+- **IM channels**: Slack, DingTalk, WeCom, Feishu, personal WeChat (official iLink QR login) and Tencent Yuanbao integrations; validated only against local fake servers so far — real credentials and online behavior are unverified.
 - **Bilingual UI**: switch between 中文 and English in Settings; dates and copy follow the selected language.
 
 ## Architecture
@@ -207,10 +207,10 @@ cd ../../tongtian-server
 This project is under active development. The following are not delivered capabilities yet:
 
 - **Service deployment**: engine + static frontend + token flow is verified locally; `deploy/Dockerfile`, real reverse proxies, TLS and public SSE long connections are unverified. See [tongtian-tauri/deploy/README.md](tongtian-tauri/deploy/README.md).
-- **IM channels**: Slack / DingTalk / WeCom / Feishu have only been verified against local fake servers; real enterprise credentials and production behavior are not accepted yet.
+- **IM channels**: Slack / DingTalk / WeCom / Feishu / personal WeChat (iLink QR login, direct messages only) / Tencent Yuanbao have only been verified against local fake servers; real credentials and production behavior are not accepted yet.
 - **Office artifacts**: HTML, PPTX and Markdown are generated as real files; `.xlsx` / `.docx` are not implemented and are never faked by renaming.
 - **Cross-platform**: the desktop app is primarily developed and verified on Windows; macOS / Linux builds, bundled Python and installers are unverified, and system-level isolation is Windows-only.
-- **System isolation**: covers terminal, MCP stdio and ACP child processes only; hooks still run with app privileges. With networking off, container processes cannot reach loopback or LAN either — reaching local services requires an administrator-configured loopback exemption.
+- **System isolation**: covers terminal, MCP stdio and ACP child processes; hooks now go through the same launcher when isolation is on (commands must be "program + arguments", shell syntax and cmd built-ins are refused, the working directory is read-only), but that step is code-only — it has not been compiled or accepted on a real machine yet. With networking off, container processes cannot reach loopback or LAN either — reaching local services requires an administrator-configured loopback exemption.
 - **Full gap list**: see the status column in the [PRD](docs/PRD-任我行.md) and the [defect & implementation plan](docs/缺陷与实现计划-任我行.md); this README does not duplicate them.
 
 ## Security notes

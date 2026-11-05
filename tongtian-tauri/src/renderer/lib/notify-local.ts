@@ -13,6 +13,7 @@
 
 import type { ChatEvent } from '../../shared/types';
 import { detectOs } from './permissions-local';
+import { errorTextOf } from '../../shared/error-messages';
 
 /**
  * 哪些任务事件值得给用户一次系统级反馈（设置页「桌面通知/声音通知」的触发口径）。
@@ -43,7 +44,7 @@ export function resetNoticeClaims(): void {
   claimed.clear();
 }
 
-export type NoticeKind = 'delivered' | 'await_review' | 'failed';
+export type NoticeKind = 'delivered' | 'await_review' | 'failed' | 'budget_warning';
 
 /**
  * 任务栏未读角标的平台能力。
@@ -77,6 +78,7 @@ const TITLE: Record<NoticeKind, string> = {
   delivered: '任务已完成',
   await_review: '等你确认执行计划',
   failed: '任务执行失败',
+  budget_warning: 'Token 预算预警',
 };
 
 /** 系统通知能力与权限（unsupported = 当前 WebView 不提供 Notification） */
@@ -119,7 +121,7 @@ export function postTaskNotice(kind: NoticeKind, body: string): { notified: bool
     new window.Notification(TITLE[kind], { body, tag: `tontian-${kind}` });
     return { notified: true };
   } catch (e) {
-    return { notified: false, reason: `系统通知发送失败：${e instanceof Error ? e.message : String(e)}` };
+    return { notified: false, reason: `系统通知发送失败：${errorTextOf(e, '原因未知')}` };
   }
 }
 
@@ -151,7 +153,7 @@ export function playDoneChime(): { soundPlayed: boolean; reason?: string } {
       ? { soundPlayed: true }
       : { soundPlayed: false, reason: '浏览器暂时挡住了声音，需先在页面里操作一次' };
   } catch (e) {
-    return { soundPlayed: false, reason: `提示音播放失败：${e instanceof Error ? e.message : String(e)}` };
+    return { soundPlayed: false, reason: `提示音播放失败：${errorTextOf(e, '原因未知')}` };
   }
 }
 

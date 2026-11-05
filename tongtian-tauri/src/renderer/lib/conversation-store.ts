@@ -50,7 +50,10 @@ function readLedger(): ChatMessageRow[] {
   try {
     const raw = s.getItem(LEDGER_KEY);
     const rows = raw ? (JSON.parse(raw) as unknown) : [];
-    return Array.isArray(rows) ? rows.filter(isValidRow) : [];
+    // 旧台账没有 workspaceId：按 Rust 迁移的存量口径归到 default，不丢历史会话
+    return Array.isArray(rows)
+      ? rows.filter(isValidRow).map((r) => ({ ...r, workspaceId: r.workspaceId || 'default' }))
+      : [];
   } catch {
     return [];
   }
@@ -111,6 +114,7 @@ export function recordConversationMessage(row: ChatMessageRow): void {
     turnIndex: row.turnIndex,
     role: row.role,
     taskId: row.taskId,
+    workspaceId: row.workspaceId?.trim() || 'default',
     content,
     artifacts: row.role === 'assistant' ? [...(row.artifacts ?? [])] : [],
     tsMs: row.tsMs,
@@ -126,9 +130,11 @@ export function recordConversationMessage(row: ChatMessageRow): void {
 }
 
 /** 本地会话聚合（与 Rust `list_conversations` 同口径：标题取首轮提问、按最近活跃倒序） */
-export function localConversations(limit = 50): ConversationRow[] {
+export function localConversations(limit = 50, workspaceId?: string): ConversationRow[] {
+  const filter = workspaceId?.trim() || '';
   const byConv = new Map<string, ChatMessageRow[]>();
   for (const row of ledgerRows()) {
+    if (filter && (row.workspaceId || 'default') !== filter) continue;
     const group = byConv.get(row.convId);
     if (group) group.push(row);
     else byConv.set(row.convId, [row]);
@@ -148,6 +154,7 @@ export function localConversations(limit = 50): ConversationRow[] {
       createdAtMs: Math.min(...rows.map((r) => r.tsMs)),
       updatedAtMs: Math.max(...rows.map((r) => r.tsMs)),
       lastTaskId: lastByTurn?.taskId ?? '',
+      workspaceId: first?.workspaceId || 'default',
     });
   }
   return out.sort((a, b) => b.updatedAtMs - a.updatedAtMs).slice(0, Math.max(0, limit));
@@ -212,6 +219,8 @@ export async function editConversationTurn(
     await api.invoke(IPC_CHANNELS.CHAT_EDIT_TURN, convId, turnIndex, content);
     return;
   }
+  // 改写正文不改变归属：先从被改写的会话取原工作区，再截断后续轮次
+  const workspaceId = ledgerRows().find((r) => r.convId === convId)?.workspaceId || 'default';
   const rows = ledgerRows().filter(
     (r) =>
       !(
@@ -226,6 +235,7 @@ export async function editConversationTurn(
     turnIndex,
     role: 'user',
     taskId: '',
+    workspaceId,
     content,
     artifacts: [],
     tsMs: Date.now(),
@@ -261,6 +271,7 @@ export function toMessageRows(resp: unknown): ChatMessageRow[] {
       turnIndex: Number(r.turnIndex ?? 0) || 0,
       role,
       taskId: String(r.taskId ?? ''),
+      workspaceId: String(r.workspaceId ?? '') || 'default',
       content: r.content,
       artifacts: Array.isArray(r.artifacts) ? (r.artifacts as unknown[]).map((a) => String(a)) : [],
       tsMs: Number(r.tsMs ?? 0) || 0,
@@ -284,23 +295,32 @@ export function toConversationRows(resp: unknown): ConversationRow[] {
       createdAtMs: Number(r.createdAtMs ?? 0) || 0,
       updatedAtMs: Number(r.updatedAtMs ?? 0) || 0,
       lastTaskId: String(r.lastTaskId ?? ''),
+      workspaceId: String(r.workspaceId ?? '') || 'default',
     });
   }
   return out;
 }
 
-/** 会话列表：桌面走 Rust，其余走本地台账 */
-export async function fetchConversations(limit = 50): Promise<ConversationRow[]> {
+/**
+ * 会话列表：桌面走 Rust，其余走本地台账。
+ * `workspaceId` 为空表示全部项目；有值时服务端与本地台账都按项目过滤。
+ */
+export async function fetchConversations(
+  limit = 50,
+  workspaceId?: string
+): Promise<ConversationRow[]> {
   const api = getAPI();
   if (api && isDesktopRuntime()) {
     try {
-      const rows = toConversationRows(await api.invoke(IPC_CHANNELS.CHAT_CONVERSATIONS, limit));
+      const rows = toConversationRows(
+        await api.invoke(IPC_CHANNELS.CHAT_CONVERSATIONS, limit, workspaceId)
+      );
       if (rows.length) return rows;
     } catch {
       // Rust 通道不可用时回退本地台账，恢复路径不阻断启动
     }
   }
-  return localConversations(limit);
+  return localConversations(limit, workspaceId);
 }
 
 /** 单会话正文：桌面走 Rust，其余走本地台账 */

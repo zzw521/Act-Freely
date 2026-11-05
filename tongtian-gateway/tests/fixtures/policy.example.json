@@ -1,0 +1,96 @@
+{
+  "contractVersion": "gateway-contract.v1",
+  "policyVersion": "2026-10-30T12:00:00Z#7",
+  "version": "2026-10-30T12:00:00Z#7",
+  "tenant": "acme",
+  "gateway": { "url": "http://127.0.0.1:8001" },
+  "noLog": true,
+  "embeddingRoute": "embedding-default",
+  "byok": { "allowed": true, "hardQuota": false },
+  "models": {
+    "azure-gpt-4o": {
+      "provider": "azure_openai",
+      "upstreamModel": "gpt-4o",
+      "capabilities": ["chat", "tools", "vision"],
+      "contextWindow": 128000,
+      "maxOutputTokens": 16384,
+      "priceVersion": "2026-10-01",
+      "pricing": {
+        "currency": "USD",
+        "inputPer1M": "2.50",
+        "outputPer1M": "10.00",
+        "cachedInputPer1M": "1.25",
+        "reasoningAsOutput": true
+      }
+    },
+    "bailian-qwen-max": {
+      "provider": "bailian",
+      "upstreamModel": "qwen-max",
+      "capabilities": ["chat", "tools"],
+      "contextWindow": 32768,
+      "maxOutputTokens": 8192,
+      "priceVersion": "2026-10-01",
+      "pricing": {
+        "currency": "USD",
+        "inputPer1M": "0.40",
+        "outputPer1M": "1.20",
+        "reasoningAsOutput": true
+      }
+    },
+    "azure-text-embedding-3-small": {
+      "provider": "azure_openai",
+      "upstreamModel": "text-embedding-3-small",
+      "capabilities": ["embeddings"],
+      "contextWindow": 8191,
+      "priceVersion": "2026-10-01",
+      "pricing": {
+        "currency": "USD",
+        "inputPer1M": "0.02",
+        "outputPer1M": "0",
+        "reasoningAsOutput": false
+      }
+    }
+  },
+  "routes": {
+    "auto": { "chain": ["azure-gpt-4o", "bailian-qwen-max"], "fallbackAllowed": true },
+    "advanced": { "chain": ["azure-gpt-4o"], "fallbackAllowed": false },
+    "basic": { "chain": ["bailian-qwen-max"], "fallbackAllowed": true },
+    "economy": { "chain": ["bailian-qwen-max"], "fallbackAllowed": false },
+    "embedding-default": {
+      "chain": ["azure-text-embedding-3-small"],
+      "fallbackAllowed": false
+    }
+  },
+  "allowedModels": [
+    "auto",
+    "advanced",
+    "basic",
+    "economy",
+    "embedding-default",
+    "azure-gpt-4o",
+    "bailian-qwen-max",
+    "azure-text-embedding-3-small"
+  ],
+  "quotaDefaults": {
+    "monthlyTokens": 2000000,
+    "concurrency": 4,
+    "rpm": 60,
+    "tpm": 60000,
+    "maxOutputTokens": 8192
+  },
+  "departments": {
+    "dept-sales": {
+      "allowedModels": [
+        "auto",
+        "basic",
+        "embedding-default",
+        "bailian-qwen-max",
+        "azure-text-embedding-3-small"
+      ],
+      "quota": { "monthlyTokens": 500000, "concurrency": 2, "maxOutputTokens": 2048 },
+      "byokAllowed": true
+    }
+  },
+  "issuedAt": "2026-10-30T12:00:00Z",
+  "expiresAt": "2026-10-30T12:05:00Z"
+}

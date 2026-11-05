@@ -213,9 +213,9 @@ const BrowserUsePanel: React.FC<BrowserUsePanelProps> = ({ embedded = false }) =
       }}
     >
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-        <LanguageIcon sx={{ fontSize: 22, color: '#059669' }} />
+        <LanguageIcon sx={{ fontSize: 22, color: 'var(--tt-success)' }} />
         <Typography sx={{ fontSize: '20px', fontWeight: 700, color: 'var(--tt-text-1)' }}>浏览器 AI+</Typography>
-        {loading && <CircularProgress size={16} sx={{ color: '#059669' }} />}
+        {loading && <CircularProgress size={16} sx={{ color: 'var(--tt-success)' }} />}
       </Box>
       <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-3)', mt: 0.5 }}>
         受控浏览器执行器：AI 在本应用启动的独立浏览器里打开网页、读取页面并按序号点击或输入。
@@ -235,23 +235,23 @@ const BrowserUsePanel: React.FC<BrowserUsePanelProps> = ({ embedded = false }) =
         >
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexWrap: 'wrap' }}>
             {ready ? (
-              <CheckCircleIcon sx={{ fontSize: 18, color: '#059669' }} />
+              <CheckCircleIcon sx={{ fontSize: 18, color: 'var(--tt-success)' }} />
             ) : (
-              <WarningAmberIcon sx={{ fontSize: 18, color: '#D97706' }} />
+              <WarningAmberIcon sx={{ fontSize: 18, color: 'var(--tt-warning)' }} />
             )}
-            <Typography sx={{ fontSize: '13.5px', fontWeight: 700, color: ready ? '#047857' : '#B45309' }}>
+            <Typography sx={{ fontSize: '13.5px', fontWeight: 700, color: ready ? 'var(--tt-success)' : 'var(--tt-warning)' }}>
               {ready ? '执行器可用' : '执行器不可用'}
             </Typography>
             {caps && (
               <Box sx={{ px: 1, py: 0.2, borderRadius: '6px', bgcolor: 'rgba(107, 114, 128, 0.12)' }}>
-                <Typography sx={{ fontSize: '11px', fontWeight: 600, color: '#6B7280' }}>
+                <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-text-2)' }}>
                   {caps.browser || caps.platform}
                 </Typography>
               </Box>
             )}
             {caps?.running && (
               <Box sx={{ px: 1, py: 0.2, borderRadius: '6px', bgcolor: 'rgba(5, 150, 105, 0.12)' }}>
-                <Typography sx={{ fontSize: '11px', fontWeight: 600, color: '#047857' }}>
+                <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-success)' }}>
                   会话运行中 · 端口 {caps.port ?? '—'}
                 </Typography>
               </Box>
@@ -292,11 +292,11 @@ const BrowserUsePanel: React.FC<BrowserUsePanelProps> = ({ embedded = false }) =
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 3, mb: 1 }}>
           <Typography sx={{ fontSize: '16px', fontWeight: 700, color: 'var(--tt-text-1)' }}>执行策略</Typography>
           <Box sx={{ px: 1, py: 0.2, borderRadius: '6px', bgcolor: 'rgba(5, 150, 105, 0.12)' }}>
-            <Typography sx={{ fontSize: '11px', fontWeight: 600, color: '#047857' }}>
+            <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-success)' }}>
               当前：{policyLabel(activePolicy)}
             </Typography>
           </Box>
-          {savingBusy && <CircularProgress size={14} sx={{ color: '#059669' }} />}
+          {savingBusy && <CircularProgress size={14} sx={{ color: 'var(--tt-success)' }} />}
         </Box>
         <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-3)', mb: 1.5 }}>
           {caps?.supported
@@ -323,23 +323,23 @@ const BrowserUsePanel: React.FC<BrowserUsePanelProps> = ({ embedded = false }) =
                 width: '100%',
                 gap: 1.5,
                 bgcolor: 'var(--tt-surface)',
-                border: selected ? '1.5px solid #10B981' : '1px solid var(--tt-border)',
+                border: selected ? '1.5px solid var(--tt-success)' : '1px solid var(--tt-border)',
                 borderRadius: '14px',
                 px: 2,
                 py: 1.75,
                 mb: 1,
                 opacity: disabled && !selected ? 0.6 : 1,
                 cursor: disabled ? 'default' : 'pointer',
-                '&:hover': disabled ? {} : { borderColor: '#10B981' },
+                '&:hover': disabled ? {} : { borderColor: 'var(--tt-success)' },
               }}
             >
               {selected ? (
-                <CheckCircleIcon sx={{ fontSize: 18, color: '#059669' }} />
+                <CheckCircleIcon sx={{ fontSize: 18, color: 'var(--tt-success)' }} />
               ) : (
-                <RadioButtonUncheckedIcon sx={{ fontSize: 18, color: '#D1D5DB' }} />
+                <RadioButtonUncheckedIcon sx={{ fontSize: 18, color: 'var(--tt-text-4)' }} />
               )}
               <Box>
-                <Typography sx={{ fontSize: '13.5px', fontWeight: 600, color: selected ? '#047857' : 'var(--tt-text-1)' }}>
+                <Typography sx={{ fontSize: '13.5px', fontWeight: 600, color: selected ? 'var(--tt-success)' : 'var(--tt-text-1)' }}>
                   {p.label}
                 </Typography>
                 <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-3)', mt: 0.25 }}>{p.desc}</Typography>
@@ -420,13 +420,13 @@ const BrowserUsePanel: React.FC<BrowserUsePanelProps> = ({ embedded = false }) =
                       width: 26,
                       height: 26,
                       borderRadius: '50%',
-                      bgcolor: '#ECFDF5',
+                      bgcolor: 'var(--tt-chip-success)',
                       display: 'flex',
                       alignItems: 'center',
                       justifyContent: 'center',
                     }}
                   >
-                    <Icon sx={{ fontSize: 15, color: '#059669' }} />
+                    <Icon sx={{ fontSize: 15, color: 'var(--tt-success)' }} />
                   </Box>
                   <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)' }}>
                     {i + 1}. {t.title}
@@ -463,18 +463,18 @@ const BrowserUsePanel: React.FC<BrowserUsePanelProps> = ({ embedded = false }) =
           sx={{
             mt: 3,
             mb: 2,
-            bgcolor: '#FFFBEB',
+            bgcolor: 'var(--tt-chip-warning)',
             border: '1px solid rgba(217, 119, 6, 0.25)',
             borderRadius: '14px',
             p: 2,
           }}
         >
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mb: 1 }}>
-            <WarningAmberIcon sx={{ fontSize: 17, color: '#D97706' }} />
-            <Typography sx={{ fontSize: '13px', fontWeight: 700, color: '#B45309' }}>使用注意</Typography>
+            <WarningAmberIcon sx={{ fontSize: 17, color: 'var(--tt-warning)' }} />
+            <Typography sx={{ fontSize: '13px', fontWeight: 700, color: 'var(--tt-warning)' }}>使用注意</Typography>
           </Box>
           {warnings.map((w) => (
-            <Typography key={w} sx={{ fontSize: '12px', color: '#92400E', mb: 0.75, lineHeight: 1.6 }}>
+            <Typography key={w} sx={{ fontSize: '12px', color: 'var(--tt-warning)', mb: 0.75, lineHeight: 1.6 }}>
               · {w}
             </Typography>
           ))}

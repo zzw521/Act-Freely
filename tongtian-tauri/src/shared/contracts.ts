@@ -9,7 +9,19 @@ import type {
   WaitReason,
   TaskMeta,
   PiiOutboundMode,
+  FilePermissionMode,
 } from './types';
+
+// ── #164 IPC 车道预留段（各窗口只改自己那份，本文件之后不再逐条加通道）──
+// 通道名规则：`<lane>:xxx` 的冒号后半段就是 src-tauri/src/ipc/<lane>.rs 里 dispatch 的 method 名。
+// 分派命令由 lib.rs 的 generate_handler! 一次挂齐，前端经 src/shared/ipc-lanes.ts 单点接线。
+export { IPC_LANE_KNOWLEDGE, IPC_CHANNELS_KNOWLEDGE } from './contracts_knowledge';
+export { IPC_LANE_ARTIFACT, IPC_CHANNELS_ARTIFACT } from './contracts_artifact';
+export { IPC_LANE_WORKSPACE, IPC_CHANNELS_WORKSPACE } from './contracts_workspace';
+export { IPC_LANE_EXEC, IPC_CHANNELS_EXEC } from './contracts_exec';
+export { IPC_LANE_CONNECT, IPC_CHANNELS_CONNECT } from './contracts_connect';
+export { IPC_LANE_ORCHESTRATE, IPC_CHANNELS_ORCHESTRATE } from './contracts_orchestrate';
+export { IPC_LANE_VOICE, IPC_CHANNELS_VOICE } from './contracts_voice';
 
 // ── Error Codes ──────────────────────────────────────────────
 
@@ -36,6 +48,8 @@ export enum ErrorCode {
   FILE_CONVERSION_FAILED = 'FILE_CONVERSION_FAILED',
   FILE_TOO_LARGE = 'FILE_TOO_LARGE',
   FILE_BACKUP_FAILED = 'FILE_BACKUP_FAILED',
+  /** 暂存复制失败：附件没能进入运行目录，任务不应带着半套文件继续 */
+  FILE_STAGE_FAILED = 'FILE_STAGE_FAILED',
   /** 仅浏览器直连/Mock 通道使用：网页侧无法读取本机文档正文 */
   FILE_UNSUPPORTED = 'FILE_UNSUPPORTED',
 
@@ -51,6 +65,8 @@ export enum ErrorCode {
   CONFIG_INVALID = 'CONFIG_INVALID',
   CONFIG_MISSING = 'CONFIG_MISSING',
   CONFIG_PARSE_ERROR = 'CONFIG_PARSE_ERROR',
+  /** 系统专用设置项不允许经设置页写入（如引擎令牌） */
+  SETTING_KEY_RESERVED = 'SETTING_KEY_RESERVED',
 
   // Workspace errors
   WORKSPACE_INVALID_ID = 'WORKSPACE_INVALID_ID',
@@ -78,6 +94,8 @@ export enum ErrorCode {
   SUITE_NOT_FOUND = 'SUITE_NOT_FOUND',
   SUITE_INCOMPATIBLE = 'SUITE_INCOMPATIBLE',
   SUITE_INSTALL_FAILED = 'SUITE_INSTALL_FAILED',
+  /** 升级失败且旧版本也放不回原位：明细里带回收目录与目标路径，需要手工恢复 */
+  SUITE_ROLLBACK_FAILED = 'SUITE_ROLLBACK_FAILED',
 
   // Plugin SDK（安装前预检与起始模板）
   PLUGIN_INVALID_PACKAGE = 'PLUGIN_INVALID_PACKAGE',
@@ -99,10 +117,12 @@ export enum ErrorCode {
   MARKET_SIGNATURE_REQUIRED = 'MARKET_SIGNATURE_REQUIRED',
   MARKET_SIGNATURE_INVALID = 'MARKET_SIGNATURE_INVALID',
   MARKET_TRUST_SAVE_FAILED = 'MARKET_TRUST_SAVE_FAILED',
+  MARKET_ITEM_REVOKED = 'MARKET_ITEM_REVOKED',
 
   // ── 本地知识库（RAG） ──
   KNOWLEDGE_INVALID_ID = 'KNOWLEDGE_INVALID_ID',
   KNOWLEDGE_INVALID_NAME = 'KNOWLEDGE_INVALID_NAME',
+  KNOWLEDGE_INVALID_SCOPE = 'KNOWLEDGE_INVALID_SCOPE',
   KNOWLEDGE_INVALID_DESC = 'KNOWLEDGE_INVALID_DESC',
   KNOWLEDGE_INVALID_DOC = 'KNOWLEDGE_INVALID_DOC',
   KNOWLEDGE_EXISTS = 'KNOWLEDGE_EXISTS',
@@ -157,6 +177,10 @@ export enum ErrorCode {
   MCP_OAUTH_NETWORK = 'MCP_OAUTH_NETWORK',
   MCP_OAUTH_OPEN_FAILED = 'MCP_OAUTH_OPEN_FAILED',
   MCP_OAUTH_UNSUPPORTED = 'MCP_OAUTH_UNSUPPORTED',
+
+  // MCP 常驻连接枢纽（引擎侧跨轮复用；失败时退回一次性连接，不中断任务）
+  MCP_HUB_NOT_STARTED = 'MCP_HUB_NOT_STARTED',
+  MCP_HUB_UNKNOWN_OP = 'MCP_HUB_UNKNOWN_OP',
 
   // 项目协作（跨用户 / 跨机器；桌面端 Rust → 账号服务）
   COLLAB_UNSUPPORTED = 'COLLAB_UNSUPPORTED',
@@ -261,6 +285,8 @@ export enum ErrorCode {
   // ── 三层架构演进云端必需码（P0，需求分析报告 M4 + 主 SPEC §5.3 补全） ──
   /** 组织预算耗尽（Gateway 权威台账） */
   BUDGET_EXHAUSTED = 'BUDGET_EXHAUSTED',
+  /** 单个任务的 Token 预算已用满（缺陷 D-14.1：执行面已停在下一轮模型调用之前） */
+  BUDGET_TASK_EXCEEDED = 'BUDGET_TASK_EXCEEDED',
   /** 排队超时（QUEUE_TIMEOUT 10min，可配） */
   QUEUE_TIMEOUT = 'QUEUE_TIMEOUT',
   /** 租约丢失（Runner 崩溃/心跳超时 60s） */
@@ -293,6 +319,8 @@ export enum ErrorCode {
   POLICY_INVALID_WORKSPACE = 'POLICY_INVALID_WORKSPACE',
   /** 受控执行白名单里的命令名非法（必须是裸命令名） */
   POLICY_INVALID_COMMAND = 'POLICY_INVALID_COMMAND',
+  /** 通用 shell 缺少命令执行授权（必须同时开启） */
+  POLICY_INVALID_SHELL = 'POLICY_INVALID_SHELL',
   /** 联网白名单里的主机名非法 */
   POLICY_INVALID_HOST = 'POLICY_INVALID_HOST',
   /** 已落库策略 JSON 损坏（拒绝按默认值放行） */
@@ -347,6 +375,12 @@ export enum ErrorCode {
   USAGE_STATS_FAILED = 'USAGE_STATS_FAILED',
   /** 用量报表查询/组装失败（按日趋势或明细读取失败） */
   USAGE_REPORT_FAILED = 'USAGE_REPORT_FAILED',
+  /** 用量上报失败（读取台账、请求服务端或解析响应受阻） */
+  USAGE_UPLOAD_FAILED = 'USAGE_UPLOAD_FAILED',
+  /** 未登录或账号资料缺少 uid，无法上报 */
+  USAGE_UPLOAD_LOGIN_REQUIRED = 'USAGE_UPLOAD_LOGIN_REQUIRED',
+  /** 上报时登录态失效，刷新重试后仍被拒 */
+  USAGE_UPLOAD_AUTH_EXPIRED = 'USAGE_UPLOAD_AUTH_EXPIRED',
 
   // ── 对齐整改通道（Rust align::* 抛出：Hooks / 连接器 / 归档 / 电脑操控） ──
   /** Hook 事件名不在支持清单内 */
@@ -412,10 +446,10 @@ export enum ErrorCode {
   /** 网关请求体不是合法 JSON */
   COMPUTER_USE_BAD_JSON = 'COMPUTER_USE_BAD_JSON',
 
-  // ── 远程桌面（本机实时画面；只看不控） ──
+  // ── 本机画面（本机实时画面；只看不控） ──
   /** 当前平台没有桌面截屏执行器（仅 Windows 桌面版） */
   REMOTE_UNSUPPORTED = 'REMOTE_UNSUPPORTED',
-  /** 电脑操控档位为禁用，远程桌面无法开启 */
+  /** 电脑操控档位为禁用，本机画面无法开启 */
   REMOTE_DISABLED = 'REMOTE_DISABLED',
   /** 会话未开启或已结束 */
   REMOTE_NO_SESSION = 'REMOTE_NO_SESSION',
@@ -528,6 +562,24 @@ export enum ErrorCode {
   /** 当前系统没有可用的原生确认框 */
   TOOL_APPROVAL_CONFIRM_UNAVAILABLE = 'TOOL_APPROVAL_CONFIRM_UNAVAILABLE',
 
+  // ── 文件访问档位（每次询问 / 自动审批 / 完全访问） ──
+  /** 档位非法（仅 ask_every_time / auto_approve / full_access），任务不受理 */
+  FILE_PERMISSION_INVALID = 'FILE_PERMISSION_INVALID',
+  /** 档位为「每次询问」时用户拒绝了这次写/删，操作未执行 */
+  FILE_PERMISSION_DENIED_BY_USER = 'FILE_PERMISSION_DENIED_BY_USER',
+  /** 档位不是「每次询问」却来敲门：确认框不该弹，弹了也不放行 */
+  FILE_PERMISSION_ASK_NOT_REQUIRED = 'FILE_PERMISSION_ASK_NOT_REQUIRED',
+  /** 系统确认框拉不起来（缺 zenity/kdialog、线程异常），这次写/删未执行 */
+  FILE_PERMISSION_CONFIRM_UNAVAILABLE = 'FILE_PERMISSION_CONFIRM_UNAVAILABLE',
+  /** 删除前的回收目录建不出来或不可写，文件保持原样 */
+  TRASH_DIR_UNAVAILABLE = 'TRASH_DIR_UNAVAILABLE',
+  /** 回收目录同秒重名过多，放弃这次删除 */
+  TRASH_NAME_EXHAUSTED = 'TRASH_NAME_EXHAUSTED',
+  /** 回收文件名取不出来（路径异常），不删原文件 */
+  TRASH_NAME_UNAVAILABLE = 'TRASH_NAME_UNAVAILABLE',
+  /** 复制进回收目录失败，文件未被删除（删除永远先备份） */
+  TRASH_BACKUP_FAILED = 'TRASH_BACKUP_FAILED',
+
   // ── 意识（awareness:*：画像 + 能力文件 + 长期记忆条目） ──
   /** 意识目录不可访问（读取/初始化落盘失败） */
   AWARENESS_DIR_FAILED = 'AWARENESS_DIR_FAILED',
@@ -543,6 +595,38 @@ export enum ErrorCode {
   AWARENESS_MEMORY_EMPTY = 'AWARENESS_MEMORY_EMPTY',
   /** 长期记忆条目不存在（删除时按 id 未命中） */
   AWARENESS_MEMORY_NOT_FOUND = 'AWARENESS_MEMORY_NOT_FOUND',
+
+  // ── 长期记忆库（桌面 memories 表：跨任务、按项目归属、去重合并） ──
+  /** 记忆归属非法（仅 global / workspace，项目记忆须带合法工作区 id） */
+  MEMORY_INVALID_SCOPE = 'MEMORY_INVALID_SCOPE',
+  /** 记忆类型非法（仅 task / fact / preference / decision） */
+  MEMORY_INVALID_KIND = 'MEMORY_INVALID_KIND',
+  /** 记忆内容为空 */
+  MEMORY_CONTENT_EMPTY = 'MEMORY_CONTENT_EMPTY',
+  /** 记忆内容超出单条上限 */
+  MEMORY_CONTENT_TOO_LONG = 'MEMORY_CONTENT_TOO_LONG',
+  /** 记忆条目不存在（删除时按 id 未命中） */
+  MEMORY_NOT_FOUND = 'MEMORY_NOT_FOUND',
+  /** 记忆写入/合并失败 */
+  MEMORY_SAVE_FAILED = 'MEMORY_SAVE_FAILED',
+  /** 记忆列表读取失败 */
+  MEMORY_LIST_FAILED = 'MEMORY_LIST_FAILED',
+  /** 单条记忆读取失败 */
+  MEMORY_LOAD_FAILED = 'MEMORY_LOAD_FAILED',
+  /** 复核动作非法（仅 confirm / reject / archive / restore） */
+  MEMORY_STATUS_INVALID = 'MEMORY_STATUS_INVALID',
+  /** 该记忆已被更新的同类事实取代，不能直接确认/恢复 */
+  MEMORY_SUPERSEDED = 'MEMORY_SUPERSEDED',
+  /** 结构化事实字段非法（主体/属性/取值超长） */
+  MEMORY_INVALID_FACT = 'MEMORY_INVALID_FACT',
+  /** 内容疑似包含凭据，拒绝写入记忆库 */
+  MEMORY_SECRET_BLOCKED = 'MEMORY_SECRET_BLOCKED',
+  /** 导入文件不是合法导出格式（format/version/entries 校验失败） */
+  MEMORY_IMPORT_INVALID = 'MEMORY_IMPORT_INVALID',
+  /** 导出记忆到文件失败（目录不可写/磁盘满） */
+  MEMORY_EXPORT_FAILED = 'MEMORY_EXPORT_FAILED',
+  /** 浏览器直连没有桌面记忆库（复核/实体页/导入导出只在桌面版可用） */
+  MEMORY_DESKTOP_ONLY = 'MEMORY_DESKTOP_ONLY',
 
   // ── IM 频道（引擎 /api/im/*：长连接只跑在引擎进程里） ──
   /** 引擎未运行：频道绑定与状态只有引擎知道，不做前端假清单 */
@@ -567,6 +651,8 @@ export enum ErrorCode {
   IM_CREDENTIAL_MISSING = 'IM_CREDENTIAL_MISSING',
   /** 凭据格式明显不对（如 Slack App Token 不是 xapp- 开头） */
   IM_CREDENTIAL_INVALID = 'IM_CREDENTIAL_INVALID',
+  /** 扫码登录查状态时没带二维码票据 */
+  IM_LOGIN_TICKET_MISSING = 'IM_LOGIN_TICKET_MISSING',
   /** 凭据被 IM 服务端拒绝（真实的鉴权往返失败） */
   IM_AUTH_FAILED = 'IM_AUTH_FAILED',
   /** IM 服务端返回业务错误 */
@@ -602,6 +688,7 @@ export interface AppError {
  */
 export type { ChatSubmitReq } from './types';
 export type { PiiOutboundMode } from './types';
+export type { FilePermissionMode } from './types';
 
 export interface ChatReviewReq {
   /** 计划审阅时必填；从检查点恢复（resume）时不需要计划 */
@@ -617,7 +704,16 @@ export interface ChatReviewReq {
  */
 export type ChatEvent =
   | { type: 'plan'; planId: string; steps: ChatStepPreview[]; seq?: number; taskId?: string }
-  | { type: 'step_start'; stepId: string; stepType: StepType; description: string; seq?: number; taskId?: string }
+  | {
+      type: 'step_start';
+      stepId: string;
+      stepType: StepType;
+      description: string;
+      /** 引擎直连通道随事件带出的工具名；Rust 转发只留 stepId+description，界面需从描述兜底解析 */
+      tool?: string;
+      seq?: number;
+      taskId?: string;
+    }
   | { type: 'step_progress'; stepId: string; progress: number; message: string; seq?: number; taskId?: string }
   | { type: 'step_done'; stepId: string; output: string; usage?: { promptTokens?: number; completionTokens?: number }; seq?: number; taskId?: string }
   | { type: 'step_failed'; stepId: string; error: string; seq?: number; taskId?: string }
@@ -634,7 +730,7 @@ export type ChatEvent =
   | { type: 'error'; code: ErrorCode; message: string; seq?: number; taskId?: string }
   // ── 三层架构演进新增事件 ──
   | { type: 'status_change'; taskId: string; status: TaskStatus; waitReason?: WaitReason; statusReasonCode?: string; queuePosition?: number; seq?: number }
-  | { type: 'quota_warning'; level: '70' | '85' | '95' | '100'; action: 'notify' | 'degrade' | 'queue' | 'block'; usedTokens: number; quotaTokens: number; seq?: number }
+  | { type: 'quota_warning'; level: '70' | '85' | '95' | '100'; action: 'notify' | 'degrade' | 'queue' | 'block'; usedTokens: number; quotaTokens: number; seq?: number; scope?: 'daily' | 'task'; taskId?: string }
   | {
       type: 'checkpoint';
       taskId: string;
@@ -652,6 +748,9 @@ export type ChatEvent =
       mediaOmitted?: number;
       droppedMessages?: number;
       captureError?: string;
+      /** 本地 harness：一轮工具调用被中断时，还没拿到结果的数量与工具名（不含参数） */
+      pendingToolCalls?: number;
+      pendingTools?: string[];
       seq?: number;
     }
   | { type: 'heartbeat'; seq?: number };
@@ -745,6 +844,8 @@ export interface EngineEndpoint {
   baseUrl: string;
   port: number;
   status: AgentInstanceStatus;
+  /** 桌面壳注入的本机引擎令牌；渲染层直连 /api 时随请求携带 */
+  token?: string;
 }
 
 /** 工作空间创建入参（标识即目录名，须通过 Rust 同口径校验） */
@@ -878,6 +979,8 @@ export interface KnowledgeBase {
   name: string;
   description: string;
   enabled: boolean;
+  /** 归属：global=所有项目共享；workspace:<id>=只在指定工作区进入检索面 */
+  scope: string;
   createdAt: string;
   updatedAt: string;
   /** 知识库目录绝对路径（桌面端真实落盘位置） */
@@ -1079,6 +1182,9 @@ export interface MarketItemBase {
   sizeBytes: number | null;
   /** 本机是否已安装同标识条目 */
   installed: boolean;
+  /** 索引声明该条目（或该版本）已被撤销：装不上，已装的在检查更新后转禁用 */
+  revoked: boolean;
+  revokedReason: string | null;
   /** 发布者与签名状态；未签名条目由索引策略决定能否安装 */
   publisherId: string | null;
   publisherName: string | null;
@@ -1107,12 +1213,119 @@ export interface MarketList<T> {
   fetchedAtMs: number;
   /** 未配置时为 null */
   signaturePolicy: MarketSignaturePolicy | null;
+  /** 撤销清单（索引顶层 revokedUrl）是否读到；读不到时只代表「本轮没拿到外部清单」 */
+  revokedSourceOk: boolean;
+  revokedSourceError: string | null;
   publishers: MarketPublisher[];
   items: T[];
 }
 
 export interface MarketInstallReq {
   itemId: string;
+}
+
+/** 本机已安装条目的更新/撤销状态；只有这六种，不臆造「最新」 */
+export type MarketInstalledStatus =
+  | 'upToDate'
+  | 'updateAvailable'
+  | 'ahead'
+  | 'unknownVersion'
+  | 'delisted'
+  | 'revoked';
+
+/** 已安装清单条目（不联网也能读到的本机事实） */
+export interface MarketInstalledItem {
+  kind: 'skill' | 'suite';
+  id: string;
+  name: string | null;
+  installedVersion: string | null;
+  sha256: string | null;
+  sourceHost: string | null;
+  installedAtMs: number;
+  /** market = 由在线市场安装并落清单；scanned = 本机扫盘补齐，不参与撤销比对 */
+  provenance: 'market' | 'scanned';
+  revoked: boolean;
+  revokedReason: string | null;
+  disabled: boolean;
+}
+
+export interface MarketInstalledList {
+  supported: boolean;
+  items: MarketInstalledItem[];
+  /** 上次检查更新时间；从未检查过时为 null */
+  lastCheckAtMs: number | null;
+}
+
+/** 检查更新 + 应用撤销的报告条目 */
+export interface MarketUpdateItem extends MarketInstalledItem {
+  latestVersion: string | null;
+  status: MarketInstalledStatus;
+  updateAvailable: boolean;
+  /** 已被撤销并在执行面拦掉 */
+  blocked: boolean;
+}
+
+export interface MarketUpdateReport {
+  supported: boolean;
+  checkedAtMs: number;
+  /** 本轮实际读取了几个索引源（0/1/2）；未配置的来源不会伪造结论 */
+  sourcesConfigured: number;
+  /** 逐来源的读取失败说明；非空不代表整体失败 */
+  errors: string[];
+  items: MarketUpdateItem[];
+  summary: {
+    updateAvailable: number;
+    revoked: number;
+    delisted: number;
+    disabledApplied: number;
+  };
+}
+
+/**
+ * 单条升级的回执：在安装回执（技能目录 / 套件目录的现状）之上，额外给出
+ * 「旧版本去了哪」与「市场这一版是什么」。升级不物理删除旧版本，回收目录路径
+ * 必须回给页面，用户才有手工放回的办法。
+ */
+export type MarketUpgradeResult<T> = T & {
+  upgraded: true;
+  /** 旧版本被移入的回收目录绝对路径 */
+  previousVersionTrash: string;
+  /** 本次落下的市场版本（技能目录本身不存版本，只能由市场条目给出） */
+  marketVersion: string | null;
+};
+
+/** 一键升级的逐条结果：失败条只带原因，不影响同批其余条目 */
+export interface MarketUpgradeItemResult {
+  kind: 'skill' | 'suite';
+  id: string;
+  name: string | null;
+  ok: boolean;
+  /** 本机清单里升级前的版本；从未落过清单时为 null */
+  fromVersion: string | null;
+  /** 成功时为落下的新版本；失败时为 null */
+  toVersion: string | null;
+  /** 成功时：旧版本的回收目录 */
+  previousVersionTrash?: string | null;
+  /**
+   * 成功时：升级后该条目是否启用。撤销后被禁用的条目**不会**因为升级自动放开，
+   * 开关仍由用户在技能页决定（页面要如实显示这个状态）
+   */
+  enabled?: boolean;
+  /** 失败时：Rust 侧原样错误串（带 MARKET_* / SKILL_* / SUITE_* 前缀） */
+  error?: string;
+}
+
+/** 一键升级报告：只处理检查更新判定为 updateAvailable 的条目 */
+export interface MarketUpgradeReport {
+  supported: boolean;
+  /** 本次批量前置的检查更新时间戳 */
+  checkedAtMs: number;
+  attempted: number;
+  upgraded: number;
+  failed: number;
+  /** 检查更新阶段的逐源读取失败，非空不代表升级失败 */
+  errors: string[];
+  items: MarketUpgradeItemResult[];
 }
 
 // ── Audit ────────────────────────────────────────────────────
@@ -1292,6 +1505,580 @@ export interface CollabCommentResp {
   seq: number;
 }
 
+// ── 项目事件订阅（缺陷 D-06：实时推送替掉 10 秒轮询） ──────────
+
+/**
+ * 桌面端从账号服务项目事件流转发出来的一条事件。
+ * seq 是服务端全库自增：只能比大小，不能假设相邻（中间的可能属于别的项目）。
+ */
+export interface CollabEvent {
+  projectId: string;
+  seq: number;
+  kind: string;
+  actorUid: string | null;
+  payload: unknown;
+  createdAtMs: number | null;
+}
+
+/** 订阅自身的状态；界面用它决定「实时」还是退回轮询，降级时必须看得见 */
+export interface CollabWatchStateEvent {
+  projectId: string;
+  state: 'connecting' | 'streaming' | 'degraded' | 'closed' | 'stopped';
+  /** 已交付到事件流的游标（重连从这里续） */
+  cursor: number;
+  reason: string;
+}
+
+export interface CollabWatchStartResp {
+  ok: true;
+  projectId: string;
+  cursor: number;
+  state: string;
+}
+
+export interface CollabWatchStopResp {
+  ok: true;
+  stopped: boolean;
+}
+
+export interface CollabWatchStatusResp {
+  ok: true;
+  watches: Array<{ projectId: string; cursor: number; stopping: boolean }>;
+}
+
+// ── 工单层（缺陷 D-47 · 授权工作单元与待人工状态机） ──────────
+//
+// 与服务端 `app/tickets.py` 的视图同构。「等人」只由结构化字段判定：
+// stage ∈ {awaiting_answer, awaiting_review, blocked} 才进「等你的工单」，
+// 停止是唯一撤权动作；判定都在服务端，前端只是如实展示与提交动作。
+
+export type AgentTicketStage =
+  | 'input_undelivered'
+  | 'queued'
+  | 'working'
+  | 'awaiting_answer'
+  | 'awaiting_review'
+  | 'idle'
+  | 'blocked'
+  | 'closed';
+
+export type AgentReportKind = 'progress' | 'waiting' | 'ready' | 'blocked' | 'failed' | 'dropped';
+export type AgentAssignmentEndStatus = 'finished' | 'dropped' | 'lost';
+export type AgentMandateIntensity = 'explicit' | 'inferred';
+
+export interface AgentMandate {
+  id: string;
+  ticketId: string;
+  seq: number;
+  brief: string;
+  scope: string;
+  outOfScope: string;
+  intensity: AgentMandateIntensity;
+  intensityLabel: string;
+  sourceKind: string;
+  sourceRef: string;
+  policyVersion: number;
+  digest: string;
+  status: 'active' | 'revoked';
+  statusLabel: string;
+  createdBy: string;
+  createdAtMs: number;
+  revokedAtMs: number;
+  revokedBy: string;
+  revokeReason: string;
+}
+
+export interface AgentAssignmentReadStep {
+  seq: number;
+  atMs: number;
+  by: string;
+}
+
+export interface AgentAssignment {
+  id: string;
+  ticketId: string;
+  mandateId: string;
+  seq: number;
+  workerId: string;
+  holderUid: string;
+  workspaceKind: string;
+  workspaceRef: string;
+  checkpointRef: string;
+  machine: string;
+  status: 'live' | 'ended';
+  recoveryNote: string;
+  readSteps: AgentAssignmentReadStep[];
+  startedAtMs: number;
+  endedAtMs: number;
+  exitReason: string;
+}
+
+export interface AgentReport {
+  id: string;
+  ticketId: string;
+  assignmentId: string;
+  kind: AgentReportKind;
+  kindLabel: string;
+  summary: string;
+  detail: string;
+  /** 只含文件名，不含本机路径 */
+  artifacts: string[];
+  handedBack: boolean;
+  contextSeq: number;
+  createdBy: string;
+  createdAtMs: number;
+}
+
+export interface AgentAttention {
+  id: string;
+  ticketId: string;
+  reportId: string;
+  kind: 'answer' | 'review';
+  kindLabel: string;
+  question: string;
+  reason: string;
+  options: string[];
+  status: 'open' | 'answered' | 'withdrawn';
+  answer: string;
+  answeredBy: string;
+  answeredAtMs: number;
+  createdAtMs: number;
+}
+
+export interface AgentSubscription {
+  id: string;
+  ticketId: string;
+  targetKind: string;
+  targetRef: string;
+  lastFannedSeq: number;
+  createdAtMs: number;
+  closedAtMs: number;
+}
+
+export interface AgentTicketView {
+  id: string;
+  projectId: string;
+  projectName: string;
+  title: string;
+  detail: string;
+  stage: AgentTicketStage;
+  stageLabel: string;
+  /** 服务端判定：这三种 stage 才需要人动手 */
+  needsHuman: boolean;
+  intensity: AgentMandateIntensity;
+  createdBy: string;
+  createdByNickname: string;
+  createdFrom: string;
+  version: number;
+  closedAtMs: number;
+  closedReason: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+/** 「等你的工单」列表项：视图 + 当前开放问题 + 授权摘要 */
+export interface AgentTicketListItem extends AgentTicketView {
+  attention: AgentAttention | null;
+  mandateBrief: string;
+  mandateSeq: number;
+}
+
+/** 扇出给在跑执行体的上下文条目（只补视野，不给授权） */
+export interface AgentTicketContextItem {
+  seq: number;
+  kind: string;
+  actorUid: string | null;
+  payload: unknown;
+  createdAtMs: number;
+  subscriptionId: string;
+}
+
+export interface AgentMyTicketsResp {
+  ok: true;
+  tickets: AgentTicketListItem[];
+  count: number;
+}
+
+export interface AgentTicketListResp {
+  ok: true;
+  tickets: AgentTicketView[];
+  count: number;
+}
+
+export interface AgentTicketDetailResp {
+  ok: true;
+  ticket: AgentTicketView;
+  mandate: AgentMandate | null;
+  assignments: AgentAssignment[];
+  reports: AgentReport[];
+  attentions: AgentAttention[];
+  subscriptions: AgentSubscription[];
+  contexts: AgentTicketContextItem[];
+}
+
+export interface AgentTicketCreateResp {
+  ok: true;
+  ticket: AgentTicketView;
+  mandate: AgentMandate;
+  subscription: AgentSubscription | null;
+  seq: number;
+}
+
+/** 建单入参（与 Rust build_ticket_create / 服务端 TicketCreateIn 白名单一致） */
+export interface AgentTicketCreateIn {
+  title: string;
+  brief: string;
+  detail?: string;
+  scope?: string;
+  outOfScope?: string;
+  intensity?: AgentMandateIntensity;
+  sourceKind?: string;
+  /** intensity=inferred 时必填：从哪条事件推断出的授权 */
+  sourceRef?: string;
+  policyVersion?: number;
+  subscribeTaskId?: string;
+}
+
+/** 领取入参（mandateId 必填；digest 允许缺省） */
+export interface AgentAssignmentClaimIn {
+  mandateId: string;
+  workerId?: string;
+  workspaceKind?: string;
+  workspaceRef?: string;
+  checkpointRef?: string;
+  machine?: string;
+  recoveryNote?: string;
+  expectedMandateDigest?: string;
+}
+
+/** 报告入参（kind 六态；waiting 必须带 question） */
+export interface AgentReportIn {
+  kind: AgentReportKind;
+  summary: string;
+  assignmentId?: string;
+  detail?: string;
+  artifacts?: string[];
+  question?: string;
+  reason?: string;
+  options?: string[];
+  contextSeq?: number;
+}
+
+// ── Super-agent 主动候选（缺陷 D-46 · 影子段：只记账与判定，零自动执行） ──
+//
+// 类型是桌面 Rust `superagent` 模块的契约镜像（`src-tauri/src/superagent/*`）。
+// 这一层的产物只有「这条环境事件本可接单」，没有任何执行入口：不要在这里加
+// 「采纳并开工」这类字段，也不要在界面拼第二套显示名（`kindLabel` / `strengthLabel`
+// / `modeLabel` / `statusLabel` 都由 Rust 给，和判定理由用的是同一份文案）。
+// 表名一律不出现在渲染层（`tests/unit/storage/ownership-contract.test.ts` 全量扫描）。
+
+/** 事件入口类型（与 Rust `SOURCE_KIND_*` 同集合；`im_inbound` 本段只登记不读取） */
+export type SuperagentSourceKind =
+  | 'project_event'
+  | 'schedule'
+  | 'condition'
+  | 'workspace_file'
+  | 'im_inbound';
+
+/** 巡检档位：`auto` 需要工单层与执行体隔离先落地，Rust 侧会拒绝写入 */
+export type SuperagentAcceptMode = 'off' | 'observe' | 'auto';
+
+/** 判定强度：`explicit` 是唯一可以直接开工的强度，`inferred` 只在启用规则命中时给出 */
+export type SuperagentStrength = 'explicit' | 'inferred' | 'not_admitted';
+
+/** 判定结果（observe 档下阳性只记 `wouldAccept`，不会出现 `admitted`） */
+export type SuperagentOutcome = 'not_admitted' | 'would_accept' | 'admitted' | 'mode_off';
+
+/** 一条准入规则：留空的字段表示「不限」，`enabled` 为假时永远不命中 */
+export interface SuperagentRule {
+  id: string;
+  enabled: boolean;
+  kinds: string[];
+  actors: string[];
+  textAny: string[];
+  threadAny: string[];
+  minChars: number;
+}
+
+/** 一个事件入口实例的授权（按 `(kind, instance)` 精确匹配，不做整类放行） */
+export interface SuperagentSourcePolicy {
+  kind: SuperagentSourceKind;
+  instance: string;
+  /** 是否参与准入；与「是否在读取」是两回事，两个都要显式打开 */
+  enabled: boolean;
+  label: string;
+  allowUsers: string[];
+  bots: string[];
+  rules: SuperagentRule[];
+}
+
+/** 准入策略文档（有版本、可哈希；内容没变不新增版本） */
+export interface SuperagentPolicyDoc {
+  acceptMode: SuperagentAcceptMode;
+  dailyEvalCap: number;
+  /**
+   * 第二层（模型研判）的当日预算：管「今天最多问几次模型」。
+   * 缺省由 Rust 补（`DEFAULT_ASSESS_CAP`），写 `0` 是显式关闭第二层——
+   * 与「没配模型」不同：那是状态，这是决定。前端不传时 Rust 按缺省处理。
+   */
+  assessMaxPerDay?: number;
+  sources: SuperagentSourcePolicy[];
+}
+
+/** 事件入口账本行：游标是这一个入口自己的读取位置 */
+export interface SuperagentSource {
+  id: string;
+  kind: SuperagentSourceKind;
+  /** 具体实例（项目 id / 会话 id / 目录），本机类入口允许为空 */
+  instance: string;
+  label: string;
+  enabled: boolean;
+  cursor: number;
+  config: Record<string, unknown>;
+  lastError: string | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+  /** Rust 给的显示名 */
+  kindLabel: string;
+}
+
+/** 一条入账的环境事件 */
+export interface SuperagentTrigger {
+  id: string;
+  sourceId: string;
+  /** 上游幂等标识：同一入口内唯一，重复投递只有一行 */
+  externalId: string;
+  /** 上游事件类型（如 `task.commented`），不是入口类型 */
+  kind: string;
+  text: string;
+  actor: string;
+  threadKey: string;
+  /** 来源声明的事实：这条事件是否直接指向本应用（正文里的 @ 不算） */
+  addressedAgent: boolean;
+  sourceSeq: number;
+  arrivedAtMs: number;
+  payload: unknown;
+}
+
+/** 主动候选：判定为「本可接单」的事件 + 依据 + 当时生效的策略版本 */
+export interface SuperagentCandidate {
+  decisionId: string;
+  triggerId: string;
+  policyVersion: number;
+  strength: SuperagentStrength;
+  outcome: SuperagentOutcome;
+  wouldAccept: boolean;
+  /** 判定依据（哪个入口、哪条规则给的强度） */
+  basis: string;
+  matchedRules: string[];
+  reason: string;
+  decidedAtMs: number;
+  sourceId: string;
+  sourceKind: SuperagentSourceKind;
+  sourceInstance: string;
+  sourceLabel: string;
+  externalId: string;
+  eventKind: string;
+  text: string;
+  actor: string;
+  threadKey: string;
+  addressedAgent: boolean;
+  arrivedAtMs: number;
+  payload: unknown;
+  sourceKindLabel: string;
+  strengthLabel: string;
+  // ── 第二层（模型研判）的结论：`assessStatus` 为空串 = 这一条还没问过模型 ──
+  // 结论只是「值不值得现在开工」的判断，同样不带来任何动作；显示名由 Rust 给（assess::*_label）。
+  assessStatus: string;
+  assessStatusLabel: string;
+  assessVerdict: string;
+  assessVerdictLabel: string;
+  assessReason: string;
+  assessModel: string;
+  /** 这一次研判的 token 合计（计量口径，界面只显示不估算） */
+  assessTokens: number;
+  /** 失败原因（中文，不含凭据）；成功时为空串 */
+  assessError: string;
+  assessedAtMs: number;
+  /**
+   * 这一行现在排在哪个策略版本的研判队列里。与 `policyVersion` 可以不同：
+   * `policyVersion` 是「依据哪一版策略判出来的」（留痕，不改写），
+   * 这一列是「待办挂在哪一版」，策略升版时由 Rust 重排。
+   */
+  assessQueueVersion: number;
+  /** 因策略升版被重排的时刻；0 = 从没被重排过 */
+  requeuedAtMs: number;
+  /** 重排说明（Rust 给的一句话；没重排过就没有这一项） */
+  requeueLabel?: string;
+}
+
+/** 判定留痕（含阴性：为什么没做也要看得见） */
+export interface SuperagentDecision {
+  id: string;
+  triggerId: string;
+  policyVersion: number;
+  strength: SuperagentStrength;
+  outcome: SuperagentOutcome;
+  wouldAccept: boolean;
+  basis: string;
+  matchedRules: string[];
+  reason: string;
+  decidedAtMs: number;
+  strengthLabel: string;
+}
+
+/** 台账概览（数字全部来自本机账本，界面不自己数） */
+export interface SuperagentStats {
+  ok: true;
+  acceptMode: string;
+  modeLabel: string;
+  /** 当前档位是否就是缺省档位（缺省即影子模式） */
+  modeIsDefault: boolean;
+  policyVersion: number;
+  dailyEvalCap: number;
+  /** 第二层（模型研判）的当日预算，来自策略；0 表示已显式关闭 */
+  assessCap: number;
+  decidedToday: number;
+  /** 今日已研判（成功或失败都算花了钱）的条数 */
+  assessedToday: number;
+  /** 历史上判成功过的条数 */
+  assessed: number;
+  /** 当前策略版本下还欠多少条没判（按研判队列键统计，策略升版后重排的候选也在这里） */
+  assessPending: number;
+  /** 历史上被策略升版重排过的候选条数（回答「改了策略有没有把候选弄丢」） */
+  requeued: number;
+  sources: number;
+  enabledSources: number;
+  triggers: number;
+  decisions: number;
+  candidates: number;
+  note: string;
+}
+
+/** 策略视图：可选项与「`auto` 为什么还不能用」都在这份里，界面不写死 */
+export interface SuperagentPolicyView {
+  version: number;
+  doc: SuperagentPolicyDoc;
+  modeLabel: string;
+  /** Rust 允许的档位（本段只有 off / observe） */
+  allowedModes: string[];
+  autoAvailable: boolean;
+  autoBlockedBy: string;
+  sourceKinds: Array<{ kind: string; label: string; readable: boolean }>;
+}
+
+export interface SuperagentSavePolicyResp {
+  version: number;
+  /** 内容与当前版本一致时不新增版本，`changed` 为假 */
+  changed: boolean;
+  doc: SuperagentPolicyDoc;
+  modeLabel: string;
+  /** 升版时被重排到新队列的待研判候选条数（`changed` 为假时是 0） */
+  requeued: number;
+  /** 重排的中文说明；没有重排时 Rust 不给这一项 */
+  requeueNote?: string | null;
+}
+
+export interface SuperagentPolicyVersion {
+  version: number;
+  digest: string;
+  source: string;
+  createdAtMs: number;
+  doc: SuperagentPolicyDoc;
+  modeLabel: string;
+}
+
+/** 一轮巡检里单个入口的结果 */
+export interface SuperagentPumpRun {
+  sourceId: string;
+  kind: SuperagentSourceKind;
+  instance: string;
+  fetched: number;
+  inserted: number;
+  decided: number;
+  candidates: number;
+  /** ok / waiting / idle_login_required / fetch_failed / ingest_failed / capped */
+  status: string;
+  statusLabel: string;
+  kindLabel: string;
+  error: string | null;
+}
+
+/**
+ * 一轮模型研判（第二层）的摘要。
+ *
+ * 口径写死在这里：这一层只回答「值不值得现在开工」并把结论记进判定行，
+ * 不创建任务、不起工作区——所以摘要里没有任何「执行了多少」的字段。
+ * `blocked` / `unavailable` 只活在这一轮摘要里：它们表示「这次没花成钱」，
+ * 不会被写进判定行，候选因此还留在待研判队列里。
+ */
+export interface SuperagentAssessSummary {
+  ok: boolean;
+  policyVersion: number;
+  /** 策略里的当日预算 */
+  assessCap: number;
+  /** 今日已研判数（分子来自账本，重启不丢） */
+  capUsedToday: number;
+  /** 这一轮最多判几条 */
+  batch: number;
+  pending: number;
+  attempted: number;
+  written: number;
+  /**
+   * 本轮因策略升版被作废的结论条数：模型调用已经发出、token 已记进配额与用量，
+   * 但那份结论按旧策略语境问出来的，不写进判定行；候选已按新版本重排，下一轮再判。
+   */
+  superseded: number;
+  worth: number;
+  notWorth: number;
+  unsure: number;
+  failed: number;
+  blocked: number;
+  unavailable: number;
+  /** 实际用的模型显示名；没发起调用时为 null */
+  model: string | null;
+  /** 整轮跳过的原因键（off / cap_off / cap_reached / no_pending / read_failed / quota_blocked / model_unavailable） */
+  skipped: string | null;
+  skipReason: string | null;
+  lastError: string | null;
+  note: string;
+  tookMs?: number;
+  startedAtMs?: number;
+}
+
+/** 巡检摘要（后台循环投的事件与「立即巡检」的返回同形状） */
+export interface SuperagentPumpSummary {
+  ok: boolean;
+  startedAtMs?: number;
+  tookMs?: number;
+  acceptMode?: string;
+  modeLabel?: string;
+  policyVersion?: number;
+  dailyEvalCap?: number;
+  capUsed?: number;
+  fetched?: number;
+  inserted?: number;
+  decided?: number;
+  candidates?: number;
+  /** 本轮跳过的原因键（如 `no_enabled_source`） */
+  skipped?: string;
+  skippedLabel?: string;
+  /** 后台循环在这一轮顺手跑的模型研判（第二层）摘要；手动「立即巡检」不带这一项 */
+  assessment?: SuperagentAssessSummary;
+  sources: SuperagentPumpRun[];
+  error?: string;
+  note?: string;
+}
+
+/** 候选清单导出结果：路径由 Rust 拼（本机运行时目录下的 exports），界面只显示不拼接 */
+export interface SuperagentExportResult {
+  path: string;
+  count: number;
+  format: 'json' | 'csv';
+  /** 影子模式声明，随文件一起落盘，界面也原样显示 */
+  note: string;
+}
+
 export interface CollabTaskPatch {
   version: number;
   title?: string;
@@ -1303,8 +2090,13 @@ export interface CollabTaskPatch {
 
 // ── Schedule ─────────────────────────────────────────────────
 
-/** 定时频率（Rust `task::schedule::normalize_freq` 同口径，兼容界面中文标签） */
-export type ScheduleFreq = 'hourly' | 'daily' | 'weekly' | 'monthly';
+/** 定时频率（Rust `task::schedule::normalize_freq` 同口径，兼容界面中文标签）
+ *
+ * `interval` / `once` 由 D-30（W5 #139）落地后上收进主契约：Rust 早就按同一份 camelCase
+ * 序列化，缺省即 undefined，所以这里是把已存在的后端事实登记进契约，不是新造口径。
+ * `contracts_connect.ts` 的 D-30 扩展段自此只是别名，渲染层引用由 W5 自己收敛。
+ */
+export type ScheduleFreq = 'hourly' | 'daily' | 'weekly' | 'monthly' | 'interval' | 'once';
 
 /** 星期（1=周一 … 7=周日，仅 weekly 使用） */
 export type ScheduleWeekday = 1 | 2 | 3 | 4 | 5 | 6 | 7;
@@ -1331,6 +2123,10 @@ export interface ScheduledTask {
   notifyChannel: string;
   /** 推送目标会话标识（Slack 频道 ID / 钉钉等已有会话 ID） */
   notifyTarget: string;
+  /** 间隔步长（分钟），仅 freq=interval 有值；老任务为 NULL 而不是 0（0 会被读成「每 0 分钟」） */
+  intervalMinutes?: number | null;
+  /** 一次性任务的绝对执行时刻（UTC 毫秒），仅 freq=once 有值 */
+  runAtMs?: number | null;
 }
 
 /** 一句话解析结果（Rust `task::schedule::ParsedSchedule` 契约镜像） */
@@ -1341,6 +2137,14 @@ export interface ScheduleParseResult {
   name: string;
   /** 解析时的默认假设说明（例如「未写频率，已按每天处理」） */
   note?: string | null;
+  /** 间隔步长（分钟），仅 freq=interval */
+  intervalMinutes?: number | null;
+  /** 一次性任务的本地日期（yyyy-mm-dd，未做时区换算）；仅 freq=once */
+  runDate?: string | null;
+  /** runDate 来自「明天 / 下周三」这类相对说法：界面需按本地日重锚，否则 UTC+8 凌晨会差一天 */
+  runDateRelative?: boolean;
+  /** 中文回显（「每 2 小时执行一次」/「2026-03-06 09:00 执行一次（本地时间，确认后落库）」），先预览再确认用 */
+  preview?: string;
 }
 
 /** 执行记录状态（Rust `task::schedule::RUN_*` 同口径） */
@@ -1372,6 +2176,10 @@ export interface ScheduleCreateReq {
   workspaceId?: string;
   notifyChannel?: string;
   notifyTarget?: string;
+  /** freq=interval 时的步长（分钟） */
+  intervalMinutes?: number | null;
+  /** freq=once 时的绝对执行时刻（UTC 毫秒） */
+  runAtMs?: number | null;
 }
 
 /** 编辑定时任务（缺省字段沿用原配置，与 Rust `UpdateSchedule` 同口径） */
@@ -1386,6 +2194,10 @@ export interface ScheduleUpdateReq {
   /** 传空串表示关闭推送（同时清空目标）；不传表示保持原值 */
   notifyChannel?: string;
   notifyTarget?: string;
+  /** freq=interval 时的步长（分钟）；换成别的频率时置 NULL，留着旧步长会让界面显示一个不生效的配置 */
+  intervalMinutes?: number | null;
+  /** freq=once 时的绝对执行时刻（UTC 毫秒） */
+  runAtMs?: number | null;
 }
 
 // ── MCP ──────────────────────────────────────────────────────
@@ -1541,6 +2353,18 @@ export interface UsageReport {
   days: UsageDayPoint[];
   models: ModelUsageRow[];
   totals: UsageTotals;
+}
+
+/**
+ * 桌面台账上报结果（D-43：`usage:upload`）。
+ * `uploaded=false` 表示本地没有待上报的行，不是失败；未登录/服务不可达走错误。
+ */
+export interface UsageUploadResult {
+  uploaded: boolean;
+  rows: number;
+  accepted: number;
+  deviceId: string;
+  message: string;
 }
 
 // ── Compliance ───────────────────────────────────────────────
@@ -1713,6 +2537,34 @@ export interface QuotaSnapshot {
   updatedAt?: string;
 }
 
+/**
+ * Token 预算（缺陷 D-14）：渲染层按用量台账判档的阈值。
+ * 0 或负数表示该档不设预算（不阻断、不预警）。
+ */
+export interface BudgetSettings {
+  /** 单日（UTC 日）Token 预算 */
+  dailyTokens: number;
+  /** 当月（UTC 月）Token 预算 */
+  monthlyTokens: number;
+  /**
+   * 单个任务的 Token 预算（缺陷 D-14.1）。0 表示不限。
+   * 用满后执行面停在下一轮模型调用之前，任务转入「预算暂停」；
+   * 调高后需要在任务上点「继续」唤回，不会自动唤回。
+   */
+  perTaskTokens: number;
+}
+
+/**
+ * 出厂默认预算：日档对齐 Rust `DEFAULT_DAILY_QUOTA_TOKENS`（免费层 20 万/日，ADJ-R5-3），
+ * 月档默认不设——没有权威依据的月度数字不如不填，由用户自己按用量设定。
+ * 单任务档同样默认不设：拦停是有代价的动作，出厂就拦等于替用户做主。
+ */
+export const DEFAULT_BUDGET: BudgetSettings = {
+  dailyTokens: 200_000,
+  monthlyTokens: 0,
+  perTaskTokens: 0,
+};
+
 export interface FileInfo {
   name: string;
   path: string;
@@ -1820,6 +2672,8 @@ export interface HooksStatus {
   /** 用户配了、但当前执行链路没有触发点的事件（页面必须逐条说明，不能让它看起来配了就会跑） */
   mountedUnfired: HookEventName[];
   ungranted: string[];
+  /** 系统级隔离已生效：Hook 命令会以容器令牌启动，且只接受「程序 + 参数」的单条命令（无本机执行通道时为 false） */
+  sandboxed?: boolean;
   grants: HookGrant[];
   /** 浏览器/引擎直连通道没有本机执行网关时，如实写明原因（桌面通道不带此键） */
   gateError?: string;
@@ -1849,6 +2703,10 @@ export interface AwarenessProfile {
   mode: boolean;
   autoMemory: boolean;
   style: AwarenessStyleId;
+  /** 自动记忆是否先进入待审队列（确认后才参与召回）；手动录入不受影响 */
+  memoryReview: boolean;
+  /** 是否在任务收尾额外跑一次模型事实抽取（默认关闭，会多一次模型调用） */
+  memoryModelExtract: boolean;
   /** 最近一次保存意识配置的 ISO 时间 */
   updatedAt: string;
 }
@@ -1865,16 +2723,118 @@ export interface AwarenessPatch {
   mode?: boolean;
   autoMemory?: boolean;
   style?: AwarenessStyleId;
+  memoryReview?: boolean;
+  memoryModelExtract?: boolean;
   files?: Partial<Record<AwarenessFileName, string>>;
 }
 
+/** 长期记忆归属：全局（所有项目可见）或单个项目 */
+export type MemoryScope = 'global' | 'workspace';
+/** 长期记忆类型：任务摘要 / 事实 / 偏好 / 决策 */
+export type MemoryKind = 'task' | 'fact' | 'preference' | 'decision';
+/**
+ * 记忆状态：active 生效（参与召回）/ pending 待审（不参与召回）/ archived 已归档（驳回或退休）
+ * 归档只改状态不删正文，证据与来源始终保留。
+ */
+export type MemoryStatus = 'active' | 'pending' | 'archived';
+
 export interface MemoryEntry {
-  /** 落盘在 MEMORY.md 行首的稳定标识 */
+  /** 记忆库主键（mem-{uuid}） */
   id: string;
   content: string;
   source: 'auto' | 'manual' | 'reflection';
-  /** ISO 时间（落盘与排序口径） */
+  /** 首次写入的 ISO 时间 */
   createdAt: string;
+  /** 归属档位：global 或当前项目 */
+  scope: MemoryScope;
+  /** 项目维度的工作区 id；全局记忆为空串 */
+  workspaceId: string;
+  kind: MemoryKind;
+  /** 产生该记忆的任务（手动录入或旧条目导入时为 null） */
+  taskId: string | null;
+  /** 证据任务标题（任务已清理时为 null） */
+  taskTitle: string | null;
+  /** 最近一次写入/合并的 ISO 时间 */
+  updatedAt: string;
+  /** 最近一次被检索注入的 ISO 时间 */
+  lastUsedAt: string | null;
+  /** 被检索注入的次数 */
+  useCount: number;
+  /** 相同内容出现的次数（重复任务合并时累加） */
+  occurrences: number;
+  /** 生效 / 待审 / 已归档（旧数据一律按 active 展示） */
+  status?: MemoryStatus;
+  /** 最近一次复核（确认 / 驳回）的 ISO 时间 */
+  reviewedAt?: string | null;
+  /** 被哪条新事实取代（软退休时写入） */
+  supersededBy?: string | null;
+  /** 结构化事实：主体 / 属性 / 取值；普通摘要三者为空串 */
+  subject?: string;
+  predicate?: string;
+  object?: string;
+  /** 0–1，规则抽取低于人工录入；旧数据视为 1 */
+  confidence?: number;
+}
+
+/** `awareness:memoryReview` 的动作：确认 / 驳回 / 退休 / 恢复 */
+export type MemoryReviewAction = 'confirm' | 'reject' | 'archive' | 'restore';
+
+/** 实体页：按事实主体聚合的活跃条目（由 MemoryEntry.subject 派生，不单独建表） */
+export interface MemoryEntityPage {
+  subject: string;
+  count: number;
+  kinds: MemoryKind[];
+  /** 该主体下最近一条记忆的 ISO 时间 */
+  latest: string;
+  entries: MemoryEntry[];
+}
+
+/** `awareness:memoryExport` 返回体：导出文件落在运行目录 exports/ 下 */
+export interface MemoryExportResult {
+  path: string;
+  count: number;
+}
+
+/** `awareness:memoryImport` 返回体：逐条去重，导入前已自动备份 */
+export interface MemoryImportResult {
+  inserted: number;
+  merged: number;
+  skipped: number;
+  total: number;
+  /** 导入前的自动备份文件路径（导入失败前的数据保护） */
+  backupPath: string;
+}
+
+/** `awareness:memoryCompact` 返回体 */
+export interface MemoryCompactResult {
+  archived: number;
+  keepPerScope: number;
+}
+
+/** `awareness:memoryDocSync` 返回体：MEMORY.md 人工对账（只增不删，可重复执行） */
+export interface MemoryDocSyncResult {
+  /** MEMORY.md 里解析出的结构化行数 */
+  fileCount: number;
+  /** 本次新导入库的条数 */
+  imported: number;
+  /** 文件里有、库里已存在（按内容哈希命中）的条数 */
+  existing: number;
+  /** 格式不可用或写入失败的条数 */
+  skipped: number;
+}
+
+/** `awareness:memoryExportPackage` 返回体：迁移包落在运行目录 exports/ 下 */
+export interface MemoryPackageExportResult {
+  path: string;
+  count: number;
+}
+
+/** `awareness:memoryImportPackage` 返回体：迁移包元信息 + 常规导入统计 */
+export interface MemoryPackageImportResult extends MemoryImportResult {
+  /** 迁移包 manifest 的版本号 */
+  packageVersion: number;
+  /** 迁移包创建时间（ISO；缺失时为 null） */
+  exportedAt: string | null;
 }
 
 export interface ArchiveRecord {
@@ -1927,7 +2887,7 @@ export interface ComputerUseCapture {
   scaled: boolean;
 }
 
-// ── 远程桌面（本机实时画面） ─────────────────────────────────
+// ── 本机画面（本机实时画面） ─────────────────────────────────
 
 /** 跨主机能力边界：当前版本只做本机画面，远程转发明确不支持 */
 export interface RemoteCrossHostCapability {
@@ -2179,6 +3139,11 @@ export interface AppSettingsData {
   piiOutboundMode: PiiOutboundMode;
   /** 逐工具审批档位（副作用工具执行前系统确认；默认 off） */
   toolApprovalMode: ToolApprovalMode;
+  /**
+   * 文件访问默认档位（真实目录里的创建/更新/删除；缺会话自己的选择时用这一档，默认 ask_every_time）。
+   * 与上面的逐工具审批是两轴：那条管「要不要问」，这条管「能写到哪、能不能删」。
+   */
+  filePermissionDefault: FilePermissionMode;
   /** 单轮工具循环上限（1~32；达到上限时请求模型总结进展并结束本轮） */
   agentMaxIters: number;
   /** 自动压缩长上下文（默认开启；摘要会额外调用一次模型） */
@@ -2190,6 +3155,11 @@ export interface AppSettingsData {
   workbenchDefaultMode: string;
   /** 幻灯片模板 id（内置主题 id 或本机导入模板 id；缺省用内置商务蓝） */
   pptxTemplateId: string;
+  /**
+   * Token 预算（日/月/单任务三档；缺键用 `DEFAULT_BUDGET`）。
+   * 只由渲染层闸门消费：Rust 的 `quota-ledger.json` 另有自己的一本账，两侧不互通（见 D-14 已知边界）。
+   */
+  budget?: BudgetSettings;
   /** 快捷键改键台账：能力 id → 组合（如 'Ctrl+Shift+K'）；缺项用出厂默认 */
   shortcuts: Record<string, string>;
   experiments: Record<string, boolean>;
@@ -2296,6 +3266,8 @@ export interface ChatMessageRow {
   role: 'user' | 'assistant';
   /** 本轮任务 id（过程明细事件按它在事件流里取回） */
   taskId: string;
+  /** 本轮所属工作区（缺省 default，与 tasks.workspaceId 同口径） */
+  workspaceId: string;
   content: string;
   /** 交付物文件名清单（仅 assistant 行有值） */
   artifacts: string[];
@@ -2314,6 +3286,8 @@ export interface ConversationRow {
   updatedAtMs: number;
   /** 最近一轮的任务 id（归档标记按它匹配） */
   lastTaskId: string;
+  /** 会话所属工作区（取首轮提问归属；按项目过滤时使用） */
+  workspaceId: string;
 }
 
 /**
@@ -2398,8 +3372,25 @@ export interface ImChannelView {
   account: Record<string, string>;
   setupUrl: string;
   setupNote: string;
+  /** 'qr' = 扫码授权（个人微信）；空串 = 提交凭据 */
+  loginMode: string;
   fields: ImCredentialField[];
   sessions: number;
+}
+
+/** 扫码登录第一步的返回：二维码内容与票据（凭据不在这里） */
+export interface ImLoginStart {
+  ticket: string;
+  qrContent: string;
+  expiresInSeconds: number;
+}
+
+/** 扫码登录一次状态查询；confirmed 只表示引擎已落盘并起连接，不回传令牌 */
+export interface ImLoginPoll {
+  status: string;
+  message: string;
+  needVerifyCode?: boolean;
+  configured?: boolean;
 }
 
 export interface ImSessionMessage {
@@ -2474,6 +3465,12 @@ export const IPC_CHANNELS = {
   // Engine
   /** 按 workspace 解析引擎 HTTP 端点（第二个实例可能分配在 18001） */
   ENGINE_ENDPOINT: 'engine:endpoint',
+  /**
+   * 启动指定 workspace 的引擎实例（幂等：已在跑直接复用）。
+   * 桌面端给「必须由引擎承载、但不等用户发消息」的页面用，例如 IM 频道；
+   * 浏览器直连模式由外部进程托管，渲染层不得调用。
+   */
+  ENGINE_START: 'engine:start',
 
   // Skill
   SKILL_ROOT: 'skill:root',
@@ -2502,6 +3499,12 @@ export const IPC_CHANNELS = {
   MARKET_TRUST_GET: 'market:trustGet',
   MARKET_TRUST_ADD: 'market:trustAdd',
   MARKET_TRUST_REMOVE: 'market:trustRemove',
+  MARKET_UPDATE_CHECK: 'market:updateCheck',
+  MARKET_INSTALLED_LIST: 'market:installedList',
+  /** 升级单条 / 一键升级：校验链与安装同一条，落盘换成「旧版本进回收目录 + 新版本原子落位」 */
+  MARKET_SKILL_UPGRADE: 'market:skillUpgrade',
+  MARKET_SUITE_UPGRADE: 'market:suiteUpgrade',
+  MARKET_UPGRADE_ALL: 'market:upgradeAll',
 
   // MCP
   MCP_LIST_SERVERS: 'mcp:listServers',
@@ -2567,6 +3570,7 @@ export const IPC_CHANNELS = {
   // Usage
   USAGE_STATS: 'usage:stats',
   USAGE_REPORT: 'usage:report',
+  USAGE_UPLOAD: 'usage:upload',
 
   // System
   SYSTEM_INFO: 'system:info',
@@ -2585,6 +3589,22 @@ export const IPC_CHANNELS = {
   AWARENESS_MEMORIES: 'awareness:memories',
   AWARENESS_MEMORY_ADD: 'awareness:memoryAdd',
   AWARENESS_MEMORY_DELETE: 'awareness:memoryDelete',
+  /** 记忆复核：确认 / 驳回 / 归档 / 恢复（只改状态，不删正文） */
+  AWARENESS_MEMORY_REVIEW: 'awareness:memoryReview',
+  /** 实体页：按事实主体聚合当前项目的活跃条目 */
+  AWARENESS_MEMORY_ENTITIES: 'awareness:memoryEntities',
+  /** 导出记忆为 JSON（运行目录 exports/） */
+  AWARENESS_MEMORY_EXPORT: 'awareness:memoryExport',
+  /** 从 JSON 导入记忆（导入前自动备份） */
+  AWARENESS_MEMORY_IMPORT: 'awareness:memoryImport',
+  /** 维护：归档超过保留条数的旧自动任务摘要 */
+  AWARENESS_MEMORY_COMPACT: 'awareness:memoryCompact',
+  /** 与 MEMORY.md 对账：导入文件里有、库里没有的条目（文件不改） */
+  AWARENESS_MEMORY_DOC_SYNC: 'awareness:memoryDocSync',
+  /** 导出 .hmpkg 迁移包（zip：manifest + memories.json） */
+  AWARENESS_MEMORY_EXPORT_PACKAGE: 'awareness:memoryExportPackage',
+  /** 导入 .hmpkg 迁移包（base64 透传；导入前自动备份） */
+  AWARENESS_MEMORY_IMPORT_PACKAGE: 'awareness:memoryImportPackage',
   TASK_ARCHIVE: 'task:archive',
   TASK_UNARCHIVE: 'task:unarchive',
   TASK_ARCHIVE_DELETE: 'task:archiveDelete',
@@ -2597,7 +3617,7 @@ export const IPC_CHANNELS = {
   /** 用户主动触发的截屏自检（按当前档位确认，图片只回传界面） */
   COMPUTER_USE_CAPTURE: 'computerUse:capture',
 
-  // ── 远程桌面（本机实时画面；显式开启、10 分钟到期、只看不控） ──
+  // ── 本机画面（本机实时画面；显式开启、10 分钟到期、只看不控） ──
   REMOTE_DESKTOP_CAPABILITIES: 'remote:capabilities',
   REMOTE_DESKTOP_STATUS: 'remote:status',
   REMOTE_DESKTOP_START: 'remote:start',
@@ -2676,10 +3696,55 @@ export const IPC_CHANNELS = {
   COLLAB_UPDATE_TASK: 'collab:updateTask',
   COLLAB_ADD_COMMENT: 'collab:addComment',
   COLLAB_REPORT_RESULT: 'collab:reportResult',
+  COLLAB_WATCH_START: 'collab:watchStart',
+  COLLAB_WATCH_STOP: 'collab:watchStop',
+  COLLAB_WATCH_STATUS: 'collab:watchStatus',
+
+  // ── 工单层（缺陷 D-47 · 无授权工作单元与待人工状态机） ──
+  // 桌面端只经 Rust 桥接访问服务端；每条通道对应 collab/tickets.rs 的一个命令。
+  COLLAB_TICKET_MY: 'collab:ticketMyTickets',
+  COLLAB_TICKET_LIST: 'collab:ticketList',
+  COLLAB_TICKET_DETAIL: 'collab:ticketDetail',
+  COLLAB_TICKET_CREATE: 'collab:ticketCreate',
+  COLLAB_TICKET_SUBSCRIBE: 'collab:ticketSubscribe',
+  COLLAB_TICKET_CLAIM: 'collab:ticketClaim',
+  COLLAB_TICKET_END_ASSIGNMENT: 'collab:ticketEndAssignment',
+  COLLAB_TICKET_REPORT: 'collab:ticketReport',
+  COLLAB_TICKET_HANDBACK: 'collab:ticketHandback',
+  COLLAB_TICKET_ANSWER: 'collab:ticketAnswer',
+  COLLAB_TICKET_ACCEPT: 'collab:ticketAccept',
+  COLLAB_TICKET_AMEND: 'collab:ticketAmend',
+  COLLAB_TICKET_STOP: 'collab:ticketStop',
+  COLLAB_TICKET_MARK_READ: 'collab:ticketMarkRead',
+
+  // ── Super-agent 主动候选（缺陷 D-46 · 影子段：账本 + 策略 + 巡检，零自动执行） ──
+  // 只有读取与授权配置两类通道，没有「采纳/开工」通道：影子模式的产物就是清单本身。
+  SUPERAGENT_STATS: 'superagent:stats',
+  SUPERAGENT_LIST_SOURCES: 'superagent:listSources',
+  SUPERAGENT_REGISTER_SOURCE: 'superagent:registerSource',
+  SUPERAGENT_SET_SOURCE_ENABLED: 'superagent:setSourceEnabled',
+  SUPERAGENT_LIST_CANDIDATES: 'superagent:listCandidates',
+  SUPERAGENT_LIST_DECISIONS: 'superagent:listDecisions',
+  SUPERAGENT_LIST_TRIGGERS: 'superagent:listTriggers',
+  SUPERAGENT_GET_TRIGGER: 'superagent:getTrigger',
+  SUPERAGENT_GET_POLICY: 'superagent:getPolicy',
+  SUPERAGENT_SAVE_POLICY: 'superagent:savePolicy',
+  SUPERAGENT_POLICY_VERSIONS: 'superagent:policyVersions',
+  SUPERAGENT_PUMP_NOW: 'superagent:pumpNow',
+  /**
+   * 立刻跑一轮模型研判（第二层）。
+   * 这是「问模型值不值得开工」，不是「开工」：只写判定行，不创建任务。
+   * 与「立即巡检」分开是因为前者会花模型的钱，要人明确点一下才动。
+   */
+  SUPERAGENT_ASSESS_NOW: 'superagent:assessNow',
+  /** 把当前候选清单落成文件（影子模式的产物只有清单，导出就是它的交付） */
+  SUPERAGENT_EXPORT_CANDIDATES: 'superagent:exportCandidates',
 
   // ── IM 频道（代理引擎 /api/im/*；Rust/浏览器直连两通道同源） ──
   IM_CHANNELS: 'im:channels',
   IM_CONFIGURE: 'im:configure',
+  IM_LOGIN_START: 'im:loginStart',
+  IM_LOGIN_POLL: 'im:loginPoll',
   IM_START: 'im:start',
   IM_STOP: 'im:stop',
   IM_FORGET: 'im:forget',

@@ -93,28 +93,28 @@ const ArchiveView: React.FC = () => {
   return (
     <Box sx={{ height: 'calc(100vh - 104px)', overflowY: 'auto', pr: 1 }}>
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
-        <ArchiveIcon sx={{ fontSize: 21, color: '#0D9488' }} />
-        <Typography sx={{ fontSize: '20px', fontWeight: 700, color: '#111827' }}>已归档</Typography>
+        <ArchiveIcon sx={{ fontSize: 21, color: 'var(--tt-teal)' }} />
+        <Typography sx={{ fontSize: '20px', fontWeight: 700, color: 'var(--tt-text-1)' }}>已归档</Typography>
         <Box sx={{ flexGrow: 1 }} />
         {records.length > 0 && (
           <Button
             size="small"
             startIcon={<DeleteOutlineIcon sx={{ fontSize: 15 }} />}
             onClick={() => setClearOpen(true)}
-            sx={{ color: '#EF4444', fontSize: '12px' }}
+            sx={{ color: 'var(--tt-danger)', fontSize: '12px' }}
           >
             全部删除
           </Button>
         )}
       </Box>
-      <Typography sx={{ fontSize: '13px', color: '#9CA3AF', mb: 2.5 }}>
+      <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-4)', mb: 2.5 }}>
         归档的任务可在此恢复或彻底删除。「全部删除」只清空归档清单，任务本体仍保留；单条「删除」不可撤销。
       </Typography>
 
       <Box sx={{ maxWidth: 860 }}>
         {records.length === 0 && (
-          <Box sx={{ border: '1px dashed #E5E7EB', borderRadius: '14px', p: 6, textAlign: 'center' }}>
-            <Typography sx={{ fontSize: '14px', color: '#6B7280' }}>暂无归档任务</Typography>
+          <Box sx={{ border: '1px dashed var(--tt-border)', borderRadius: '14px', p: 6, textAlign: 'center' }}>
+            <Typography sx={{ fontSize: '14px', color: 'var(--tt-text-2)' }}>暂无归档任务</Typography>
           </Box>
         )}
         {records.map((r) => (
@@ -124,8 +124,8 @@ const ArchiveView: React.FC = () => {
               display: 'flex',
               alignItems: 'center',
               gap: 1.5,
-              bgcolor: '#FFFFFF',
-              border: '1px solid #E5E7EB',
+              bgcolor: 'var(--tt-surface)',
+              border: '1px solid var(--tt-border)',
               borderRadius: '14px',
               px: 2,
               py: 1.5,
@@ -133,10 +133,10 @@ const ArchiveView: React.FC = () => {
             }}
           >
             <Box sx={{ flexGrow: 1, minWidth: 0 }}>
-              <Typography sx={{ fontSize: '13.5px', fontWeight: 600, color: '#111827' }} noWrap>
+              <Typography sx={{ fontSize: '13.5px', fontWeight: 600, color: 'var(--tt-text-1)' }} noWrap>
                 {r.title}
               </Typography>
-              <Typography sx={{ fontSize: '12px', color: '#9CA3AF', mt: 0.25 }}>
+              <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mt: 0.25 }}>
                 {r.workspaceName} · 归档于 {r.archivedAt}
               </Typography>
             </Box>
@@ -150,7 +150,7 @@ const ArchiveView: React.FC = () => {
                     showNotification(errorTextOf(err, '恢复失败'), 'error'),
                   );
               }}
-              sx={{ color: '#0D9488', fontSize: '12px' }}
+              sx={{ color: 'var(--tt-teal)', fontSize: '12px' }}
             >
               恢复
             </Button>
@@ -158,7 +158,7 @@ const ArchiveView: React.FC = () => {
               size="small"
               startIcon={<DeleteOutlineIcon sx={{ fontSize: 15 }} />}
               onClick={() => setDeleteTarget(r)}
-              sx={{ color: '#EF4444', fontSize: '12px' }}
+              sx={{ color: 'var(--tt-danger)', fontSize: '12px' }}
             >
               删除
             </Button>
@@ -170,15 +170,15 @@ const ArchiveView: React.FC = () => {
       <Dialog open={Boolean(deleteTarget)} onClose={() => setDeleteTarget(null)} maxWidth="xs">
         <DialogTitle sx={{ fontSize: '15px', fontWeight: 700 }}>彻底删除该任务？</DialogTitle>
         <DialogContent>
-          <Typography sx={{ fontSize: '13px', color: '#6B7280' }}>
+          <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-2)' }}>
             「{deleteTarget?.title}」将被彻底删除，此操作不可撤销。
           </Typography>
         </DialogContent>
         <DialogActions sx={{ px: 3, pb: 2 }}>
-          <Button onClick={() => setDeleteTarget(null)} sx={{ color: '#6B7280', fontSize: '13px' }}>
+          <Button onClick={() => setDeleteTarget(null)} sx={{ color: 'var(--tt-text-2)', fontSize: '13px' }}>
             取消
           </Button>
-          <Button onClick={handleDelete} sx={{ color: '#EF4444', fontSize: '13px', fontWeight: 600 }}>
+          <Button onClick={handleDelete} sx={{ color: 'var(--tt-danger)', fontSize: '13px', fontWeight: 600 }}>
             彻底删除
           </Button>
         </DialogActions>
@@ -188,7 +188,7 @@ const ArchiveView: React.FC = () => {
       <Dialog open={clearOpen} onClose={() => setClearOpen(false)} maxWidth="xs">
         <DialogTitle sx={{ fontSize: '15px', fontWeight: 700 }}>清空归档清单？</DialogTitle>
         <DialogContent>
-          <Typography sx={{ fontSize: '13px', color: '#6B7280', mb: 1.5 }}>
+          <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-2)', mb: 1.5 }}>
             将移除全部 {records.length} 条归档标记，任务本体与文件仍保留在本地。请输入 DELETE 确认。
           </Typography>
           <TextField
@@ -206,7 +206,7 @@ const ArchiveView: React.FC = () => {
               setClearOpen(false);
               setConfirmText('');
             }}
-            sx={{ color: '#6B7280', fontSize: '13px' }}
+            sx={{ color: 'var(--tt-text-2)', fontSize: '13px' }}
           >
             取消
           </Button>
@@ -214,7 +214,7 @@ const ArchiveView: React.FC = () => {
             disabled={confirmText !== 'DELETE'}
             onClick={handleClearAll}
             sx={{
-              color: confirmText === 'DELETE' ? '#EF4444' : '#D1D5DB',
+              color: confirmText === 'DELETE' ? 'var(--tt-danger)' : 'var(--tt-text-4)',
               fontSize: '13px',
               fontWeight: 600,
             }}

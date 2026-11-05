@@ -252,6 +252,10 @@ async fn post(
 ) -> Result<Value, String> {
     let resp = crate::proxy::loopback_client()
         .post(format!("{}{}", base.trim_end_matches('/'), path))
+        .header(
+            crate::bridge::agent::ENGINE_TOKEN_HEADER,
+            crate::bridge::agent::engine_local_token(),
+        )
         .header("X-TT-Terminal-Token", engine_token())
         .timeout(timeout)
         .json(&payload)
@@ -264,6 +268,10 @@ async fn post(
 async fn get(base: &str, path: &str, query: &[(&str, String)]) -> Result<Value, String> {
     let resp = crate::proxy::loopback_client()
         .get(format!("{}{}", base.trim_end_matches('/'), path))
+        .header(
+            crate::bridge::agent::ENGINE_TOKEN_HEADER,
+            crate::bridge::agent::engine_local_token(),
+        )
         .header("X-TT-Terminal-Token", engine_token())
         .query(query)
         .timeout(Duration::from_secs(15))

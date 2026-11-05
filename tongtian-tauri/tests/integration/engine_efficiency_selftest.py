@@ -6,7 +6,9 @@
 1. 单轮工具循环上限 / 上下文压缩阈值来自 runtime.agentPolicy + modelConfig.contextWindow，
    非法值要按边界执行并留下用户可见说明；
 2. AgentScope 压缩配置真的能构造，token 计数失败只跳过压缩、不炸整轮任务；
-3. MCP 工具按需载入：未激活分组不进 function schema，search_tools 命中后才启用；
+3. MCP 工具按需载入：未激活分组不进 function schema，search_tools 命中后**只把被检索到的
+   那几个**搬进已激活组（D-40 第 5 项验收：30 个工具只加载命中的 schema）；
+   工具总数未过阈值时不绕搜索这一步，直接载入；
 4. 检查点快照排除被压缩的原始消息，恢复时上下文不会翻倍。
 
 离线运行；agentscope/mcp 缺失时输出 SKIP 并以 0 退出。
@@ -52,14 +54,20 @@ def policy_checks() -> None:
     check("缺省开启压缩", policy.auto_compress is True)
     check("缺省按需载入 MCP", policy.lazy_mcp_tools is True)
     check("缺省窗口 8192", policy.context_window == 8192)
-    check("缺省阈值 4403", policy.trigger_threshold == 4403, str(policy.trigger_threshold))
+    check("缺省阈值 4096（窗口8192减下限预留4096）", policy.trigger_threshold == 4096, str(policy.trigger_threshold))
     text = " ".join(policy.notes())
     check("说明里摊出窗口是估算值", "8192" in text and "估算" in text, text)
 
     runtime = {"agentPolicy": {"maxIters": 12, "autoCompress": False, "lazyMcpTools": False}}
     policy = cb.resolve(runtime, {"contextWindow": 32000})
     check("设置值生效", (policy.max_iters, policy.auto_compress, policy.lazy_mcp_tools) == (12, False, False), str(policy))
-    check("阈值按模型窗口计算", policy.trigger_threshold == 18688, str(policy.trigger_threshold))
+    check("阈值按模型窗口计算", policy.trigger_threshold == 27904, str(policy.trigger_threshold))
+    wide = cb.resolve(None, {"contextWindow": 1_000_000})
+    check(
+        "百万窗口按动态预留触发（90%+，不再固定 60%）",
+        wide.trigger_threshold == 950_000 and wide.compression_reserve() == 50_000,
+        str(wide.trigger_threshold),
+    )
     check("模型窗口被标记为真实值", policy.context_window_from_model is True)
     text = " ".join(policy.notes())
     check("关闭压缩时说明风险", "压缩已关闭" in text and "可能被模型拒绝" in text, text)
@@ -102,7 +110,7 @@ def compression_checks() -> None:
     check("压缩配置可构造", config is not None and error == "", error)
     if config is not None:
         check("压缩已启用", config.enable is True)
-        check("阈值随窗口下发", config.trigger_threshold == 18688, str(config.trigger_threshold))
+        check("阈值随窗口下发", config.trigger_threshold == 27904, str(config.trigger_threshold))
         check("保留最近 3 条", config.keep_recent == 3, str(config.keep_recent))
         check("计数器被安全包装", type(config.agent_token_counter).__name__ == "SafeTokenCounter", type(config.agent_token_counter).__name__)
 
@@ -226,6 +234,7 @@ def tool_search_checks() -> None:
     mail_group = ts.ensure_group(toolkit, {"serverId": "mail", "name": "邮箱"}, 0)
     calendar_group = ts.ensure_group(toolkit, {"serverId": "cal", "name": "日历"}, 1)
     _register_sample(toolkit, mail_group, "send_email", "发送邮件，支持正文与附件")
+    _register_sample(toolkit, mail_group, "check_inbox", "查看收件箱列表与未读数")
     _register_sample(toolkit, calendar_group, "create_event", "创建日历日程并邀请参会人")
 
     names = _schema_names(toolkit)
@@ -235,8 +244,16 @@ def tool_search_checks() -> None:
     result = ts.search(toolkit, "发送邮件")
     matched = {m["name"] for m in result["matches"]}
     check("中文关键词命中邮件工具", "send_email" in matched, str(result))
-    check("命中后激活对应分组", result["activatedGroups"] == [mail_group], str(result["activatedGroups"]))
+    check(
+        "命中后只载入被检索到的那个工具（不是整组）",
+        result["activatedTools"] == ["send_email"]
+        and toolkit.tools["send_email"].group == ts.EQUIPPED_GROUP
+        and toolkit.groups[mail_group].active is False,
+        str(result["activatedTools"]),
+    )
     check("激活后 schema 含工具", "send_email" in _schema_names(toolkit))
+    check("同组未命中的工具仍不进 schema", "check_inbox" not in _schema_names(toolkit),
+          str(_schema_names(toolkit)))
     check("未命中的分组仍未激活", toolkit.groups[calendar_group].active is False)
     check("未命中分组仍可见（供模型换词）", any(name == calendar_group for name, _ in result["inactiveGroups"]), str(result["inactiveGroups"]))
 
@@ -262,6 +279,58 @@ def tool_search_checks() -> None:
 
     check("连接器计数只认 serverId", ts.mcp_server_count({"mcp": [{"serverId": "a"}, {"name": "x"}, {"serverId": "b"}]}) == 2)
     check("缺连接器清单计 0", ts.mcp_server_count(None) == 0)
+
+
+def lazy_threshold_checks() -> None:
+    """D-40 第 5 项验收口径：30 个 MCP 工具只加载被检索到的 schema"""
+    print("--- 3b. 阈值判定与 30 工具按需载入 ---")
+    runtime = {"mcp": [{"serverId": "srv-a", "name": "甲", "tools": [{"name": f"t{i}"} for i in range(30)]}]}
+    check("声明工具总数按探测缓存累加", ts.declared_tool_count(runtime) == 30,
+          str(ts.declared_tool_count(runtime)))
+    check("总数超过阈值才走按需载入", ts.should_lazy(runtime) is True)
+    small = {"mcp": [{"serverId": "srv-a", "name": "甲", "tools": [{"name": "t1"}, {"name": "t2"}]}]}
+    check("工具不多就不该让模型多绕一轮", ts.should_lazy(small) is False,
+          str(ts.declared_tool_count(small)))
+    check("策略关掉时永不按需", ts.should_lazy(runtime, False) is False)
+    check("没探测到工具清单时按 0 计（宁可直接载入，不藏进搜不到的关键词后面）",
+          ts.declared_tool_count({"mcp": [{"serverId": "a", "name": "甲"}]}) == 0)
+    check("只认有 serverId 的条目", ts.declared_tool_count({"mcp": [{"tools": [{"name": "x"}]}]}) == 0)
+
+    policy = cb.resolve(None, None)
+    text = " ".join(policy.notes(1, 30, True))
+    check("按需说明写出工具数与「只载入命中的那几个」",
+          "30 个工具" in text and "只载入被检索到的那几个" in text, text)
+    text = " ".join(policy.notes(1, 2, False))
+    check("没过阈值时说明直接载入而不是照抄按需", "直接载入" in text and "未超过按需阈值" in text, text)
+
+    toolkit = Toolkit()
+    group = ts.ensure_group(toolkit, {"serverId": "bulk", "name": "批量连接器"}, 0)
+    for i in range(1, 31):
+        desc = "批量导出财务报表，按科目汇总" if i == 23 else f"通用演示动作 {i}"
+        _register_sample(toolkit, group, f"tt_tool_{i:02d}", desc)
+    ts.install(toolkit)
+
+    hidden = {n for n in _schema_names(toolkit) if n.startswith("tt_tool_")}
+    check("30 个工具默认一个都不进 schema", hidden == set(), str(hidden))
+
+    result = ts.search(toolkit, "财务报表")
+    loaded = {n for n in _schema_names(toolkit) if n.startswith("tt_tool_")}
+    check("检索命中后 schema 里只多出被命中的那一个",
+          loaded == {"tt_tool_23"} and result["activatedTools"] == ["tt_tool_23"],
+          f"{sorted(loaded)} {result['activatedTools']}")
+    check("整组没有被顺手激活", toolkit.groups[group].active is False)
+    check("命中说明点明只载入了命中的", "只载入" in ts._hit_text(result) or "按检索结果载入" in ts._hit_text(result),
+          ts._hit_text(result))
+
+    broad = ts.search(toolkit, "通用演示")
+    loaded = {n for n in _schema_names(toolkit) if n.startswith("tt_tool_")}
+    check("宽泛命中也只按上限载入，不是整组灌进上下文",
+          len(loaded) <= ts.MAX_ACTIVATED_TOOLS + 1 and len(broad["activatedTools"]) <= ts.MAX_ACTIVATED_TOOLS,
+          f"{len(loaded)} {len(broad['activatedTools'])}")
+    check("命中面太宽时提示换更具体的关键词",
+          "更具体" in ts._hit_text(broad), ts._hit_text(broad)[-120:])
+    check("内置工具不会被搬进按需载入组",
+          toolkit.tools["search_tools"].group == "basic")
 
 
 # ── 4. attach(lazy=True) 真接入 ───────────────────────────────
@@ -337,6 +406,7 @@ def main() -> None:
     compression_checks()
     compression_behavior_checks()
     tool_search_checks()
+    lazy_threshold_checks()
     asyncio.run(_lazy_attach())
     checkpoint_checks()
     print()

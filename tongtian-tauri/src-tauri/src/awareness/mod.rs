@@ -1,15 +1,18 @@
 //! 意识（awareness:* 五通道的桌面权威实现）
 //!
-//! 事实来源是意识目录下的**真实文件**，而不是第二份数据库副本：
+//! 意识画像与四个能力文件的事实来源是**真实文件**，不是数据库副本：
 //!
 //! ```text
 //! {TONGTIANWORK_HOME | ~/.tongtianwork}/awareness/main/
 //!   SOUL.md          协作风格（四个预设模板之一，可定制正文）
 //!   WORK_MANUAL.md   工作手册
 //!   USER_PROFILE.md  用户画像
-//!   MEMORY.md        长期记忆（每行一条结构化条目 + 用户自己的正文）
+//!   MEMORY.md        长期记忆（用户手写正文 + 历史结构化行）
 //!   PROFILE.json     意识开关与风格选择（引擎通道读写同一文件，避免双写源）
 //! ```
+//!
+//! 长期记忆条目的事实来源是桌面库 `memories` 表（跨任务、按项目归属、去重合并）；
+//! `MEMORY.md` 里的历史结构化行在启动时一次性导入，文件里手写正文原样保留。
 //!
 //! 引擎侧 `engine/server.py` 的 `/api/awareness/*` 指向**同一目录**，因此桌面（Rust）
 //! 与浏览器直连引擎两条通道看到的意识内容一致；无文件系统的 Mock 通道由
@@ -49,6 +52,10 @@ pub const DEFAULT_MARK: &str = "系统默认";
 pub struct Profile {
     pub mode: bool,
     pub auto_memory: bool,
+    /// 自动候选先落「待审」，确认后才参与召回（D-35 第二阶段）
+    pub memory_review: bool,
+    /// 任务收尾额外跑一次模型事实抽取（D-35 第三阶段；默认关闭，避免额外调用与延迟）
+    pub memory_model_extract: bool,
     pub style: String,
     pub updated_at: String,
 }
@@ -58,6 +65,8 @@ impl Default for Profile {
         Self {
             mode: true,
             auto_memory: true,
+            memory_review: false,
+            memory_model_extract: false,
             style: DEFAULT_STYLE.to_string(),
             updated_at: String::new(),
         }
@@ -90,6 +99,8 @@ pub struct MemoryEntry {
 pub struct View {
     pub mode: bool,
     pub auto_memory: bool,
+    pub memory_review: bool,
+    pub memory_model_extract: bool,
     pub style: String,
     pub updated_at: String,
     pub dir: String,
@@ -250,6 +261,8 @@ pub fn load_profile(dir: &Path) -> Profile {
     Profile {
         mode: read_bool("mode", true),
         auto_memory: read_bool("autoMemory", true),
+        memory_review: read_bool("memoryReview", false),
+        memory_model_extract: read_bool("memoryModelExtract", false),
         style,
         updated_at: obj
             .get("updatedAt")
@@ -257,6 +270,18 @@ pub fn load_profile(dir: &Path) -> Profile {
             .unwrap_or_default()
             .to_string(),
     }
+}
+
+/// 「写入前待审」开关：自动候选先落 pending，确认后才参与召回。
+/// 读取失败按关闭处理，不因意识配置损坏而阻塞任务。
+pub fn review_enabled(dir: &Path) -> bool {
+    load_profile(dir).memory_review
+}
+
+/// 「模型辅助抽取」开关：只在桌面记忆库模式且有模型配置时由引擎执行；
+/// 读取失败按关闭处理，绝不因意识配置损坏而多发一次模型调用。
+pub fn model_extract_enabled(dir: &Path) -> bool {
+    load_profile(dir).memory_model_extract
 }
 
 pub fn save_profile(dir: &Path, profile: &Profile) -> Result<(), String> {
@@ -275,6 +300,8 @@ pub fn view(dir: &Path) -> Result<View, String> {
     Ok(View {
         mode: profile.mode,
         auto_memory: profile.auto_memory,
+        memory_review: profile.memory_review,
+        memory_model_extract: profile.memory_model_extract,
         style: profile.style,
         updated_at: profile.updated_at,
         dir: dir.to_string_lossy().to_string(),
@@ -455,6 +482,20 @@ pub fn update(dir: &Path, patch: &Value, now_ms: i64) -> Result<View, String> {
             other => other.as_bool().unwrap_or(profile.auto_memory),
         };
     }
+    if let Some(v) = obj.get("memoryReview") {
+        profile.memory_review = match v {
+            Value::Bool(b) => *b,
+            Value::String(s) => s.trim() == "true",
+            other => other.as_bool().unwrap_or(profile.memory_review),
+        };
+    }
+    if let Some(v) = obj.get("memoryModelExtract") {
+        profile.memory_model_extract = match v {
+            Value::Bool(b) => *b,
+            Value::String(s) => s.trim() == "true",
+            other => other.as_bool().unwrap_or(profile.memory_model_extract),
+        };
+    }
     if let Some(v) = obj.get("style") {
         let raw = v.as_str().unwrap_or_default();
         profile.style = validate_style(raw)?.to_string();
@@ -487,8 +528,12 @@ pub fn update_summary(view: &View, patch: &Value) -> String {
         format!("画像与文件 {files}")
     };
     format!(
-        "意识更新：{changed}（style={}，mode={}，autoMemory={}）",
-        view.style, view.mode, view.auto_memory
+        "意识更新：{changed}（style={}，mode={}，autoMemory={}，memoryReview={}，memoryModelExtract={}）",
+        view.style,
+        view.mode,
+        view.auto_memory,
+        view.memory_review,
+        view.memory_model_extract
     )
 }
 
@@ -513,38 +558,72 @@ pub async fn awareness_update(patch: Value) -> Result<Value, String> {
 }
 
 /// 长期记忆条目列表（`awareness:memories`）
+///
+/// 事实来源是桌面库 `memories` 表（跨任务、可按项目归属），不再是 MEMORY.md 的行；
+/// 旧文件里的结构化条目在启动时一次性导入（`memories::import_legacy`）。
 #[tauri::command]
-pub async fn awareness_memories() -> Result<Value, String> {
-    let rows = list_memories(&dir())?;
-    serde_json::to_value(rows).map_err(|e| format!("AWARENESS_LOAD_FAILED: 记忆清单序列化失败：{e}"))
+pub async fn memory_list(p0: State<'_, Arc<P0Services>>) -> Result<Value, String> {
+    let rows = crate::store::memories::list(
+        &p0.store,
+        crate::store::memories::ListFilter {
+            workspace_id: None,
+            scope: None,
+            status: None,
+            limit: None,
+        },
+    )?;
+    serde_json::to_value(rows).map_err(|e| format!("MEMORY_LIST_FAILED: 记忆清单序列化失败：{e}"))
 }
 
-/// 新增长期记忆条目（`awareness:memoryAdd`）
+/// 新增长期记忆条目（`awareness:memoryAdd`）：默认归当前项目，可显式写入全局
 #[tauri::command]
-pub async fn awareness_memory_add(
+pub async fn memory_add(
     p0: State<'_, Arc<P0Services>>,
     content: String,
     source: Option<String>,
+    scope: Option<String>,
+    workspace_id: Option<String>,
 ) -> Result<Value, String> {
-    let now = crate::bridge::event_store::now_ms() as i64;
-    let entry = add_memory(&dir(), &content, source.as_deref(), now)?;
+    let now = crate::security::audit::iso8601_utc(crate::bridge::event_store::now_ms() as i64);
+    let outcome = crate::store::memories::add(
+        &p0.store,
+        crate::store::memories::AddInput {
+            content: &content,
+            scope: scope.as_deref(),
+            workspace_id: workspace_id.as_deref(),
+            // 手动录入默认按事实存档；任务摘要由引擎候选带 kind=task
+            kind: None,
+            source: source.as_deref(),
+            conv_id: None,
+            task_id: None,
+            created_at: None,
+            // 手动录入默认直接生效；待审只针对自动候选
+            status: Some(crate::store::memories::STATUS_ACTIVE),
+            subject: None,
+            predicate: None,
+            object: None,
+            confidence: None,
+        },
+        &now,
+    )?;
     audit::record_quiet(
         &p0.store,
         audit::ACTION_CONFIG_CHANGE,
         audit::SEV_INFO,
         "awareness",
-        &format!("新增长期记忆条目：{}", entry.content),
+        &format!("新增长期记忆条目：{}", outcome.row.content),
     );
-    serde_json::to_value(entry).map_err(|e| format!("AWARENESS_SAVE_FAILED: 记忆条目序列化失败：{e}"))
+    serde_json::to_value(outcome.row)
+        .map_err(|e| format!("MEMORY_SAVE_FAILED: 记忆条目序列化失败：{e}"))
 }
 
 /// 删除长期记忆条目（`awareness:memoryDelete`，只删用户点名的这一条）
 #[tauri::command]
-pub async fn awareness_memory_delete(
+pub async fn memory_delete(
     p0: State<'_, Arc<P0Services>>,
     id: String,
 ) -> Result<Value, String> {
-    let removed = delete_memory(&dir(), &id)?;
+    let removed = crate::store::memories::delete(&p0.store, &id)?;
     audit::record_quiet(
         &p0.store,
         audit::ACTION_CONFIG_CHANGE,
@@ -553,6 +632,182 @@ pub async fn awareness_memory_delete(
         &format!("删除长期记忆条目：{id}"),
     );
     Ok(json!({ "ok": removed, "id": id }))
+}
+
+/// 复核长期记忆（`awareness:memoryReview`）：确认 / 驳回 / 退休 / 恢复。
+/// 只改状态，不物理删除；正文与证据始终保留。
+#[tauri::command]
+pub async fn memory_review(
+    p0: State<'_, Arc<P0Services>>,
+    id: String,
+    action: String,
+) -> Result<Value, String> {
+    let now = crate::security::audit::iso8601_utc(crate::bridge::event_store::now_ms() as i64);
+    let row = crate::store::memories::set_status(&p0.store, &id, &action, &now)?;
+    let severity = if matches!(action.as_str(), "reject" | "archive") {
+        audit::SEV_WARNING
+    } else {
+        audit::SEV_INFO
+    };
+    audit::record_quiet(
+        &p0.store,
+        audit::ACTION_CONFIG_CHANGE,
+        severity,
+        "awareness",
+        &format!("记忆复核：{action} → {}（{}）", row.status, row.id),
+    );
+    serde_json::to_value(row)
+        .map_err(|e| format!("MEMORY_SAVE_FAILED: 记忆条目序列化失败：{e}"))
+}
+
+/// 实体页（`awareness:memoryEntities`）：按 subject 聚合当前项目可见的活跃事实
+#[tauri::command]
+pub async fn memory_entities(
+    p0: State<'_, Arc<P0Services>>,
+    workspace_id: Option<String>,
+) -> Result<Value, String> {
+    let ws = workspace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default");
+    let pages = crate::store::memories::entities(&p0.store, ws)?;
+    serde_json::to_value(pages)
+        .map_err(|e| format!("MEMORY_LIST_FAILED: 实体页序列化失败：{e}"))
+}
+
+/// 导出记忆（`awareness:memoryExport`）：写入 `{TONGTIAN_HOME}/exports/memories-*.json`
+#[tauri::command]
+pub async fn memory_export(p0: State<'_, Arc<P0Services>>) -> Result<Value, String> {
+    let now = crate::security::audit::iso8601_utc(crate::bridge::event_store::now_ms() as i64);
+    let dir = crate::store::db::runtime_home().join("exports");
+    let (path, count) = crate::store::memories::export_to(&p0.store, &dir, &now)?;
+    audit::record_quiet(
+        &p0.store,
+        audit::ACTION_CONFIG_CHANGE,
+        audit::SEV_INFO,
+        "awareness",
+        &format!("导出长期记忆：{count} 条 → {path}"),
+    );
+    Ok(json!({ "path": path, "count": count }))
+}
+
+/// 导入记忆（`awareness:memoryImport`）：导入前自动备份，失败不继续
+#[tauri::command]
+pub async fn memory_import(
+    p0: State<'_, Arc<P0Services>>,
+    json: String,
+) -> Result<Value, String> {
+    if json.len() > 32 * 1024 * 1024 {
+        return Err("MEMORY_IMPORT_INVALID: 导入文件超过 32MB".to_string());
+    }
+    let now = crate::security::audit::iso8601_utc(crate::bridge::event_store::now_ms() as i64);
+    let dir = crate::store::db::runtime_home().join("backups");
+    let result = crate::store::memories::import_json(&p0.store, &json, &now, &dir)?;
+    audit::record_quiet(
+        &p0.store,
+        audit::ACTION_CONFIG_CHANGE,
+        audit::SEV_WARNING,
+        "awareness",
+        &format!(
+            "导入长期记忆：新增 {}，合并 {}，跳过 {}",
+            result.get("inserted").and_then(|v| v.as_u64()).unwrap_or(0),
+            result.get("merged").and_then(|v| v.as_u64()).unwrap_or(0),
+            result.get("skipped").and_then(|v| v.as_u64()).unwrap_or(0),
+        ),
+    );
+    Ok(result)
+}
+
+/// 维护（`awareness:memoryCompact`）：每个归属只保留最近的自动任务摘要，其余软归档
+#[tauri::command]
+pub async fn memory_compact(p0: State<'_, Arc<P0Services>>) -> Result<Value, String> {
+    let now = crate::security::audit::iso8601_utc(crate::bridge::event_store::now_ms() as i64);
+    let archived = crate::store::memories::compact(
+        &p0.store,
+        crate::store::memories::COMPACT_KEEP_PER_SCOPE,
+        &now,
+    )?;
+    audit::record_quiet(
+        &p0.store,
+        audit::ACTION_CONFIG_CHANGE,
+        audit::SEV_INFO,
+        "awareness",
+        &format!("记忆维护：归档 {archived} 条旧任务摘要"),
+    );
+    Ok(json!({
+        "archived": archived,
+        "keepPerScope": crate::store::memories::COMPACT_KEEP_PER_SCOPE,
+    }))
+}
+
+/// 人工文档对账（`awareness:memoryDocSync`）：把 MEMORY.md 里未入库的行导入为全局记忆。
+/// 可重复执行；只增不删，文件与库互不覆盖。
+#[tauri::command]
+pub async fn memory_doc_sync(p0: State<'_, Arc<P0Services>>) -> Result<Value, String> {
+    let now = crate::security::audit::iso8601_utc(crate::bridge::event_store::now_ms() as i64);
+    let result = crate::store::memories::sync_doc(&p0.store, &dir(), &now)?;
+    audit::record_quiet(
+        &p0.store,
+        audit::ACTION_CONFIG_CHANGE,
+        audit::SEV_INFO,
+        "awareness",
+        &format!(
+            "MEMORY.md 对账：文件 {} 条，新导入 {}，已存在 {}，跳过 {}",
+            result.file_count, result.imported, result.existing, result.skipped
+        ),
+    );
+    serde_json::to_value(result)
+        .map_err(|e| format!("MEMORY_LIST_FAILED: 对账结果序列化失败：{e}"))
+}
+
+/// 导出迁移包（`awareness:memoryExportPackage`）：`{TONGTIAN_HOME}/exports/memories-*.hmpkg`
+#[tauri::command]
+pub async fn memory_export_package(p0: State<'_, Arc<P0Services>>) -> Result<Value, String> {
+    let now = crate::security::audit::iso8601_utc(crate::bridge::event_store::now_ms() as i64);
+    let out = crate::store::db::runtime_home().join("exports");
+    let (path, count) = crate::store::memories::export_package(&p0.store, &out, &now)?;
+    audit::record_quiet(
+        &p0.store,
+        audit::ACTION_CONFIG_CHANGE,
+        audit::SEV_INFO,
+        "awareness",
+        &format!("导出记忆迁移包：{count} 条 → {path}"),
+    );
+    Ok(json!({ "path": path, "count": count }))
+}
+
+/// 导入迁移包（`awareness:memoryImportPackage`）：base64 透传 zip 字节，
+/// 校验 manifest / 版本 / sha256 后复用 JSON 导入（导入前强制备份）。
+#[tauri::command]
+pub async fn memory_import_package(
+    p0: State<'_, Arc<P0Services>>,
+    data: String,
+) -> Result<Value, String> {
+    use base64::Engine as _;
+    let limit = crate::store::memories::PACKAGE_MAX_BYTES * 4 / 3 + 8;
+    if data.len() > limit {
+        return Err("MEMORY_IMPORT_INVALID: 迁移包超过 32MB".to_string());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|e| format!("MEMORY_IMPORT_INVALID: 迁移包不是合法 base64：{e}"))?;
+    let now = crate::security::audit::iso8601_utc(crate::bridge::event_store::now_ms() as i64);
+    let backups = crate::store::db::runtime_home().join("backups");
+    let result = crate::store::memories::import_package(&p0.store, &bytes, &now, &backups)?;
+    audit::record_quiet(
+        &p0.store,
+        audit::ACTION_CONFIG_CHANGE,
+        audit::SEV_WARNING,
+        "awareness",
+        &format!(
+            "导入记忆迁移包：新增 {}，合并 {}，跳过 {}",
+            result.get("inserted").and_then(|v| v.as_u64()).unwrap_or(0),
+            result.get("merged").and_then(|v| v.as_u64()).unwrap_or(0),
+            result.get("skipped").and_then(|v| v.as_u64()).unwrap_or(0),
+        ),
+    );
+    Ok(result)
 }
 
 #[cfg(test)]

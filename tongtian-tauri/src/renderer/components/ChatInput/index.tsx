@@ -21,10 +21,17 @@ import {
   Chip,
   Popover,
   CircularProgress,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogContentText,
+  DialogActions,
+  Button,
 } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import AttachFileIcon from '@mui/icons-material/AttachFile';
 import FolderOutlinedIcon from '@mui/icons-material/FolderOutlined';
+import ShieldOutlinedIcon from '@mui/icons-material/ShieldOutlined';
 import AutoAwesomeIcon from '@mui/icons-material/AutoAwesome';
 import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
 import MicIcon from '@mui/icons-material/Mic';
@@ -32,9 +39,10 @@ import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
 import StopIcon from '@mui/icons-material/Stop';
 import CheckIcon from '@mui/icons-material/Check';
 import GroupsIcon from '@mui/icons-material/Groups';
-import type { AttachmentMeta, ModelConfig, WorkMode } from '../../../shared/types';
+import type { AttachmentMeta, FilePermissionMode, ModelConfig, WorkMode } from '../../../shared/types';
 import type { ExpertInfo } from '../../../shared/contracts';
 import { isTauri } from '../../lib/tauri-api';
+import { getActiveWorkspaceId } from '../../store/workspaceStore';
 import { chatAPI, expertsAPI } from '../../lib/api';
 import {
   BUILTIN_CHAT_MODELS,
@@ -45,12 +53,19 @@ import {
 import { loadAllSkills, SKILL_SOURCE_META, type SkillInfo } from '../../lib/skills';
 import { useAppSettings } from '../../lib/use-app-settings';
 import { useWorkMode, MODE_PLACEHOLDERS } from '../../lib/use-work-mode';
+import {
+  FILE_PERMISSION_DEFS,
+  DEFAULT_FILE_PERMISSION,
+  filePermissionDef,
+  normalizeFileMode,
+} from '../../lib/file-permission';
 import { usePptxTemplates } from '../../lib/use-pptx-templates';
 import { useWorkbenchStore } from '../../store/workbenchStore';
 import { useI18n } from '../../i18n';
 import Panda from '../Panda';
 import { useNavigate } from 'react-router-dom';
 import { errorTextOf } from '../../../shared/error-messages';
+import { anchorMenuProps, clickableProps } from '../../lib/a11y';
 
 interface ChatInputProps {
   /** 发送消息回调（两阶段协议：附件暂存后随提交上送；modelBinding 为内置档位；
@@ -80,6 +95,10 @@ interface ChatInputProps {
   workDir?: string;
   /** 选择工作目录回调（真实目录选择） */
   onSelectWorkDir?: (dir: string) => void;
+  /** 本轮文件访问档位：AI 在真实目录里创建/更新/删除文件放开到哪一档 */
+  filePermission?: FilePermissionMode;
+  /** 切换档位回调；切到「完全访问」时会带上用户读完红色警告并确认的时刻 */
+  onFilePermissionChange?: (mode: FilePermissionMode, confirmedAtMs?: number) => void;
   /** 对话态紧凑模式：收起提示词建议，避免和消息流争夺空间 */
   compact?: boolean;
   /** 空态主视觉：坐在输入卡上沿、下半身被卡片遮住的吉祥物（不参与点击） */
@@ -89,6 +108,17 @@ interface ChatInputProps {
 // 附件约束（交互补设计 §3.3；含图片格式，原「插入图片」已合并到添加文件）
 const ATTACH_EXTS = ['docx', 'xlsx', 'pdf', 'csv', 'txt', 'md', 'png', 'jpg', 'jpeg', 'gif', 'webp'];
 const ATTACH_MAX_COUNT = 10;
+// 与 Rust 暂存上限一致：图片 10MB（要转 base64 随请求下发），文档 50MB
+const ATTACH_MAX_BYTES = 50 * 1024 * 1024;
+const IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp'];
+
+/** 超大文件就地拒绝，避免整份读入内存后才失败 */
+function oversizedLabel(name: string, size: number): string | null {
+  const limit = IMAGE_EXTS.includes(extOf(name)) ? IMAGE_MAX_BYTES : ATTACH_MAX_BYTES;
+  if (size <= limit) return null;
+  return `${name}（超出 ${Math.round(limit / (1024 * 1024))}MB 上限）`;
+}
 
 /** 文件名 → 扩展名 */
 function extOf(name: string): string {
@@ -144,6 +174,8 @@ const ChatInput: React.FC<ChatInputProps> = ({
   initialText,
   workDir,
   onSelectWorkDir,
+  filePermission,
+  onFilePermissionChange,
   compact = false,
   mascot,
 }) => {
@@ -193,7 +225,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
     desc: [tr(modelSourceLabel(m.source)), m.modelName, m.isDefault ? tr('默认') : '']
       .filter(Boolean)
       .join(' · '),
-    color: '#0EA5E9',
+    color: 'var(--tt-info)',
     savedId: m.id,
     baseUrl: m.baseUrl?.trim() || undefined,
   }));
@@ -273,6 +305,8 @@ const ChatInput: React.FC<ChatInputProps> = ({
     fileName: string;
     srcPath: string;
     staged?: AttachmentMeta;
+    /** 文件夹附件的逐文件暂存结果（发送时展开成多个附件） */
+    stagedList?: AttachmentMeta[];
     error?: string;
     /** 浏览器模式选中的真实文件（发送时读取内容上传到对话接口） */
     file?: File;
@@ -320,7 +354,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
         }
         pushAttachments(next);
       } catch (e) {
-        setAttachError(tr('打开文件对话框失败：{msg}', { msg: String(e) }));
+        setAttachError(tr('打开文件对话框失败：{msg}', { msg: errorTextOf(e, tr('原因未知')) }));
       }
     } else {
       fileInputRef.current?.click();
@@ -339,7 +373,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
           pushAttachments([{ fileName: tr('{folder}（文件夹）', { folder: dirName }), srcPath: picked, kind: 'folder' }]);
         }
       } catch (e) {
-        setAttachError(tr('打开文件夹对话框失败：{msg}', { msg: String(e) }));
+        setAttachError(tr('打开文件夹对话框失败：{msg}', { msg: errorTextOf(e, tr('原因未知')) }));
       }
     } else {
       folderInputRef.current?.click();
@@ -355,6 +389,11 @@ const ChatInput: React.FC<ChatInputProps> = ({
         setAttachError(tr('不支持的格式：{name}（支持 {exts}）', { name: f.name, exts: ATTACH_EXTS.join('/') }));
         continue;
       }
+      const tooLarge = oversizedLabel(f.name, f.size);
+      if (tooLarge) {
+        setAttachError(tr('文件过大：{name}', { name: tooLarge }));
+        continue;
+      }
       next.push({ fileName: f.name, srcPath: `local://${f.name}`, file: f, kind: 'file' });
     }
     pushAttachments(next);
@@ -368,6 +407,11 @@ const ChatInput: React.FC<ChatInputProps> = ({
     const next: PendingAttachment[] = [];
     for (const f of files) {
       if (!ATTACH_EXTS.includes(extOf(f.name))) continue;
+      const tooLarge = oversizedLabel(f.name, f.size);
+      if (tooLarge) {
+        setAttachError(tr('已跳过过大文件：{name}', { name: tooLarge }));
+        continue;
+      }
       const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
       next.push({ fileName: rel, srcPath: `local://${rel}`, file: f, kind: 'file' });
     }
@@ -389,9 +433,23 @@ const ChatInput: React.FC<ChatInputProps> = ({
     const metas: AttachmentMeta[] = [];
     if (attachments.length > 0) {
       setStaging(true);
-      const apiObj = (window as unknown as { tongtianAPI?: { fileStageAttachment?: (src: string, taskId?: string, ws?: string) => Promise<AttachmentMeta> } }).tongtianAPI;
+      const apiObj = (window as unknown as {
+        tongtianAPI?: {
+          fileStageAttachment?: (src: string, taskId?: string, ws?: string) => Promise<AttachmentMeta>;
+          fileStageFolder?: (src: string, taskId?: string, ws?: string) => Promise<AttachmentMeta[]>;
+        };
+      }).tongtianAPI;
+      // 同一批附件共用一个暂存目录，并带上当前工作空间：
+      // 缺省会落到 default 工作空间，多工作空间下模型拿不到文件
+      const batchId = `pending-${Date.now()}`;
+      const workspaceId = getActiveWorkspaceId();
       const updated: PendingAttachment[] = [];
       for (const att of attachments) {
+        if (att.stagedList) {
+          metas.push(...att.stagedList);
+          updated.push(att);
+          continue;
+        }
         if (att.staged) {
           metas.push(att.staged);
           updated.push(att);
@@ -407,15 +465,28 @@ const ChatInput: React.FC<ChatInputProps> = ({
               dataBase64,
               mime: att.file.type || undefined,
             });
+          } else if (att.kind === 'folder') {
+            // 文件夹：Rust 递归复制受支持的文件，返回逐文件 meta
+            if (!apiObj?.fileStageFolder) {
+              throw new Error(tr('当前版本不支持文件夹附件（缺少暂存接口）'));
+            }
+            const list = await apiObj.fileStageFolder(att.srcPath, batchId, workspaceId);
+            if (!Array.isArray(list) || list.length === 0) {
+              throw new Error(tr('文件夹内没有可附加的文件'));
+            }
+            metas.push(...list);
+            updated.push({ ...att, stagedList: list, error: undefined });
+            continue;
           } else {
-            meta = apiObj?.fileStageAttachment
-              ? await apiObj.fileStageAttachment(att.srcPath)
-              : { fileName: att.fileName, stagedPath: att.srcPath, sizeBytes: 0, mime: 'application/octet-stream', sensitivity: 'public' };
+            if (!apiObj?.fileStageAttachment) {
+              throw new Error(tr('当前版本不支持本地附件暂存（缺少暂存接口）'));
+            }
+            meta = await apiObj.fileStageAttachment(att.srcPath, batchId, workspaceId);
           }
           metas.push(meta);
           updated.push({ ...att, staged: meta, error: undefined });
         } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
+          const msg = errorTextOf(e, tr('上传未成功'));
           updated.push({ ...att, error: msg });
           setAttachError(tr('附件上传失败：{name}（{msg}）', { name: att.fileName, msg }));
         }
@@ -466,6 +537,31 @@ const ChatInput: React.FC<ChatInputProps> = ({
       // 用户取消选择，忽略
     }
   }, [onSelectWorkDir]);
+
+  // ── 文件访问档位（真实目录里的创建 / 更新 / 删除） ──
+  // 档位本体与每会话台账在 store + lib/file-permission 里；这里只负责选择与「完全访问」的红色确认。
+  const [permAnchor, setPermAnchor] = useState<null | HTMLElement>(null);
+  const [permPending, setPermPending] = useState<FilePermissionMode | null>(null);
+  const permMode = normalizeFileMode(filePermission ?? DEFAULT_FILE_PERMISSION);
+  const permDef = filePermissionDef(permMode);
+
+  /** 选档：前两档直接生效；「完全访问」先弹红色警告，用户确认后才落 */
+  const handlePickFilePermission = useCallback((mode: FilePermissionMode) => {
+    setPermAnchor(null);
+    if (mode === permMode) return;
+    if (filePermissionDef(mode).danger) {
+      setPermPending(mode);
+      return;
+    }
+    onFilePermissionChange?.(mode);
+  }, [permMode, onFilePermissionChange]);
+
+  /** 确认放开边界：带上确认时刻，台账只认「读过警告」的完全访问 */
+  const handleConfirmFullAccess = useCallback(() => {
+    const mode = permPending ?? 'full_access';
+    setPermPending(null);
+    onFilePermissionChange?.(mode, Date.now());
+  }, [permPending, onFilePermissionChange]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -530,13 +626,13 @@ const ChatInput: React.FC<ChatInputProps> = ({
                   borderRadius: '999px',
                   fontSize: '12px',
                   fontWeight: selected ? 600 : 500,
-                  bgcolor: selected ? '#14B8A6' : 'transparent',
+                  bgcolor: selected ? 'var(--tt-teal-fill)' : 'transparent',
                   color: selected ? '#fff' : 'var(--tt-text-3)',
-                  border: `1px solid ${selected ? '#14B8A6' : 'var(--tt-border)'}`,
+                  border: `1px solid ${selected ? 'var(--tt-teal-fill)' : 'var(--tt-border)'}`,
                   transition: 'all 0.15s ease',
                   '&:hover': {
-                    bgcolor: selected ? '#0D9488' : 'rgba(20, 184, 166, 0.06)',
-                    borderColor: '#14B8A6',
+                    bgcolor: selected ? 'var(--tt-teal-fill)' : 'var(--tt-surface-3)',
+                    borderColor: 'var(--tt-teal)',
                   },
                   '& .MuiChip-label': { px: 1.25 },
                 }}
@@ -571,9 +667,15 @@ const ChatInput: React.FC<ChatInputProps> = ({
         zIndex: 1,
         bgcolor: 'var(--tt-surface)',
         borderRadius: '24px',
-        border: `1px solid ${focused ? '#14B8A6' : '#E5E7EB'}`,
+        border: `1px solid ${focused ? 'var(--tt-teal)' : '#E5E7EB'}`,
+        // 焦点信号画在卡片自己身上（内层 textarea 那条全局环由下方输入框外层 Box 的
+        // data-tt-ring="container" 点名排除）：
+        // Chromium 对文本控件一律命中 :focus-visible，全局那条环落在卡片里面就是「框中框」。
+        // 这里不挂 --tt-focus 的蓝环（跟卡片自己的青绿打架），改成贴着边沿长实心一圈
+        // --tt-teal：随皮肤翻，实算对页面底亮 5.15:1（#0f766e vs #f7f8fa）、暗 12.07:1
+        //（#5eead4 vs #0f172a），都 ≥3:1（1.4.11）；原先写死的 #14B8A6 只有 2.49:1。
         boxShadow: focused
-          ? '0 0 0 3px rgba(20, 184, 166, 0.12), 0 12px 36px rgba(15, 23, 42, 0.08)'
+          ? '0 0 0 2px var(--tt-teal), 0 12px 36px rgba(15, 23, 42, 0.08)'
           : '0 6px 24px rgba(15, 23, 42, 0.05)',
         transition: 'border-color 0.2s ease, box-shadow 0.2s ease',
         px: 2,
@@ -615,7 +717,11 @@ const ChatInput: React.FC<ChatInputProps> = ({
             const meta = SKILL_SOURCE_META[referencedSkill.source];
             return (
               <Box
-                onClick={(e) => setSkillBlockAnchor(active ? null : e.currentTarget)}
+                {...anchorMenuProps(
+                  (target) => setSkillBlockAnchor(active ? null : target),
+                  tr('引用技能：{name}', { name: referencedSkill.name }),
+                  active,
+                )}
                 sx={{
                   display: 'inline-flex',
                   alignItems: 'center',
@@ -626,7 +732,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
                   borderRadius: '8px',
                   cursor: 'pointer',
                   flexShrink: 0,
-                  background: active ? meta.activeBg : meta.bg,
+                  background: meta.bg,
                   border: `1px solid ${active ? meta.activeBorder : meta.border}`,
                   transition: 'background 0.15s ease, border-color 0.15s ease',
                 }}
@@ -667,6 +773,12 @@ const ChatInput: React.FC<ChatInputProps> = ({
               </Box>
             );
           })()}
+          {/* 焦点环由容器承担：全局那条 :is(...):focus-visible 的特异性是 (3,0,0)
+              （:is 跟最 specific 的参数 [tabindex]:not([tabindex='-1']) 走），组件里写
+              `textarea:focus-visible { outline: none }`（(2,1,0)）压根压不住它——曾经这样写过，
+              实机看仍是蓝框。所以改成让全局规则按 data-tt-ring 点名排除：这一层只包输入框，
+              卡片里其它控件（+ 号、发送、模式）的焦点环一条不少。容器侧的实心环见上方卡片 sx。 */}
+          <Box data-tt-ring="container" sx={{ flex: 1, minWidth: 0 }}>
           <TextField
           inputRef={inputRef}
           value={value}
@@ -703,8 +815,8 @@ const ChatInput: React.FC<ChatInputProps> = ({
               '&::placeholder': { color: 'var(--tt-text-4)' },
             },
           }}
-          sx={{ flex: 1, minWidth: 0 }}
           />
+          </Box>
         </Box>
       </Box>
 
@@ -729,7 +841,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 bgcolor: 'transparent',
                 border: '1px solid var(--tt-border)',
                 borderRadius: '999px',
-                '&:hover': { color: '#0D9488', borderColor: '#5EEAD4', bgcolor: 'rgba(20, 184, 166, 0.06)' },
+                '&:hover': { color: 'var(--tt-teal)', borderColor: 'var(--tt-teal)', bgcolor: 'rgba(20, 184, 166, 0.06)' },
               }}
             />
           ))}
@@ -747,11 +859,14 @@ const ChatInput: React.FC<ChatInputProps> = ({
           mt: 1.25,
         }}
       >
-        {/* 左侧：附加操作 + 负责人专家 */}
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.25 }}>
+        {/* 左侧：附加操作 + 文件访问档位 + 负责人专家（窄屏可换行，别把档位挤到卡片外） */}
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.25, flexWrap: 'wrap', minWidth: 0 }}>
           <Tooltip title={tr('添加内容（文件 / 文件夹 / 技能）')}>
             <IconButton
               size="small"
+              aria-label={tr('添加内容（文件 / 文件夹 / 技能）')}
+              aria-haspopup="menu"
+              aria-expanded={Boolean(addContentAnchor)}
               sx={{ color: 'var(--tt-text-3)', width: 28, height: 28 }}
               onClick={(e) => setAddContentAnchor(e.currentTarget)}
             >
@@ -759,11 +874,67 @@ const ChatInput: React.FC<ChatInputProps> = ({
             </IconButton>
           </Tooltip>
 
+          {/* 文件访问档位：这一轮 AI 能在真实目录里写到哪、能不能删（完全访问标红）。
+              挂在 + 之后、与模型选择同一工具栏：档位是"这轮怎么发"的输入侧设置，
+              跟发送动作贴在一起才不容易被忽略（原先在输入卡下方的目录行里，离得远）。 */}
+          <Tooltip
+            title={tr('{desc}｜当前目录：{dir}', {
+              desc: tr(permDef.desc),
+              dir: workDir || tr('未绑定，产出落在应用工作目录'),
+            })}
+            placement="top"
+          >
+            <Box
+              {...anchorMenuProps(
+                setPermAnchor,
+                tr('文件访问权限：{name}', { name: tr(permDef.name) }),
+                Boolean(permAnchor),
+              )}
+              data-file-permission=""
+              // 全局环带 2px 外偏移，套在 8px 圆角的无边框小控件上会浮成一层「套框」，
+              // 看着像控件自己带了个蓝底框。这里点名不要全局环（data-tt-ring='self'），
+              // 由下方自己的 :focus-visible 承担：环仍 2px、仍用 --tt-focus，只是贴边 inward，
+              // 键盘焦点可见（2.4.7）不减。
+              data-tt-ring="self"
+              sx={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 0.5,
+                px: 0.75,
+                py: 0.35,
+                borderRadius: '8px',
+                cursor: 'pointer',
+                transition: 'background 0.15s ease',
+                '&:hover': { background: 'rgba(15, 23, 42, 0.04)' },
+                '&:focus-visible': { outline: '2px solid var(--tt-focus)', outlineOffset: '-2px' },
+              }}
+            >
+              <ShieldOutlinedIcon
+                sx={{ fontSize: 14, color: permDef.danger ? 'var(--tt-danger)' : 'var(--tt-text-4)' }}
+              />
+              <Typography
+                sx={{
+                  fontSize: '12px',
+                  color: permDef.danger ? 'var(--tt-danger)' : 'var(--tt-text-4)',
+                  fontWeight: permDef.danger ? 700 : 400,
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {tr(permDef.name)}
+              </Typography>
+              <KeyboardArrowDownIcon sx={{ fontSize: 14, color: 'var(--tt-text-4)' }} />
+            </Box>
+          </Tooltip>
+
           {/* 负责人专家：只在实际有专家时出现；本轮提示词与模型按专家执行 */}
           {experts.length > 0 && (
             <Tooltip title={tr('选择负责人专家（本轮由该专家组织结论，可绑定模型）')}>
               <Box
-                onClick={(e) => setExpertAnchor(e.currentTarget)}
+                {...anchorMenuProps(
+                  setExpertAnchor,
+                  tr('选择负责人专家（当前：{name}）', { name: selectedExpert?.name ?? tr('通用助手') }),
+                  Boolean(expertAnchor),
+                )}
                 sx={{
                   display: 'flex',
                   alignItems: 'center',
@@ -774,10 +945,10 @@ const ChatInput: React.FC<ChatInputProps> = ({
                   border: '1px solid var(--tt-border)',
                   cursor: 'pointer',
                   transition: 'all 0.15s ease',
-                  '&:hover': { borderColor: '#0EA5E9', background: 'rgba(14, 165, 233, 0.04)' },
+                  '&:hover': { borderColor: 'var(--tt-info)', background: 'rgba(14, 165, 233, 0.04)' },
                 }}
               >
-                <GroupsIcon sx={{ fontSize: 14, color: selectedExpert ? '#0EA5E9' : 'var(--tt-text-4)' }} />
+                <GroupsIcon sx={{ fontSize: 14, color: selectedExpert ? 'var(--tt-info)' : 'var(--tt-text-4)' }} />
                 <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-2)', fontWeight: 500 }}>
                   {selectedExpert?.name ?? tr('通用助手')}
                 </Typography>
@@ -792,7 +963,11 @@ const ChatInput: React.FC<ChatInputProps> = ({
           {/* 选择模型（原「添加到队列」占位已替换为模型选择能力） */}
           <Tooltip title={tr('选择模型')}>
             <Box
-              onClick={(e) => setModelAnchor(e.currentTarget)}
+              {...anchorMenuProps(
+                setModelAnchor,
+                tr('选择模型（当前：{name}）', { name: selectedModel.name }),
+                Boolean(modelAnchor),
+              )}
               sx={{
                 display: 'flex',
                 alignItems: 'center',
@@ -803,7 +978,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 border: '1px solid var(--tt-border)',
                 cursor: 'pointer',
                 transition: 'all 0.15s ease',
-                '&:hover': { borderColor: '#8B5CF6', background: 'rgba(139, 92, 246, 0.04)' },
+                '&:hover': { borderColor: 'var(--tt-accent-violet)', background: 'rgba(139, 92, 246, 0.04)' },
               }}
             >
               <Box
@@ -845,16 +1020,17 @@ const ChatInput: React.FC<ChatInputProps> = ({
                   width: 34,
                   height: 34,
                   borderRadius: '50%',
-                  bgcolor: canSend ? '#14B8A6' : stoppable ? '#F59E0B' : '#E5E7EB',
-                  color: canSend || stoppable ? '#fff' : '#9CA3AF',
-                  boxShadow: canSend ? '0 2px 8px rgba(20, 184, 166, 0.35)' : 'none',
+                  bgcolor: canSend ? 'var(--tt-teal-fill)' : stoppable ? 'var(--tt-warning-fill)' : 'var(--tt-surface-3)',
+                  color: canSend || stoppable ? '#fff' : 'var(--tt-text-4)',
+                  boxShadow: canSend ? '0 2px 8px rgba(15, 118, 110, 0.35)' : 'none',
                   transition: 'all 0.2s ease',
                   '&:hover': {
-                    bgcolor: canSend ? '#0D9488' : stoppable ? '#D97706' : '#E5E7EB',
+                    bgcolor: canSend ? 'var(--tt-teal-fill)' : stoppable ? 'var(--tt-warning-fill)' : 'var(--tt-surface-3)',
+                    filter: canSend || stoppable ? 'brightness(1.08)' : 'none',
                   },
                   '&.Mui-disabled': {
-                    bgcolor: stoppable ? '#F59E0B' : '#E5E7EB',
-                    color: stoppable ? '#fff' : '#9CA3AF',
+                    bgcolor: stoppable ? 'var(--tt-warning-fill)' : 'var(--tt-surface-3)',
+                    color: stoppable ? '#fff' : 'var(--tt-text-4)',
                   },
                 }}
               >
@@ -898,11 +1074,11 @@ const ChatInput: React.FC<ChatInputProps> = ({
               }}
             >
               <AutoAwesomeIcon
-                sx={{ fontSize: 15, color: SKILL_SOURCE_META[referencedSkill.source].solid }}
+                sx={{ fontSize: 15, color: SKILL_SOURCE_META[referencedSkill.source].fg }}
               />
             </Box>
             <Box sx={{ flexGrow: 1, minWidth: 0 }}>
-              <Typography sx={{ fontSize: '13.5px', fontWeight: 700, color: '#111827' }}>
+              <Typography sx={{ fontSize: '13.5px', fontWeight: 700, color: 'var(--tt-text-1)' }}>
                 /{referencedSkill.name}
               </Typography>
               <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
@@ -917,6 +1093,11 @@ const ChatInput: React.FC<ChatInputProps> = ({
           )}
           <Box sx={{ display: 'flex', gap: 1, mt: 1.5 }}>
             <Box
+              {...clickableProps(() => {
+                setSkillBlockAnchor(null);
+                setSkillFilter('');
+                setSkillsAnchor(inputWrapRef.current);
+              })}
               onClick={() => {
                 setSkillBlockAnchor(null);
                 setSkillFilter('');
@@ -930,12 +1111,16 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 border: '1px solid var(--tt-border)',
                 cursor: 'pointer',
                 transition: 'all 0.15s ease',
-                '&:hover': { borderColor: '#8B5CF6', color: '#8B5CF6' },
+                '&:hover': { borderColor: 'var(--tt-accent-violet)', color: 'var(--tt-accent-violet)' },
               }}
             >
               <Typography sx={{ fontSize: '12px', fontWeight: 600, color: 'var(--tt-text-2)' }}>{tr('重新选择')}</Typography>
             </Box>
             <Box
+              {...clickableProps(() => {
+                setSkillBlockAnchor(null);
+                setReferencedSkill(null);
+              })}
               onClick={() => {
                 setSkillBlockAnchor(null);
                 setReferencedSkill(null);
@@ -951,7 +1136,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 '&:hover': { background: 'rgba(239, 68, 68, 0.05)' },
               }}
             >
-              <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#EF4444' }}>{tr('取消引用')}</Typography>
+              <Typography sx={{ fontSize: '12px', fontWeight: 600, color: 'var(--tt-danger)' }}>{tr('取消引用')}</Typography>
             </Box>
           </Box>
         </Popover>
@@ -990,6 +1175,8 @@ const ChatInput: React.FC<ChatInputProps> = ({
         {filteredSkills.map((s) => (
           <Box
             key={s.id}
+            {...clickableProps(() => pickSkill(s))}
+            role="menuitem"
             onClick={() => pickSkill(s)}
             sx={{
               display: 'flex',
@@ -1015,10 +1202,10 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 flexShrink: 0,
               }}
             >
-              <AutoAwesomeIcon sx={{ fontSize: 14, color: SKILL_SOURCE_META[s.source].solid }} />
+              <AutoAwesomeIcon sx={{ fontSize: 14, color: SKILL_SOURCE_META[s.source].fg }} />
             </Box>
             <Box sx={{ flexGrow: 1, minWidth: 0 }}>
-              <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#1F2937' }}>/{s.name}</Typography>
+              <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)' }}>/{s.name}</Typography>
               {s.description && (
                 <Typography
                   sx={{
@@ -1075,6 +1262,12 @@ const ChatInput: React.FC<ChatInputProps> = ({
         {BUILTIN_MODELS.map((m) => (
           <Box
             key={m.id}
+            {...clickableProps(() => {
+              setChatModelId(m.id);
+              setModelAnchor(null);
+            })}
+            role="menuitem"
+            aria-current={chatModelId === m.id ? 'true' : undefined}
             onClick={() => {
               setChatModelId(m.id);
               setModelAnchor(null);
@@ -1106,10 +1299,10 @@ const ChatInput: React.FC<ChatInputProps> = ({
               <Typography sx={{ fontSize: '12px', fontWeight: 700, color: m.color }}>{m.name[0]}</Typography>
             </Box>
             <Box sx={{ flexGrow: 1, minWidth: 0 }}>
-              <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#1F2937' }}>{tr(m.name)}</Typography>
+              <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)' }}>{tr(m.name)}</Typography>
               <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)', mt: 0.15 }}>{tr(m.desc)}</Typography>
             </Box>
-            {selectedModel.id === m.id && <CheckIcon sx={{ fontSize: 16, color: '#8B5CF6' }} />}
+            {selectedModel.id === m.id && <CheckIcon sx={{ fontSize: 16, color: 'var(--tt-accent-violet)' }} />}
           </Box>
         ))}
 
@@ -1122,6 +1315,12 @@ const ChatInput: React.FC<ChatInputProps> = ({
             {savedOptions.map((m) => (
               <Box
                 key={m.id}
+                {...clickableProps(() => {
+                  setChatModelId(m.id);
+                  setModelAnchor(null);
+                })}
+                role="menuitem"
+                aria-current={chatModelId === m.id ? 'true' : undefined}
                 onClick={() => {
                   setChatModelId(m.id);
                   setModelAnchor(null);
@@ -1153,17 +1352,22 @@ const ChatInput: React.FC<ChatInputProps> = ({
                   <Typography sx={{ fontSize: '12px', fontWeight: 700, color: m.color }}>{m.name[0]}</Typography>
                 </Box>
                 <Box sx={{ flexGrow: 1, minWidth: 0 }}>
-                  <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#1F2937' }}>{m.name}</Typography>
+                  <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)' }}>{m.name}</Typography>
                   <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)', mt: 0.15, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.desc}</Typography>
                 </Box>
-                {selectedModel.id === m.id && <CheckIcon sx={{ fontSize: 16, color: '#8B5CF6' }} />}
+                {selectedModel.id === m.id && <CheckIcon sx={{ fontSize: 16, color: 'var(--tt-accent-violet)' }} />}
               </Box>
             ))}
           </>
         )}
 
-        <Box sx={{ borderTop: '1px solid #F3F4F6', mt: 0.5, pt: 0.5 }}>
+        <Box sx={{ borderTop: '1px solid var(--tt-border-soft)', mt: 0.5, pt: 0.5 }}>
           <Box
+            {...clickableProps(() => {
+              setModelAnchor(null);
+              navigate('/settings?s=models');
+            })}
+            role="menuitem"
             onClick={() => {
               setModelAnchor(null);
               navigate('/settings?s=models');
@@ -1185,7 +1389,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 width: 26,
                 height: 26,
                 borderRadius: '8px',
-                background: '#F3F4F6',
+                background: 'var(--tt-chip-neutral)',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
@@ -1280,7 +1484,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
           sx={{ fontSize: '13px', gap: 1 }}
         >
           <Box sx={{ width: 16, flexShrink: 0 }}>
-            {!chatExpertId && <CheckIcon sx={{ fontSize: 16, color: '#0EA5E9' }} />}
+            {!chatExpertId && <CheckIcon sx={{ fontSize: 16, color: 'var(--tt-info)' }} />}
           </Box>
           <Box sx={{ minWidth: 0 }}>
             <Typography sx={{ fontSize: '13px', fontWeight: 500 }}>{tr('通用助手')}</Typography>
@@ -1301,14 +1505,14 @@ const ChatInput: React.FC<ChatInputProps> = ({
             sx={{ fontSize: '13px', gap: 1, alignItems: 'flex-start' }}
           >
             <Box sx={{ width: 16, flexShrink: 0, pt: 0.25 }}>
-              {e.id === chatExpertId && <CheckIcon sx={{ fontSize: 16, color: '#0EA5E9' }} />}
+              {e.id === chatExpertId && <CheckIcon sx={{ fontSize: 16, color: 'var(--tt-info)' }} />}
             </Box>
             <Box sx={{ minWidth: 0 }}>
               <Typography sx={{ fontSize: '13px', fontWeight: 500 }}>{e.name}</Typography>
               <Typography
                 sx={{
                   fontSize: '11px',
-                  color: e.modelError ? '#DC2626' : 'var(--tt-text-4)',
+                  color: e.modelError ? 'var(--tt-danger)' : 'var(--tt-text-4)',
                   whiteSpace: 'normal',
                 }}
               >
@@ -1321,11 +1525,16 @@ const ChatInput: React.FC<ChatInputProps> = ({
     </Box>
     </Box>
 
-          {/* 输入框下方：选择工作目录（真实目录） + 免责提示 */}
+      {/* 输入框下方：选择工作目录（真实目录）+ 免责提示；文件访问档位已进卡片内工具栏 */}
       <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mt: 0.75, px: 0.5 }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.25, minWidth: 0 }}>
         <Tooltip title={workDir || tr('选择会话内容与产出物的存放目录')} placement="top">
           <Box
+            {...clickableProps(handlePickWorkDir, workDir ? tr('更换工作目录') : tr('选择工作目录'))}
             onClick={handlePickWorkDir}
+            // 与卡片内工具栏的档位 chip 同一处理：这类控件自己没有边框，
+            // 外偏移的全局焦点环会在它外面再画一个框，改为自绘贴边环
+            data-tt-ring="self"
             sx={{
               display: 'flex',
               alignItems: 'center',
@@ -1337,13 +1546,14 @@ const ChatInput: React.FC<ChatInputProps> = ({
               cursor: 'pointer',
               transition: 'background 0.15s ease',
               '&:hover': { background: 'rgba(15, 23, 42, 0.04)' },
+              '&:focus-visible': { outline: '2px solid var(--tt-focus)', outlineOffset: '-2px' },
             }}
           >
-            <FolderOutlinedIcon sx={{ fontSize: 14, color: workDir ? '#4F46E5' : '#9CA3AF' }} />
+            <FolderOutlinedIcon sx={{ fontSize: 14, color: workDir ? 'var(--tt-accent)' : 'var(--tt-text-4)' }} />
             <Typography
               sx={{
                 fontSize: '12px',
-                color: workDir ? '#4F46E5' : '#9CA3AF',
+                color: workDir ? 'var(--tt-accent)' : 'var(--tt-text-4)',
                 fontWeight: workDir ? 600 : 400,
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
@@ -1354,8 +1564,88 @@ const ChatInput: React.FC<ChatInputProps> = ({
             </Typography>
           </Box>
         </Tooltip>
-        <Typography sx={{ fontSize: '12px', color: '#C0C4CA' }}>{tr('内容由 AI 生成，请注意核实')}</Typography>
+        </Box>
+        <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>{tr('内容由 AI 生成，请注意核实')}</Typography>
       </Box>
+
+      {/* 文件访问档位菜单：三档说明各自写清放开/收紧了什么。
+          触发件在卡片内工具栏（+ 之后），菜单本身走 portal，留在这里不影响锚定。 */}
+      <Menu
+        anchorEl={permAnchor}
+        open={Boolean(permAnchor)}
+        onClose={() => setPermAnchor(null)}
+        anchorOrigin={{ vertical: 'top', horizontal: 'left' }}
+        transformOrigin={{ vertical: 'bottom', horizontal: 'left' }}
+        PaperProps={{ sx: { width: 330, mb: 0.5, borderRadius: '14px', p: 0.75 } }}
+      >
+        <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-text-4)', px: 1.25, py: 0.5 }}>
+          {tr('文件访问权限')}
+        </Typography>
+        {FILE_PERMISSION_DEFS.map((def) => (
+          <MenuItem
+            key={def.id}
+            onClick={() => handlePickFilePermission(def.id)}
+            selected={def.id === permMode}
+            sx={{ alignItems: 'flex-start', gap: 1, px: 1.25, py: 0.9, borderRadius: '10px' }}
+          >
+            <Box sx={{ width: 18, flexShrink: 0, pt: 0.25 }}>
+              {def.id === permMode && <CheckIcon sx={{ fontSize: 16, color: 'var(--tt-accent)' }} />}
+            </Box>
+            <Box sx={{ minWidth: 0 }}>
+              <Typography
+                sx={{
+                  fontSize: '13px',
+                  fontWeight: 600,
+                  color: def.danger ? 'var(--tt-danger)' : 'var(--tt-text-2)',
+                }}
+              >
+                {tr(def.name)}
+              </Typography>
+              <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)', lineHeight: 1.6 }}>
+                {tr(def.desc)}
+              </Typography>
+            </Box>
+          </MenuItem>
+        ))}
+      </Menu>
+
+      {/* 完全访问：红色警告 + 明确确认，确认时刻随档位一起写进每会话台账 */}
+      <Dialog
+        open={Boolean(permPending)}
+        onClose={() => setPermPending(null)}
+        aria-labelledby="file-permission-danger-title"
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle id="file-permission-danger-title" sx={{ fontSize: '16px', fontWeight: 700 }}>
+          {tr('启用「完全访问」？')}
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText component="div" sx={{ fontSize: '13px', lineHeight: 1.8 }}>
+            <Box sx={{ color: 'var(--tt-danger)', fontWeight: 700, mb: 1 }}>
+              {tr('开启后，AI 在本次会话里可以直接读写工作目录之外的本机路径，并删除文件，不再逐次询问。')}
+            </Box>
+            <Box sx={{ mb: 1 }}>
+              {tr('删除是不可逆操作：文件会先复制进应用回收目录并记下原路径与原因，但找回仍需手动操作。建议只在核对过执行计划的会话里开启，用完切回「每次询问」。')}
+            </Box>
+            <Box sx={{ color: 'var(--tt-danger)', fontWeight: 600 }}>
+              {tr('家目录、系统关键目录与应用数据目录始终硬拒：完全访问放开的是目录边界，不是整台电脑。')}
+            </Box>
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setPermPending(null)} sx={{ textTransform: 'none' }}>
+            {tr('取消')}
+          </Button>
+          <Button
+            variant="contained"
+            onClick={handleConfirmFullAccess}
+            sx={{ textTransform: 'none', bgcolor: 'var(--tt-danger-fill)', '&:hover': { bgcolor: '#B91C1C' } }}
+          >
+            {tr('我已了解，启用完全访问')}
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       {/* 幻灯片模板：放在工作目录之后；只列可用模板，导入通道在设置页 */}
       {activeMode === 'slides' && (
@@ -1366,6 +1656,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
           <Box
             component="select"
             data-pptx-picker=""
+            aria-label={tr('幻灯片模板')}
             value={pptx.selectedId}
             disabled={pptx.loading || pptxSwitching || pptxOptions.length === 0}
             onChange={(e: React.ChangeEvent<HTMLSelectElement>) => void handlePptxSelect(e.target.value)}
@@ -1380,8 +1671,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
               fontSize: '12px',
               color: 'var(--tt-text-2)',
               cursor: 'pointer',
-              outline: 'none',
-              '&:hover': { borderColor: '#14B8A6' },
+              '&:hover': { borderColor: 'var(--tt-teal)' },
               '&:disabled': { opacity: 0.55, cursor: 'not-allowed' },
             }}
           >
@@ -1393,7 +1683,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
             ))}
           </Box>
           {pptx.loading && <CircularProgress size={12} />}
-          {pptxError && <Typography sx={{ fontSize: '12px', color: '#EF4444' }}>{pptxError}</Typography>}
+          {pptxError && <Typography sx={{ fontSize: '12px', color: 'var(--tt-danger)' }}>{pptxError}</Typography>}
           {!pptx.desktop && (
             <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>{tr('浏览器直连仅内置主题')}</Typography>
           )}

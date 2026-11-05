@@ -227,21 +227,59 @@ describe('Rust 发布者签名实现', () => {
   });
 
   it('SHA-256 先过、签名后过、最后才写盘', () => {
-    for (const install of ['install_skill_from', 'install_suite_from']) {
-      const start = market.indexOf(`pub async fn ${install}(`);
-      const end =
-        install === 'install_skill_from'
-          ? market.indexOf('pub async fn install_suite_from(')
-          : market.indexOf('#[tauri::command]', start);
-      const body = market.slice(start, end);
+    /** 取某个函数（从 from 起）到下一个同级定义（next）之间的源码，定位失败就报错 */
+    const fnBody = (from: string, next: string): string => {
+      const start = market.indexOf(from);
+      expect(start, `market/mod.rs 定位失败：${from}`).toBeGreaterThanOrEqual(0);
+      const end = market.indexOf(next, start + from.length);
+      expect(end, `market/mod.rs 片段终点定位失败：${next}（在 ${from} 之后找不到）`).toBeGreaterThan(start);
+      return market.slice(start, end);
+    };
+    /** 校验链调用点：技能链 / 套件链哪个先出现取哪个 */
+    const chainAt = (body: string): number => {
+      const hits = [body.indexOf('verified_skill_item('), body.indexOf('verified_suite_item(')].filter(
+        (i) => i >= 0,
+      );
+      return hits.length > 0 ? Math.min(...hits) : -1;
+    };
+
+    // 校验链抽成 verified_*_item（安装与升级共用同一条），落盘留给调用方：顺序仍然锁死
+    for (const [fn, next] of [
+      ['async fn verified_skill_item(', 'async fn verified_suite_item('],
+      ['async fn verified_suite_item(', 'pub async fn install_skill_from('],
+    ]) {
+      const body = fnBody(fn, next);
       const sha = body.indexOf('verify_sha256(&bytes, &item.sha256)?;');
       const sig = body.indexOf('verify_artifact_signature(');
-      const write = body.indexOf(
-        install === 'install_skill_from' ? 'skill::install_content_in(' : 'suite::install_bytes_in(',
-      );
-      expect(sha, `${install} 缺少 SHA-256 校验`).toBeGreaterThan(-1);
-      expect(sig, `${install} 缺少发布者验签`).toBeGreaterThan(sha);
-      expect(write, `${install} 未在验签之后落盘`).toBeGreaterThan(sig);
+      expect(sha, `${fn} 缺少 SHA-256 校验`).toBeGreaterThan(-1);
+      expect(sig, `${fn} 缺少发布者验签`).toBeGreaterThan(sha);
+      // 校验链本身不落盘：否则「验签没过但已经写了一半」
+      expect(body.includes('content_in(') || body.includes('bytes_in('), `${fn} 在校验链里就落盘`).toBe(false);
+    }
+
+    // 安装与升级都只在校验链返回之后才动盘
+    for (const [fn, next, write] of [
+      ['pub async fn install_skill_from(', 'pub async fn install_suite_from(', 'skill::install_content_in('],
+      ['pub async fn install_suite_from(', 'pub fn source_host(', 'suite::install_bytes_in('],
+    ]) {
+      const body = fnBody(fn, next);
+      const chain = chainAt(body);
+      expect(chain, `${fn} 没走校验链`).toBeGreaterThanOrEqual(0);
+      expect(body.indexOf(write), `${fn} 缺少落盘 ${write}`).toBeGreaterThan(chain);
+    }
+
+    // 升级按技能 / 套件分支各查一次：升级不能成为绕过验签的旁路
+    const up = fnBody('async fn upgrade_item(', 'fn with_market_version(');
+    const cut = up.indexOf('verified_suite_item(');
+    expect(cut, 'upgrade_item 里没找到套件校验链').toBeGreaterThan(0);
+    for (const [part, chain, write] of [
+      [up.slice(0, cut), 'verified_skill_item(', 'skill::upgrade_content_in('],
+      [up.slice(cut), 'verified_suite_item(', 'suite::upgrade_bytes_in('],
+    ]) {
+      const body = part as string;
+      const at = body.indexOf(chain as string);
+      expect(at, `升级 ${write} 前没走校验链 ${chain}`).toBeGreaterThanOrEqual(0);
+      expect(body.indexOf(write as string), `升级缺少 ${write}`).toBeGreaterThan(at);
     }
   });
 });
@@ -340,7 +378,16 @@ describe('市场窗口的信任交互', () => {
     expect(browser).toContain(
       'const blockedByTrust = item.signed && (!item.publisherTrusted || item.publisherKeyChanged);',
     );
-    expect(browser).toContain('disabled={Boolean(installingId) || blockedByTrust}');
+    // 安装按钮的禁用条件里必须仍有 blockedByTrust（升级在飞行中也一并挡住，不并发动盘）
+    expect(browser).toMatch(/disabled=\{Boolean\(installingId\)[^}]*blockedByTrust\}/);
+    // 安装与升级的处理函数互不越权：升级 handler 不写信任库
+    const upgradeBody = browser.slice(
+      browser.indexOf('const handleUpgrade'),
+      browser.indexOf('const handleTrust'),
+    );
+    expect(upgradeBody.length).toBeGreaterThan(100);
+    expect(upgradeBody).not.toContain('trustAdd');
+    expect(upgradeBody).not.toContain('trustRemove');
     expect(browser).toContain('请先在「发布者信任」中确认并信任该发布者');
     expect(browser).toContain("blockedByTrust ? '先信任发布者' : '安装'");
   });

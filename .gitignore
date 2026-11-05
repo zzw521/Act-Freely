@@ -55,3 +55,13 @@ image/
 # 本机调研资料与历史归档（不随仓库分发）
 tongtian-tauri/千问办公调研报告.html
 docs/archive/
+
+# 多窗口并行开发的本机自测输出与台账草稿
+# （*.log 已被上面的规则忽略，这里补的是同目录下的 .txt/.out/.md/.sh）
+_w*-logs/
+
+# scripts/stage-engine.mjs 整目录拷贝生成的引擎构建副本，与 engine/ 同源，不入库
+tongtian-tauri/src-tauri/staged-engine/
+
+# 工单链路本机验证用的临时数据目录（内含 market.db 等运行时数据）
+/.tmp-ticket-check/

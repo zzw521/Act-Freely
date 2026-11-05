@@ -6,6 +6,10 @@
 1. 未授权/白名单为空 → 工具不注册，system prompt 也不提；
 2. run_command 只接受白名单裸命令名，argv 方式执行（不经 shell），
    工作目录固定、超时/输出有上限、子进程环境变量不含引擎秘密；
+   run_shell 必须在命令执行之上再显式授权，支持管道/链式命令，
+   但工作目录固定、超时/输出有上限、审计只记哈希；
+   run_shell 还禁睡等（D-48.4c）：shell 动词与解释器内联的 sleep/setTimeout 一律不执行、
+   当场不启动子进程、审计记 denied，判定表与工单执行体共用一份（`twa.find_sleep_pattern`）；
 3. fetch_url 只允许白名单公网主机，本机/内网/链路本地拒绝，重定向逐跳复核，
    非文本与超长响应被拒/截断；
 4. 成功、失败、超时、拒绝都发 tool_audit，且审计 target 不带 URL 凭据/查询串，
@@ -114,6 +118,7 @@ def grants_policy(**overrides) -> tg.ToolGrantPolicy:
         "workspaceId": "ws-grants",
         "execEnabled": True,
         "execAllowlist": [cmd_name()],
+        "shellEnabled": False,
         "networkEnabled": False,
         "networkAllowlist": [],
     }
@@ -127,7 +132,19 @@ def pure_checks(tmp: Path) -> None:
     check("无 runtime → 执行默认关闭", not off.exec_enabled and not off.network_enabled)
     check("无授权 → 没有可注册的工具", off.notes() == [] and off.system_hint() == "")
     check("无授权 → run_command 被拒", "未授权" in (off.exec_denial("python") or ""))
+    check("无授权 → run_shell 被拒", "未授权" in (off.shell_denial() or ""))
     check("无授权 → fetch_url 被拒", "未授权" in (off.network_denial("https://example.com") or ""))
+
+    exec_only = grants_policy()
+    check("只开命令执行 → 通用 shell 仍关闭",
+          "未授权通用 shell" in (exec_only.shell_denial() or ""), exec_only.shell_denial() or "")
+    check("只开命令执行 → 提示词不提 run_shell", "run_shell" not in exec_only.system_hint())
+    shell_only = grants_policy(execEnabled=False, shellEnabled=True)
+    check("只开通用 shell 不开命令执行 → 拒绝",
+          "未授权命令执行" in (shell_only.shell_denial() or ""), shell_only.shell_denial() or "")
+    both = grants_policy(shellEnabled=True)
+    check("双重授权 → 通用 shell 可用", both.shell_denial() is None, both.shell_denial() or "")
+    check("双重授权 → 提示词说明 run_shell", "run_shell" in both.system_hint(), both.system_hint())
 
     empty = grants_policy(execAllowlist=[])
     check("开启但白名单为空 → 说明未注册", any("run_command 未注册" in n for n in empty.notes()), str(empty.notes()))
@@ -166,14 +183,30 @@ def pure_checks(tmp: Path) -> None:
 def registration_checks(tmp: Path) -> None:
     print("--- 2. 工具注册与提示词（未授权不注册） ---")
     plain = engine_server.build_toolkit(tmp)
-    check("默认 toolkit 不含 run_command/fetch_url",
-          "run_command" not in plain.tools and "fetch_url" not in plain.tools, str(list(plain.tools)))
+    check("默认 toolkit 不含 run_command/run_shell/fetch_url",
+          "run_command" not in plain.tools and "run_shell" not in plain.tools
+          and "fetch_url" not in plain.tools, str(list(plain.tools)))
 
     disabled = engine_server.build_toolkit(
         tmp, grants=grants_policy(execEnabled=False, networkEnabled=False)
     )
     check("显式关闭时不注册执行/联网工具",
-          "run_command" not in disabled.tools and "fetch_url" not in disabled.tools, str(list(disabled.tools)))
+          "run_command" not in disabled.tools and "run_shell" not in disabled.tools
+          and "fetch_url" not in disabled.tools, str(list(disabled.tools)))
+
+    exec_only = engine_server.build_toolkit(tmp, grants=grants_policy())
+    check("只开命令执行时 run_shell 不注册",
+          "run_command" in exec_only.tools and "run_shell" not in exec_only.tools,
+          str(list(exec_only.tools)))
+
+    shell_only = engine_server.build_toolkit(
+        tmp, grants=grants_policy(execEnabled=False, shellEnabled=True)
+    )
+    check("只开通用 shell 时 run_shell 不注册",
+          "run_shell" not in shell_only.tools, str(list(shell_only.tools)))
+
+    with_shell = engine_server.build_toolkit(tmp, grants=grants_policy(shellEnabled=True))
+    check("双重授权后注册 run_shell", "run_shell" in with_shell.tools, str(list(with_shell.tools)))
 
     empty = engine_server.build_toolkit(
         tmp, grants=grants_policy(execAllowlist=[], networkAllowlist=[], networkEnabled=True)
@@ -247,6 +280,175 @@ def exec_checks(tmp: Path) -> None:
     os.environ.pop("TT_SELFTEST_TOKEN", None)
     check("子进程环境不含任意 *_TOKEN", "TT_SELFTEST_TOKEN" not in env, str(sorted(env)[:8]))
     check("子进程环境保留 PATH", "PATH" in env or "Path" in env, str(sorted(env)[:8]))
+
+
+def shell_checks(tmp: Path) -> None:
+    print("--- 3a. 通用 shell：管道、固定工作目录、超时、哈希审计 ---")
+    events = []
+    toolkit = engine_server.build_toolkit(
+        tmp,
+        grants=grants_policy(shellEnabled=True),
+        emit=lambda ev, data: events.append((ev, data)),
+        task_id="task-shell",
+    )
+    if "run_shell" not in toolkit.tools:
+        check("双重授权后 run_shell 可调用", False, str(list(toolkit.tools)))
+        return
+    run = toolkit.tools["run_shell"].original_func
+
+    pipeline = (
+        "echo shell-pipe | findstr shell-pipe"
+        if os.name == "nt"
+        else "echo shell-pipe | grep shell-pipe"
+    )
+    out = tool_text(run(pipeline, 30))
+    check("管道命令真实执行", "shell-pipe" in out and "退出码：0" in out, out[:240])
+    ok_audits = [d for e, d in events if e == "tool_audit" and d.get("outcome") == "ok"]
+    check("shell 成功调用写审计", len(ok_audits) == 1, str(events))
+    check("shell 审计只记哈希与长度",
+          ok_audits and "sha256:" in ok_audits[0].get("target", "")
+          and " 字符" in ok_audits[0].get("target", "")
+          and pipeline not in json.dumps(events, ensure_ascii=False),
+          str(ok_audits[:1]))
+
+    events.clear()
+    # 命令里的引号（D-48.4c 撞出的第二个真缺陷）：整条命令交给 cmd 时如果走 argv 列表，
+    # Python 会把 `"` 转义成 `\"`，而 cmd 不认识这套转义——原样收到反斜杠。
+    # 后果不是报错而是**静默跑错**：`python -c "print(42)"` 退出码 0、输出为空。
+    quoted = tool_text(run('echo "hello world"', 30))
+    check("带引号的命令不被反斜杠改写",
+          "hello world" in quoted and '\\"' not in quoted, quoted[:200])
+    if shutil.which("python") is not None:
+        inner = tool_text(run('python -c "print(42)"', 30))
+        check("引号里的解释器内联命令真的跑了（不是退出码 0 的空输出）",
+              "42" in inner and "退出码：0" in inner, inner[:200])
+    else:
+        print("SKIP: python 不在 PATH，跳过内联命令检查")
+    show = "type" if os.name == "nt" else "cat"
+    write_quoted = tool_text(run(f'echo "spaced arg" > qnote.txt && {show} qnote.txt', 30))
+    check("引号随重定向一起存活",
+          "spaced arg" in write_quoted and "退出码：0" in write_quoted, write_quoted[:200])
+
+    events.clear()
+    cwd_out = tool_text(run("cd" if os.name == "nt" else "pwd", 30))
+    check("工作目录固定在任务目录", str(tmp.resolve()) in cwd_out, cwd_out[:240])
+
+    events.clear()
+    # 超时要的是「一条确实跑得久的命令」，不是「一条在睡的命令」：D-48.4c 起 shell 里的
+    # 睡等写法（`sleep 3` / `ping -n 5 127.0.0.1`）根本进不到执行，用它测超时等于测拒绝。
+    # 这里的空转循环没有任何等待 API，判定表认不出来，才是「真作业被超时打断」的真实形态。
+    # Windows 侧不能用 `"C:\...\python.exe" -c "…"`：整条命令里有引号会被现有 argv 构造改写
+    # （见本文件坑注释与台账 D-48.4c），换循环体是为了不把那条独立缺陷混进本用例。
+    slow = (
+        "for /L %i in (1,0,2) do @cd >nul"
+        if os.name == "nt"
+        else "i=0; while [ $i -lt 1 ]; do :; done"
+    )
+    timeout_out = tool_text(run(slow, 1))
+    check("shell 超时会被终止", "超时" in timeout_out and "整棵进程树已终止" in timeout_out,
+          timeout_out[:240])
+    timeout_audits = [d for e, d in events if e == "tool_audit" and d.get("outcome") == "timeout"]
+    check("shell 超时写审计", len(timeout_audits) == 1, str(events))
+
+    events.clear()
+    empty_out = tool_text(run("   ", 30))
+    check("空 shell 命令被拒", "不能为空" in empty_out, empty_out[:160])
+    too_long_out = tool_text(run("echo " + "x" * (tg.MAX_SHELL_COMMAND_CHARS + 1), 30))
+    check("超长 shell 命令被拒", "超过" in too_long_out, too_long_out[:160])
+    denied = [d for e, d in events if e == "tool_audit" and d.get("outcome") == "denied"]
+    check("拒绝调用也写审计", len(denied) == 2, str(events))
+    check("拒绝审计不含命令正文",
+          all("x" * 100 not in json.dumps(d, ensure_ascii=False) for _, d in events),
+          str(events)[:300])
+
+
+def shell_sleep_guard_checks(tmp: Path) -> None:
+    """D-48.4c：主会话 shell 的等待拦截——判定表与工单执行体**共用一份**，理由各写各的。
+
+    锁五件事：① 睡等写法（shell 动词与解释器内联）一律**不执行**，且当场不启动任何子进程；
+    ② 拒绝要写审计；③ 拦的是写法不是时长，同名字串不误伤；
+    ④ 禁令在**模型看得见的两个地方**都在（工具声明 + 「已启用」说明）；
+    ⑤ 判定只有一份来源——`tool_grants.py` 里不许再出现第二张睡等表。
+    """
+    print("--- 3a2. 主会话 shell 禁睡等（与执行体同一张判定表）---")
+    import ticket_worker_adapter as twa
+
+    events = []
+    toolkit = engine_server.build_toolkit(
+        tmp,
+        grants=grants_policy(shellEnabled=True),
+        emit=lambda ev, data: events.append((ev, data)),
+        task_id="task-shell-sleep",
+    )
+    if "run_shell" not in toolkit.tools:
+        check("双重授权后 run_shell 可调用", False, str(list(toolkit.tools)))
+        return
+    run = toolkit.tools["run_shell"].original_func
+
+    blocked = [
+        ("shell 动词 sleep", "sleep 5"),
+        ("PowerShell Start-Sleep", "powershell -Command Start-Sleep -Seconds 5"),
+        ("Windows timeout /t", "timeout /t 5"),
+        ("ping -t 无限重复", "ping -t 127.0.0.1"),
+        ("解释器内联 time.sleep", 'python -c "import time;time.sleep(20)"'),
+        ("node 内联 setTimeout", 'node -e "setTimeout(()=>{},5000)"'),
+        ("回环 ping 当 sleep", "ping -n 5 127.0.0.1"),
+    ]
+    for label, cmd in blocked:
+        events.clear()
+        out = tool_text(run(cmd, 30))
+        check(f"{label} 被拒并说明等待靠排队",
+              "命令未执行" in out and "等待靠排队不靠轮询" in out, out[:200])
+        audits = [d for e, d in events if e == "tool_audit"]
+        check(f"{label} 的审计记 denied",
+              len(audits) == 1 and audits[0].get("outcome") == "denied", str(audits)[:200])
+
+    # 「不执行」不能只靠返回值里那句「未执行」——把真起进程的那道门数一遍
+    started = {"n": 0}
+    real_popen = tg.subprocess.Popen
+
+    class CountingPopen(real_popen):  # type: ignore[misc,valid-type]
+        def __init__(self, *a, **kw):
+            started["n"] += 1
+            super().__init__(*a, **kw)
+
+    tg.subprocess.Popen = CountingPopen
+    try:
+        for _label, cmd in blocked:
+            tool_text(run(cmd, 30))
+    finally:
+        tg.subprocess.Popen = real_popen
+    check("被拒的睡等命令一次也没启动子进程", started["n"] == 0, str(started))
+
+    pipe = "echo real-work | findstr real-work" if os.name == "nt" else "echo real-work | grep real-work"
+    allowed = [
+        ("真活（管道）不被当成睡等", pipe),
+        ("同名字串不误伤：读一个叫 sleep.py 的文件",
+         f"echo logged > sleep.py && {'type' if os.name == 'nt' else 'cat'} sleep.py"),
+    ]
+    for label, cmd in allowed:
+        events.clear()
+        out = tool_text(run(cmd, 30))
+        check(label, "命令未执行" not in out and "退出码：0" in out, out[:200])
+
+    declared = str(toolkit.tools["run_shell"].original_func.__doc__ or "")
+    check("工具声明里写了禁睡等（模型唯一能看见的地方）",
+          "禁止睡等" in declared and "等待靠排队不靠轮询" in declared, declared[:200])
+    enabled_hint = grants_policy(shellEnabled=True).system_hint()
+    check("「已启用」说明里写了禁睡等与「不拦时长」这条边界",
+          "run_shell" in enabled_hint and "禁用睡等" in enabled_hint
+          and "等待靠排队不靠轮询" in enabled_hint and "不是「跑得久」" in enabled_hint,
+          enabled_hint[-320:])
+
+    source = (PROJECT_ROOT / "engine" / "tool_grants.py").read_text(encoding="utf-8")
+    check("判定表只有一份：tool_grants 里既没第二张表、也只从 twa 取",
+          "_SLEEP_PATTERNS" not in source and "twa.find_sleep_pattern(raw)" in source,
+          f"patterns={source.count('_SLEEP_PATTERNS')} call={source.count('twa.find_sleep_pattern(raw)')}")
+    check("执行体的 guard 也走同一张表（find_sleep_pattern 是它唯一的判据）",
+          "find_sleep_pattern" in twa.guard_shell_command.__doc__ + str(
+              [c for c in twa.guard_shell_command.__code__.co_names])
+          and all(twa.find_sleep_pattern(cmd) for _l, cmd in blocked),
+          str([(cmd, twa.find_sleep_pattern(cmd)) for _l, cmd in blocked]))
 
 
 def sandbox_checks(tmp: Path) -> None:
@@ -524,6 +726,8 @@ def main() -> None:
         pure_checks(tmp)
         registration_checks(tmp)
         exec_checks(tmp)
+        shell_checks(tmp)
+        shell_sleep_guard_checks(tmp)
         sandbox_checks(tmp)
         fetch_checks(tmp)
         http_checks(tmp)

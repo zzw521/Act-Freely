@@ -127,9 +127,12 @@ async fn real_login(app: &AppHandle, p0: &Arc<P0Services>) -> Result<Value, Stri
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
 
     let state = service::gen_state();
+    // PKCE：授权码在回调链路上可被本机其他进程窥探，换 token 时用 verifier 绑定
+    let code_verifier = service::gen_code_verifier();
+    let code_challenge = service::code_challenge_s256(&code_verifier);
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
     let login_url = format!(
-        "{base}/auth/login?state={state}&redirect_uri={}",
+        "{base}/auth/login?state={state}&redirect_uri={}&code_challenge={code_challenge}&code_challenge_method=S256",
         service::urlencode(&redirect_uri)
     );
 
@@ -150,7 +153,7 @@ async fn real_login(app: &AppHandle, p0: &Arc<P0Services>) -> Result<Value, Stri
         return Err("AUTH_STATE_MISMATCH: 回调 state 校验失败".into());
     }
 
-    let body = service::exchange_code(&base, &code, &state).await?;
+    let body = service::exchange_code(&base, &code, &state, &code_verifier).await?;
     let refresh = body
         .get("refreshToken")
         .and_then(|v| v.as_str())

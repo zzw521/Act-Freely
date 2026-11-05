@@ -279,11 +279,14 @@ for mod in ("ssl", "sqlite3", "win32api", "win32job", "win32file", "pywintypes",
             "uvicorn", "fastapi", "multipart", "agentscope", "dashscope", "openai",
             "dingtalk_stream", "aibot"):
     importlib.import_module(mod)
+# read_document 直接依赖这四个解析库：缺一个，模型读 Word/Excel/PPT/PDF 时就只能回「未安装」
+for mod in ("docx", "openpyxl", "pptx", "pypdf"):
+    importlib.import_module(mod)
 import mcp.client.streamable_http as sh
 assert hasattr(sh, "streamablehttp_client"), "mcp 版本与 agentscope 不兼容"
 # 钉钉与企业微信通道的协议都来自随包的官方 SDK：缺任一个依赖，通道会如实退回「尚未接入」，
 # 界面就成了「看得到输入框但永远连不上」——打包前先把这个可能性排除掉
-import slack_channel, dingtalk_channel, wecom_channel
+import slack_channel, dingtalk_channel, wecom_channel, wechat_channel, yuanbao_channel
 # 飞书的 lark-oapi 是整包发布（20MB/上万文件，根 __init__ 把全部 API 模块都拉进来说话），
 # 引擎启动不陪它等，只有绑定/启动连接那一次才加载。所以这里分成两段量：先证明注册飞书通道
 # 这件事在启动侧几乎是免费的，再证明随包运行时真的加载得动它——两段缺一都算随包件不合格。
@@ -296,7 +299,8 @@ lark_at = time.perf_counter()
 importlib.import_module("lark_oapi")
 lark_cost = time.perf_counter() - lark_at
 missing = [c.kind for c in (dingtalk_channel.DingTalkStreamChannel, wecom_channel.WeComAibotChannel,
-                            feishu_channel.FeishuChannel) if not c.supported]
+                            feishu_channel.FeishuChannel, wechat_channel.WeChatILinkChannel,
+                            yuanbao_channel.YuanbaoChannel) if not c.supported]
 assert not missing, f"随包运行时缺 IM 协议依赖，通道退回未接入：{missing}"
 print(f"  ✓ 导入通过（{sys.version.split()[0]}，{len(sys.path)} 条搜索路径，IM 通道协议齐全）")
 print(f"    飞书：启动侧注册 {boot_cost:.2f}s 且不加载 SDK；整包 import {lark_cost:.1f}s（绑定/启动连接时才付这一次）")

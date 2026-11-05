@@ -69,6 +69,7 @@ const SandboxPolicyForm: React.FC<SandboxPolicyFormProps> = ({
     maxDiskWriteMbps: initialPolicy?.maxDiskWriteMbps || 10,
     execEnabled: initialPolicy?.execEnabled ?? false,
     execAllowlist: initialPolicy?.execAllowlist ?? [],
+    shellEnabled: (initialPolicy?.execEnabled ? initialPolicy?.shellEnabled : false) ?? false,
     networkEnabled: initialPolicy?.networkEnabled ?? false,
     networkAllowlist: initialPolicy?.networkAllowlist ?? [],
   });
@@ -100,6 +101,10 @@ const SandboxPolicyForm: React.FC<SandboxPolicyFormProps> = ({
   };
 
   const handleSaveClick = () => {
+    if (policy.shellEnabled && !policy.execEnabled) {
+      setMessage({ type: 'error', text: '通用 shell 依赖命令执行授权：请先开启任务级命令执行，或关闭通用 shell' });
+      return;
+    }
     if (policy.execEnabled && policy.execAllowlist.length === 0) {
       setMessage({ type: 'error', text: '已开启受控命令执行，但命令白名单为空：请先添加至少一个命令，或关闭该能力' });
       return;
@@ -110,6 +115,7 @@ const SandboxPolicyForm: React.FC<SandboxPolicyFormProps> = ({
     }
     const newlyGranted =
       (policy.execEnabled && !initialPolicy?.execEnabled)
+      || (policy.shellEnabled && !initialPolicy?.shellEnabled)
       || (policy.networkEnabled && !initialPolicy?.networkEnabled);
     if (newlyGranted) {
       setConfirmOpen(true);
@@ -341,7 +347,7 @@ const SandboxPolicyForm: React.FC<SandboxPolicyFormProps> = ({
             🧰 工具访问白名单
           </Typography>
           <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
-            留空表示不限制工具；填写后仅列出的工具可调用。内置工具：view_text_file、write_text_file、insert_text_file，
+            留空表示不限制工具；填写后仅列出的工具可调用。内置工具：list_directory、view_text_file、read_document、write_text_file、insert_text_file、delete_text_file，
             可用 * 通配（如 mcp__*）。
           </Typography>
           <Stack direction="row" spacing={1} sx={{ mb: 1 }}>
@@ -453,7 +459,12 @@ const SandboxPolicyForm: React.FC<SandboxPolicyFormProps> = ({
               <Switch
                 checked={policy.execEnabled}
                 disabled={!desktop}
-                onChange={(e) => setPolicy({ ...policy, execEnabled: e.target.checked })}
+                onChange={(e) => setPolicy({
+                  ...policy,
+                  execEnabled: e.target.checked,
+                  // 关掉命令执行时通用 shell 必须一起关，避免留下一个不生效的授权
+                  shellEnabled: e.target.checked ? policy.shellEnabled : false,
+                })}
               />
             }
             label="允许模型运行命令（仅在白名单内）"
@@ -495,6 +506,34 @@ const SandboxPolicyForm: React.FC<SandboxPolicyFormProps> = ({
                   />
                 ))
               )}
+            </Box>
+          )}
+
+          {policy.execEnabled && (
+            <Box
+              sx={{
+                mt: 1,
+                mb: 2,
+                pl: 1.25,
+                borderLeft: '3px solid rgba(217,119,6,0.55)',
+              }}
+            >
+              <FormControlLabel
+                control={
+                  <Switch
+                    color="warning"
+                    checked={policy.shellEnabled}
+                    disabled={!desktop}
+                    onChange={(e) => setPolicy({ ...policy, shellEnabled: e.target.checked })}
+                  />
+                }
+                label="允许通用 shell（高风险）"
+              />
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                开启后模型可执行任意命令（支持管道、重定向与 &&），不再受命令白名单约束；
+                工作目录固定为任务目录，单次最长 120 秒、输出截断，每次调用写审计（命令正文只存哈希）。
+                它会以当前用户身份读写该用户有权限的文件，请只在信任的工作区开启。
+              </Typography>
             </Box>
           )}
 
@@ -681,6 +720,13 @@ const SandboxPolicyForm: React.FC<SandboxPolicyFormProps> = ({
                   访问这些主机：
                   <strong>{policy.networkAllowlist.join('、') || '（空）'}</strong>
                   。请求从本机真实发出；白名单只限制主机名，不限制请求内容。
+                </li>
+              )}
+              {policy.shellEnabled && (
+                <li>
+                  <strong>执行任意 shell 命令</strong>（支持管道、重定向与链式命令）。
+                  命令不再受白名单限制，可读写当前用户有权限的文件；只在确实需要
+                  <code>npm install &amp;&amp; npm run build</code> 这类步骤时开启。
                 </li>
               )}
             </Box>

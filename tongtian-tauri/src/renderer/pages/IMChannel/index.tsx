@@ -10,7 +10,7 @@
  * 因此界面上没有「测试连接」这种独立假按钮，也没有需要额外承诺的绑定入口。
  */
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import {
   Alert,
@@ -37,26 +37,31 @@ import HubIcon from '@mui/icons-material/Hub';
 import CloseIcon from '@mui/icons-material/Close';
 import OpenInNewIcon from '@mui/icons-material/OpenInNew';
 import RefreshIcon from '@mui/icons-material/Refresh';
+import SmartToyIcon from '@mui/icons-material/SmartToy';
+import { QRCodeSVG } from 'qrcode.react';
 import { errorTextOf } from '../../../shared/error-messages';
-import type { ImChannelState, ImChannelView } from '../../../shared/contracts';
+import type { ImChannelState, ImChannelView, ImLoginPoll } from '../../../shared/contracts';
 import {
   configureImChannel,
   forgetImChannel,
+  pollImLogin,
   startImChannel,
+  startImLogin,
   stopImChannel,
 } from '../../lib/alignment-api';
 import { imChannelMeta, useImChannelStore } from '../../stores/imChannelStore';
+import { getActiveWorkspaceId } from '../../store/workspaceStore';
 
 // ── 状态展示 ────────────────────────────────────────────────────────
 
 const STATE_META: Record<ImChannelState, { label: string; fg: string; bg: string }> = {
-  not_configured: { label: '未绑定', fg: '#6B7280', bg: '#F3F4F6' },
-  idle: { label: '待启动', fg: '#6B7280', bg: '#F3F4F6' },
-  connecting: { label: '连接中', fg: '#B45309', bg: '#FEF3C7' },
-  connected: { label: '已连接', fg: '#047857', bg: '#D1FAE5' },
-  reconnecting: { label: '重连中', fg: '#B45309', bg: '#FEF3C7' },
-  failed: { label: '连接失败', fg: '#B91C1C', bg: '#FEE2E2' },
-  stopped: { label: '已停止', fg: '#4B5563', bg: '#EEF0F2' },
+  not_configured: { label: '未绑定', fg: 'var(--tt-text-3)', bg: 'var(--tt-chip-neutral)' },
+  idle: { label: '待启动', fg: 'var(--tt-text-3)', bg: 'var(--tt-chip-neutral)' },
+  connecting: { label: '连接中', fg: 'var(--tt-warning)', bg: 'var(--tt-chip-warning)' },
+  connected: { label: '已连接', fg: 'var(--tt-success)', bg: 'var(--tt-chip-success)' },
+  reconnecting: { label: '重连中', fg: 'var(--tt-warning)', bg: 'var(--tt-chip-warning)' },
+  failed: { label: '连接失败', fg: 'var(--tt-danger)', bg: 'var(--tt-chip-danger)' },
+  stopped: { label: '已停止', fg: 'var(--tt-text-2)', bg: 'var(--tt-border-soft)' },
 };
 
 /** 通道图标按 kind 上色；引擎新增通道时落到中性图标，不需要前端同步改表 */
@@ -66,6 +71,7 @@ const ICONS: Record<string, { icon: React.ElementType; bg: string }> = {
   lark: { icon: SendIcon, bg: '#00B578' },
   wechat: { icon: ChatBubbleIcon, bg: '#07C160' },
   wecom: { icon: ForumIcon, bg: '#2B7FFF' },
+  yuanbao: { icon: SmartToyIcon, bg: '#0EA5E9' },
   slack: { icon: HubIcon, bg: '#611F69' },
 };
 
@@ -91,23 +97,45 @@ const ACCOUNT_LABELS: Record<string, string> = {
   subscribeEvent: '订阅事件',
   connectionId: '连接标识（脱敏）',
   pingIntervalSeconds: '保活间隔秒',
+  directMessageOnly: '仅单聊',
+  protocol: '接入协议',
+  tokenSource: '令牌来源',
 };
 
 const timeOfText = (ms: number) =>
   new Date(ms).toLocaleString('zh-CN', { hour12: false }).replace(/\//g, '-');
 
+/** 扫码登录弹窗的本地状态；二维码内容只存在内存里，关掉弹窗就丢 */
+interface QrLoginState {
+  kind: string;
+  label: string;
+  ticket: string;
+  content: string;
+  status: string;
+  message: string;
+  needVerifyCode: boolean;
+}
+
 // ── 页面组件 ──────────────────────────────────────────────────────
 
 const IMChannel: React.FC = () => {
-  const { channels, sessions, loading, loaded, error, loadSessions } = useImChannelStore(
-    useShallow((s) => ({
-      channels: s.channels,
-      sessions: s.channelSessions,
-      loading: s.loading,
-      loaded: s.loaded,
-      error: s.error,
-      loadSessions: s.loadSessions,
-    })),
+  const { channels, sessions, loading, loaded, error, loadSessions: loadSessionsRaw } =
+    useImChannelStore(
+      useShallow((s) => ({
+        channels: s.channels,
+        sessions: s.channelSessions,
+        loading: s.loading,
+        loaded: s.loaded,
+        error: s.error,
+        loadSessions: s.loadSessions,
+      })),
+    );
+
+  // IM 数据只能由引擎进程提供，而引擎默认等到首次提交任务才拉起：
+  // 直接打开本页时先确保当前工作空间的引擎在跑，否则页面只剩「引擎未运行」。
+  const loadSessions = useCallback(
+    () => loadSessionsRaw(getActiveWorkspaceId()),
+    [loadSessionsRaw],
   );
 
   const [openKind, setOpenKind] = useState<string | null>(null);
@@ -115,10 +143,111 @@ const IMChannel: React.FC = () => {
   const [savingError, setSavingError] = useState('');
   const [busyKind, setBusyKind] = useState('');
   const [toast, setToast] = useState<{ text: string; severity: 'success' | 'info' } | null>(null);
+  const [qr, setQr] = useState<QrLoginState | null>(null);
+  const [verifyCode, setVerifyCode] = useState('');
+  const verifyRef = useRef('');
+  const pollTimer = useRef<number | null>(null);
+  const pollRef = useRef<(kind: string, ticket: string) => void>(() => undefined);
 
   useEffect(() => {
     void loadSessions();
   }, [loadSessions]);
+
+  const stopPolling = useCallback(() => {
+    if (pollTimer.current !== null) {
+      window.clearTimeout(pollTimer.current);
+      pollTimer.current = null;
+    }
+  }, []);
+
+  // 扫码状态只能问引擎（引擎持有二维码票据与服务端会话），前端不猜「扫没扫到」
+  const pollQr = useCallback(
+    async (kind: string, ticket: string) => {
+      try {
+        const res: ImLoginPoll = await pollImLogin(kind, ticket, verifyRef.current);
+        if (res.status === 'confirmed') {
+          stopPolling();
+          setQr(null);
+          setVerifyCode('');
+          verifyRef.current = '';
+          await loadSessions();
+          setToast({ text: '已扫码绑定并连接', severity: 'success' });
+          return;
+        }
+        const message =
+          res.needVerifyCode && verifyRef.current
+            ? '数字不正确，请重新输入手机微信显示的数字'
+            : res.message;
+        setQr((prev) =>
+          prev && prev.ticket === ticket
+            ? { ...prev, status: res.status, message, needVerifyCode: Boolean(res.needVerifyCode) }
+            : prev,
+        );
+        // 需要配对码时停下等用户输入；继续空轮询只会把同一个状态再问一遍
+        if (res.needVerifyCode || ['expired', 'verify_code_blocked', 'binded_redirect'].includes(res.status)) {
+          stopPolling();
+          return;
+        }
+        pollTimer.current = window.setTimeout(() => pollRef.current(kind, ticket), 1200);
+      } catch (err) {
+        stopPolling();
+        setQr((prev) =>
+          prev && prev.ticket === ticket
+            ? { ...prev, status: 'failed', message: errorTextOf(err, '扫码状态查询失败') }
+            : prev,
+        );
+      }
+    },
+    [loadSessions, stopPolling],
+  );
+
+  useEffect(() => {
+    pollRef.current = (kind, ticket) => {
+      void pollQr(kind, ticket);
+    };
+    return () => {
+      stopPolling();
+    };
+  }, [pollQr, stopPolling]);
+
+  const beginLogin = async (c: ImChannelView) => {
+    setBusyKind(c.kind);
+    setSavingError('');
+    try {
+      const res = await startImLogin(c.kind);
+      setVerifyCode('');
+      verifyRef.current = '';
+      setQr({
+        kind: c.kind,
+        label: c.label,
+        ticket: res.ticket,
+        content: res.qrContent,
+        status: 'wait',
+        message: '等待扫码',
+        needVerifyCode: false,
+      });
+      stopPolling();
+      void pollQr(c.kind, res.ticket);
+    } catch (err) {
+      setToast({ text: errorTextOf(err, '生成二维码失败'), severity: 'info' });
+    } finally {
+      setBusyKind('');
+    }
+  };
+
+  const submitVerifyCode = () => {
+    if (!qr) return;
+    verifyRef.current = verifyCode.trim();
+    stopPolling();
+    void pollQr(qr.kind, qr.ticket);
+  };
+
+  const closeQr = () => {
+    stopPolling();
+    setQr(null);
+    setVerifyCode('');
+    verifyRef.current = '';
+  };
 
   // 数据刷新由常驻的侧边栏统一负责（见 components/Layout/Sidebar.tsx）：
   // 引擎持有长连接但不向界面推送事件，两处各自轮询会变成每 4s 问两遍同一个接口。
@@ -194,10 +323,11 @@ const IMChannel: React.FC = () => {
       </Typography>
 
       <Alert severity="info" sx={{ mb: 2, fontSize: '12.5px', alignItems: 'flex-start' }}>
-        Slack / 钉钉 / 企业微信 / 飞书的协议实现只在本地假服务端做过双向对拍，
-        尚未用真实企业凭据做端到端验证；真实服务端是否可用，以绑定后引擎返回的状态为准。
+        Slack / 钉钉 / 企业微信 / 飞书 / 个人微信 / 腾讯元宝 的协议实现只在本地假服务端做过双向对拍，
+        尚未用真实凭据做端到端验证；真实服务端是否可用，以绑定后引擎返回的状态为准。
         飞书首次绑定要等官方 SDK 冷启动，可能需要 8~33 秒，期间停在「连接中」属正常现象。
-        个人微信没有可用的官方机器人长连接，保持未接入（不使用非官方协议）。
+        个人微信走腾讯官方 iLink 机器人协议（手机扫码授权），只支持单聊、机器人不能主动发起会话，
+        用户 24 小时没说话后回贴窗口失效；不使用任何非官方微信协议。
       </Alert>
 
       <Box sx={{ display: 'flex', justifyContent: 'flex-end', mb: 1.5 }}>
@@ -226,7 +356,13 @@ const IMChannel: React.FC = () => {
         </Alert>
       )}
 
-      {!engineDown && loaded && channels.length === 0 && (
+      {loading && channels.length === 0 && (
+        <Alert severity="info" sx={{ mb: 2, fontSize: '13px' }}>
+          正在读取频道状态；首次打开会先拉起本地引擎，可能需要几秒。
+        </Alert>
+      )}
+
+      {!loading && !engineDown && loaded && channels.length === 0 && (
         <Alert severity="info" sx={{ mb: 2, fontSize: '13px' }}>
           引擎当前没有注册任何 IM 通道。
         </Alert>
@@ -247,7 +383,7 @@ const IMChannel: React.FC = () => {
                 display: 'flex',
                 alignItems: 'flex-start',
                 gap: 2,
-                border: '1px solid var(--tt-border-soft, #EEF0F2)',
+                border: '1px solid var(--tt-border-soft, var(--tt-border))',
                 borderRadius: '14px',
                 p: 2,
                 background: 'var(--tt-surface, #FFFFFF)',
@@ -279,7 +415,7 @@ const IMChannel: React.FC = () => {
                       height: 20,
                       fontSize: '11.5px',
                       fontWeight: 600,
-                      color: c.supported ? state.fg : '#6B7280',
+                      color: c.supported ? state.fg : 'var(--tt-text-3)',
                       background: c.supported ? state.bg : 'var(--tt-bg, #F3F4F6)',
                     }}
                   />
@@ -318,7 +454,7 @@ const IMChannel: React.FC = () => {
                 )}
 
                 {c.lastError && (
-                  <Typography sx={{ fontSize: '12px', color: '#B91C1C', mt: 0.75 }}>
+                  <Typography sx={{ fontSize: '12px', color: 'var(--tt-danger)', mt: 0.75 }}>
                     最近错误：{errorTextOf(`${c.lastError.code}: ${c.lastError.detail}`, c.lastError.code)}
                     （{timeOfText(c.lastError.atMs)}）
                   </Typography>
@@ -367,17 +503,26 @@ const IMChannel: React.FC = () => {
                       size="small"
                       variant="contained"
                       disableElevation
-                      onClick={() => beginConfigure(c)}
+                      disabled={busy}
+                      onClick={() => (c.loginMode === 'qr' ? void beginLogin(c) : beginConfigure(c))}
                       sx={{
                         textTransform: 'none',
                         fontSize: '13px',
                         fontWeight: 600,
                         borderRadius: '10px',
-                        bgcolor: '#111827',
-                        '&:hover': { bgcolor: '#4F46E5' },
+                        bgcolor: 'var(--tt-cta-fill)',
+                        '&:hover': { bgcolor: 'var(--tt-cta-fill-hover)' },
                       }}
                     >
-                      {c.configured ? '改凭据' : '配置凭据'}
+                      {busy
+                        ? '处理中'
+                        : c.loginMode === 'qr'
+                          ? c.configured
+                            ? '重新扫码'
+                            : '扫码绑定'
+                          : c.configured
+                            ? '改凭据'
+                            : '配置凭据'}
                     </Button>
                     {c.configured && (
                       <Button
@@ -408,7 +553,7 @@ const IMChannel: React.FC = () => {
             还没有来自 IM 的消息。绑定并连上频道后，从会话里 @机器人即可触发任务。
           </Typography>
         ) : (
-          <Box sx={{ border: '1px solid var(--tt-border-soft, #EEF0F2)', borderRadius: '14px', overflow: 'hidden' }}>
+          <Box sx={{ border: '1px solid var(--tt-border-soft, var(--tt-border))', borderRadius: '14px', overflow: 'hidden' }}>
             {sessions.map((s, i) => {
               const meta = imChannelMeta(s.source, channels.find((c) => c.kind === s.source)?.label);
               return (
@@ -448,6 +593,119 @@ const IMChannel: React.FC = () => {
         )}
       </Box>
 
+      {/* 扫码绑定：二维码内容由引擎生成，前端只负责画出来；bot_token 从不经过界面 */}
+      {qr && (
+        <Dialog
+          open
+          onClose={closeQr}
+          PaperProps={{ sx: { width: 400, borderRadius: '16px', p: 1, position: 'relative' } }}
+        >
+          <IconButton
+            aria-label="close"
+            onClick={closeQr}
+            sx={{ position: 'absolute', right: 10, top: 10, color: 'var(--tt-text-4)', zIndex: 1 }}
+          >
+            <CloseIcon sx={{ fontSize: 18 }} />
+          </IconButton>
+          <DialogTitle sx={{ pb: 0.5 }}>
+            <Typography sx={{ fontSize: '16px', fontWeight: 700, color: 'var(--tt-text-1)' }}>
+              扫码绑定 {qr.label}
+            </Typography>
+            <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-3, #6B7280)', mt: 0.5, lineHeight: 1.7 }}>
+              用手机微信扫码并按提示确认。二维码只在本地引擎内存里生成，关闭弹窗即失效；
+              确认后登录凭据由引擎直接落盘（0600），界面不显示也不回传。
+            </Typography>
+          </DialogTitle>
+          <DialogContent sx={{ pt: '12px !important' }}>
+            {qr.status === 'failed' || qr.status === 'expired' || qr.status === 'verify_code_blocked' || qr.status === 'binded_redirect' ? (
+              <Alert
+                severity={qr.status === 'failed' || qr.status === 'verify_code_blocked' ? 'error' : 'warning'}
+                sx={{ fontSize: '12.5px', alignItems: 'flex-start', mb: 1 }}
+              >
+                {qr.message}
+              </Alert>
+            ) : (
+              <Box sx={{ display: 'flex', justifyContent: 'center', my: 1 }}>
+                <Box
+                  sx={{
+                    p: 1.5,
+                    // 亮色孤岛：二维码必须固定白底，深色皮肤下也要能被扫码器识别
+                    bgcolor: '#FFFFFF',
+                    border: '1px solid var(--tt-border, #E5E7EB)',
+                    borderRadius: '12px',
+                  }}
+                >
+                  <QRCodeSVG value={qr.content} size={200} level="M" />
+                </Box>
+              </Box>
+            )}
+
+            <Typography
+              sx={{
+                fontSize: '13px',
+                textAlign: 'center',
+                color: qr.status === 'scaned' || qr.status === 'need_verifycode' ? 'var(--tt-warning)' : 'var(--tt-text-2)',
+              }}
+            >
+              {qr.message}
+            </Typography>
+
+            {qr.needVerifyCode && (
+              <Box sx={{ display: 'flex', gap: 1, mt: 2 }}>
+                <TextField
+                  size="small"
+                  fullWidth
+                  autoFocus
+                  value={verifyCode}
+                  onChange={(e) => setVerifyCode(e.target.value.replace(/\D/g, ''))}
+                  placeholder="手机微信上显示的数字"
+                  sx={{ '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
+                />
+                <Button
+                  variant="contained"
+                  disableElevation
+                  disabled={!verifyCode.trim()}
+                  onClick={submitVerifyCode}
+                  sx={{
+                    bgcolor: 'var(--tt-cta-fill)',
+                    borderRadius: '10px',
+                    textTransform: 'none',
+                    fontSize: '13px',
+                    fontWeight: 600,
+                    '&:hover': { bgcolor: 'var(--tt-cta-fill-hover)' },
+                  }}
+                >
+                  提交
+                </Button>
+              </Box>
+            )}
+
+            <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1, mt: 2, mb: 1 }}>
+              {['expired', 'verify_code_blocked', 'failed', 'binded_redirect'].includes(qr.status) && (
+                <Button
+                  variant="outlined"
+                  size="small"
+                  disabled={busyKind === qr.kind}
+                  onClick={() => {
+                    const target = channels.find((c) => c.kind === qr.kind);
+                    if (target) void beginLogin(target);
+                  }}
+                  sx={{ textTransform: 'none', fontSize: '13px', borderColor: 'var(--tt-border, #E5E7EB)' }}
+                >
+                  重新生成
+                </Button>
+              )}
+              <Button
+                onClick={closeQr}
+                sx={{ textTransform: 'none', fontSize: '13px', color: 'var(--tt-text-2, #4B5563)' }}
+              >
+                关闭
+              </Button>
+            </Box>
+          </DialogContent>
+        </Dialog>
+      )}
+
       {/* 凭据弹窗：字段清单由引擎下发，界面不写死「哪个 IM 要什么」 */}
       {openChannel && (
         <Dialog
@@ -458,7 +716,7 @@ const IMChannel: React.FC = () => {
           <IconButton
             aria-label="close"
             onClick={() => setOpenKind(null)}
-            sx={{ position: 'absolute', right: 10, top: 10, color: '#9CA3AF', zIndex: 1 }}
+            sx={{ position: 'absolute', right: 10, top: 10, color: 'var(--tt-text-4)', zIndex: 1 }}
           >
             <CloseIcon sx={{ fontSize: 18 }} />
           </IconButton>
@@ -484,7 +742,7 @@ const IMChannel: React.FC = () => {
               <Box key={f.key} sx={{ mb: 2 }}>
                 <Typography sx={{ fontSize: '12.5px', fontWeight: 600, mb: 0.75 }}>
                   {f.label}
-                  {f.required && <Box component="span" sx={{ color: '#EF4444' }}> *</Box>}
+                  {f.required && <Box component="span" sx={{ color: 'var(--tt-danger)' }}> *</Box>}
                   {f.present && (
                     <Box component="span" sx={{ color: 'var(--tt-text-3, #9CA3AF)', fontWeight: 400, ml: 1 }}>
                       已登记
@@ -534,13 +792,13 @@ const IMChannel: React.FC = () => {
                 disabled={busyKind === openChannel.kind}
                 onClick={() => void submitConfigure()}
                 sx={{
-                  bgcolor: '#111827',
+                  bgcolor: 'var(--tt-cta-fill)',
                   borderRadius: '10px',
                   textTransform: 'none',
                   fontSize: '13px',
                   fontWeight: 700,
                   px: 3,
-                  '&:hover': { bgcolor: '#4F46E5' },
+                  '&:hover': { bgcolor: 'var(--tt-cta-fill-hover)' },
                 }}
               >
                 {busyKind === openChannel.kind ? '校验中…' : '校验并绑定'}

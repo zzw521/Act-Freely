@@ -110,7 +110,7 @@ describe('浏览器直连提交链路', () => {
     const src = workbenchStore();
     // 三条提交路径：新任务、重新生成、改写提问后重跑
     expect(src.split('piiOutboundMode: settings?.piiOutboundMode,').length).toBe(4);
-    const regen = src.split('regenerateTurn: async (')[1].split('resumeTask: async (')[0];
+    const regen = src.split('regenerateTurn: async (')[1].split('resumeTaskFromStep: async (')[0];
     expect(regen).toContain('const settings = await getSettings()');
     expect(regen).toContain('piiOutboundMode: settings?.piiOutboundMode,');
   });

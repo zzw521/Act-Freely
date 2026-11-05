@@ -699,6 +699,21 @@ async fn stdio_handshake(job: ProbeTarget) -> Result<Vec<ToolRow>, String> {
     use tokio::io::AsyncBufReadExt;
 
     let (program, args) = spawn_plan(&job.command, &job.args);
+    // Windows 下经 cmd /C 启动 .cmd 时，& | < > ^ % 会被 cmd 二次解释：
+    // 参数里的 `& calc` 会变成第二条命令。命令本身来自用户配置，但 MCP 配置
+    // 也可能随连接器导入，不能把 shell 注入面留给它。
+    if program == "cmd" {
+        // args = ["/C", 命令本体, ...参数]：跳过 /C，检查其余每一段
+        let parts = args.iter().map(String::as_str).skip(1);
+        if let Some(bad) = parts
+            .filter(|part| part.chars().any(|c| matches!(c, '&' | '|' | '<' | '>' | '^' | '%' | '\n' | '\r')))
+            .next()
+        {
+            return Err(format!(
+                "MCP_INVALID_COMMAND: Windows 启动命令或参数含 shell 解释字符（& | < > ^ %）：{bad}"
+            ));
+        }
+    }
     // 系统隔离开启时，探测进程与真实会话走同一个启动器；套壳失败直接拒绝，不静默降级
     let keep_env: Vec<String> = job.env.keys().cloned().collect();
     let (program, args) = match crate::sandbox::wrap_for_spawn(&program, &args, &keep_env)

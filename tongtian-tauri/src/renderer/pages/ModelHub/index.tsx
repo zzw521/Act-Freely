@@ -54,6 +54,7 @@ import { ModelConfig, ModelSource, ModelTestReq, ModelTestResp } from '../../../
 import { errorTextOf } from '../../../shared/error-messages';
 import api from '../../lib/api';
 import { useShallow } from 'zustand/react/shallow';
+import { useI18n } from '../../i18n';
 
 /** shared ModelConfig → store 展示模型映射 */
 function toStoreModel(m: ModelConfig): StoreModelConfig {
@@ -71,6 +72,7 @@ function toStoreModel(m: ModelConfig): StoreModelConfig {
 
 const ModelHub: React.FC = () => {
   const theme = useTheme();
+  const { t: tr } = useI18n();
   const [searchQuery, setSearchQuery] = useState('');
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingModel, setEditingModel] = useState<Partial<ModelConfig> | undefined>();
@@ -128,7 +130,7 @@ const ModelHub: React.FC = () => {
       setRawModels(list);
       setModels(list.map(toStoreModel));
     } catch (err) {
-      setError(`加载模型列表失败: ${err}`);
+      setError(`加载模型列表失败: ${errorTextOf(err, '原因未知')}`);
     }
   };
 
@@ -217,7 +219,7 @@ const ModelHub: React.FC = () => {
       removeModel(id);
       setRawModels((prev) => prev.filter((m) => m.id !== id));
     } catch (err) {
-      setError(`删除模型失败: ${err}`);
+      setError(`删除模型失败: ${errorTextOf(err, '原因未知')}`);
     }
   };
 
@@ -296,18 +298,24 @@ const ModelHub: React.FC = () => {
             <Chip
               label="今日"
               clickable
+              aria-label={tr('统计周期：今日')}
+              aria-pressed={period === 'daily'}
               color={period === 'daily' ? 'primary' : 'default'}
               onClick={() => setPeriod('daily')}
             />
             <Chip
               label="本月"
               clickable
+              aria-label={tr('统计周期：本月')}
+              aria-pressed={period === 'monthly'}
               color={period === 'monthly' ? 'primary' : 'default'}
               onClick={() => setPeriod('monthly')}
             />
             <Chip
               label="总计"
               clickable
+              aria-label={tr('统计周期：总计')}
+              aria-pressed={period === 'total'}
               color={period === 'total' ? 'primary' : 'default'}
               onClick={() => setPeriod('total')}
             />
@@ -401,12 +409,12 @@ const ModelHub: React.FC = () => {
                     </Button>
                     <Box sx={{ flex: 1 }} />
                     <Tooltip title="编辑">
-                      <IconButton size="small" onClick={() => handleEdit(model)}>
+                      <IconButton size="small" aria-label={tr('编辑模型：{name}', { name: model.name })} onClick={() => handleEdit(model)}>
                         <EditIcon />
                       </IconButton>
                     </Tooltip>
                     <Tooltip title="删除">
-                      <IconButton size="small" color="error" onClick={() => handleDelete(model.id)}>
+                      <IconButton size="small" color="error" aria-label={tr('删除模型：{name}', { name: model.name })} onClick={() => handleDelete(model.id)}>
                         <DeleteIcon />
                       </IconButton>
                     </Tooltip>
@@ -453,6 +461,7 @@ const ModelHub: React.FC = () => {
       <Dialog
         open={dialogOpen}
         onClose={() => setDialogOpen(false)}
+        aria-labelledby="tt-model-form-title"
         maxWidth="md"
         fullWidth
         PaperProps={{ sx: { borderRadius: '16px' } }}

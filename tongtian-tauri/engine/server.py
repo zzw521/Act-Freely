@@ -42,8 +42,9 @@ import traceback
 import uuid
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
+import urllib.request as urlreq
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -58,8 +59,12 @@ import slack_channel  # noqa: E402,F401  （导入即注册 Slack Socket Mode �
 import dingtalk_channel  # noqa: E402,F401  （导入即注册钉钉 Stream 通道，协议取自官方 SDK）
 import wecom_channel  # noqa: E402,F401  （导入即注册企业微信智能机器人通道，协议取自官方 aibot SDK）
 import feishu_channel  # noqa: E402,F401  （导入即注册飞书通道：模块只探测 lark_oapi 在不在，真正加载推迟到绑定/启动）
+import wechat_channel  # noqa: E402,F401  （导入即注册个人微信通道：官方 iLink 协议，长轮询 HTTP）
+import yuanbao_channel  # noqa: E402,F401  （导入即注册腾讯元宝通道：官方 WS + protobuf）
 import runtime_context as rc  # noqa: E402  （执行面 P0：意识/技能/附件 → 模型上下文）
 import mcp_runtime as mr  # noqa: E402  （执行面 P0：连接器工具 → Toolkit）
+import mcp_session_runtime as msr  # noqa: E402  （D-40 第 5 项：连接器跨轮常驻连接）
+import memory_tools as mt  # noqa: E402  （D-35：长期记忆检索/读取/写入工具，桌面通道才注册）
 import context_budget as cb  # noqa: E402  （P1 上下文效率：迭代上限 + 压缩阈值）
 import tool_search as tsr  # noqa: E402  （P1 工具效率：MCP 工具按需搜索载入）
 import hooks_runtime as hr  # noqa: E402  （执行面 P0：Hooks 事件 → 本机网关执行）
@@ -67,6 +72,7 @@ import sandbox_runtime as sr  # noqa: E402  （执行面 P1：沙箱策略 → �
 import subagent_runtime as sar  # noqa: E402  （多 Agent 第一层：本地子 Agent 派发与结果汇总）
 import checkpoint_runtime as ckpt  # noqa: E402  （任务检查点：模型调用前快照 + 副作用幂等台账）
 import tool_grants as tg  # noqa: E402  （执行面 P1：受控命令执行/联网获取，默认不注册）
+import extension_decls as exd  # noqa: E402  （D-08：扩展声明了什么能力 ⇒ 现在能不能用，一份可核对的清单）
 import web_search as ws  # noqa: E402  （联网搜索：受同一份联网授权约束，默认不注册）
 import computer_use as cu  # noqa: E402  （执行面 P1/P2：Windows 电脑操控，仅桌面壳可执行）
 import browser_use as bu  # noqa: E402  （执行面 P2：受控浏览器会话，CDP 操作由桌面壳放行）
@@ -76,6 +82,25 @@ import tool_approval as tap  # noqa: E402  （逐工具审批：副作用工具�
 import expert_runtime as er  # noqa: E402  （专家团队：负责人提示词、每专家模型与子 Agent 路由）
 import terminal_runtime as trm  # noqa: E402  （终端 AI+：真实 shell 会话 + 命令建议）
 import acp_client as acpm  # noqa: E402  （ACP 客户端：把编码子任务委派给外部 Agent，默认不注册）
+import data_paths as dp  # noqa: E402  （D-43：引擎数据根与数据文件路径的唯一解析处）
+import usage_store as us  # noqa: E402  （D-43：用量台账落盘 + 调用来源标记，合并视图靠它去重）
+import gateway_token as gwt  # noqa: E402  （M1.3 网关模式：access token → 短期网关令牌，仅存内存）
+import ticket_model_channel as tmc  # noqa: E402  （D-48.7：工单执行体的模型通道，路由只取它的用量口径）
+import ticket_worker_service as tws  # noqa: E402  （D-48.7：工单执行体的进程内装配 + 端点面，路由只做薄包装）
+import ticket_worker_adapter as twa  # noqa: E402  （D-48.4b：主会话读取件复用执行体的分页预算常量与夹取口径，数字只有一份来源）
+import artifact_history_runtime as ahr  # noqa: E402  （D-26：产物版本历史；主会话写盘前经它留一版可回滚的旧内容）
+import write_staging_runtime as wsr  # noqa: E402  （D-03.5：文件写入先落暂存区，用户在界面看过 diff 批准后才合并）
+import crash_runtime as crt  # noqa: E402  （D-28 后半：崩溃现场本地留存——引擎的 stdout/stderr 被桌面壳丢掉了，现场必须落盘）
+import telemetry_runtime as tlm  # noqa: E402  （D-28 前半：可选遥测，默认关、开启要确认词、字段白名单、看得见将发送什么）
+import routes_lanes as rln  # noqa: E402  （#164 接缝：各窗口的引擎端点写 routes_<domain>.py，不再打开本文件）
+import routes_knowledge  # noqa: E402  （W2：知识库/技能/产物历史）
+import routes_artifact  # noqa: E402  （W4：产物与发布）
+import routes_workspace  # noqa: E402  （W3：工作区后端/快照/存储）
+import routes_exec  # noqa: E402  （W4：执行面/沙箱/写暂存）
+import routes_connect  # noqa: E402  （W5：MCP/IM/定时/浏览器）
+import routes_orchestrate  # noqa: E402  （W6：团队/编排/成员检查点）
+import routes_voice  # noqa: E402  （W7：语音链路）
+import toolkit_lanes as tl  # noqa: E402  （#164 接缝：模式作用域工具的条件注册集中声明处）
 
 # ── .env 加载（项目根目录，无第三方依赖） ──────────────────────
 
@@ -105,6 +130,12 @@ WORK_DIR = Path(".")
 REPLAY_WINDOW_SECONDS = 10 * 60   # 重放窗口时间上限（≥10min）
 REPLAY_WINDOW_MAX_EVENTS = 2048   # 重放窗口条数上限（drop-oldest）
 KEEPALIVE_INTERVAL_SECONDS = 15   # SSE 心跳注释行间隔
+MAX_IN_MEMORY_SESSIONS = 500      # 进程内会话上限；超出时淘汰已结束的旧会话
+
+# 连接器跨轮常驻连接枢纽（D-40 第 5 项）：同一 task_id 的多轮共用同一批客户端，
+# 会话被淘汰或引擎关停时才收进程。绑定事件循环在 lifespan 里 start() 时完成，
+# 在那之前（或跑在别的循环上）attach 会如实降级成本轮自建的一次性连接。
+MCP_HUB = msr.McpSessionHub()
 
 
 class TaskSession:
@@ -118,6 +149,9 @@ class TaskSession:
         self.window: deque = deque(maxlen=REPLAY_WINDOW_MAX_EVENTS)
         self.agent_task: asyncio.Task | None = None
         self.cancelled = False
+        # 取消的成因码（USER_CANCELLED / BUDGET_TASK_EXCEEDED）：Rust 的引擎拦停与用户
+        # 点「停止」以前都只发 task_id，落到引擎侧同一条路，界面分不清是谁停的（D-14.5）。
+        self.cancel_reason = ""
         # ── 两阶段协议（plan → review → execute） ──
         self.goal: str = ""
         self.plan: list | None = None
@@ -129,6 +163,9 @@ class TaskSession:
         self.model_binding: str | None = None
         # 本任务工作目录（前端选择的工作目录，approve 重新执行时沿用）
         self.work_dir: Path | None = None
+        # 文件访问档位（ask_every_time/auto_approve/full_access）：与 work_dir 配套，
+        # 决定这一轮能不能越出绑定目录写文件、能不能删文件；approve 重跑沿用
+        self.file_permission: str = ""
         # 安全工作环境开关（true 且未自选工作目录时，任务落在 environment/{taskId} 隔离目录）
         self.secure_env: bool = False
         # 隐私模式（Rust 随提交下发）：跳过会话目录 / conversation.md / 自动记忆，
@@ -152,6 +189,9 @@ class TaskSession:
         self.attachments: list = []
         # 任务检查点（进程内）：记忆快照 + 副作用台账；新任务在 /api/chat 重置
         self.checkpoint = ckpt.TaskCheckpoint(task_id)
+        # 服务化归属（D-02 组织隔离）：首建时按 JWT 主体盖章，桌面/无令牌为 None
+        self.owner_sub: str | None = None
+        self.owner_org: str = ""
 
     def next_seq(self) -> int:
         self.seq += 1
@@ -171,10 +211,39 @@ class TaskSession:
 # 任务会话注册表（进程内；引擎重启后由检查点磁盘文件恢复可续跑任务）
 _TASK_SESSIONS: dict[str, TaskSession] = {}
 
+# SSE 响应头：/api/chat 与 /api/chat/review 都要用。放在模块级是因为
+# 审阅/续跑曾经是 chat_submit 的局部变量，浏览器直连引擎时四条审阅动作全部 NameError 500。
+SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+def _evict_finished_sessions() -> None:
+    """会话表超上限时淘汰已结束的旧会话（磁盘检查点不受影响）。
+
+    只淘汰 agent_task 已结束或已取消的会话：待审阅的计划会话仍需留在内存里，
+    否则用户点「批准」时会退化成重新生成计划。
+    """
+    overflow = len(_TASK_SESSIONS) - MAX_IN_MEMORY_SESSIONS
+    if overflow <= 0:
+        return
+    candidates = sorted(
+        (
+            (session.created_at, tid)
+            for tid, session in _TASK_SESSIONS.items()
+            if session.cancelled
+            or (session.agent_task is not None and session.agent_task.done())
+        ),
+        key=lambda item: item[0],
+    )
+    for _created, tid in candidates[:overflow]:
+        # 会话出内存 = 它的常驻连接器也该收摊，否则子进程跟着会话数一起涨
+        MCP_HUB.schedule_session_drop(tid)
+        _TASK_SESSIONS.pop(tid, None)
+
 
 def _get_or_create_session(task_id: str) -> TaskSession:
     session = _TASK_SESSIONS.get(task_id)
     if session is None:
+        _evict_finished_sessions()
         session = TaskSession(task_id)
         _TASK_SESSIONS[task_id] = session
     return session
@@ -273,6 +342,8 @@ def _checkpoint_context(session: TaskSession) -> dict:
         "runtime": _runtime_for_disk(session.runtime),
         "attachments": session.attachments,
         "sessionDir": str(session.session_dir) if session.session_dir else "",
+        "ownerSub": session.owner_sub or "",
+        "ownerOrg": session.owner_org or "",
         "attachmentsMediaOmitted": 0,
     }
 
@@ -326,9 +397,28 @@ def _checkpoint_public(session: TaskSession) -> dict:
     return info
 
 
-def _apply_resume_overrides(session: TaskSession, payload: dict) -> None:
+SERVICE_FORBIDDEN_RUNTIME_KEYS = ("mcp", "mcpServers")
+
+
+def _runtime_guard_error(runtime_raw) -> str | None:
+    """服务化模式禁止客户端下发 MCP 服务器配置。
+
+    stdio MCP 会在引擎主机上按客户端给的命令启动子进程；JWT/静态令牌子账号
+    若能任意下发，等于拿到宿主机执行面。桌面壳（本机令牌，principal=None）
+    不受影响——那里的 MCP 配置本来就是用户本机自己的。
+    """
+    if current_principal() is None or not isinstance(runtime_raw, dict):
+        return None
+    for key in SERVICE_FORBIDDEN_RUNTIME_KEYS:
+        if runtime_raw.get(key):
+            return "服务化模式不允许客户端下发 MCP 服务器配置（会启动服务器进程）"
+    return None
+
+
+def _apply_resume_overrides(session: TaskSession, payload: dict) -> str | None:
     """Rust 在 resume 时重新下发模型配置与 runtime（磁盘里不存密钥）。
-    浏览器直连没有这两项：模型配置已在 _restore_session_from_disk 里按 modelId 解析。"""
+    浏览器直连没有这两项：模型配置已在 _restore_session_from_disk 里按 modelId 解析。
+    返回错误文案表示该 runtime 不被当前调用主体接受。"""
     model_config_raw = payload.get("modelConfig")
     if isinstance(model_config_raw, dict) and model_config_raw:
         model_config = dict(model_config_raw)
@@ -339,9 +429,13 @@ def _apply_resume_overrides(session: TaskSession, payload: dict) -> None:
         session.model_config = model_config
     runtime_raw = payload.get("runtime")
     if isinstance(runtime_raw, dict) and runtime_raw:
+        guard = _runtime_guard_error(runtime_raw)
+        if guard:
+            return guard
         session.runtime = runtime_raw
     if payload.get("expertId") is not None:
         session.expert_id = str(payload.get("expertId") or "").strip() or None
+    return None
 
 
 def _restore_session_from_disk(
@@ -396,6 +490,10 @@ def _restore_session_from_disk(
         session_dir = Path(session_dir_raw)
         session.session_dir = session_dir if session_dir.is_dir() else None
 
+    # 服务化归属（D-02）：恢复后仍按原 owner 隔离，跨用户 resume 会被拒
+    session.owner_sub = str(context.get("ownerSub") or "").strip() or None
+    session.owner_org = str(context.get("ownerOrg") or "").strip()
+
     # 模型配置：Rust 会在 resume 里重新下发；浏览器直连按 modelId 在 models.json 找回
     model_config_raw = payload.get("modelConfig")
     if isinstance(model_config_raw, dict) and model_config_raw:
@@ -423,8 +521,10 @@ def _restore_session_from_disk(
 
 # ── 模型用量台账（真实 token 采集） ────────────────────────────
 #
-# 权威持久化在 Rust 侧 model_usage 表（按 usage 事件记账，见 bridge/agent.rs）；
-# 本台账服务于浏览器直连模式（无 Rust）与计划阶段用量展示，进程重启即清零。
+# 桌面通道另有 Rust 侧 `model_usage` 表（按 usage 事件记账，见 bridge/agent.rs）；
+# 本台账覆盖所有进入模型层的调用（浏览器直连、IM、CLI、定时任务、桌面通道），
+# 并按「来源 × 用户 × 模型 × 日」追加落盘，引擎重启后重放恢复（D-43），
+# 因此配额硬停与上报服务端都有连续依据，不再是一次性内存值。
 
 # 当前请求的调用主体（JWT 模式为账号 uid；桌面/无令牌模式为 None）。
 # 模型调用链较深，用 contextvar 传递，避免把 principal 穿过每一层函数。
@@ -432,9 +532,115 @@ _CURRENT_PRINCIPAL: contextvars.ContextVar[dict | None] = contextvars.ContextVar
     "tt_engine_principal", default=None
 )
 
+# 当前请求携带的账号 access token（JWT 模式才有）。网关模式换票用它，
+# 只在本请求的上下文里存活；不写日志、不落盘、不进事件流。
+_CURRENT_ACCESS_TOKEN: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "tt_engine_access_token", default=""
+)
+
+
+def current_access_token() -> str:
+    return _CURRENT_ACCESS_TOKEN.get()
+
 
 def current_principal() -> dict | None:
     return _CURRENT_PRINCIPAL.get()
+
+
+def _principal_is_admin(principal: dict | None) -> bool:
+    return bool(principal) and principal.get("auth") == "jwt" and principal.get("role") == "admin"
+
+
+def _stamp_or_check_session(session: "TaskSession") -> dict | None:
+    """服务化按人隔离（D-02 组织数据隔离）：首建盖章，跨用户访问返回错误。
+
+    - 桌面 / 无令牌模式（principal 为 None）：不隔离，直接放行。
+    - 会话尚无 owner：按当前 JWT 主体盖章。
+    - owner 与当前 sub 一致，或当前主体是管理员：放行。
+    - 其余：返回 403 错误字典（调用者据此拒绝，不泄露他人会话与产物）。
+    """
+    principal = current_principal()
+    if principal is None:
+        return None
+    sub = str(principal.get("sub") or "")
+    if not session.owner_sub:
+        session.owner_sub = sub
+        session.owner_org = str(principal.get("org") or "")
+        return None
+    if session.owner_sub == sub or _principal_is_admin(principal):
+        return None
+    return {
+        "status": 403,
+        "code": "TASK_FORBIDDEN",
+        "message": "该任务不属于当前用户（服务化按人隔离，管理员除外）",
+    }
+
+
+def _principal_can_access(principal: dict | None, owner_sub: str | None) -> bool:
+    """判断当前主体能否访问归属为 owner_sub 的会话/检查点。
+
+    桌面/无令牌放行；未归属（空 owner，如 IM/系统任务或隔离上线前的存量）放行；
+    管理员放行；否则仅本人。
+    """
+    if principal is None:
+        return True
+    if not owner_sub:
+        return True
+    if _principal_is_admin(principal):
+        return True
+    return str(principal.get("sub") or "") == owner_sub
+
+
+def _checkpoint_owner(data: dict) -> str:
+    context = data.get("context") if isinstance(data.get("context"), dict) else {}
+    return str(context.get("ownerSub") or "")
+
+
+def _active_task_count(sub: str) -> int:
+    """该用户名下仍在执行的任务数（用于并发配额硬停）"""
+    if not sub:
+        return 0
+    count = 0
+    for session in list(_TASK_SESSIONS.values()):
+        if session.owner_sub != sub:
+            continue
+        task = session.agent_task
+        if task is not None and not task.done():
+            count += 1
+    return count
+
+
+def _quota_error(principal: dict | None) -> dict | None:
+    """JWT 主体的配额硬停（D-02）：monthlyTokens / concurrentTasks 超限即拒绝且不执行。
+
+    桌面 / 无令牌 / 静态令牌（没有 JWT 配额声明）不做硬停，返回 None。
+    值为 0 或缺失表示不限制。
+    """
+    if not principal or principal.get("auth") != "jwt":
+        return None
+    quota = principal.get("quota")
+    if not isinstance(quota, dict):
+        return None
+    sub = str(principal.get("sub") or "")
+    monthly = quota.get("monthlyTokens")
+    if isinstance(monthly, int) and monthly > 0:
+        used = USAGE_LEDGER.tokens_used(sub, "monthly")
+        if used >= monthly:
+            return {
+                "status": 429,
+                "code": "QUOTA_TOKENS_EXCEEDED",
+                "message": f"本月 token 配额已用尽（{used}/{monthly}），任务未执行",
+            }
+    concurrent = quota.get("concurrentTasks")
+    if isinstance(concurrent, int) and concurrent > 0:
+        active = _active_task_count(sub)
+        if active >= concurrent:
+            return {
+                "status": 429,
+                "code": "QUOTA_CONCURRENCY_EXCEEDED",
+                "message": f"并发任务已达上限（{active}/{concurrent}），请等待其他任务完成后重试",
+            }
+    return None
 
 
 def _utc_day(ms: int | None = None) -> str:
@@ -448,29 +654,72 @@ def _utc_month(ms: int | None = None) -> str:
 
 
 class UsageLedger:
-    """进程内用量台账：按「模型 × 日」累计 token、调用次数、延迟与成本
+    """模型用量台账：按「来源 × 用户 × 模型 × 日」累计并落盘
 
     延迟取每次真实模型调用的端到端耗时（流式为整段生成耗时）；成本按调用方
     配置的每 1M tokens 单价换算成 micros。没有单价时只记调用次数，不按 0 元
     假装免费（`pricedCalls`/`unpricedCalls` 分开暴露）。
+
+    落盘为追加式增量日志（`usage_store.UsageDeltaLog`）：启动后首次访问时重放，
+    引擎重启用量不丢；增量行累计到阈值再合并成快照行，避免文件无界增长。写入失败
+    只记状态、不阻断模型调用链，但一定通过 `/api/usage` 的 `persist` 字段披露。
     """
 
-    def __init__(self) -> None:
-        # key = (model_name, day) → row
-        self.rows: dict[tuple[str, str], dict] = {}
+    def __init__(self, log: us.UsageDeltaLog | None = None) -> None:
+        # key = (subject, model_name, day) → row
+        self.rows: dict[tuple[str, str, str], dict] = {}
+        self._log = log or us.UsageDeltaLog()
+        self._loaded = False
+        self._drops = 0
 
-    def add(self, model_name: str, prompt_tokens: int, completion_tokens: int,
-            latency_ms: int | None = None, cost_micros: int | None = None,
-            currency: str | None = None, priced: bool = False,
-            sub: str | None = None, org: str | None = None) -> dict:
-        name = (model_name or "").strip() or "unknown"
-        subject = (sub or "").strip() or "local"
-        day = _utc_day()
+    # ── 落盘与重放 ────────────────────────────────────────────
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        lines, drops, _error = self._log.read()
+        self._drops = drops
+        for line in lines:
+            key = line.get("key") if isinstance(line.get("key"), dict) else {}
+            subject = str(key.get("sub") or "").strip() or "local"
+            name = str(key.get("model") or "").strip() or "unknown"
+            day = str(key.get("day") or "").strip()
+            if not day:
+                self._drops += 1
+                continue
+            if line.get("kind") == us.KIND_MERGED:
+                restored = _row_from_snapshot(subject, name, day, line.get("row"))
+                if restored is None:
+                    self._drops += 1
+                    continue
+                self.rows[(subject, name, day)] = restored
+            else:
+                self._apply_delta(subject, name, day, line.get("d") or {})
+
+    def reset(self) -> None:
+        """清空内存与加载标记（仅测试用：模拟进程重启，不删落盘文件）"""
+        self.rows = {}
+        self._loaded = False
+        self._drops = 0
+
+    def persist_status(self) -> dict:
+        self._ensure_loaded()
+        return self._log.status(loaded=self._loaded, rows=len(self.rows), drops=self._drops)
+
+    def _snapshot_rows(self) -> list[tuple[dict, dict]]:
+        return [
+            ({"sub": subject, "model": name, "day": day}, row)
+            for (subject, name, day), row in self.rows.items()
+        ]
+
+    def _apply_delta(self, subject: str, name: str, day: str, delta: dict) -> dict:
+        """把一条增量并入内存态：落盘重放与实时记账共用同一段口径，避免两处漂移"""
         row = self.rows.get((subject, name, day))
         if row is None:
             row = {
                 "sub": subject,
-                "org": (org or "").strip(),
+                "org": "",
                 "modelName": name,
                 "day": day,
                 "promptTokens": 0,
@@ -482,28 +731,101 @@ class UsageLedger:
                 "costs": {},
                 "pricedCalls": 0,
                 "unpricedCalls": 0,
+                "byOrigin": {},
             }
             self.rows[(subject, name, day)] = row
-        row["promptTokens"] += max(0, int(prompt_tokens))
-        row["completionTokens"] += max(0, int(completion_tokens))
-        row["calls"] += 1
-        row["lastUsedAtMs"] = int(time.time() * 1000)
-        if latency_ms is not None:
-            row["latencyMsTotal"] += max(0, int(latency_ms))
-            row["latencySamples"] += 1
-        if priced and cost_micros is not None:
-            code = (str(currency or "CNY").strip().upper() or "CNY")
-            row["costs"][code] = row["costs"].get(code, 0) + max(0, int(cost_micros))
-            row["pricedCalls"] += 1
+        prompt = max(0, int(delta.get("pt") or 0))
+        completion = max(0, int(delta.get("ct") or 0))
+        calls = max(1, int(delta.get("calls") or 1))
+        priced = bool(delta.get("priced"))
+        origin = us.normalize_origin(delta.get("origin"))
+        row["promptTokens"] += prompt
+        row["completionTokens"] += completion
+        row["calls"] += calls
+        at_ms = int(delta.get("atMs") or 0)
+        row["lastUsedAtMs"] = max(row["lastUsedAtMs"], at_ms)
+        latency = delta.get("lat")
+        if latency is not None:
+            row["latencyMsTotal"] += max(0, int(latency))
+            row["latencySamples"] += calls
+        bucket = row["byOrigin"].setdefault(
+            origin,
+            {
+                "promptTokens": 0,
+                "completionTokens": 0,
+                "calls": 0,
+                "pricedCalls": 0,
+                "unpricedCalls": 0,
+                "latencyMsTotal": 0,
+                "latencySamples": 0,
+                "costs": {},
+            },
+        )
+        bucket["promptTokens"] += prompt
+        bucket["completionTokens"] += completion
+        bucket["calls"] += calls
+        if latency is not None:
+            bucket["latencyMsTotal"] += max(0, int(latency))
+            bucket["latencySamples"] += calls
+        if priced:
+            row["pricedCalls"] += calls
+            bucket["pricedCalls"] += calls
+            for code, micros in (delta.get("cost") or {}).items():
+                key = (str(code).strip().upper() or "CNY")
+                row["costs"][key] = row["costs"].get(key, 0) + max(0, int(micros))
+                bucket["costs"][key] = bucket["costs"].get(key, 0) + max(0, int(micros))
         else:
-            row["unpricedCalls"] += 1
+            row["unpricedCalls"] += calls
+            bucket["unpricedCalls"] += calls
+        org = str(delta.get("org") or "").strip()
+        if org and not row["org"]:
+            row["org"] = org
         return row
+
+    # ── 记账 ─────────────────────────────────────────────────
+
+    def add(self, model_name: str, prompt_tokens: int, completion_tokens: int,
+            latency_ms: int | None = None, cost_micros: int | None = None,
+            currency: str | None = None, priced: bool = False,
+            sub: str | None = None, org: str | None = None,
+            origin: str | None = None) -> dict:
+        name = (model_name or "").strip() or "unknown"
+        subject = (sub or "").strip() or "local"
+        day = _utc_day()
+        sample_origin = us.normalize_origin(origin) if origin not in (None, "") else us.usage_origin()
+        self._ensure_loaded()
+        prompt = max(0, int(prompt_tokens))
+        completion = max(0, int(completion_tokens))
+        cost_code = (str(currency or "CNY").strip().upper() or "CNY")
+        delta = {
+            "org": (org or "").strip(),
+            "pt": prompt,
+            "ct": completion,
+            "calls": 1,
+            "lat": latency_ms,
+            "origin": sample_origin,
+            "priced": 1 if (priced and cost_micros is not None) else 0,
+            "cost": (
+                {cost_code: max(0, int(cost_micros))}
+                if priced and cost_micros is not None
+                else {}
+            ),
+            "atMs": int(time.time() * 1000),
+        }
+        row = self._apply_delta(subject, name, day, delta)
+        self._log.append({"sub": subject, "model": name, "day": day}, delta)
+        if self._log.should_compact():
+            self._log.write_snapshot(self._snapshot_rows())
+        return row
+
+    # ── 读法 ─────────────────────────────────────────────────
 
     def aggregate(self, period: str, subject: str | None = None) -> list[dict]:
         """按周期聚合为「模型一行」（daily=今日 / monthly=本月 / total=全部）
 
         subject 为 None 时汇总全部用户；传入具体 uid 时只看该用户。
         """
+        self._ensure_loaded()
         if period == "daily":
             match = lambda day: day == _utc_day()  # noqa: E731
         elif period == "monthly":
@@ -532,6 +854,7 @@ class UsageLedger:
                     "costs": {},
                     "pricedCalls": 0,
                     "unpricedCalls": 0,
+                    "byOrigin": {},
                 }
                 agg[name] = cur
             cur["promptTokens"] += row["promptTokens"]
@@ -545,6 +868,13 @@ class UsageLedger:
             cur["unpricedCalls"] += row["unpricedCalls"]
             for code, micros in row["costs"].items():
                 cur["costs"][code] = cur["costs"].get(code, 0) + micros
+            for origin, bucket in (row.get("byOrigin") or {}).items():
+                target = cur["byOrigin"].setdefault(
+                    origin, {"promptTokens": 0, "completionTokens": 0, "calls": 0}
+                )
+                target["promptTokens"] += int(bucket.get("promptTokens") or 0)
+                target["completionTokens"] += int(bucket.get("completionTokens") or 0)
+                target["calls"] += int(bucket.get("calls") or 0)
         rows = sorted(agg.values(), key=lambda r: r["tokensUsed"], reverse=True)
         for row in rows:
             _finalize_usage_row(row)
@@ -559,8 +889,68 @@ class UsageLedger:
             return lambda d: d.startswith(month)
         return lambda d: True
 
+    def daily_rows(self, period: str = "total", subject: str | None = None) -> list[dict]:
+        """按「用户 × 模型 × 日 × 来源」导出明细：合并视图与上报服务端的唯一口径。
+
+        为什么按来源拆开：桌面端 `model_usage` 与引擎台账会记到同一批调用，合并时必须
+        只排除明确标记为桌面的那部分，其余（IM / CLI / 定时 / 浏览器直连）桌面端根本没有，
+        必须原样补入，否则用量会在合并视图里静默消失。
+        """
+        self._ensure_loaded()
+        match = self._match(period)
+        out: list[dict] = []
+        for (row_subject, name, day), row in self.rows.items():
+            if subject is not None and row_subject != subject:
+                continue
+            if not match(day):
+                continue
+            for origin, bucket in sorted((row.get("byOrigin") or {}).items()):
+                prompt = int(bucket.get("promptTokens") or 0)
+                completion = int(bucket.get("completionTokens") or 0)
+                samples = int(bucket.get("latencySamples") or 0)
+                latency_total = int(bucket.get("latencyMsTotal") or 0)
+                bucket_costs = bucket.get("costs") or {}
+                out.append({
+                    "sub": row_subject,
+                    "org": row.get("org") or "",
+                    "modelName": name,
+                    "day": day,
+                    "origin": origin,
+                    "promptTokens": prompt,
+                    "completionTokens": completion,
+                    "tokensUsed": prompt + completion,
+                    "calls": int(bucket.get("calls") or 0),
+                    "pricedCalls": int(bucket.get("pricedCalls") or 0),
+                    "unpricedCalls": int(bucket.get("unpricedCalls") or 0),
+                    # 延迟与成本按来源一起导出：合并视图里引擎补入的那部分
+                    # 若不带这两项，服务端算出的总口径会比客户端少一截
+                    "latencyMsTotal": latency_total,
+                    "latencySamples": samples,
+                    "costs": [
+                        {"currency": code, "micros": int(bucket_costs[code])}
+                        for code in sorted(bucket_costs)
+                    ],
+                    "lastUsedAtMs": row.get("lastUsedAtMs") or 0,
+                })
+        out.sort(key=lambda r: (r["day"], r["sub"], r["modelName"], r["origin"]))
+        return out
+
+    def tokens_used(self, sub: str, period: str = "monthly") -> int:
+        """指定用户在该周期内累计消耗的 token（prompt + completion），用于配额硬停。"""
+        if not sub:
+            return 0
+        self._ensure_loaded()
+        match = self._match(period)
+        total = 0
+        for (row_subject, _name, day), row in self.rows.items():
+            if row_subject != sub or not match(day):
+                continue
+            total += row["promptTokens"] + row["completionTokens"]
+        return total
+
     def days(self, period: str, subject: str | None = None) -> list[dict]:
         """按 UTC 日分桶的趋势点（升序），口径与 aggregate 同一周期过滤"""
+        self._ensure_loaded()
         match = self._match(period)
         buckets: dict[str, dict] = {}
         for (row_subject, name, day), row in self.rows.items():
@@ -595,6 +985,7 @@ class UsageLedger:
 
     def users(self, period: str, subject: str | None = None) -> list[dict]:
         """按用户聚合：谁用了多少 token、调用了多少次、涉及哪些模型"""
+        self._ensure_loaded()
         match = self._match(period)
         agg: dict[str, dict] = {}
         for (row_subject, name, day), row in self.rows.items():
@@ -661,7 +1052,7 @@ class UsageLedger:
             "calls": sum(r["calls"] for r in rows),
             "activeModels": len(rows),
             "lastUsedAtMs": max((r["lastUsedAtMs"] for r in rows), default=0),
-            "avgLatencyMs": round(weighted / samples) if samples else None,
+            "avgLatencyMs": weighted // samples if samples else None,
             "latencySamples": samples,
             "costs": [{"currency": code, "micros": costs[code]} for code in sorted(costs)],
             "pricedCalls": sum(int(r.get("pricedCalls") or 0) for r in rows),
@@ -670,18 +1061,110 @@ class UsageLedger:
 
 
 def _finalize_usage_row(row: dict) -> None:
-    """把内部累计字段收口为对外字段：平均延迟 + 按币种成本清单"""
+    """把内部累计字段收口为对外字段：平均延迟 + 按币种成本清单 + 按来源明细"""
     samples = int(row.pop("latencySamples", 0) or 0)
     total = int(row.pop("latencyMsTotal", 0) or 0)
-    row["avgLatencyMs"] = round(total / samples) if samples else None
+    # 平均延迟一律向下取整：与 Rust 的 i64 整除、前端的 Math.floor 同口径，
+    # 否则同一份台账在三处能差出 1ms，合并视图就对不上账
+    row["avgLatencyMs"] = total // samples if samples else None
     row["latencySamples"] = samples
     costs = row.pop("costs", {}) or {}
     row["costs"] = [
         {"currency": code, "micros": int(costs[code])} for code in sorted(costs)
     ]
+    by_origin = row.pop("byOrigin", {}) or {}
+    row["origins"] = sorted(
+        (
+            {
+                "origin": origin,
+                "promptTokens": int(bucket.get("promptTokens") or 0),
+                "completionTokens": int(bucket.get("completionTokens") or 0),
+                "tokensUsed": int(bucket.get("promptTokens") or 0) + int(bucket.get("completionTokens") or 0),
+                "calls": int(bucket.get("calls") or 0),
+            }
+            for origin, bucket in by_origin.items()
+        ),
+        key=lambda item: item["tokensUsed"],
+        reverse=True,
+    )
+
+
+def _row_from_snapshot(subject: str, name: str, day: str, raw: object) -> dict | None:
+    """快照行 → 内存行：逐字段取值并限非负；坏行丢弃而不是让台账读到脏数据"""
+    if not isinstance(raw, dict):
+        return None
+    costs_src = raw.get("costs") or {}
+    origins_src = raw.get("byOrigin") or {}
+    if not isinstance(costs_src, dict) or not isinstance(origins_src, dict):
+        return None
+    try:
+        costs = {
+            (str(code).strip().upper() or "CNY"): max(0, int(micros))
+            for code, micros in costs_src.items()
+        }
+        by_origin: dict[str, dict] = {}
+        for origin, bucket in origins_src.items():
+            if not isinstance(bucket, dict):
+                continue
+            bucket_costs = bucket.get("costs") or {}
+            if not isinstance(bucket_costs, dict):
+                return None
+            by_origin[us.normalize_origin(origin)] = {
+                "promptTokens": max(0, int(bucket.get("promptTokens") or 0)),
+                "completionTokens": max(0, int(bucket.get("completionTokens") or 0)),
+                "calls": max(0, int(bucket.get("calls") or 0)),
+                "pricedCalls": max(0, int(bucket.get("pricedCalls") or 0)),
+                "unpricedCalls": max(0, int(bucket.get("unpricedCalls") or 0)),
+                "latencyMsTotal": max(0, int(bucket.get("latencyMsTotal") or 0)),
+                "latencySamples": max(0, int(bucket.get("latencySamples") or 0)),
+                "costs": {
+                    (str(code).strip().upper() or "CNY"): max(0, int(micros))
+                    for code, micros in bucket_costs.items()
+                },
+            }
+        return {
+            "sub": subject,
+            "org": str(raw.get("org") or ""),
+            "modelName": name,
+            "day": day,
+            "promptTokens": max(0, int(raw.get("promptTokens") or 0)),
+            "completionTokens": max(0, int(raw.get("completionTokens") or 0)),
+            "calls": max(0, int(raw.get("calls") or 0)),
+            "lastUsedAtMs": max(0, int(raw.get("lastUsedAtMs") or 0)),
+            "latencyMsTotal": max(0, int(raw.get("latencyMsTotal") or 0)),
+            "latencySamples": max(0, int(raw.get("latencySamples") or 0)),
+            "costs": costs,
+            "pricedCalls": max(0, int(raw.get("pricedCalls") or 0)),
+            "unpricedCalls": max(0, int(raw.get("unpricedCalls") or 0)),
+            "byOrigin": by_origin,
+        }
+    except (TypeError, ValueError):
+        return None
 
 
 USAGE_LEDGER = UsageLedger()
+
+
+def _stream_has_content(chunk) -> bool:
+    """这条 chunk 是否真的吐出了正文或工具调用。
+
+    「首包」指的是第一个有内容的增量：只有 role、只有空 blocks、或只带 usage 的
+    收尾包都不算，否则会把排队时间读成 0ms。与 Rust harness 的同名口径一致，
+    两侧的首包数字才可比。ChatResponse 是 DictMixin(dict) 子类，按 dict 取值。"""
+    content = chunk.get("content") if isinstance(chunk, dict) else getattr(chunk, "content", None)
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                return True  # 非字典块（未知形态）宁可算作有内容，不低估首包
+            kind = block.get("type")
+            if kind == "text" and str(block.get("text") or "").strip():
+                return True
+            if kind == "tool_use" and (block.get("name") or block.get("input")):
+                return True
+        return False
+    return bool(content)
 
 
 def _usage_of(resp) -> tuple[int, int] | None:
@@ -700,6 +1183,18 @@ def _usage_of(resp) -> tuple[int, int] | None:
             return int(getattr(usage, "input_tokens") or 0), int(getattr(usage, "output_tokens") or 0)
         except Exception:
             return None
+
+
+def _metadata_of(resp) -> dict | None:
+    """从 ChatResponse 取结构化输出（缺失/空返回 None）。
+
+    AgentScope 的上下文压缩靠这条通道拿摘要：模型没按 `structured_model` 回内容时，
+    内核只打一条 WARNING 就继续跑，压缩其实整轮没生效。包装层把它记下来，
+    界面才有机会如实说明「压缩未生效」而不是假装压过了。"""
+    meta = resp.get("metadata") if isinstance(resp, dict) else getattr(resp, "metadata", None)
+    if isinstance(meta, dict) and meta:
+        return meta
+    return None
 
 
 def _prices_of(config: dict | None) -> dict | None:
@@ -872,12 +1367,14 @@ async def _generate_plan(goal: str, context: str = "", mode: str = "general",
 
     def _capture(prompt: int, completion: int, model_name: str,
                  latency_ms: int | None = None, cost_micros: int | None = None,
-                 currency: str | None = None, priced: bool = False) -> None:
+                 currency: str | None = None, priced: bool = False,
+                 first_token_ms: int | None = None) -> None:
         captured.append({
             "promptTokens": prompt,
             "completionTokens": completion,
             "model": model_name,
             "latencyMs": latency_ms,
+            "firstTokenMs": first_token_ms,
             "costMicros": cost_micros,
             "costCurrency": currency,
             "priced": priced,
@@ -1222,6 +1719,31 @@ def _diff_files(base: Path, before: dict, after: dict, exclude_dir: "Path | None
     return changed
 
 
+# 取消成因的白名单：引擎只认这两个码，其余（含空）一律按用户手动取消记账。
+# 码表与 src/shared/error-messages.ts 同源，界面按码查中文文案，不在引擎里拼句子。
+CANCEL_REASONS = ("USER_CANCELLED", "BUDGET_TASK_EXCEEDED")
+
+# agentscope 的中断路径：AgentBase.__call__ 捕获 CancelledError 后改调 handle_interrupt，
+# 回一句英文兜底话并在 metadata 里带 _is_interrupted（见 _agent_base.py:458 与
+# _react_agent.py:814）——所以被取消的任务在引擎这一层看到的是「正常返回」。
+AGENT_INTERRUPTED_METADATA_KEY = "_is_interrupted"
+
+
+def _agent_reported_interruption(result) -> bool:
+    """模型侧自己承认「这轮被打断了」吗？用于补 session.cancelled 看不到的中断来源。"""
+    metadata = getattr(result, "metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    return bool(metadata.get(AGENT_INTERRUPTED_METADATA_KEY))
+
+
+def _cancel_note(reason: str) -> str:
+    """取消路径给检查点的中文原因：谁停的就说是谁，不把预算拦停写成用户取消。"""
+    if reason == "BUDGET_TASK_EXCEEDED":
+        return "单任务预算已用满，可从最近一次模型调用前的检查点继续"
+    return "用户取消了任务，可从最近一次模型调用前的检查点继续"
+
+
 async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay_from: list, model_binding: str | None = None, work_dir: "Path | None" = None, history: list | None = None, model_config: dict | None = None, resume: bool = False):
     """阶段二：执行流（status_change(executing) → Agent 事件 → deliver/done）。
     model_binding 为对话内选中的模型档位；
@@ -1257,6 +1779,9 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
     # 逐工具审批：档位读不出来或网关不可用都中止——审批策略不可知时继续执行
     # 等于绕过审批（曾把无效档位降成 off，结果静默放行）
     tool_approval = tap.ToolApproval.from_runtime(session.runtime)
+    # D-03.5 合并口径：写暂存开着时，那两件文本写入的批准由暂存面板承担（一次写入一次批准），
+    # 这一层不再为同一次写入弹第二个框。判定与 build_agent 用同一个函数，不留第二套规则。
+    tool_approval.staged_writes = wsr.staging_enabled(session.runtime)
     if tool_approval.runtime_present and tool_approval.error:
         yield sse("error", {
             "code": "TOOL_APPROVAL_UNAVAILABLE",
@@ -1290,13 +1815,17 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
 
     def _on_usage(prompt_tokens: int, completion_tokens: int, model_name: str,
                   latency_ms: int | None = None, cost_micros: int | None = None,
-                  currency: str | None = None, priced: bool = False) -> None:
+                  currency: str | None = None, priced: bool = False,
+                  first_token_ms: int | None = None) -> None:
         _safe_put(queue, "usage", {
             "usage": {
                 "promptTokens": prompt_tokens,
                 "completionTokens": completion_tokens,
                 "model": model_name,
                 "latencyMs": latency_ms,
+                # 首包：台账不存这一列（库里没有对应字段），但用量事件里留着，
+                # 长任务基准与「慢首包」诊断靠它把「排队」和「出字慢」分开看
+                "firstTokenMs": first_token_ms,
                 "costMicros": cost_micros,
                 "costCurrency": currency,
                 "priced": priced,
@@ -1346,6 +1875,9 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
     sandbox = sr.SandboxPolicy.from_runtime(session.runtime, work_dir=eff_work_dir)
     # 受控执行/联网：同一份沙箱策略里的显式授权；默认关闭，未授权不注册工具
     grants = tg.ToolGrantPolicy.from_runtime(session.runtime)
+    # D-08：把「这一轮的扩展声明了什么能力、现在能不能用」摊成一份读数，供
+    # `/api/exec/extensions` 原样展示。清单只从 runtime 摊，不去盘上扫扩展包。
+    exd.observe(session.runtime, task_id=task_id)
     # 联网搜索：搜索源来自进程环境，授权沿用同一份联网白/名单；只给父 Agent
     web = ws.WebSearchRuntime.from_env(grants)
     # 视觉能力按本轮真正生效的模型判定（专家绑定的模型可能没有视觉能力）
@@ -1472,7 +2004,7 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
             checkpoint.mark_final(False, "沙箱门禁未装上，尚未产生可恢复的检查点")
         yield sse("error", {
             "code": "SANDBOX_GUARD_FAILED",
-            "message": f"沙箱策略已配置，但工具门禁没有装上：{guard_err}",
+            "message": f"工具门禁没有装上（文件访问档位与工作区沙箱都靠它落地）：{guard_err}",
         })
         yield sse("checkpoint", checkpoint.final_event())
         yield sse("done", {})
@@ -1533,7 +2065,8 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
     from agentscope.message import Msg
 
     async def run_agent():
-        mcp_clients: list = []
+        mcp_clients: list = []   # 本轮自建、必须在同一任务里关闭的一次性连接
+        mcp_held: list = []      # 本轮从枢纽借出的常驻连接（收尾只归还引用）
         end_reason = "completed"
         end_note = ""
         resume_info: dict = {}
@@ -1617,8 +2150,10 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
             mcp_result = await mr.attach(
                 agent.toolkit, session.runtime,
                 lazy=bool(getattr(agent, "_tt_lazy_mcp", False)),
+                hub=MCP_HUB, session_key=session.task_id,
             )
             mcp_clients = mcp_result["clients"]
+            mcp_held = mcp_result.get("held") or []
             images = rc.collect_vision_images(session.attachments) if vision else []
             prompt, msg_notes, _skill = rc.compose_user_message(
                 goal, session.runtime, session.attachments, images_inlined=vision
@@ -1674,6 +2209,12 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
                 # 恢复不是一次新的用户输入：不重复触发 UserPromptSubmit
                 await hook_runner.fire("UserPromptSubmit", payload={"message": goal})
             result = await agent(msg)
+
+            # D-14.5：中断被 agentscope 吞掉时这里拿到的是「正常返回」。被取消/被预算
+            # 停下的任务不许继续走成功收尾（deliver「任务完成」、自动记忆、Stop 钩子、
+            # 检查点标不可续），统一改道到下面的 cancelled 分支。
+            if session.cancelled or _agent_reported_interruption(result):
+                raise asyncio.CancelledError()
 
             # 压缩是否真的发生，以记忆里的摘要为准；不说「已压缩」除非确实有摘要
             if getattr(agent.memory, "_compressed_summary", ""):
@@ -1744,10 +2285,40 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
             final_text = _text_of(getattr(result, "content", ""))
             # 自动记忆：只在成功收尾时追加一条可审计摘要；开关/凭据/条数上限
             # 未通过时不写，但把原因作为步骤事件摊出来（不静默少写）。
-            _memory_ok, memory_note = _auto_memory_after_success(
-                session.runtime, goal, final_text, artifacts,
-                privacy=session.privacy_mode,
-            )
+            # 桌面记忆库模式下引擎不碰 MEMORY.md：候选随 deliver 回给 Rust 落库。
+            memory_candidates: list[dict] = []
+            if rc.desktop_memory_mode(session.runtime):
+                memory_candidates, memory_note = _auto_memory_candidates(
+                    session.runtime, goal, final_text, artifacts,
+                    privacy=session.privacy_mode,
+                )
+                # 可选模型抽取：失败只降级为规则结果，不阻断交付
+                if _model_memory_extract_enabled(session.runtime, session.privacy_mode):
+                    model_facts, model_note = await _model_fact_candidates(
+                        goal, final_text,
+                        model_binding=session.model_binding,
+                        model_config=session.model_config,
+                        pii_mode=session.pii_mode,
+                        on_usage=_on_usage,
+                    )
+                    merged, added, secret_skipped = _merge_memory_candidates(
+                        memory_candidates, model_facts
+                    )
+                    memory_candidates = merged
+                    if added:
+                        model_note = f"模型抽取补充 {added} 条候选"
+                    elif secret_skipped:
+                        model_note = (
+                            f"{secret_skipped} 条模型候选疑似包含凭据，已跳过"
+                        )
+                    memory_note = "；".join(
+                        part for part in (memory_note, model_note) if part
+                    )
+            else:
+                _memory_ok, memory_note = _auto_memory_after_success(
+                    session.runtime, goal, final_text, artifacts,
+                    privacy=session.privacy_mode,
+                )
             if memory_note:
                 _safe_put(queue, "step_start", {
                     "step_id": "memory-auto",
@@ -1755,21 +2326,32 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
                     "description": memory_note,
                 })
                 _safe_put(queue, "step_done", {"step_id": "memory-auto", "output": memory_note})
-            _safe_put(queue, "deliver", {
+            deliver_event = {
                 "summary": "任务完成",
                 "artifacts": artifacts,
                 "final_text": final_text,
-            })
+            }
+            if memory_candidates:
+                # 复数键：一条摘要 + 若干规则抽取的事实，由 Rust 逐条去重/判冲突后落库
+                deliver_event["memory_candidates"] = memory_candidates
+            _safe_put(queue, "deliver", deliver_event)
             # Stop：脚本可以 exit 2 表达「别停，继续」；能否续跑由下面的说明如实交代
             await hook_runner.fire("Stop", payload={"reason": "completed"})
         except asyncio.CancelledError:
             end_reason = "cancelled"
-            end_note = "用户取消了任务，可从最近一次模型调用前的检查点继续"
+            # 成因由取消请求带进来（Rust 的预算拦停发 BUDGET_TASK_EXCEEDED，界面上的
+            # 「谁停的」跟着它走）；没带或不在码表里就按用户手动取消，不猜第三个码。
+            reason_code = (
+                session.cancel_reason
+                if session.cancel_reason in CANCEL_REASONS
+                else "USER_CANCELLED"
+            )
+            end_note = _cancel_note(reason_code)
             # 取消路径（POST /api/chat/cancel）：cancelled 状态事件后正常收尾
             _safe_put(queue, "status_change", {
                 "taskId": task_id,
                 "status": "cancelled",
-                "statusReasonCode": "USER_CANCELLED",
+                "statusReasonCode": reason_code,
             })
         except pg.PrivacyBlocked as exc:
             # 出站脱敏档位为 block：命中后不再发下一次模型调用，直接中止本轮
@@ -1785,8 +2367,10 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
             traceback.print_exc()
             _safe_put(queue, "error", {"code": "AGENT_ERROR", "message": str(exc)})
         finally:
-            # 连接器子进程随本轮结束退出（必须在这里，与 attach 同任务）
+            # 一次性连接随本轮退出（必须在这里，与 attach 同任务）；
+            # 常驻连接只归还引用，进程留给同会话的下一轮（D-40 第 5 项）
             await mr.close_all(mcp_clients)
+            await mr.release_hub(MCP_HUB, session.task_id, mcp_held)
             try:
                 # 取消路径下这个 await 可能被打断：尽力补一条 SessionEnd，失败不拖累收尾
                 await hook_runner.fire("SessionEnd", payload={"reason": end_reason})
@@ -1816,6 +2400,9 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
             # 先发 checkpoint 再发 done：前端收到即可决定是否显示「从检查点继续」
             _safe_put(queue, "checkpoint", checkpoint.final_event())
             _safe_put(queue, "done", {})
+            # D-28：收尾计一条 task_finished（放在 done 之后：事件流一个字节也不变）。
+            # 隐私轮不记；没同意时 record() 自己回「未开启」，这里不额外判断档位。
+            _telemetry_task_finished(session, end_reason, checkpoint)
 
     task = asyncio.create_task(run_agent())
     session.agent_task = task
@@ -1861,13 +2448,15 @@ async def _run_execution(session: "TaskSession", task_id: str, goal: str, replay
 SYS_PROMPT = """你是“通天办公”AI 工作助手，运行在用户的本地电脑上。
 
 工作方式:
-1. 分析用户目标，必要时先查看相关文件再动手
-2. 使用工具完成任务（读写文件、执行代码等）
+1. 分析用户目标，必要时先列目录、查看相关文件再动手
+2. 使用工具完成任务（列目录、读写文件、抽取文档正文等）
 3. 涉及删除或覆盖文件前务必谨慎，优先保留原内容
 4. 完成后用简洁中文总结做了什么、产出了哪些文件
 
 约束:
-- 只在当前工作目录范围内操作文件
+- 文件操作遵循本轮的文件访问档位说明：档位允许的范围内可直接操作，被拒绝时如实说明原因与切换方式
+- 不清楚目录里有什么时先调用 list_directory；Word/Excel/PowerPoint/PDF 用 read_document 抽取正文，文本文件用 view_text_file
+- 读取有分页预算（正文默认 4000、上限 8000 字符，目录清单默认 20、上限 50 项）：返回值会写明还剩多少、带哪个 start/offset 接着读，需要更多就翻页，不要把整篇塞进上下文
 - 不执行危险系统命令
 - 用户要求创建/生成/保存文件时，必须调用文件写入工具真实写入，禁止仅在回复中声称已写入
 - 声称任何文件操作完成前，必须先确认对应工具调用已成功执行
@@ -1914,9 +2503,35 @@ def vision_status(model_override: str | None = None, model_config: dict | None =
     return False, f"模型「{name}」未匹配视觉模型名（TT_VISION=on 可强制尝试）"
 
 
-def _model_kind(model_config: dict | None) -> str:
-    """本轮主模型的接入方式：自定义端点 / 环境 DashScope / 环境 OpenAI 兼容"""
+def _gateway_of(model_config: dict | None) -> dict | None:
+    """解析「网关模式」配置；存在但缺字段时直接报错，不静默退回直连。
+
+    配置只含路由信息（baseUrl / controlPlaneUrl / dept），账号 access token
+    由请求头或桌面壳在内存里注入，不写 models.json。
+    """
     cfg = model_config if isinstance(model_config, dict) else {}
+    raw = cfg.get("gateway")
+    if not isinstance(raw, dict) or not raw:
+        return None
+    base = str(raw.get("baseUrl") or "").strip().rstrip("/")
+    control = str(raw.get("controlPlaneUrl") or "").strip().rstrip("/")
+    if not base or not control:
+        raise RuntimeError(
+            "网关模式配置不完整：需要 gateway.baseUrl 与 gateway.controlPlaneUrl"
+        )
+    return {
+        "baseUrl": base,
+        "controlPlaneUrl": control,
+        "dept": str(raw.get("dept") or "").strip(),
+        "accessToken": str(raw.get("accessToken") or "").strip(),
+    }
+
+
+def _model_kind(model_config: dict | None) -> str:
+    """本轮主模型的接入方式：网关 / 自定义端点 / 环境 DashScope / 环境 OpenAI 兼容"""
+    cfg = model_config if isinstance(model_config, dict) else {}
+    if _gateway_of(model_config) is not None:
+        return "gateway"
     if str(cfg.get("baseUrl") or "").strip():
         return "custom"
     if os.environ.get("TT_PROVIDER", "dashscope").lower() == "dashscope":
@@ -1924,13 +2539,41 @@ def _model_kind(model_config: dict | None) -> str:
     return "openai"
 
 
-def _build_chat_model(model_name: str, api_key: str, base_url: str,
+# 换票主体缓存：同一控制面 + 部门 + access token 复用同一个 provider。
+# access token 只以摘要参与键名，缓存条目不会出现在日志或事件流里。
+_GATEWAY_PROVIDERS: dict[tuple[str, str, str], gwt.GatewayTokenProvider] = {}
+_GATEWAY_PROVIDERS_LOCK = threading.Lock()
+_GATEWAY_PROVIDER_LIMIT = 32
+
+
+def _gateway_provider(gateway: dict) -> gwt.GatewayTokenProvider:
+    access_token = gateway.get("accessToken") or current_access_token()
+    digest = hashlib.sha256(access_token.encode("utf-8")).hexdigest()[:16] if access_token else ""
+    key = (gateway["controlPlaneUrl"], gateway.get("dept") or "", digest)
+    with _GATEWAY_PROVIDERS_LOCK:
+        provider = _GATEWAY_PROVIDERS.get(key)
+        if provider is None:
+            provider = gwt.GatewayTokenProvider(
+                gateway["controlPlaneUrl"], access_token, gateway.get("dept") or None
+            )
+            if len(_GATEWAY_PROVIDERS) >= _GATEWAY_PROVIDER_LIMIT:
+                _GATEWAY_PROVIDERS.pop(next(iter(_GATEWAY_PROVIDERS)))
+            _GATEWAY_PROVIDERS[key] = provider
+    return provider
+
+
+def _reset_gateway_providers() -> None:
+    with _GATEWAY_PROVIDERS_LOCK:
+        _GATEWAY_PROVIDERS.clear()
+
+
+def _build_chat_model(model_name: str, api_key, base_url: str,
                       kind: str, stream: bool):
     """按接入方式构造模型与匹配的 formatter（主模型与转移目标共用）"""
     from agentscope.model import DashScopeChatModel, OpenAIChatModel
     from agentscope.formatter import DashScopeChatFormatter, OpenAIChatFormatter
 
-    if kind == "custom":
+    if kind in ("custom", "gateway"):
         model = OpenAIChatModel(
             model_name=model_name,
             api_key=api_key or "EMPTY",
@@ -1963,6 +2606,9 @@ def _usable_fallbacks(model_config: dict | None, kind: str) -> list[dict]:
     防止浏览器直连或旧配置塞进跨接入方式的目标后，用错 formatter 把请求打废。
     """
     cfg = model_config if isinstance(model_config, dict) else {}
+    if kind == "gateway":
+        # 网关模式的路由/降级由控制面策略决定，引擎不再自行换模型
+        return []
     raw = cfg.get("fallbacks")
     if not isinstance(raw, list):
         return []
@@ -1996,37 +2642,53 @@ def build_model_and_formatter(model_override: str | None = None, model_config: d
     model_config 为前端传入的自定义模型配置（models.json，含 baseUrl/apiKey/modelName/
     prices/fallbacks），存在 baseUrl 时走 OpenAI 兼容端点真实调用自定义模型；
     stream=False 用于「一次性取值」场景（计划生成按完整响应解析 JSON）；
-    on_usage(prompt, completion, model_name, latency_ms, cost_micros, currency, priced)
-    在每次真实模型调用后回调；
+    on_usage(prompt, completion, model_name, latency_ms, cost_micros, currency, priced,
+             first_token_ms=None)
+    在每次真实模型调用后回调（首包 = 第一个有内容增量的耗时，非流式时等于整包）；
     on_route_switch({from, to, reason}) 在主模型失败、切到备用模型时回调；
     pii_mode/on_redaction 为出站脱敏档位与命中回调（包装在最外层，覆盖每次模型调用）"""
     cfg = model_config or {}
     kind = _model_kind(model_config)
-    custom_base = str(cfg.get("baseUrl") or "").strip()
-    custom_key = str(cfg.get("apiKey") or "").strip()
-    env_key = os.environ.get("TT_API_KEY", "")
+    provider: gwt.GatewayTokenProvider | None = None
 
     model_name = _effective_model_name(model_override, model_config)
-    api_key = custom_key or env_key
+    if kind == "gateway":
+        # 网关模式：base_url 指向网关，密钥是换票得到的短期令牌（每次请求现取）
+        gateway = _gateway_of(model_config) or {}
+        provider = _gateway_provider(gateway)
+        base_url = gateway["baseUrl"]
+        api_key = provider.get
+    else:
+        custom_base = str(cfg.get("baseUrl") or "").strip()
+        custom_key = str(cfg.get("apiKey") or "").strip()
+        env_key = os.environ.get("TT_API_KEY", "")
+        api_key = custom_key or env_key
 
-    if kind != "custom" and not api_key:
-        # 引导去设置页配自定义模型（models.json 随请求 modelConfig 下发）；安装版没有
-        # "项目根 .env" 这个概念，.env 只是开发/内网联调时的兜底通道。
-        raise RuntimeError("未配置可用模型：请在「设置 → 模型与用量」中添加模型（或配置 TT_API_KEY 兜底）")
+        if kind != "custom" and not api_key:
+            # 引导去设置页配自定义模型（models.json 随请求 modelConfig 下发）；安装版没有
+            # "项目根 .env" 这个概念，.env 只是开发/内网联调时的兜底通道。
+            raise RuntimeError("未配置可用模型：请在「设置 → 模型与用量」中添加模型（或配置 TT_API_KEY 兜底）")
 
-    base_url = custom_base if kind == "custom" else (
-        os.environ.get("TT_BASE_URL", "") if kind == "openai" else ""
-    )
+        base_url = custom_base if kind == "custom" else (
+            os.environ.get("TT_BASE_URL", "") if kind == "openai" else ""
+        )
+
     primary, formatter = _build_chat_model(model_name, api_key, base_url, kind, stream)
+    if provider is not None:
+        primary = GatewayAuthRetryModel(primary, provider)
+    # 网关调用在台账里标 gateway：网关侧也会上报同一批用量，合并视图据此排除引擎这份
+    usage_origin = us.ORIGIN_GATEWAY if kind == "gateway" else None
     candidates = [
-        _with_usage_tracking(primary, on_usage, _prices_of(model_config))
+        _with_usage_tracking(primary, on_usage, _prices_of(model_config), usage_origin)
     ]
     for item in _usable_fallbacks(model_config, kind):
         fb_name = str(item.get("modelName") or "").strip()
         fb_base = str(item.get("baseUrl") or "").strip() if kind == "custom" else base_url
         fb_key = str(item.get("apiKey") or "").strip() or (api_key if kind != "custom" else "")
         fb_model, _ = _build_chat_model(fb_name, fb_key, fb_base, kind, stream)
-        candidates.append(_with_usage_tracking(fb_model, on_usage, _prices_of(item)))
+        candidates.append(
+            _with_usage_tracking(fb_model, on_usage, _prices_of(item), usage_origin)
+        )
 
     model = (
         candidates[0]
@@ -2055,14 +2717,21 @@ class UsageTrackingModel(ChatModelBase):
 
     流式响应的 usage 仅在末尾 chunk 出现（DashScope 末 chunk / OpenAI
     stream_options.include_usage），故按「最后一次非空 usage」计一次，
-    避免逐 chunk 重复累计；延迟按整段生成耗时计算。
+    避免逐 chunk 重复累计；延迟按整段生成耗时计算，首包按第一个有内容的
+    chunk 计算（与 Rust harness 同口径，长任务基准要拿两侧的首包对比）。
     """
 
-    def __init__(self, inner, on_usage=None, prices: dict | None = None):
+    def __init__(self, inner, on_usage=None, prices: dict | None = None,
+                 origin: str | None = None):
         self._inner = inner  # 必须先于 super().__init__：stream setter 需要它
         super().__init__(model_name=inner.model_name, stream=inner.stream)
         self._on_usage = on_usage
         self._prices = prices if isinstance(prices, dict) else None
+        # 经网关的调用固定标 gateway：网关自己会上报同一批用量，合并视图靠这个标记去重
+        self._origin = us.normalize_origin(origin) if origin else None
+        # 结构化输出（上下文压缩摘要用的就是这条通道）这一轮到底有没有拿到结果：
+        # None = 这轮没走结构化，True = 拿到了，False = 模型没按协议回，压缩会静默失败
+        self.last_structured_ok: bool | None = None
 
     @property
     def stream(self) -> bool:
@@ -2072,24 +2741,30 @@ class UsageTrackingModel(ChatModelBase):
     def stream(self, value: bool) -> None:
         self._inner.stream = value
 
-    def _record(self, usage, latency_ms: int) -> None:
+    def _record(self, usage, latency_ms: int, first_token_ms: int | None = None) -> None:
         if usage is None:
             return
+        # 没测到首包就等于整包：非流式调用只有「一次拿全」，与 harness 的缺省口径一致
+        first_ms = latency_ms if first_token_ms is None else first_token_ms
         prompt, completion = usage
         cost_micros, currency = cost_micros_of(self._prices, prompt, completion)
         priced = cost_micros is not None
         principal = current_principal() or {}
+        sample_origin = self._origin or us.usage_origin()
         row = USAGE_LEDGER.add(
             self.model_name, prompt, completion,
             latency_ms=latency_ms, cost_micros=cost_micros,
             currency=currency, priced=priced,
             sub=principal.get("sub"), org=principal.get("org"),
+            origin=sample_origin,
         )
         if self._on_usage is not None:
             try:
+                # 第 8 个位置参数：首包耗时。台账里没有这一列（库里没有对应字段），
+                # 但用量事件与基准要靠它把「排队」和「出字慢」分开看
                 self._on_usage(
                     prompt, completion, self.model_name,
-                    latency_ms, cost_micros, currency, priced,
+                    latency_ms, cost_micros, currency, priced, first_ms,
                 )
             except Exception as exc:  # 回调失败不影响模型调用链
                 print(f"[engine] usage 回调失败: {exc}", flush=True)
@@ -2098,33 +2773,138 @@ class UsageTrackingModel(ChatModelBase):
         )
         print(
             f"[engine] usage model={self.model_name} +{prompt}/+{completion} "
-            f"{latency_ms}ms{cost_text} "
+            f"{latency_ms}ms 首包{first_ms}ms{cost_text} "
+            f"origin={row['byOrigin'].get(sample_origin, {}).get('calls', 0)} "
             f"累计={row['promptTokens'] + row['completionTokens']} calls={row['calls']}",
             flush=True,
         )
 
     async def __call__(self, *args, **kwargs):
         started = time.monotonic()
+        structured = kwargs.get("structured_model") is not None
+        if structured:
+            self.last_structured_ok = None
         res = await self._inner(*args, **kwargs)
         if inspect.isasyncgen(res):
-            return self._wrap_stream(res, started)
+            return self._wrap_stream(res, started, structured)
         self._record(_usage_of(res), int((time.monotonic() - started) * 1000))
+        if structured:
+            self.last_structured_ok = _metadata_of(res) is not None
         return res
 
-    async def _wrap_stream(self, agen, started: float):
+    async def _wrap_stream(self, agen, started: float, structured: bool = False):
         last = None
-        async for chunk in agen:
-            parsed = _usage_of(chunk)
-            if parsed is not None:
-                last = parsed
-            yield chunk
-        self._record(last, int((time.monotonic() - started) * 1000))
+        first_ms: int | None = None
+        metadata_ok = False
+        try:
+            async for chunk in agen:
+                if first_ms is None and _stream_has_content(chunk):
+                    first_ms = int((time.monotonic() - started) * 1000)
+                if structured and _metadata_of(chunk) is not None:
+                    metadata_ok = True
+                parsed = _usage_of(chunk)
+                if parsed is not None:
+                    last = parsed
+                yield chunk
+        finally:
+            # D-14.5 的计量半边：流被中途取消时生成器在 yield 处就被关掉，原来写在循环
+            # 之后的那行 _record 永远跑不到——**已经到达的 usage 就这么丢了**（少计一次，
+            # 单任务预算因此最多被一次在途调用越过去）。收口放到 finally：消费完、被取消、
+            # 还是中途抛异常都只落一次账；一个 usage 都没收到就什么都不写，不拿估算值填台账。
+            self._record(last, int((time.monotonic() - started) * 1000), first_ms)
+            if structured:
+                # 生成器被消费完才定性：整条流里没有一个非空 metadata，就是没按协议回
+                self.last_structured_ok = metadata_ok
 
 
-def _with_usage_tracking(model, on_usage, prices: dict | None = None):
+def _usage_trackers(model, max_depth: int = 6) -> list:
+    """从任意层数的模型包装里找出用量包装层。
+
+    Agent 拿到的是最外层（脱敏 → 网关重试 → 路由 → 用量 → agentscope），
+    而「结构化输出到底有没有拿到摘要」只记在 UsageTrackingModel 上，得逐层往里问。"""
+    found: list = []
+    seen: set = set()
+    queue: list = [(model, 0)]
+    while queue:
+        node, depth = queue.pop()
+        if node is None or id(node) in seen or depth > max_depth:
+            continue
+        seen.add(id(node))
+        if isinstance(node, UsageTrackingModel):
+            found.append(node)
+            continue
+        for value in list(getattr(node, "__dict__", {}).values()):
+            if isinstance(value, (list, tuple)):
+                queue.extend((item, depth + 1) for item in value)
+            else:
+                queue.append((value, depth + 1))
+    return found
+
+
+def _is_auth_failure(exc: BaseException) -> bool:
+    """是否为网关返回的 401（令牌过期/被吊销），而不是策略拒绝或上游故障。"""
+    status = getattr(exc, "status_code", None)
+    if status == 401:
+        return True
+    if type(exc).__name__ == "AuthenticationError":
+        return True
+    return getattr(getattr(exc, "response", None), "status_code", None) == 401
+
+
+class GatewayAuthRetryModel(ChatModelBase):
+    """网关模式包装：401 时强制换票并重试一次。
+
+    只在尚未吐出任何 chunk 时重试，避免把两段生成内容拼在一起；
+    第二次仍失败则原样抛出，由上层按既有语义报错/转移。
+    """
+
+    def __init__(self, inner, provider: gwt.GatewayTokenProvider):
+        self._inner = inner  # 必须先于 super().__init__：stream setter 需要它
+        super().__init__(model_name=inner.model_name, stream=inner.stream)
+        self._provider = provider
+
+    @property
+    def stream(self) -> bool:
+        return self._inner.stream
+
+    @stream.setter
+    def stream(self, value: bool) -> None:
+        self._inner.stream = value
+
+    async def __call__(self, *args, **kwargs):
+        try:
+            res = await self._inner(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            if not _is_auth_failure(exc):
+                raise
+            self._provider.invalidate()
+            return await self._inner(*args, **kwargs)
+        if inspect.isasyncgen(res):
+            return self._retry_stream(res, args, kwargs)
+        return res
+
+    async def _retry_stream(self, agen, args, kwargs):
+        emitted = False
+        try:
+            async for chunk in agen:
+                emitted = True
+                yield chunk
+        except Exception as exc:  # noqa: BLE001
+            if emitted or not _is_auth_failure(exc):
+                raise
+            self._provider.invalidate()
+            retried = await self._inner(*args, **kwargs)
+            if not inspect.isasyncgen(retried):
+                return
+            async for chunk in retried:
+                yield chunk
+
+
+def _with_usage_tracking(model, on_usage, prices: dict | None = None,
+                         origin: str | None = None):
     """统一挂载用量采集（无 agentscope 基类可用时原样返回，保证不阻断）"""
     try:
-        return UsageTrackingModel(model, on_usage, prices=prices)
+        return UsageTrackingModel(model, on_usage, prices=prices, origin=origin)
     except Exception as exc:
         print(f"[engine] 用量采集包装跳过: {exc}", flush=True)
         return model
@@ -2563,14 +3343,576 @@ def _pptx_render_imported(prs, title: str, pages: list, fallback_theme: dict) ->
         _pptx_add_notes(slide, page.get("notes"))
 
 
+# ── 办公产物（D-33）：真实 .xlsx / .docx 的上限、入参归一与包自检 ──────────────────
+#
+# 这两个工具的存在理由只有一条：用户说「给我一份 Excel / Word」时必须落到真件，
+# 不能拿 Markdown 或 CSV 改名冒充。所以每次落盘收尾都过一次 OpenXML 包自检
+# （Office 文档是 zip 包，文件头必须是 PK），不过就把半成品删掉、按失败返回。
+# 上限不是为了省内存，是为了让「一次调用写完」这件事是真的：超出的部分一律截断并
+# 在返回里逐条如实带话，模型不会以为第 2001 行也写进去了。
+XLSX_MAX_SHEETS = 20
+XLSX_MAX_ROWS = 2000
+XLSX_MAX_COLS = 100
+DOCX_MAX_BLOCKS = 600
+DOCX_MAX_TABLE_ROWS = 200
+DOCX_MAX_TABLE_COLS = 20
+OFFICE_MAX_CELL_CHARS = 2000
+OFFICE_MAX_SHEET_NAME_CHARS = 31  # Excel 的硬限制，超了要等保存时才炸，这里先夹住
+OFFICE_LATIN_FONT = "Calibri"
+OFFICE_CJK_FONT = "微软雅黑"
+# 工作表名里 Excel 不让用的字符（竖线排最后，免得看代码时以为是个转义）
+XLSX_NAME_BAD_CHARS = ':*?/\\[]'
+# 单元格引用：A1 / $B$12，最多 3 个字母（更宽的表 openpyxl 自己也写不下）
+_XLSX_CELL_REF_RE = re.compile(r"^([A-Z]{1,3})([1-9][0-9]{0,6})$")
+# 引擎验过能写的函数；白名单外的公式照样落盘，但要在返回里说明没有求值器这回事
+_XLSX_KNOWN_FUNCS = frozenset({
+    "SUM", "AVERAGE", "COUNT", "COUNTA", "MAX", "MIN", "ROUND", "ABS", "IF",
+    "IFERROR", "SUMIF", "COUNTIF", "CONCAT", "CONCATENATE", "TEXT",
+})
+_XLSX_FUNC_RE = re.compile(r"([A-Z][A-Z0-9_.]{0,20})\s*\(")
+# 块类型别名：模型写 paragraph/para/text 是同一件事，这里只认一套内部名字
+_DOCX_BLOCK_ALIASES = {
+    "heading": "heading", "h1": "heading", "h2": "heading", "h3": "heading", "h4": "heading",
+    "title": "heading",
+    "paragraph": "paragraph", "para": "paragraph", "text": "paragraph", "body": "paragraph",
+    "bullet": "bullet", "bullets": "bullet", "ul": "bullet", "list": "bullet",
+    "list-item": "bullet", "listitem": "bullet",
+    "numbered": "numbered", "numbered-list": "numbered", "ordered": "numbered",
+    "ol": "numbered",
+    "table": "table",
+}
+
+
+def _office_clip(value: object, limit: int = OFFICE_MAX_CELL_CHARS) -> str:
+    """文本按上限截断（不截时原样返回）。"""
+    text = "" if value is None else str(value)
+    return text if len(text) <= limit else text[:limit]
+
+
+def _office_cell(value: object) -> tuple[object, bool, bool]:
+    """单元格落盘值的归一：(值, 是否被截断, 是否被转成文本)。
+
+    数字/布尔/空一律保持原类型——数字格式和公式都指着「这格是数字」这件事；
+    dict/list 转成 JSON 文本并如实报一句，模型把表塞成嵌套结构时不该静默丢内容。
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return value, False, False
+    if isinstance(value, str):
+        return _office_clip(value), len(value) > OFFICE_MAX_CELL_CHARS, False
+    if isinstance(value, (dict, list)):
+        raw = json.dumps(value, ensure_ascii=False, default=str)
+        return _office_clip(raw), len(raw) > OFFICE_MAX_CELL_CHARS, True
+    raw = str(value)
+    return _office_clip(raw), len(raw) > OFFICE_MAX_CELL_CHARS, True
+
+
+def _office_list(parsed: object, field: str) -> tuple[list, str]:
+    """已解析的 JSON → 列表：(条目, 错误文案)。
+
+    三种写法都收：数组本体、{"<field>": [...]}、单个对象（模型经常忘了外层方括号，
+    把它当「就一条」处理比打回去重写更省事）。
+    """
+    if isinstance(parsed, list):
+        return parsed, ""
+    if isinstance(parsed, dict):
+        inner = parsed.get(field)
+        if isinstance(inner, list):
+            return inner, ""
+        values = list(parsed.values())
+        if inner is None and len(values) == 1 and isinstance(values[0], list):
+            return values[0], ""
+        return [parsed], ""
+    return [], (
+        f"格式不对：收到的是 {type(parsed).__name__}，请给 JSON 数组，"
+        f'或形如 {{"{field}": [...]}} 的对象'
+    )
+
+
+def _office_items(raw_json: object, field: str) -> tuple[list, str]:
+    """工具入参（JSON 字符串）→ 列表：(条目, 错误文案)；解析失败时条目为空。"""
+    text = raw_json if isinstance(raw_json, str) else json.dumps(raw_json, ensure_ascii=False)
+    try:
+        parsed = json.loads(text if text.strip() else "[]")
+    except Exception as exc:  # noqa: BLE001 - 这句要给模型看懂，不能只回个异常类名
+        return [], f"不是合法 JSON：{exc}"
+    return _office_list(parsed, field)
+
+
+def _office_rows(header_raw: object, rows_raw: object, max_rows: int, max_cols: int,
+                 where: str) -> tuple[list, list, list]:
+    """表头 + 数据行的归一：(表头, 行, 说明)。行列数与单元格长度都按上限夹。
+
+    行允许三种写法：数组、对象（有表头按表头取值，没表头按键顺序）、标量（当成一个单元格）。
+    说明按「同类问题汇总成一条」给，不逐行刷屏——2000 行的表里 2000 句「已截断」没人看得完，
+    但「有多少处、首个出现在哪」是模型下一轮能用的信息。
+    """
+    notes: list[str] = []
+    raw_header = (
+        header_raw if isinstance(header_raw, list)
+        else ([] if header_raw is None else [header_raw])
+    )
+    if len(raw_header) > max_cols:
+        notes.append(f"{where}表头超过 {max_cols} 列，只取前 {max_cols} 列")
+    header = [_office_clip(value) for value in raw_header[:max_cols]]
+    raw_rows = (
+        rows_raw if isinstance(rows_raw, list)
+        else ([] if rows_raw is None else [rows_raw])
+    )
+    if len(raw_rows) > max_rows:
+        notes.append(
+            f"{where}数据超过 {max_rows} 行，只写前 {max_rows} 行"
+            f"（后面 {len(raw_rows) - max_rows} 行没进文件）"
+        )
+    rows: list[list] = []
+    dropped = dropped_at = 0
+    wide = 0
+    clipped_cells = 0
+    converted_cells = 0
+    dict_no_header = 0
+    extra_keys: list[str] = []
+    for offset, row in enumerate(raw_rows[:max_rows], 1):
+        if isinstance(row, dict):
+            if header:
+                cells = [row.get(name) for name in header]
+                for key in row:
+                    label = str(key)
+                    if label not in header and label not in extra_keys:
+                        extra_keys.append(label)
+            else:
+                cells = list(row.values())
+                dict_no_header += 1
+        elif isinstance(row, list):
+            cells = row
+        elif row is None:
+            dropped += 1
+            dropped_at = dropped_at or offset
+            continue
+        else:
+            cells = [row]
+        if len(cells) > max_cols:
+            wide += 1
+            cells = cells[:max_cols]
+        held = []
+        for value in cells:
+            kept, was_clipped, was_converted = _office_cell(value)
+            held.append(kept)
+            clipped_cells += 1 if was_clipped else 0
+            converted_cells += 1 if was_converted else 0
+        rows.append(held)
+    if dropped:
+        notes.append(f"{where}有 {dropped} 行是空值（首个在第 {dropped_at} 行），已跳过")
+    if wide:
+        notes.append(f"{where}有 {wide} 行的列数超过 {max_cols}，已逐行截断")
+    if clipped_cells:
+        notes.append(f"{where}有 {clipped_cells} 个单元格超过 {OFFICE_MAX_CELL_CHARS} 字，已截断")
+    if converted_cells:
+        notes.append(
+            f"{where}有 {converted_cells} 个单元格是嵌套结构或非数字标量，已转成文本写入"
+        )
+    if dict_no_header:
+        notes.append(
+            f"{where}有 {dict_no_header} 行是对象但没给表头，按键顺序落成单元格（列名会丢）"
+        )
+    if extra_keys:
+        notes.append(
+            f"{where}对象行里有 {len(extra_keys)} 个键不在表头中，已忽略：" + "、".join(extra_keys[:8])
+        )
+    return header, rows, notes
+
+
+def _xlsx_col_index(letters: object) -> int:
+    """列字母 → 1 起始的列号（A=1、AB=28）；不是纯字母（≤3 个）时回 0。"""
+    text = str(letters or "").strip().upper()
+    if not text or len(text) > 3 or not text.isalpha():
+        return 0
+    index = 0
+    for char in text:
+        index = index * 26 + (ord(char) - 64)
+    return index
+
+
+def _xlsx_col_letter(index: int) -> str:
+    """1 起始的列号 → 列字母（1→A、28→AB）；与 _xlsx_col_index 互逆。"""
+    letters = ""
+    number = int(index)
+    while number > 0:
+        number, remainder = divmod(number - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
+
+def _xlsx_cell_ref(ref: object) -> tuple[int, int] | None:
+    """单元格引用 → (行, 列)（都从 1 起）；写不进合法位置时回 None，不猜。"""
+    match = _XLSX_CELL_REF_RE.match(str(ref or "").strip().upper().replace("$", ""))
+    if not match:
+        return None
+    return int(match.group(2)), _xlsx_col_index(match.group(1))
+
+
+def _xlsx_unknown_funcs(formula: str) -> list[str]:
+    """公式里出现的、引擎没验过的函数名（够不着求值，只能如实说明落点在 Excel 一侧）。"""
+    found = []
+    for match in _XLSX_FUNC_RE.finditer(str(formula or "").upper()):
+        name = match.group(1)
+        if name not in _XLSX_KNOWN_FUNCS and name not in found:
+            found.append(name)
+    return found
+
+
+def _xlsx_sheet_name(value: object, index: int, taken: set) -> tuple[str, str]:
+    """干净的工作表名 + 一句改名说明（没改名时说明为空串）。
+
+    Excel 对表名有三条硬限制：不许带 : \\ / ? * [ ]、不许超 31 字、不许重名。
+    一次在这里处理完，否则要等保存时才炸出一个用户看不出所以然的错误。
+    """
+    name = str(value if value is not None else "").strip()
+    note = ""
+    if not name:
+        name = f"工作表{index}"
+        note = f"第 {index} 张表没给 name，已用「{name}」"
+    elif any(char in name for char in XLSX_NAME_BAD_CHARS):
+        cleaned = name
+        for char in XLSX_NAME_BAD_CHARS:
+            cleaned = cleaned.replace(char, "-")
+        note = f"表名「{name}」含 Excel 不允许的字符，已改成「{cleaned}」"
+        name = cleaned
+    if len(name) > OFFICE_MAX_SHEET_NAME_CHARS:
+        cut = name[:OFFICE_MAX_SHEET_NAME_CHARS].rstrip()
+        note = (note + "；" if note else "") + (
+            f"表名超过 {OFFICE_MAX_SHEET_NAME_CHARS} 字，已截断为「{cut}」"
+        )
+        name = cut
+    if name in taken:
+        dup, seq = name, 2
+        while name in taken:
+            tail = f"_{seq}"
+            name = dup[: OFFICE_MAX_SHEET_NAME_CHARS - len(tail)] + tail
+            seq += 1
+        note = (note + "；" if note else "") + f"表名「{dup}」重复，已改成「{name}」"
+    taken.add(name)
+    return name, note
+
+
+def _xlsx_normalize(items: list) -> tuple[list, list]:
+    """入参数组 → 可落盘的工作表清单：(sheets, notes)；notes 每条都是「实际写的和你给的不一样」。"""
+    notes: list[str] = []
+    kept = items[:XLSX_MAX_SHEETS]
+    if len(items) > len(kept):
+        notes.append(
+            f"工作表超过上限 {XLSX_MAX_SHEETS} 张，已忽略后 {len(items) - len(kept)} 张"
+        )
+    taken: set[str] = set()
+    sheets: list[dict] = []
+    for index, item in enumerate(kept, 1):
+        if isinstance(item, dict):
+            spec = item
+        elif isinstance(item, list):
+            spec = {"rows": item}  # 直接甩一张二维数组也认：当成一张无名表
+        else:
+            notes.append(f"第 {index} 项既不是对象也不是二维数组，已跳过")
+            continue
+        name, rename_note = _xlsx_sheet_name(spec.get("name"), index, taken)
+        if rename_note:
+            notes.append(rename_note)
+        where = f"工作表「{name}」："
+        header, rows, row_notes = _office_rows(
+            spec.get("header"), spec.get("rows"), XLSX_MAX_ROWS, XLSX_MAX_COLS, where
+        )
+        notes.extend(row_notes)
+        if not header and not rows:
+            notes.append(f"第 {index} 项（「{name}」）既没有表头也没有数据行，已跳过")
+            continue
+        numeric_cols = set()
+        for row in rows:
+            for position, value in enumerate(row, 1):
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    numeric_cols.add(position)
+        formats_raw = spec.get("formats")
+        pairs = []
+        if isinstance(formats_raw, dict):
+            pairs = list(formats_raw.items())
+        elif isinstance(formats_raw, list):
+            pairs = [(_xlsx_col_letter(i), f) for i, f in enumerate(formats_raw, 1) if f]
+        formats: list[tuple[int, str]] = []
+        bad_format_keys: list[str] = []
+        for key, fmt in pairs:
+            text = _office_clip(fmt, 60).strip()
+            if not text:
+                continue
+            label = str(key).strip()
+            column = (header.index(label) + 1) if label in header else _xlsx_col_index(label)
+            if not column or column > XLSX_MAX_COLS:
+                bad_format_keys.append(label)
+                continue
+            formats.append((column, text))
+            if column not in numeric_cols:
+                notes.append(
+                    f"{where}数字格式「{text}」落在第 {column} 列（{_xlsx_col_letter(column)}），"
+                    "但那几格不是数字，格式不会有效果"
+                )
+        if bad_format_keys:
+            notes.append(
+                f"{where}有 {len(bad_format_keys)} 个数字格式的键既不是表头名也不是列字母，已忽略："
+                + "、".join(bad_format_keys[:8])
+            )
+        formulas_raw = spec.get("formulas")
+        entries = []
+        if isinstance(formulas_raw, dict):
+            entries = [(k, v) for k, v in formulas_raw.items()]
+        elif isinstance(formulas_raw, list):
+            for entry in formulas_raw:
+                if isinstance(entry, dict):
+                    ref = entry.get("cell") or entry.get("at") or entry.get("ref")
+                    expr = entry.get("formula") or entry.get("value")
+                    if ref is None or expr is None:
+                        entries.append((None, None))
+                    else:
+                        entries.append((ref, expr))
+                else:
+                    entries.append((None, entry))
+        formulas: list[tuple[int, int, str]] = []
+        bad_refs: list[str] = []
+        missing_eq: list[str] = []
+        unknown: list[str] = []
+        for ref, expr in entries:
+            position = _xlsx_cell_ref(ref)
+            text = str(expr or "").strip()
+            if position is None:
+                bad_refs.append(str(ref) if ref is not None else "（没给 cell）")
+                continue
+            if not text.startswith("="):
+                missing_eq.append(f"{ref}←{text[:24]}")
+                continue
+            row_index, column = position
+            if row_index > XLSX_MAX_ROWS or column > XLSX_MAX_COLS:
+                bad_refs.append(f"{ref}（超出 {XLSX_MAX_ROWS} 行 / {XLSX_MAX_COLS} 列）")
+                continue
+            formulas.append((row_index, column, text))
+            # 循环变量别叫 name：外层的工作表名就叫 name，这里一 Rebind 就会把表名
+            # 换成最后一个未知函数名（「F」这张表会被存成「FOO」），是本刀自测抓出的真缺陷。
+            for func_name in _xlsx_unknown_funcs(text):
+                if func_name not in unknown:
+                    unknown.append(func_name)
+        if bad_refs:
+            notes.append(
+                f"{where}有 {len(bad_refs)} 处公式的单元格引用不合法，已忽略："
+                + "、".join(bad_refs[:8])
+            )
+        if missing_eq:
+            notes.append(
+                f"{where}有 {len(missing_eq)} 处公式没以 = 开头，已忽略（首个 {missing_eq[0]}）"
+            )
+        if unknown:
+            notes.append(
+                f"{where}公式里出现了引擎没验过的函数 { '、'.join(unknown[:6]) } —— "
+                "仍会原样写入，但能不能算开 Excel/WPS 才知道"
+            )
+        sheets.append({
+            "name": name,
+            "header": header,
+            "rows": rows,
+            "widths": _xlsx_widths(spec.get("widths"), where, notes),
+            "formats": formats,
+            "formulas": formulas,
+        })
+    return sheets, notes
+
+
+def _xlsx_widths(raw: object, where: str, notes: list) -> list[tuple[int, float]]:
+    """列宽入参归一：按列顺序给数字数组，或按列字母/表头名给对象。"""
+    pairs = []
+    if isinstance(raw, list):
+        pairs = list(enumerate(raw, 1))
+    elif isinstance(raw, dict):
+        for key, value in raw.items():
+            label = str(key).strip()
+            column = _xlsx_col_index(label)
+            if not column:
+                notes.append(f"{where}列宽键「{label}」不是列字母，已忽略")
+                continue
+            pairs.append((column, value))
+    out: list[tuple[int, float]] = []
+    junk = 0
+    for column, value in pairs:
+        if value is None or not 1 <= int(column) <= XLSX_MAX_COLS:
+            continue
+        try:
+            width = float(value)
+        except (TypeError, ValueError):
+            junk += 1
+            continue
+        # Excel 的列宽是「字符数」量纲，夹到 4–100 是为了既看得清又不至于单列撑爆屏幕
+        out.append((int(column), max(4.0, min(width, 100.0))))
+    if junk:
+        notes.append(f"{where}有 {junk} 个列宽不是数字，已忽略（用默认宽度）")
+    return out
+
+
+def _docx_normalize(items: list) -> tuple[list, list]:
+    """块数组 → 可落盘的文档块清单：(blocks, notes)；未知类型跳过并说明可用类型。"""
+    notes: list[str] = []
+    kept = items[:DOCX_MAX_BLOCKS]
+    if len(items) > len(kept):
+        notes.append(
+            f"内容块超过上限 {DOCX_MAX_BLOCKS} 块，只写前 {DOCX_MAX_BLOCKS} 块"
+            f"（后面 {len(items) - len(kept)} 块没进文件）"
+        )
+    blocks: list[dict] = []
+    skipped: list[str] = []
+    for index, item in enumerate(kept, 1):
+        if isinstance(item, str):
+            text = _office_clip(item).strip()
+            if text:
+                blocks.append({"kind": "paragraph", "text": text, "level": 1})
+            continue
+        if not isinstance(item, dict):
+            skipped.append(f"第 {index} 项不是对象/字符串")
+            continue
+        kind_raw = str(item.get("type") or item.get("kind") or "").strip().lower().replace("_", "-")
+        if not kind_raw:
+            # 没写类型时按形状猜：有 rows/header 当表，有 level 当标题，其余按段落
+            if isinstance(item.get("rows"), list) or isinstance(item.get("header"), list):
+                kind_raw = "table"
+            elif item.get("level") is not None:
+                kind_raw = "heading"
+            else:
+                kind_raw = "paragraph"
+        kind = _DOCX_BLOCK_ALIASES.get(kind_raw)
+        if kind is None:
+            skipped.append(f'第 {index} 块的类型「{kind_raw}」不认识')
+            continue
+        if kind == "table":
+            header, rows, row_notes = _office_rows(
+                item.get("header"), item.get("rows"),
+                DOCX_MAX_TABLE_ROWS, DOCX_MAX_TABLE_COLS, f"第 {index} 块表格：",
+            )
+            notes.extend(row_notes)
+            if not header and not rows:
+                skipped.append(f"第 {index} 块表格是空的")
+                continue
+            blocks.append({"kind": "table", "header": header, "rows": rows})
+            continue
+        text = _office_clip(str(item.get("text") or item.get("content") or "")).strip()
+        if not text:
+            skipped.append(f"第 {index} 块（{kind}）没有正文")
+            continue
+        level = 1
+        if kind == "heading":
+            if kind_raw.startswith("h") and kind_raw[1:].isdigit():
+                level = int(kind_raw[1])
+            else:
+                try:
+                    level = int(item.get("level", 1))
+                except (TypeError, ValueError):
+                    level = 1
+            level = max(1, min(4, level))
+        blocks.append({"kind": kind, "text": text, "level": level})
+    if skipped:
+        notes.append(
+            f"{len(skipped)} 块被跳过（首个：{skipped[0]}）；可用类型："
+            "heading / paragraph / bullet / numbered / table"
+        )
+    return blocks, notes
+
+
+def _docx_apply_fonts(document) -> str:
+    """给默认样式与标题挂上「西文 + 中文」两套字形；成功回空串，失败回一句说明。
+
+    只设 `font.name` 管的是西文那一份。中文走 w:eastAsia，缺了它 Word 会退回主题的东亚字体
+    ——中文文档最常见的外观就是「我明明设了字体，中文还是宋体/方块」，所以两份都要落进同一个
+    rFonts 节点。样式缺失或结构不认识时不硬撑：文档还是要能生成，但如实说明字体没改成。
+    """
+    from docx.oxml.ns import qn
+
+    problems = []
+    for style_name in ("Normal", "Title", "Heading 1", "Heading 2", "Heading 3"):
+        try:
+            style = document.styles[style_name]
+            style.font.name = OFFICE_LATIN_FONT
+            rpr = style.element.get_or_add_rPr()
+            rfonts = rpr.get_or_add_rFonts()
+            rfonts.set(qn("w:eastAsia"), OFFICE_CJK_FONT)
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"{style_name}: {exc}")
+    if len(problems) >= 5:
+        return f"中文字体未能设置（{problems[0]}），中文将退回 Word 的默认东亚字体"
+    if problems:
+        return "部分样式的中文字体未设置成功（" + "；".join(problems) + "）"
+    return ""
+
+
+def _docx_add_table(document, block: dict, notes: list) -> None:
+    """按块落一张 Word 表格：表头加粗，行数列数已在归一层夹过上限。"""
+    header = block.get("header") or []
+    rows = block.get("rows") or []
+    widest = max((len(row) for row in rows), default=0)
+    columns = len(header) or widest
+    if columns <= 0:
+        notes.append("有一张表格既没有表头也没有单元格，已跳过")
+        return
+    table = document.add_table(rows=(1 if header else 0) + len(rows), cols=columns)
+    try:
+        table.style = "Table Grid"  # 带边框；内置模板没有它时退成无边框，但要说出来
+    except Exception:  # noqa: BLE001 - 样式缺失不该让整份文档失败
+        notes.append("当前模板没有「Table Grid」样式，表格按无边框输出")
+    offset = 0
+    if header:
+        for column, value in enumerate(header):
+            run = table.cell(0, column).paragraphs[0].add_run(str(value))
+            run.bold = True
+        offset = 1
+    for row_index, row in enumerate(rows):
+        for column, value in enumerate(row[:columns]):
+            text = "" if value is None else (value if isinstance(value, str) else str(value))
+            # 数据格不需要加粗，直接交 .text：它会把格子换成唯一那一段，不留多余空行
+            table.cell(offset + row_index, column).text = text
+
+
+def _office_check_package(path: Path) -> str:
+    """产物收尾自检：OpenXML 是 zip 包，文件头必须是 PK；不合格就回错误文案。
+
+    不合格时先把这份半成品删掉——留着它，等于允许「扩展名对、内容不是 Office」
+    这种最坑人的假件留在用户的工作目录里，而 D-33 要堵的正是它。
+    """
+    reason = ""
+    head = b""
+    try:
+        head = path.read_bytes()[:2]
+    except Exception as exc:  # noqa: BLE001
+        reason = str(exc)
+    if head == b"PK":
+        return ""
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001 - 删不掉也要把「这不是合法文件」说清楚
+        pass
+    return (
+        f"错误：{path.name} 不是合法的 Office 文件（文件头 {head!r}），已按失败处理并删除"
+        + (f"；读取原因：{reason}" if reason else "")
+    )
+
+
 def build_toolkit(work_dir: Path, sandbox: "sr.SandboxPolicy | None" = None, slides: bool = False,
+                  office: bool = False,
                   grants: "tg.ToolGrantPolicy | None" = None, emit=None, task_id: str = "",
-                  pptx_templates: dict | None = None):
+                  pptx_templates: dict | None = None, extra: dict | None = None):
     """注册文件操作工具（自实现：路径限定在工作目录内，相对路径自动解析到工作目录）
 
-    sandbox 存在时按工作区沙箱策略校验路径（黑名单优先；L0 拒绝写；L2 放开目录限制）。
+    sandbox 存在时按工作区沙箱策略校验路径（黑名单优先；L0 拒绝写；L2 放开目录限制），
+    并按对话输入框选的文件访问档位判定：每次询问/自动审批只在绑定目录内写盘，
+    完全访问可越界但家目录与系统关键目录仍硬拒，删除文件只有完全访问允许。
     slides=True（幻灯片模式）时额外注册 generate_pptx：产出真实 .pptx，而不是文本改名。
+    office=True（通用/写作模式）时额外注册 generate_xlsx / generate_docx：办公产物落到真件，
+    不用 Markdown 或 CSV 改名冒充。这两件刻意不常驻注册——内置工具清单的契约要求本地 harness
+    为常驻清单里每个工具都给出实现（tests/unit/extensions/builtin-tools-contract.test.ts），
+    没有 Rust 实现之前把它们塞进常驻清单，等于界面上又多两条空头承诺。
     grants 是用户在工作区里的执行/联网显式授权：未授权或白名单为空时工具**不注册**。
+    通用 shell（run_shell）需要命令执行与 shell 两个开关同时打开，属于高风险能力。
+    extra 是 #164 车道的补充开关（knowledge / subagent 等装配现场对象）：缺省为空即一切不注册，
+    所以直接调 build_toolkit 的自测拿到的仍然是常驻六件。
+    extra["staging"] 给了 D-03.5 的写暂存策略且档位为 staged 时，`write_text_file` /
+    `insert_text_file` **不写目标文件**：内容进引擎数据根的暂存区并算出 diff，
+    等用户在界面批准后才由 `/api/staging/apply` 合并（暂存失败也不回退成直接写盘）。
     """
     from agentscope.tool import Toolkit, ToolResponse
     from agentscope.message import TextBlock
@@ -2583,14 +3925,26 @@ def build_toolkit(work_dir: Path, sandbox: "sr.SandboxPolicy | None" = None, sli
             p = base / p
         return p.resolve()
 
-    def _guard(p: Path, write: bool = False) -> str | None:
-        """沙箱/目录越界检查，返回错误文案或 None"""
+    def _guard(p: Path, write: bool = False, delete: bool = False) -> str | None:
+        """沙箱/目录越界/文件访问档位检查，返回错误文案或 None"""
         if sandbox is not None:
-            denial = sandbox.file_denial(p, write=write, base=base)
+            denial = sandbox.file_denial(p, write=write, base=base, delete=delete)
             if denial is not None:
-                return f"错误：沙箱拒绝访问 {p}：{denial[0]}"
+                # 档位拒绝与沙箱拒绝分开措辞：前者是对话框里自己选的约束，
+                # 告诉用户去哪儿改；后者是工作区策略，改不了就得找设置页。
+                head = (
+                    "错误：文件访问权限拒绝"
+                    if denial[1].startswith("file_permission")
+                    else "错误：沙箱拒绝访问"
+                )
+                return f"{head} {p}：{denial[0]}"
             if sandbox.configured:
                 # 策略已生效：边界由策略判定（L0/L1 限定工作目录与白名单，L2 刻意放开）
+                return None
+            if (write or delete) and sandbox.file_permission == "full_access":
+                # 没配工作区沙箱时的写/删越界放行权只属于「完全访问」档位：
+                # file_denial 已经验过硬拒清单，这里不能再拿旧的工作目录兜底二次拦，
+                # 否则「完全访问」在默认形态下等于没放开（读取仍按原边界走兜底）。
                 return None
         # 未配置策略时保留原有工作目录兜底
         try:
@@ -2599,8 +3953,14 @@ def build_toolkit(work_dir: Path, sandbox: "sr.SandboxPolicy | None" = None, sli
             return f"错误：路径超出工作目录范围: {p}"
         return None
 
-    def view_text_file(file_path: str, start_line: int | None = None, end_line: int | None = None):
-        """查看工作目录内的文本文件内容。
+    def view_text_file(
+        file_path: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        units: int | None = None,
+        start: int = 0,
+    ):
+        """查看工作目录内的文本文件内容（正文按分页预算返回，超量如实带话）。
 
         Args:
             file_path (`str`):
@@ -2609,6 +3969,12 @@ def build_toolkit(work_dir: Path, sandbox: "sr.SandboxPolicy | None" = None, sli
                 起始行号（从 1 开始），缺省为文件开头。
             end_line (`int`, optional):
                 结束行号（含），缺省为文件末尾。
+            units (`int`, optional):
+                这一页最多返回多少个单元（单元=字符，不是 token），默认 4000、上限 8000；
+                超出上限会被夹到上限并写明夹到了多少，不默默改你的意图。
+            start (`int`, optional):
+                从选定范围的第几个单元开始读（字符偏移），缺省 0。截断提示里给的
+                start= 可以照抄回来接着读，需要更多请翻页，不要把整篇塞进上下文。
         """
         p = _resolve(file_path)
         err = _guard(p)
@@ -2619,7 +3985,69 @@ def build_toolkit(work_dir: Path, sandbox: "sr.SandboxPolicy | None" = None, sli
         lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
         s = max(0, (start_line or 1) - 1)
         e = end_line or len(lines)
-        return ToolResponse(content=[TextBlock(type="text", text="\n".join(lines[s:e]))])
+        # 行轴（start_line/end_line）先选范围，字符轴（start/units）再按预算取页：
+        # 两个轴各管一件事，混在一起就没法表达「第 200 行往后、这一页 4000 字」。
+        page = twa.budgeted_read("\n".join(lines[s:e]), units, start, window=_window_reading())
+        text = page["text"]
+        note = str(page["note"] or "").strip()
+        if note:
+            text = note + "\n" + text
+        return ToolResponse(content=[TextBlock(type="text", text=text)])
+
+    history_sink = (extra or {}).get("artifact_history") is not None
+    staging_policy = (extra or {}).get("staging")
+    # D-48.8「按剩余窗口取页」：三个读取件都从这里现取本轮读数（对象是先建后填的）。
+    # 没给对象（自测直接调 build_toolkit、或其它装配点）就回空 → 走固定预算，与改造前逐字相同。
+    read_window = (extra or {}).get("read_window")
+
+    def _window_reading() -> dict:
+        """当前这一轮的窗口读数；读不到就回空字典，页面里也不出现关于窗口的话。"""
+        if read_window is None:
+            return {}
+        try:
+            return read_window.reading() or {}
+        except Exception:  # noqa: BLE001  读数坏了不拦读取：宁可给固定预算那一页，也不让工具报错
+            return {}
+
+    def _stage_instead_of_write(p: Path, new_text: str, tool: str):
+        """写暂存开启时：内容收进暂存区并返回给模型的回执；没开启返回 None（调用方照旧写盘）。
+
+        暂存失败**不回退成直接写盘**——用户选这一档要的就是「没批准就不落盘」，
+        静默降级等于把这一档变成装饰，也等于把「审批」变成事后通知。
+        """
+        if staging_policy is None or not getattr(staging_policy, "staged", False):
+            return None
+        try:
+            r = wsr.stage(new_text, target=p, task_id=task_id, tool=tool, work_dir=base)
+        except Exception as exc:  # noqa: BLE001  暂存模块自己出问题也不能写用户的文件
+            return ToolResponse(content=[TextBlock(
+                type="text",
+                text=f"错误：写暂存不可用，内容**未写入** {p}：{type(exc).__name__}: {_one_line(str(exc), 160)}",
+            )])
+        if not r.get("ok"):
+            return ToolResponse(content=[TextBlock(
+                type="text",
+                text=f"错误：{r.get('reason') or '暂存失败'}；内容**未写入** {p}",
+            )])
+        return ToolResponse(content=[TextBlock(type="text", text=str(r.get("note") or ""))])
+
+    def _capture_before_write(p: Path, tool: str) -> str:
+        """D-26：覆盖前把盘上那一份留成一版（W2 分片 138.md §5-c 请 W4 接的那根线）。
+
+        留的是**即将被盖掉的旧内容**，不是新写入的内容，所以版本 0001 等于第一次覆盖前的盘上那份。
+        三条口径：① 开关没点亮（`build_toolkit` 被自测直接调用、或装配现场没给句柄）时**什么都不做**
+        并返回空串——回执与改造前逐字相同；② 留档成功与否**都不改变写入结果**，写盘是用户要的事，
+        版本历史只是附加保险；③ 但留档的每一分代价与每一次没留住都要进回执，不许悄悄少一版
+        （超限、读失败、首次创建、去重四类在 `record_current` 里各有一句中文原因，原样转达）。
+        """
+        if not history_sink:
+            return ""
+        try:
+            rec = ahr.record_current(p, task_id=task_id, tool=tool)
+        except Exception as exc:  # noqa: BLE001 （留档任何意外都不许把用户的写入带崩）
+            return f"（覆盖前留档失败，这一次没有可回滚的旧版本：{exc}）"
+        note = str(rec.get("note") or "").strip()
+        return f"（{note}）" if note else ""
 
     def write_text_file(file_path: str, content: str):
         """创建或覆盖工作目录内的文本文件（写入前自动创建父目录）。
@@ -2634,9 +4062,15 @@ def build_toolkit(work_dir: Path, sandbox: "sr.SandboxPolicy | None" = None, sli
         err = _guard(p, write=True)
         if err:
             return ToolResponse(content=[TextBlock(type="text", text=err)])
+        staged = _stage_instead_of_write(p, content, "write_text_file")
+        if staged is not None:
+            # 暂存档：目标文件一个字节都没动，父目录也不提前建——
+            # 「即将覆盖」和「即将新建」的区分属于用户批准时看的那份 diff
+            return staged
         p.parent.mkdir(parents=True, exist_ok=True)
+        history_note = _capture_before_write(p, "write_text_file")
         p.write_text(content, encoding="utf-8")
-        return ToolResponse(content=[TextBlock(type="text", text=f"已成功写入文件: {p}")])
+        return ToolResponse(content=[TextBlock(type="text", text=f"已成功写入文件: {p}{history_note}")])
 
     def insert_text_file(file_path: str, content: str, line: int | None = None):
         """向工作目录内的文本文件插入内容（不指定行号则追加到末尾）。
@@ -2662,8 +4096,92 @@ def build_toolkit(work_dir: Path, sandbox: "sr.SandboxPolicy | None" = None, sli
         else:
             idx = max(0, min(line - 1, len(lines)))
             lines[idx:idx] = new_lines
-        p.write_text("\n".join(lines), encoding="utf-8")
-        return ToolResponse(content=[TextBlock(type="text", text=f"已成功更新文件: {p}")])
+        merged = "\n".join(lines)
+        # 暂存档收的是**整份合并后的内容**，不是片段——审批者看到的 diff 必须等于批准后会落盘的那份
+        staged = _stage_instead_of_write(p, merged, "insert_text_file")
+        if staged is not None:
+            return staged
+        history_note = _capture_before_write(p, "insert_text_file")
+        p.write_text(merged, encoding="utf-8")
+        return ToolResponse(content=[TextBlock(type="text", text=f"已成功更新文件: {p}{history_note}")])
+
+    def _to_trash(p: Path, reason: str) -> tuple[str, str]:
+        """删除前把原件复制进引擎回收目录；返回 (备份路径, 失败原因)
+
+        复制失败就绝不删除：这一档放开的是「能删」，不是「删了找不回来」。
+        """
+        try:
+            import data_paths  # noqa: PLC0415
+
+            trash_dir = data_paths.file_trash_dir()
+            trash_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            return "", f"回收目录不可用：{exc}"
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target = trash_dir / f"{stamp}_{p.name}"
+        seq = 1
+        while target.exists():
+            target = trash_dir / f"{stamp}_{seq}_{p.name}"
+            seq += 1
+        try:
+            shutil.copy2(p, target)
+        except Exception as exc:  # noqa: BLE001
+            return "", f"原件未能复制到回收目录：{exc}"
+        try:
+            meta = target.with_suffix(target.suffix + ".from.json")
+            meta.write_text(
+                json.dumps(
+                    {
+                        "origin": str(p),
+                        "reason": sr._brief(reason) if reason else "",
+                        "deletedAt": stamp,
+                        "taskId": task_id,
+                        "workDir": str(base),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:  # noqa: BLE001  说明文件写失败不影响原件已备份
+            pass
+        return str(target), ""
+
+    def delete_text_file(file_path: str, reason: str = ""):
+        """删除一个文件（仅「完全访问」档位可用；删除前会先复制到引擎回收目录）。
+
+        Args:
+            file_path (`str`):
+                要删除的文件路径（相对路径会解析到工作目录内）。只允许单个文件，
+                目录请逐个文件处理——批量删除目录属于不可逆操作，不提供给模型。
+            reason (`str`, optional):
+                删除原因，会随原路径一起记进回收目录的说明文件，便于事后找回。
+        """
+        p = _resolve(file_path)
+        if p.is_dir():
+            return ToolResponse(content=[TextBlock(
+                type="text", text=f"错误：只能删除单个文件，不支持目录：{p}"
+            )])
+        err = _guard(p, write=True, delete=True)
+        if err:
+            return ToolResponse(content=[TextBlock(type="text", text=err)])
+        if not p.exists():
+            return ToolResponse(content=[TextBlock(type="text", text=f"错误：文件不存在: {file_path}")])
+        backup, trash_error = _to_trash(p, reason)
+        if trash_error:
+            return ToolResponse(content=[TextBlock(
+                type="text", text=f"错误：未删除（{trash_error}）。文件仍在: {p}"
+            )])
+        try:
+            p.unlink()
+        except Exception as exc:  # noqa: BLE001
+            return ToolResponse(content=[TextBlock(
+                type="text",
+                text=f"错误：删除失败（{exc}）。原件仍在: {p}；回收副本: {backup}",
+            )])
+        return ToolResponse(content=[TextBlock(
+            type="text", text=f"已删除文件: {p}\n回收副本（如需找回从这里复制回去）: {backup}"
+        )])
 
     def generate_pptx(file_path: str, title: str, slides_json: str):
         """按当前幻灯片模板生成真实的 PowerPoint 演示文稿（.pptx）。
@@ -2678,7 +4196,12 @@ def build_toolkit(work_dir: Path, sandbox: "sr.SandboxPolicy | None" = None, sli
                 {"title": "页标题", "bullets": ["要点1", "要点2"], "notes": "演讲备注"}。
                 bullets 每页最多 8 条，超出会被截断并在返回里说明。
         """
-        from pptx import Presentation
+        try:
+            from pptx import Presentation
+        except ImportError:
+            return ToolResponse(content=[TextBlock(
+                type="text", text="错误：未安装 python-pptx，无法生成 .pptx（请安装 python-pptx 后重试）"
+            )])
 
         p = _resolve(file_path)
         if p.suffix.lower() != ".pptx":
@@ -2780,14 +4303,488 @@ def build_toolkit(work_dir: Path, sandbox: "sr.SandboxPolicy | None" = None, sli
             summary += "\n说明：" + "；".join(notes)
         return ToolResponse(content=[TextBlock(type="text", text=summary)])
 
+    def generate_xlsx(file_path: str, sheets_json: str):
+        """生成真实的 Excel 工作簿（.xlsx）：多工作表、表头加粗冻结、列宽、数字格式与公式。
+
+        Args:
+            file_path (`str`):
+                输出路径，必须以 .xlsx 结尾（相对路径会解析到工作目录内）。
+            sheets_json (`str`):
+                工作表数组的 JSON 字符串，每项形如 {"name": "销售", "header": ["月份", "金额"],
+                "rows": [["1月", 1200], {"月份": "2月", "金额": 1500}], "widths": [12, 14],
+                "formats": {"金额": "#,##0.00"}, "formulas": {"B4": "=SUM(B2:B3)"}}。
+                rows 三种写法都认：数组、对象（按 header 取值）、标量（当成一个单元格）；
+                金额/数量这类要参与计算的格子请给裸数字，别写成带千分位的字符串。
+                formats 的键可以是表头名或列字母，widths 按列顺序给数字。
+                上限：20 张表、单表 2000 行、100 列、单元格 2000 字，超出会截断并在返回里逐条说明。
+                公式只负责写入，数值由 Excel/WPS 打开时计算——引擎这一侧没有求值器。
+        """
+        p = _resolve(file_path)
+        if p.suffix.lower() != ".xlsx":
+            return ToolResponse(content=[TextBlock(
+                type="text", text=f"错误：工作簿路径必须以 .xlsx 结尾（收到 {p.name}）"
+            )])
+        err = _guard(p, write=True)
+        if err:
+            return ToolResponse(content=[TextBlock(type="text", text=err)])
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Alignment, Font
+        except ImportError:
+            return ToolResponse(content=[TextBlock(
+                type="text", text="错误：未安装 openpyxl，无法生成 .xlsx（请安装 openpyxl 后重试）"
+            )])
+        items, bad = _office_items(sheets_json, "sheets")
+        if bad:
+            return ToolResponse(content=[TextBlock(type="text", text=f"错误：sheets_json {bad}")])
+        sheets, notes = _xlsx_normalize(items)
+        if not sheets:
+            return ToolResponse(content=[TextBlock(
+                type="text",
+                text="错误：sheets_json 里没有可用的工作表（每张表至少要给 header 或 rows）"
+                + ("\n说明：" + "；".join(notes) if notes else ""),
+            )])
+        total_rows = 0
+        total_formulas = 0
+        try:
+            wb = Workbook()
+            wb.remove(wb.active)  # 默认那张 Sheet 不用：逐张按归一后的表名建，名字才说了算
+            for sheet in sheets:
+                ws = wb.create_sheet(title=sheet["name"])
+                header = sheet["header"]
+                if header:
+                    for column, value in enumerate(header, 1):
+                        cell = ws.cell(row=1, column=column, value=value)
+                        cell.font = Font(bold=True)
+                        cell.alignment = Alignment(horizontal="left")
+                    # 表头钉住：往下翻数据时第一行不跟着滚走，长表才有得看
+                    ws.freeze_panes = "A2"
+                for column, width in sheet["widths"]:
+                    ws.column_dimensions[_xlsx_col_letter(column)].width = width
+                first_data = 2 if header else 1
+                # 行号按**本表**偏移算：total_rows 是跨表累计的，拿它当行号会让第二张表
+                # 从第 N+2 行开始写，第一张表的行数全变成空洞。
+                for offset, row in enumerate(sheet["rows"]):
+                    for column, value in enumerate(row, start=1):
+                        ws.cell(row=first_data + offset, column=column, value=value)
+                total_rows += len(sheet["rows"])
+                for column, fmt in sheet["formats"]:
+                    for row_index in range(first_data, first_data + len(sheet["rows"])):
+                        ws.cell(row=row_index, column=column).number_format = fmt
+                for row_index, column, formula in sheet["formulas"]:
+                    ws.cell(row=row_index, column=column, value=formula)
+                    total_formulas += 1
+            p.parent.mkdir(parents=True, exist_ok=True)
+            wb.save(str(p))
+        except Exception as exc:  # noqa: BLE001 - 生成失败要说清是哪一步
+            return ToolResponse(content=[TextBlock(type="text", text=f"错误：工作簿生成失败：{exc}")])
+        broken = _office_check_package(p)
+        if broken:
+            return ToolResponse(content=[TextBlock(type="text", text=broken)])
+        summary = (
+            f"已生成工作簿: {p}（{len(sheets)} 张表，{total_rows} 行数据"
+            + (f"，{total_formulas} 处公式" if total_formulas else "")
+            + "；公式数值由 Excel/WPS 打开时计算）"
+        )
+        if notes:
+            summary += "\n说明：" + "；".join(notes)
+        return ToolResponse(content=[TextBlock(type="text", text=summary)])
+
+    def generate_docx(file_path: str, blocks_json: str, title: str = "",
+                      header_text: str = "", footer_text: str = ""):
+        """生成真实的 Word 文档（.docx）：标题层级、段落、两种列表、表格、页眉页脚与中文字体。
+
+        Args:
+            file_path (`str`):
+                输出路径，必须以 .docx 结尾（相对路径会解析到工作目录内）。
+            blocks_json (`str`):
+                内容块数组的 JSON 字符串，每项形如 {"type": "heading", "text": "小节", "level": 2}
+                / {"type": "paragraph", "text": "正文"} / {"type": "bullet", "text": "要点"}
+                / {"type": "numbered", "text": "步骤"} /
+                {"type": "table", "header": ["字段", "说明"], "rows": [["a", "b"]]}。
+                type 也接受 para/text/h1~h4/ul/ol 等常见写法，纯字符串按段落处理；
+                不认识的类型会被跳过并在返回里点名，不会静默少一段。
+                上限：600 块、单表 200 行、20 列、单元格 2000 字，超出会截断并逐条说明。
+            title (`str`, optional):
+                文档大标题（Title 样式，排在最前），缺省不加。
+            header_text (`str`, optional):
+                页眉文字，缺省不加。
+            footer_text (`str`, optional):
+                页脚文字，缺省不加。
+        """
+        p = _resolve(file_path)
+        if p.suffix.lower() != ".docx":
+            return ToolResponse(content=[TextBlock(
+                type="text", text=f"错误：文档路径必须以 .docx 结尾（收到 {p.name}）"
+            )])
+        err = _guard(p, write=True)
+        if err:
+            return ToolResponse(content=[TextBlock(type="text", text=err)])
+        try:
+            import docx
+        except ImportError:
+            return ToolResponse(content=[TextBlock(
+                type="text", text="错误：未安装 python-docx，无法生成 .docx（请安装 python-docx 后重试）"
+            )])
+        items, bad = _office_items(blocks_json, "blocks")
+        if bad:
+            return ToolResponse(content=[TextBlock(type="text", text=f"错误：blocks_json {bad}")])
+        blocks, notes = _docx_normalize(items)
+        if not blocks and not str(title or "").strip():
+            return ToolResponse(content=[TextBlock(
+                type="text",
+                text="错误：blocks_json 里没有可用的内容块"
+                + ("\n说明：" + "；".join(notes) if notes else ""),
+            )])
+        counts = {"heading": 0, "paragraph": 0, "bullet": 0, "numbered": 0, "table": 0}
+        chars = 0
+        try:
+            document = docx.Document()
+            font_note = _docx_apply_fonts(document)
+            if font_note:
+                notes.append(font_note)
+            heading_title = str(title or "").strip()
+            if heading_title:
+                document.add_heading(heading_title, level=0)
+                counts["heading"] += 1
+                chars += len(heading_title)
+            for block in blocks:
+                kind = block["kind"]
+                chars += len(block.get("text") or "")
+                for row in block.get("rows") or []:
+                    chars += sum(len("" if value is None else str(value)) for value in row)
+                chars += sum(len(str(value)) for value in (block.get("header") or []))
+                if kind == "heading":
+                    document.add_heading(block["text"], level=block["level"])
+                elif kind == "table":
+                    _docx_add_table(document, block, notes)
+                else:
+                    style_name = {"bullet": "List Bullet", "numbered": "List Number"}.get(kind)
+                    if style_name is None:
+                        document.add_paragraph(block["text"])
+                    else:
+                        try:
+                            document.add_paragraph(block["text"], style=style_name)
+                        except KeyError:
+                            # 内置模板缺这个样式时退成普通段落，比整份文档生成失败好；
+                            # 但必须说「不是真列表」，否则用户以为能接着往下编号。
+                            document.add_paragraph(block["text"])
+                            notes.append(f"当前模板没有列表样式「{style_name}」，已退为普通段落")
+                counts[kind] = counts.get(kind, 0) + 1
+            for label, text in (("页眉", header_text), ("页脚", footer_text)):
+                value = str(text or "").strip()
+                if not value:
+                    continue
+                try:
+                    part = document.sections[0].header if label == "页眉" else document.sections[0].footer
+                    part.is_linked_to_previous = False
+                    part.paragraphs[0].text = _office_clip(value)
+                except Exception as exc:  # noqa: BLE001 - 页眉页脚缺失不该拖垮整份文档
+                    notes.append(f"{label}写入失败（{exc}），正文不受影响")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            document.save(str(p))
+        except Exception as exc:  # noqa: BLE001 - 生成失败要说清是哪一步
+            return ToolResponse(content=[TextBlock(type="text", text=f"错误：文档生成失败：{exc}")])
+        broken = _office_check_package(p)
+        if broken:
+            return ToolResponse(content=[TextBlock(type="text", text=broken)])
+        summary = (
+            f"已生成文档: {p}（{len(blocks)} 块：标题 {counts['heading']} 处、段落 {counts['paragraph']} 段、"
+            f"列表 {counts['bullet'] + counts['numbered']} 条、表格 {counts['table']} 张，正文约 {chars} 字）"
+        )
+        if notes:
+            summary += "\n说明：" + "；".join(notes)
+        return ToolResponse(content=[TextBlock(type="text", text=summary)])
+
+    def list_directory(path: str = ".", depth: int = 1, limit: int | None = None, offset: int = 0):
+        """列出目录里的文件与子目录（名称、类型、大小），用于先看清目录再决定读哪些文件。
+
+        Args:
+            path (`str`, optional):
+                目录路径（相对路径按工作目录解析）；缺省为工作目录本身。
+            depth (`int`, optional):
+                递归深度：1 只看当前目录，最大 3。
+            limit (`int`, optional):
+                这一页最多返回多少条，默认 20、上限 50；超出上限会被夹到上限并写明
+                夹到了多少，需要更多请带 offset 翻页，别一次要全。
+            offset (`int`, optional):
+                从第几条开始列（从 0 计），缺省 0。截断提示里给的 offset= 可以照抄回来。
+        """
+        p = _resolve(path or ".")
+        err = _guard(p)
+        if err:
+            return ToolResponse(content=[TextBlock(type="text", text=err)])
+        if not p.exists():
+            return ToolResponse(content=[TextBlock(type="text", text=f"错误：目录不存在: {path}")])
+        if not p.is_dir():
+            return ToolResponse(content=[TextBlock(type="text", text=f"错误：不是目录: {path}")])
+        # 显式 0 走夹取（下限 1），只有缺省/非数字才回落到默认值
+        try:
+            depth_n = int(depth)
+        except (TypeError, ValueError):
+            depth_n = 1
+        depth_n = max(1, min(depth_n, 3))
+        cap, cap_note = twa.clamp_units(
+            limit, default=twa.LIST_DEFAULT_ITEMS, maximum=twa.LIST_MAX_ITEMS, what="列出条数"
+        )
+        offset_note = ""
+        if offset is None or offset == "":
+            offset_n = 0
+        else:
+            try:
+                offset_n = int(str(offset).strip())
+            except (TypeError, ValueError):
+                offset_n, offset_note = 0, f"offset「{offset}」不是整数，本次从头列起。"
+            else:
+                if offset_n < 0:
+                    offset_n, offset_note = 0, f"offset「{offset_n}」是负数，本次从头列起。"
+
+        root = p.resolve()
+        # 多收一条才知道「这一页之后还有没有」；只收到 cap 会把「还压着没给的那几条」
+        # 报成「已经列完」（与 Rust 侧同一把尺子，见 harness/tools.rs 的同名分支）
+        want = offset_n + cap + 1
+        rows: list[str] = []
+        hit_cap = False
+
+        def _size_label(size: int) -> str:
+            value = float(size)
+            for unit in ("B", "KB", "MB", "GB"):
+                if value < 1024 or unit == "GB":
+                    return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+                value /= 1024
+            return f"{size} B"
+
+        for current, dirs, files in os.walk(root, followlinks=False):
+            cur = Path(current)
+            level = len(cur.relative_to(root).parts)
+            dirs[:] = sorted(dirs)
+            entries = [(name, True) for name in dirs] + [(name, False) for name in sorted(files)]
+            for name, is_dir in entries:
+                if len(rows) >= want:
+                    hit_cap = True
+                    break
+                item = cur / name
+                rel = item.relative_to(root).as_posix()
+                if is_dir:
+                    rows.append(f"[目录] {rel}/")
+                else:
+                    try:
+                        size = _size_label(item.stat().st_size)
+                    except OSError:
+                        size = "?"
+                    rows.append(f"[文件] {rel}  {size}")
+            if hit_cap or level + 1 >= depth_n:
+                dirs[:] = []
+            if hit_cap:
+                break
+
+        # 「按剩余窗口取页」对列表的落点：**收完这一页之后再压**，不预先猜每条多长。
+        # 拿真实条目的平均字符折算单条成本（`list_unit_tokens`），只许把这一页压小、
+        # 不许抬高（maximum 传当前 cap）；窗口宽到不需要压时连一句窗口的话都不多写。
+        reading = _window_reading()
+        if reading and rows:
+            eff_default, eff_cap, window_note = twa.window_budget(
+                reading,
+                default=min(cap, len(rows)),
+                maximum=cap,
+                unit_tokens=twa.list_unit_tokens(rows[:cap]),
+                what="项",
+                floor=twa.WINDOW_PAGE_FLOOR_ITEMS,
+            )
+            if window_note and eff_cap < cap:
+                cap, cap_note = eff_cap, (cap_note + " " if cap_note else "") + window_note
+        page = rows[offset_n : offset_n + cap]
+        has_more = hit_cap or len(rows) > offset_n + len(page)
+        if page:
+            header = f"目录：{root}（深度 {depth_n}，本次第 {offset_n + 1}–{offset_n + len(page)} 条，单页上限 {cap} 条）"
+        else:
+            header = f"目录：{root}（深度 {depth_n}，单页上限 {cap} 条）"
+        notes = " ".join(x for x in (cap_note.strip(), offset_note.strip()) if x)
+        if not rows:
+            return ToolResponse(content=[TextBlock(type="text", text=header + "\n（目录为空）")])
+        if not page:
+            tail = "（这个偏移之后没有条目了；要回头看请带 offset=0）"
+            return ToolResponse(
+                content=[TextBlock(type="text", text=header + ("\n" + notes if notes else "") + "\n" + tail)]
+            )
+        body = "\n".join(page)
+        if has_more:
+            body += f"\n…（单页 {cap} 条已到，后面还有更多没列——接着列请带 offset={offset_n + cap}，别指望一次看全）"
+        return ToolResponse(
+            content=[TextBlock(type="text", text=header + ("\n" + notes if notes else "") + "\n" + body)]
+        )
+
+    def read_document(file_path: str, max_chars: int | None = None, start: int = 0):
+        """读取 Word（.docx）、Excel（.xlsx/.xlsm）、PowerPoint（.pptx）或 PDF 的正文。
+
+        文本类文件请用 view_text_file；本工具用于二进制文档，直接把正文转成文本返回。
+        正文按分页预算给出：默认 4000 字符、上限 8000 字符，截断时会告诉你带哪个 start 接着读。
+
+        Args:
+            file_path (`str`):
+                文件路径（相对路径会解析到工作目录内）。
+            max_chars (`int`, optional):
+                这一页最多返回多少字符，默认 4000、上限 8000；超出上限会被夹到上限并写明
+                夹到了多少。要读整篇请带 start 翻页，别一次要超量。
+            start (`int`, optional):
+                从正文第几个字符开始返回，缺省 0。截断提示里给的 start= 可以照抄回来接着读。
+        """
+        p = _resolve(file_path)
+        err = _guard(p)
+        if err:
+            return ToolResponse(content=[TextBlock(type="text", text=err)])
+        if not p.exists() or not p.is_file():
+            return ToolResponse(content=[TextBlock(type="text", text=f"错误：文件不存在: {file_path}")])
+
+        suffix = p.suffix.lower()
+        text = ""
+        note = ""
+        try:
+            if suffix == ".docx":
+                try:
+                    import docx
+                except ImportError:
+                    return ToolResponse(content=[TextBlock(
+                        type="text", text="错误：未安装 python-docx，无法读取 .docx（附件链路仍可抽取正文）"
+                    )])
+                document = docx.Document(str(p))
+                blocks = [para.text for para in document.paragraphs]
+                for table in document.tables:
+                    for row in table.rows:
+                        cells = [cell.text.strip() for cell in row.cells]
+                        if any(cells):
+                            blocks.append("\t".join(cells))
+                text = "\n".join(block for block in blocks if block.strip())
+            elif suffix in (".xlsx", ".xlsm"):
+                try:
+                    import openpyxl
+                except ImportError:
+                    return ToolResponse(content=[TextBlock(
+                        type="text", text="错误：未安装 openpyxl，无法读取 Excel 文件（附件链路仍可抽取正文）"
+                    )])
+                workbook = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
+                try:
+                    sheets = []
+                    for sheet in workbook.worksheets:
+                        rows = []
+                        for row in sheet.iter_rows(values_only=True):
+                            values = ["" if value is None else str(value) for value in row]
+                            if any(value.strip() for value in values):
+                                rows.append("\t".join(values).rstrip())
+                        if rows:
+                            sheets.append(f"## 工作表：{sheet.title}\n" + "\n".join(rows))
+                    text = "\n\n".join(sheets)
+                finally:
+                    workbook.close()
+            elif suffix == ".pptx":
+                try:
+                    from pptx import Presentation
+                except ImportError:
+                    return ToolResponse(content=[TextBlock(
+                        type="text", text="错误：未安装 python-pptx，无法读取 .pptx"
+                    )])
+                presentation = Presentation(str(p))
+                slides = []
+                for index, slide in enumerate(presentation.slides, 1):
+                    lines = [
+                        shape.text.strip()
+                        for shape in slide.shapes
+                        if hasattr(shape, "text") and str(shape.text).strip()
+                    ]
+                    if lines:
+                        slides.append(f"## 第 {index} 页\n" + "\n".join(lines))
+                text = "\n\n".join(slides)
+            elif suffix == ".pdf":
+                try:
+                    from pypdf import PdfReader
+                except ImportError:
+                    return ToolResponse(content=[TextBlock(
+                        type="text", text="错误：未安装 pypdf，无法读取 PDF（附件链路仍可抽取正文）"
+                    )])
+                reader = PdfReader(str(p))
+                if reader.is_encrypted:
+                    return ToolResponse(content=[TextBlock(
+                        type="text", text="错误：PDF 已加密，请先解除密码或提供未加密副本"
+                    )])
+                max_pages = 300
+                pages = []
+                for index, page in enumerate(reader.pages):
+                    if index >= max_pages:
+                        note = f"（仅读取前 {max_pages} 页，全文共 {len(reader.pages)} 页）"
+                        break
+                    try:
+                        page_text = page.extract_text() or ""
+                    except Exception:  # noqa: BLE001 - 单页解析失败不应拖垮整份文档
+                        page_text = ""
+                    if page_text.strip():
+                        pages.append(f"## 第 {index + 1} 页\n{page_text.strip()}")
+                text = "\n\n".join(pages)
+            elif suffix in {".txt", ".md", ".markdown", ".csv", ".log", ".json", ".yaml", ".yml"}:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            else:
+                return ToolResponse(content=[TextBlock(
+                    type="text",
+                    text=(
+                        f"错误：不支持的文档格式 {suffix or '（无扩展名）'}；"
+                        "支持 .docx/.xlsx/.pptx/.pdf 与文本类文件"
+                    ),
+                )])
+        except Exception as exc:  # noqa: BLE001 - 第三方解析库的异常统一转成可读原因
+            return ToolResponse(content=[TextBlock(type="text", text=f"错误：读取文档失败：{exc}")])
+
+        if not text.strip():
+            return ToolResponse(content=[TextBlock(
+                type="text",
+                text=(
+                    f"错误：未能从 {p.name} 抽取到正文。"
+                    "若为扫描件/图片型 PDF，请先用 OCR 转成可复制文本，或在输入框以附件方式发送"
+                ),
+            )])
+        # 预算走执行体同一把尺子（默认 4000、上限 8000 字符）：一条自身就超窗口的工具结果
+        # 是压缩救不回来的那一类，而「分段查看」这句提示自此才有对应参数——以前只截前缀、
+        # 没有分页入口，模型每轮拿到的都是同一段。
+        page = twa.budgeted_read(text, max_chars, start, window=_window_reading())
+        clipped = str(page["note"] or "").strip()
+        header = f"已读取：{p}（{suffix[1:]}）"
+        if note:
+            header += note
+        return ToolResponse(content=[TextBlock(
+            type="text",
+            text=header + "\n\n" + page["text"] + (("\n" + clipped) if clipped else ""),
+        )])
+
     toolkit = Toolkit()
+    toolkit.register_tool_function(list_directory)
     toolkit.register_tool_function(view_text_file)
+    toolkit.register_tool_function(read_document)
     toolkit.register_tool_function(write_text_file)
     toolkit.register_tool_function(insert_text_file)
-    if slides:
-        toolkit.register_tool_function(generate_pptx)
-    if grants is not None:
-        grants.install(toolkit, base, emit=emit, task_id=task_id)
+    # 删除是这一版新加的能力，注册即对模型可见；能不能真删由文件访问档位判定
+    # （只有「完全访问」放行），所以这里不需要按档位条件注册。
+    toolkit.register_tool_function(delete_text_file)
+    # 模式作用域工具与授权工具交给车道（#164 接缝）：开关在哪、由谁授权，只在
+    # engine/toolkit_lanes.SWITCH_BOARD 里声明一次，各窗口只填自己那份 toolkit_<domain>.py。
+    # 常驻六件刻意留在上面不动车道：没有 Rust harness 实现的能力进了常驻清单，
+    # 界面上就是空头承诺（tests/unit/extensions/builtin-tools-contract.test.ts 锁这条口径），
+    # 车道若抢注常驻名或开关全假还注册，register_all 当场拒掉。
+    tl.register_all(tl.ToolkitContext(
+        toolkit=toolkit,
+        work_dir=work_dir,
+        base=base,
+        sandbox=sandbox,
+        emit=emit,
+        task_id=task_id,
+        slides=slides,
+        office=office,
+        grants=grants,
+        pptx_templates=pptx_templates,
+        tools={
+            "generate_pptx": generate_pptx,
+            "generate_xlsx": generate_xlsx,
+            "generate_docx": generate_docx,
+        },
+        extra=extra,
+    ))
     return toolkit
 
 
@@ -2797,7 +4794,7 @@ def build_skill_tool(skills: list):
     清单只把 name/description 放进 system prompt（装几十个技能也不撑爆上下文），
     正文按需用工具读。套件指令与技能走同一条路径，缺正文时返回安装侧原因。
     这条注册刻意留在 build_toolkit 之外：/api/tools 与
-    tests/unit/extensions/builtin-tools-contract.test.ts 锁的是「内置」三件套，
+    tests/unit/extensions/builtin-tools-contract.test.ts 锁的是「内置」四个文件工具，
     技能工具是随启停出现的运行时能力，不该混进同一张清单。
     """
     from agentscope.tool import ToolResponse
@@ -2823,6 +4820,31 @@ def build_skill_tool(skills: list):
     return use_skill
 
 
+def _usage_capture_for_window(on_usage, meter: "twa.ReadWindowMeter"):
+    """把「上一次调用回报的 prompt 量」记进取页窗口读数，然后**原样**转发用量回调。
+
+    None 也接：没接用量回调的装配（自测、老调用点）照样要有窗口读数，否则取页永远只能走固定
+    预算。回调本身失败不改行为——沿用的是 `UsageTrackingModel` 那条「记账失败不影响模型调用链」
+    的既有口径，这里只是它前面的一站。
+
+    `from_report=False` 的读法留给没回报用量的路径（上游没回 usage 时 `prompt` 是 0）；
+    `note_usage` 对非正数直接不动，所以「这次没量」不会把已有的量冲掉。"""
+
+    def captured(*args: Any, **kwargs: Any):
+        try:
+            if args:
+                meter.note_usage(args[0])
+            elif kwargs:
+                meter.note_usage(kwargs.get("prompt_tokens"))
+        except Exception:  # noqa: BLE001  读数记不上不影响真正该转发的用量回调
+            pass
+        if on_usage is not None:
+            return on_usage(*args, **kwargs)
+        return None
+
+    return captured
+
+
 def build_agent(model_binding: str | None = None, work_dir: "Path | None" = None, model_config: dict | None = None,
                 on_usage=None, runtime: dict | None = None, sandbox: "sr.SandboxPolicy | None" = None,
                 mode: str = "general", extra_prompt: str = "",
@@ -2840,8 +4862,14 @@ def build_agent(model_binding: str | None = None, work_dir: "Path | None" = None
     from agentscope.agent import ReActAgent
     from agentscope.memory import InMemoryMemory
 
+    # D-48.8「按剩余窗口取页」：这一轮的窗口读数对象先建后填——窗口要等下面的策略归一化
+    # 算完（故障转移链里可能换成更小的那个），用量要等第一次模型调用回报。取页工具读的
+    # 是这个对象的**当下值**，所以装配期快照不会过期。
+    read_window = twa.ReadWindowMeter()
+    on_usage_with_window = _usage_capture_for_window(on_usage, read_window)
+
     model, formatter = build_model_and_formatter(
-        model_binding, model_config, on_usage=on_usage,
+        model_binding, model_config, on_usage=on_usage_with_window,
         pii_mode=pii_mode, on_redaction=on_privacy,
         on_route_switch=on_route_switch,
     )
@@ -2868,14 +4896,20 @@ def build_agent(model_binding: str | None = None, work_dir: "Path | None" = None
     if max_iters is not None:
         from dataclasses import replace as _dc_replace
         policy = _dc_replace(policy, max_iters=cb.normalize_max_iters(max_iters)[0])
+    # 窗口读数在此填齐：策略已经算完（含故障转移链取最小窗口那一条），取页与压缩用的是同一个
+    # `context_window`，不另算一套。`from_model` 决定页面能不能说「按你填的窗口」。
+    read_window.configure(policy.context_window, policy.context_window_from_model)
     model_name = (
         getattr(model, "model_name", "")
         or _effective_model_name(model_binding, model_config)
     )
     compression, compression_error = cb.build_compression(policy, model_name)
     mcp_count = tsr.mcp_server_count(runtime)
-    lazy_mcp = bool(policy.lazy_mcp_tools and mcp_count > 0)
-    context_notes = policy.notes(mcp_count)
+    mcp_tools = tsr.declared_tool_count(runtime)
+    # 阈值判定用 Rust 探测缓存里的工具数：在建立 Agent 前就能定，
+    # 提示词与用户看到的策略说明不会和实际注册方式各说各的
+    lazy_mcp = tsr.should_lazy(runtime, policy.lazy_mcp_tools)
+    context_notes = policy.notes(mcp_count, mcp_tools, lazy_mcp)
     if compression_error:
         # 策略上写着「已开启」但依赖不可用时，不能两句自相矛盾
         context_notes = [
@@ -2904,11 +4938,36 @@ def build_agent(model_binding: str | None = None, work_dir: "Path | None" = None
     if grants is not None:
         # 提示词与工具同时出现：没授权就不提，避免「模型知道有这能力但调不到」
         sys_prompt += grants.system_hint()
+    # D-03.5：写暂存档位（缺省 off = 照旧直接写盘）。开启后文本写入工具不再碰目标文件，
+    # 内容先进引擎数据根的暂存区，用户在界面看过 diff 批准后才由 `/api/staging/apply` 合并。
+    # 档位只影响 `write_text_file` / `insert_text_file` 两件；office/pptx 生成件与删除仍走原路，
+    # 这一点在暂存模块的文档字符串和给模型的回执里都写明了，不在这里悄悄扩大范围。
+    staging = wsr.WriteStaging.from_runtime(runtime)
+    if staging.staged:
+        sys_prompt += staging.system_hint()
+    if staging.staged or staging.error:
+        # 「本轮到底有没有生效、为什么没生效」要和沙箱/审批同一口径摊给用户；
+        # 缺省档位不进 notes，否则每条对话都多一句没信息量的「写暂存：直接写盘」
+        context_notes.append(staging.note())
     toolkit = build_toolkit(
         work_dir or WORK_DIR, sandbox=sandbox, slides=rc.normalize_mode(mode) == "slides",
+        # 办公产物在通用与写作两种模式下都给：用户最常在最普通的对话里直接说
+        # 「把这个做成一份 Excel」，只放行写作模式会让最常见的那句要求拿不到真件。
+        office=rc.normalize_mode(mode) in ("general", "writing"),
         grants=grants, emit=emit, task_id=task_id,
         pptx_templates=(runtime or {}).get("pptxTemplates")
         if isinstance(runtime, dict) else None,
+        # 车道补充开关：把 build_agent 已有的装配现场交下去，W2/W6 之后加工具不必再开本文件。
+        # 这些对象在下面仍以原有顺序各自 install，车道只是「开关是否点亮」的读数，不改任何行为。
+        # artifact_history 是 D-26 的第二把开关（分片 138.md §5-a）：产物版本历史不该挂在
+        # 「装了知识库」那把门上——没挂知识库的会话同样需要能回滚被覆盖的产物。
+        extra={"knowledge": knowledge, "subagent": subagent_runner, "artifact_history": ahr,
+               # 写暂存是「装配现场的政策对象」，和 knowledge/subagent 同一条补充开关通道：
+               # 直接调 build_toolkit 的自测拿不到它，行为与改造前逐字相同（缺省=直接写盘）。
+               "staging": staging,
+               # 取页窗口同理走 extra：没给（自测直接调 build_toolkit）就是固定预算，
+               # 与改造前逐字相同；给了则三个读取件按剩余窗口压这一页的上限。
+               "read_window": read_window},
     )
     if knowledge is not None and knowledge.ready():
         # 知识库清单与检索工具同进同出；不可用的库已由 notes() 摊给用户
@@ -2946,6 +5005,14 @@ def build_agent(model_binding: str | None = None, work_dir: "Path | None" = None
         )
     if skills:
         toolkit.register_tool_function(build_skill_tool(skills))
+    # 长期记忆工具：只在 Rust 下发了桌面记忆库时注册；浏览器直连没有落库通道，
+    # 不注册假工具，避免模型以为保存成功。
+    if mt.install(toolkit, runtime, emit, secret_check=_looks_like_secret):
+        sys_prompt += mt.system_hint(runtime)
+        context_notes.append(
+            "长期记忆工具已启用：memory_search / memory_get / memory_save"
+            "（写入由桌面端去重、判冲突并与待审开关联动）"
+        )
     # 本地子 Agent：只有父 Agent 注册派发工具；子 Agent 走 subagent_runner=None，
     # 从工具面上杜绝递归派生。提示词与工具同时出现，避免「模型知道有这能力但无工具」。
     if subagent_runner is not None:
@@ -2954,7 +5021,7 @@ def build_agent(model_binding: str | None = None, work_dir: "Path | None" = None
     if lazy_mcp:
         try:
             tsr.install(toolkit)
-            sys_prompt += tsr.system_hint(mcp_count)
+            sys_prompt += tsr.system_hint(mcp_count, mcp_tools)
         except Exception as exc:  # noqa: BLE001
             # 搜索工具装不上就不能把 MCP 工具藏起来，否则模型永远够不到；
             # 同时撤掉「按需载入」说明，避免用户看到的策略与实际执行不一致
@@ -2983,12 +5050,26 @@ def build_agent(model_binding: str | None = None, work_dir: "Path | None" = None
         # 包装一层把「压缩失败」降级为可见说明，任务继续用未压缩上下文完成。
         original_compress = agent._compress_memory_if_needed
         agent._tt_compression_error = ""
+        trackers = _usage_trackers(model)
 
         async def _safe_compress():
+            for tracker in trackers:
+                tracker.last_structured_ok = None   # 每次压缩前复位，不读上一轮的结论
             try:
                 await original_compress()
             except Exception as exc:  # noqa: BLE001
                 agent._tt_compression_error = " ".join(str(exc).split())[:240]
+                if getattr(agent, "compression_config", None) is not None:
+                    agent.compression_config.enable = False
+                return
+            # 没抛异常不等于压成了：模型不按结构化协议回摘要时，AgentScope 只留一条
+            # WARNING 就继续跑，上下文一点没减，而且每一轮都会再白烧一次摘要调用
+            # （长任务基准实测：36 次触发、36 次失败、36 次白花）。这里把静默失败
+            # 变成用户看得见的说明，并关掉本次任务的压缩重试。
+            if trackers and all(t.last_structured_ok is False for t in trackers):
+                agent._tt_compression_error = (
+                    "模型未按结构化输出协议返回压缩摘要（端点不支持或未按 tools/response_format 应答）"
+                )
                 if getattr(agent, "compression_config", None) is not None:
                     agent.compression_config.enable = False
 
@@ -3160,42 +5241,336 @@ async def _im_bootstrap() -> None:
 
 
 async def _im_lifespan(_app: FastAPI):
+    # D-28：这里有本轮唯一能拿到的事件循环对象——循环回调里抛出的异常只有接得上循环才留得住
+    _crash_telemetry_bootstrap(asyncio.get_running_loop())
     await _im_bootstrap()
+    try:
+        # 常驻连接枢纽绑定到这个循环：attach/收尾都在它自己的任务里排队（D-40 第 5 项）
+        await MCP_HUB.start()
+    except Exception as exc:
+        print(f"[engine] MCP 连接枢纽启动失败，连接器退回一次性连接: {exc}", flush=True)
+    _ticket_worker_startup()  # D-48.7：工单执行体的装配 + 外发周期泵（失败不拦引擎启动）
     yield
+    try:
+        await MCP_HUB.shutdown()
+    except Exception as exc:
+        print(f"[engine] MCP 连接枢纽关停失败: {exc}", flush=True)
     await im_channels.shutdown()
     try:
         TERMINALS.close_all()
     except Exception as exc:
         print(f"[engine] 终端会话清理失败: {exc}", flush=True)
+    await _ticket_worker_shutdown()  # D-48.7：收尾在飞回合并拆掉单例（下一轮启动要重新认数据根）
+
+
+# ── 工单执行体的进程内生命周期（D-48.7）────────────────────────
+# 装配本体在 ticket_worker_service（那里有 190 项自测）；这一层只补两件只在「跑在引擎里」
+# 才存在的问题：
+#   1) 事件循环。worker 回合是同步线程，IM 通道挂在 uvicorn 的循环上，投递要跨循环回投，
+#      所以循环对象必须在 lifespan 里捕获——构造期拿不到，构造期也不该去猜。
+#   2) 外发周期泵。盘上欠着的外发（退避未到的、上一进程没发完的）不该等「有人再点一下」
+#      才发出去；没有这一条，D-48.2 的耐久队列在重启后就只是躺在那儿。
+DEFAULT_TICKET_OUTBOX_POLL_SECONDS = 20.0
+_TICKET_LOOP: asyncio.AbstractEventLoop | None = None
+_TICKET_PUMP_TASK: "asyncio.Task | None" = None
+
+
+def _ticket_outbox_poll_seconds() -> float:
+    """周期泵间隔：`TT_TICKET_OUTBOX_POLL_SECONDS`，给 0/off 就是关掉泵（端点照旧能手动推）。
+
+    下界 1 秒：外发是真发网络请求，0.1 秒一次的泵只会把通道打成排队。"""
+    raw = str(os.environ.get("TT_TICKET_OUTBOX_POLL_SECONDS") or "").strip().lower()
+    if raw in ("0", "off", "no", "false", ""):
+        if raw == "":
+            return DEFAULT_TICKET_OUTBOX_POLL_SECONDS
+        return 0.0
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return DEFAULT_TICKET_OUTBOX_POLL_SECONDS
+
+
+def _ticket_runtime():
+    """取（必要时建）工单执行体装配；循环在这里给进去，构造之后通道投递就认它。
+
+    只在建的时候生效（`get_runtime` 的 kwargs 语义）：已经建好之后再传循环是假的「换了一个
+    循环」，旧装配里的通道还挂着原来那个。"""
+    return tws.get_runtime(loop=_TICKET_LOOP)
+
+
+def _ticket_worker_startup() -> None:
+    """lifespan 启动段：捕获循环 + 建装配 + 起泵。任何一步失败都只打印，不拦引擎起来。
+
+    工单执行体是可选能力：它建不起来（数据根不可写等）时，桌面其余功能照常用，
+    端点会各自如实报失败；在这里抛出等于让一个可选执行体拖垮整个引擎。"""
+    global _TICKET_LOOP, _TICKET_PUMP_TASK
+    try:
+        _TICKET_LOOP = asyncio.get_running_loop()
+    except RuntimeError as exc:
+        print(f"[engine][tickets] 没有可用事件循环，工单执行体退回无循环模式: {exc}", flush=True)
+    try:
+        runtime = _ticket_runtime()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[engine][tickets] 工单执行体装配创建失败，工单端点将逐个如实报错: {type(exc).__name__}: {exc}", flush=True)
+        return
+    poll_seconds = _ticket_outbox_poll_seconds()
+    if poll_seconds <= 0:
+        print("[engine][tickets] 外发周期泵已关闭（TT_TICKET_OUTBOX_POLL_SECONDS=0）：只由端点手动推", flush=True)
+        return
+    try:
+        _TICKET_PUMP_TASK = asyncio.create_task(_ticket_outbox_pump(poll_seconds))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[engine][tickets] 外发周期泵启动失败，外发只能靠端点推: {type(exc).__name__}: {exc}", flush=True)
+
+
+async def _ticket_outbox_pump(poll_seconds: float) -> None:
+    """周期性推外发队列：真正的投递在 `asyncio.to_thread` 里跑，不占引擎循环。
+
+    `run_outbox` 同步等通道回话（最长 30 秒一条），放在循环里会让整个引擎卡住；
+    失败也不退出循环：一条发不出去是那条的事，泵停会让盘上所有欠账一起失联。"""
+    while True:
+        await asyncio.sleep(poll_seconds)
+        try:
+            if tws.peek_runtime() is None:
+                continue
+            result = await asyncio.to_thread(_ticket_runtime().run_outbox)
+            if not result.get("ok", True):
+                print(f"[engine][tickets] 周期推外发失败：{result.get('reason') or result}", flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print(f"[engine][tickets] 周期推外发异常（下一轮继续）：{type(exc).__name__}: {exc}", flush=True)
+
+
+async def _ticket_worker_shutdown() -> None:
+    """lifespan 关停段：停泵 + 收在飞回合。报告里有没停干净的回合就如实打印。"""
+    global _TICKET_PUMP_TASK, _TICKET_LOOP
+    task = _TICKET_PUMP_TASK
+    _TICKET_PUMP_TASK = None
+    if task is not None:
+        task.cancel()
+        # 泵任务被取消时抛的是 CancelledError（BaseException 派生），不接住会让关停整段碎掉
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001  泵自己的异常在循环里已打过，这里只收尾
+            print(f"[engine][tickets] 外发周期泵停用时抛错：{type(exc).__name__}: {exc}", flush=True)
+    try:
+        report = tws.reset_runtime(timeout_seconds=2.0)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[engine][tickets] 工单执行体收尾失败: {type(exc).__name__}: {exc}", flush=True)
+        report = {}
+    _TICKET_LOOP = None
+    if report.get("existed") and (report.get("inFlight") or report.get("runningJobs")):
+        print(f"[engine][tickets] 关停时仍有未收口：{report}", flush=True)
+
+
+# ── D-28：崩溃留存挂钩 + 可选遥测的装配现场 ────────────────────
+#
+# 为什么必须有这一段：引擎是桌面壳起的子进程，`src-tauri/src/bridge/agent.rs::pump_logs()`
+# 把它的 stdout/stderr 一路转成 GUI 进程的 `println!`，而 GUI 是
+# `windows_subsystem="windows"`（`src-tauri/src/main.rs:1`）——**那两条管道没有目的地**。
+# 于是一条未捕获异常在用户那边只剩「任务转圈然后失败」，traceback 一个字都没落到任何地方，
+# 重启之后连「刚才崩过」都无法证明。`crash_runtime` 负责留存与导出，`telemetry_runtime`
+# 负责「默认关的可选计数」，这一段只做三件只有跑在引擎里才存在的问题：
+#
+#   1) 装钩子并拿到事件循环对象——构造期拿不到（与 `_TICKET_LOOP` 同一个理由），
+#      循环回调里抛出的异常只有 lifespan 才接得上；
+#   2) 把「新落了一份现场」转成一条 `crash_recorded` 计数。观察者由装配现场登记，
+#      `crash_runtime` 本身不认识 `telemetry_runtime`：留存不该依赖外发面，
+#      关掉遥测时崩溃现场照样落盘；
+#   3) 起一轮记一条 `engine_started`，收尾记一条 `task_finished`。
+#
+# 三件都**不许拦住启动或收尾**：本段的任何失败只印一句中文说明（那句能不能被人看见另说，
+# 但不能因为「想留现场」把引擎弄不起来）。字段来源逐条写在 `_telemetry_task_finished` 里，
+# 不在表里的字段传不进去（白名单在 `telemetry_runtime.ALLOWED_FIELDS`）。
+
+_CRASH_TELEMETRY: dict[str, Any] = {"bootstrap": {}, "startedEmitted": False, "crashObserver": 0}
+
+
+def _os_family() -> str:
+    """只到「哪个系统家族」这一层：不带发行版、不带机器名、不提用户名。"""
+    try:
+        import platform as _platform
+
+        return str(_platform.system() or "")[:24]
+    except Exception:  # noqa: BLE001  取不到就不带这一列，不为此丢一条计数
+        return ""
+
+
+def _crash_observer(event: dict) -> None:
+    """崩溃 → 计数事件：只带类别与「本机还有几份没导出」，正文一个字也不进遥测。"""
+    try:
+        _CRASH_TELEMETRY["crashObserver"] = int(_CRASH_TELEMETRY.get("crashObserver") or 0) + 1
+        tlm.record("crash_recorded", {
+            "engineVersion": ENGINE_VERSION,
+            "category": str(event.get("category") or ""),
+            "pendingReports": int(crt.status().get("count") or 0),
+        })
+    except Exception as exc:  # noqa: BLE001  计数记不上不影响留存本身
+        print(f"[engine][crash] 崩溃计数事件记不上: {type(exc).__name__}: {exc}", flush=True)
+
+
+def _crash_telemetry_bootstrap(loop: Any = None) -> dict[str, Any]:
+    """装配崩溃钩子 + 遥测观察者 + 一条 engine_started；**幂等**，任何失败只说明不拦停。
+
+    两段各自带一层兜底，而且**钩子那一段在前**：如果 `set_recorder` 或记 `engine_started`
+    这一半炸了，崩溃留存必须已经装好——遥测是可选项（默认还关着），现场是不可选项。
+    反过来共用一个 try 的话，遥测侧一个异常就把留存一起带走了，正是这段想治的病。
+    """
+    installed: dict[str, Any] = {}
+    try:
+        installed = dict(crt.install(engine_version=ENGINE_VERSION, loop=loop))
+    except Exception as exc:  # noqa: BLE001  挂钩本身失败也不能影响启动
+        installed = {"ok": False, "installed": [], "installError": f"{type(exc).__name__}: {str(exc)[:200]}"}
+    try:
+        crt.set_recorder(_crash_observer)
+        if not _CRASH_TELEMETRY["startedEmitted"]:
+            _CRASH_TELEMETRY["startedEmitted"] = True
+            tlm.record("engine_started", {
+                "engineVersion": ENGINE_VERSION,
+                "osFamily": _os_family(),
+                "pythonFamily": str(getattr(sys, "implementation", None) and sys.implementation.name or ""),
+            })
+    except Exception as exc:  # noqa: BLE001  观察者/计数这一半炸了不该把已装好的钩子带下去
+        installed["recorderError"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+    result = {**installed, "recorder": crt.recorder_state()}
+    _CRASH_TELEMETRY["bootstrap"] = result
+    if not installed.get("ok"):
+        print(f"[engine][crash] 崩溃钩子没装上: {installed.get('installError')}", flush=True)
+    return result
+
+
+def _telemetry_task_finished(session: "TaskSession", end_reason: str, checkpoint: Any) -> dict[str, Any]:
+    """任务收尾计一条 `task_finished`。字段来源逐条写明，不在这张表里的东西传不进去。
+
+    `privacy_mode` 走 `record(..., privacy=)`：隐私轮**连计数都不记**——隐私档的语义是
+    「这一轮的内容与轨迹都不出本机」，遥测不是例外。其余字段：
+
+    - `endReason` ← `run_agent` 的 `end_reason`（本文件里只有四处赋值，词表与之逐字对上）
+    - `modelCallCount` / `toolCallCount` ← `checkpoint.last_summary` 的 `modelCalls` /
+      `executedTools`（「崩/停在第几次调用上」是这条事件存在的理由）
+    - `checkpointResumable` ← `checkpoint.resumable`
+    - `secureEnv` ← `session.secure_env`；`durationMs` ← `session.created_at`
+    """
+    try:
+        summary = getattr(checkpoint, "last_summary", {}) or {}
+        fields = {
+            "engineVersion": ENGINE_VERSION,
+            "endReason": str(end_reason or ""),
+            "durationMs": int(max(0.0, time.time() - float(getattr(session, "created_at", time.time()))) * 1000),
+            "modelCallCount": int(summary.get("modelCalls") or 0),
+            "toolCallCount": int(summary.get("executedTools") or 0),
+            "hadError": end_reason == "error",
+            "privacyBlocked": end_reason == "privacy_blocked",
+            "checkpointResumable": bool(getattr(checkpoint, "resumable", False)),
+            "secureEnv": bool(getattr(session, "secure_env", False)),
+        }
+        return tlm.record("task_finished", fields, privacy=bool(getattr(session, "privacy_mode", False)))
+    except Exception as exc:  # noqa: BLE001  收尾计数记不上不影响这一轮交付
+        return {"ok": False, "buffered": False, "reason": f"收尾计数失败：{type(exc).__name__}: {str(exc)[:160]}"}
 
 
 # ── FastAPI 应用 ───────────────────────────────────────────────
 
 app = FastAPI(title="tongtian-agent-engine", version=ENGINE_VERSION, lifespan=_im_lifespan)
 
-# CORS：浏览器直连联调（开发/联调阶段）
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """请求级未捕获异常：留一份崩溃现场，再回一句人话（缺陷 D-28 后半，#141）。
+
+    为什么必须在这里接：Starlette 默认把未处理异常抛回 ASGI 服务器，uvicorn 只往
+    stderr 印一段——而引擎的 stderr 在桌面壳那边没有目的地（见上一节的说明）。
+    也就是说**今天这些异常是彻底消失的**，用户只看到一个转圈失败的界面。
+
+    三条口径：
+
+    - **只留现场、不改语义**：响应仍是 500，`code` 固定一个，`message` 是中文；
+      异常原文与 traceback 不进响应体（远程调用方不该看见本机栈），只进本机现场；
+    - **给得出编号**：`crashReport` 让界面能写「这次崩溃已记为 X，可在设置页导出」，
+      人不用去猜目录名；本机才有详情，读详情走 desktop-only 的 `/api/exec/crash/detail`；
+    - **留存自己再炸也不能把响应弄没**：`handle_exception` 本身永不抛出，这里再包一层，
+      最坏情况是这次没留下现场，但请求仍回一个能读的 500。
+    """
+    scene = crt.handle_exception(
+        "http_unhandled",
+        type(exc),
+        exc,
+        exc.__traceback__,
+        context={"endpoint": str(getattr(getattr(request, "url", None), "path", "") or "")[:120]},
+        note=f"{getattr(request, 'method', '')} {getattr(getattr(request, 'url', None), 'path', '')}".strip(),
+    )
+    body: dict[str, Any] = {
+        "ok": False,
+        "code": "ENGINE_INTERNAL_ERROR",
+        "message": (
+            "引擎在处理这个请求时遇到了未预期的异常，已经在本机留下一份可导出的现场"
+            "（设置页 → 崩溃记录）。这次请求没有完成，重复同样的操作很可能还是同一个结果。"
+            if scene.get("ok")
+            else "引擎在处理这个请求时遇到了未预期的异常，且现场没能落盘："
+                 f"{str(scene.get('reason') or '')[:120]}"
+        ),
+        "crashReport": str(scene.get("reportId") or ""),
+        "deduped": bool(scene.get("deduped")),
+    }
+    return JSONResponse(status_code=500, content=body)
+
+# CORS：只放行桌面壳与本地开发端口（允许任意 localhost 端口便于 Vite 联调）。
+# 过去用 `*`，任意网页都能读取本机引擎的响应，等于把本地执行面暴露给浏览器；
+# 服务化部署用 TT_ENGINE_ALLOWED_ORIGINS 显式白名单（逗号分隔，`*` 表示全部）。
+DEFAULT_CORS_ORIGINS = [
+    "tauri://localhost",
+    "http://tauri.localhost",
+    "https://tauri.localhost",
+]
+DEFAULT_CORS_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+
+
+def _cors_origins() -> tuple[list[str], str | None]:
+    raw = str(os.environ.get("TT_ENGINE_ALLOWED_ORIGINS") or "").strip()
+    if not raw:
+        return list(DEFAULT_CORS_ORIGINS), DEFAULT_CORS_ORIGIN_REGEX
+    if raw == "*":
+        return ["*"], None
+    return [item.strip() for item in raw.split(",") if item.strip()], None
+
+
 try:
     from fastapi.middleware.cors import CORSMiddleware
 
+    _cors_allow, _cors_regex = _cors_origins()
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=_cors_allow,
+        allow_origin_regex=_cors_regex,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=[
+            "Content-Type",
+            "Authorization",
+            "X-TT-Engine-Token",
+            "X-TT-Terminal-Token",
+            "X-TT-Client",
+        ],
     )
 except Exception:
     pass
 
 
 # ── 服务化（可选）：Token 守卫与静态站点托管 ─────────────────
-# 桌面模式不设置 TT_ENGINE_TOKEN，行为与原来完全一致。
-# 服务化模式（容器/内网）必须显式设置令牌，CLI 与前置反代携带 Authorization: Bearer。
+# 桌面壳启动引擎时会注入 TT_ENGINE_LOCAL_TOKEN，所有 /api 请求必须携带；
+# 手工启动/浏览器直连的引擎没有任何令牌配置，行为与原来一致（仅供本机联调）。
+# 服务化模式（容器/内网）设置 TT_ENGINE_TOKEN / TT_ENGINE_JWT_SECRET，
+# CLI 与前置反代携带 Authorization: Bearer。
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 DEFAULT_JWT_ISSUER = "tongtian-auth"
 DEFAULT_JWT_AUDIENCE = "tongtian-engine"
 JWT_ALG = "HS256"
 AUDIT_MAX_ENTRIES = 2000
+# 附件上传上限：base64 解码后 100MB（对话附件，非整盘文件服务）
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 JWT_UNAUTHORIZED_MESSAGE = (
     "服务化模式需要携带有效的引擎令牌"
@@ -3221,6 +5596,56 @@ def _engine_jwt_audience() -> str:
 def _engine_allowed_users() -> set[str]:
     raw = str(os.environ.get("TT_ENGINE_ALLOWED_USERS") or "")
     return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+# ── 账号服务吊销实时内省（可选，缩短 exp 前的 15 分钟窗口） ──────────
+# 关闭时（默认，含桌面/离线）只按令牌 exp 失效，行为与原来一致。
+# 开启后每个 JWT 请求先查账号服务该 sid 是否仍有效；命中缓存则不再发起网络请求。
+INTROSPECT_CACHE_TTL_SECONDS = 30
+# sid → (是否有效, 过期时刻 monotonic)
+_INTROSPECT_CACHE: dict[str, tuple[bool, float]] = {}
+
+
+def _engine_introspect_url() -> str:
+    return str(os.environ.get("TT_ENGINE_INTROSPECT_URL") or "").strip()
+
+
+def _engine_introspect_token() -> str:
+    return str(os.environ.get("TT_ENGINE_INTROSPECT_TOKEN") or "").strip()
+
+
+def session_is_active(sub: str, sid: str) -> bool:
+    """向账号服务内省该会话令牌是否仍有效（未被吊销且未过期）。
+
+    - 未配置 TT_ENGINE_INTROSPECT_URL：内省关闭，返回 True（只按 exp 失效，离线兼容）。
+    - 命中缓存：返回缓存结果。
+    - 网络异常或服务不可达：fail-open 返回 True，避免账号服务抖动时整体拒绝服务；
+      吊销的确定答复（active=false）才拒绝，并写入缓存。
+    """
+    base = _engine_introspect_url()
+    if not base:
+        return True
+    if not sub or not sid:
+        return False
+    cache_key = f"{sub}:{sid}"
+    now = time.monotonic()
+    cached = _INTROSPECT_CACHE.get(cache_key)
+    if cached is not None and cached[1] > now:
+        return cached[0]
+    url = f"{base.rstrip('/')}/api/v1/engine/introspect?sub={sub}&sid={sid}"
+    try:
+        req = urlreq.Request(url, method="GET")
+        token = _engine_introspect_token()
+        if token:
+            req.add_header("x-tt-engine-introspect", token)
+        with urlreq.urlopen(req, timeout=3) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        active = bool(isinstance(body, dict) and body.get("active"))
+    except Exception as exc:  # 网络/解析异常 → fail-open，不缓存
+        print(f"[engine] 令牌吊销内省失败（放行）：{exc}", flush=True)
+        return True
+    _INTROSPECT_CACHE[cache_key] = (active, now + INTROSPECT_CACHE_TTL_SECONDS)
+    return active
 
 
 def _b64url_decode(raw: str) -> bytes:
@@ -3295,36 +5720,44 @@ STATIC_PRINCIPAL = {
 }
 
 
-def _authenticate_engine_request(request: Request) -> tuple[dict | None, str]:
-    """解析服务化请求的调用主体。
+def _authenticate_engine_request(request: Request) -> tuple[dict | None, str, bool]:
+    """解析服务化/桌面请求的调用主体。
 
-    未配置任何凭据时返回 (None, "")，即桌面/回环模式，行为保持不变。
-    配置后静态令牌与账号 JWT 都接受（静态令牌保留为应急通道）。
+    返回 (principal, error, desktop_local)：
+    - 未配置任何凭据：``(None, "", False)``，桌面/回环模式，行为保持不变；
+    - 桌面壳注入的本机令牌：``(None, "", True)``，只证明请求来自桌面进程，
+      不引入用户主体（保持按人隔离/用量归属的既有语义）；
+    - 服务化静态令牌：role=service 的静态主体；账号 JWT：按 claims 建主体。
     """
     static_token = str(os.environ.get("TT_ENGINE_TOKEN") or "").strip()
     jwt_secret = _engine_jwt_secret()
-    if not static_token and not jwt_secret:
-        return None, ""
+    local_token = str(os.environ.get("TT_ENGINE_LOCAL_TOKEN") or "").strip()
+    if not static_token and not jwt_secret and not local_token:
+        return None, "", False
     auth = request.headers.get("authorization") or ""
     got = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
     if not got:
         got = (request.headers.get("x-tt-engine-token") or "").strip()
     if not got:
-        return None, "missing_token"
+        return None, "missing_token", False
+    if local_token and hmac.compare_digest(local_token, got):
+        return None, "", True
     if static_token and hmac.compare_digest(static_token, got):
-        return dict(STATIC_PRINCIPAL), ""
+        return dict(STATIC_PRINCIPAL), "", False
     if not jwt_secret:
-        return None, "invalid_token"
+        return None, "invalid_token", False
     claims, reason = verify_engine_jwt(
         got, jwt_secret, _engine_jwt_issuer(), _engine_jwt_audience()
     )
     if not claims:
-        return None, reason or "invalid_token"
+        return None, reason or "invalid_token", False
     principal = principal_from_claims(claims)
     allowed = _engine_allowed_users()
     if allowed and principal["sub"] not in allowed:
-        return None, "user_not_allowed"
-    return principal, ""
+        return None, "user_not_allowed", False
+    if not session_is_active(principal["sub"], principal["sid"]):
+        return None, "revoked_session", False
+    return principal, "", False
 
 
 class AuditLog:
@@ -3368,6 +5801,36 @@ def _client_host(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _is_desktop_local(request: Request) -> bool:
+    """请求是否由桌面壳（持本机令牌）发起。"""
+    return bool(getattr(request.state, "desktop_local", False))
+
+
+def _engine_data_roots() -> list[Path]:
+    """允许无用户主体时读写的目录：引擎工作目录 + 引擎数据根。"""
+    roots = [WORK_DIR.resolve()]
+    try:
+        import data_paths  # noqa: PLC0415  与产出物台账同根
+
+        roots.append(Path(data_paths.engine_home()).resolve())
+    except Exception:  # noqa: BLE001
+        roots.append((Path.home() / ".tongtianwork").resolve())
+    return roots
+
+
+def _path_within(path: Path, roots: list[Path]) -> bool:
+    """规范化后判断 path 是否位于任一 roots 内（Windows 大小写不敏感）。"""
+    try:
+        target = os.path.normcase(str(path.resolve()))
+    except Exception:  # noqa: BLE001
+        return False
+    for root in roots:
+        base = os.path.normcase(str(root.resolve()))
+        if target == base or target.startswith(base + os.sep):
+            return True
+    return False
+
+
 def _is_jwt_admin(principal: dict | None) -> bool:
     return bool(principal) and principal.get("auth") == "jwt" and principal.get("role") == "admin"
 
@@ -3406,7 +5869,7 @@ async def _engine_token_guard(request: Request, call_next):
     path = request.url.path
     if not path.startswith("/api/") or request.method == "OPTIONS":
         return await call_next(request)
-    principal, error = _authenticate_engine_request(request)
+    principal, error, desktop_local = _authenticate_engine_request(request)
     if error:
         status = 403 if error == "user_not_allowed" else 401
         AUDIT_LOG.record(
@@ -3437,7 +5900,17 @@ async def _engine_token_guard(request: Request, call_next):
             status_code=status,
         )
     token = _CURRENT_PRINCIPAL.set(principal)
+    request_access = ""
+    if principal and principal.get("auth") == "jwt":
+        auth_header = request.headers.get("authorization") or ""
+        if auth_header.lower().startswith("bearer "):
+            request_access = auth_header[7:].strip()
+        if not request_access:
+            request_access = (request.headers.get("x-tt-engine-token") or "").strip()
+    access_state = _CURRENT_ACCESS_TOKEN.set(request_access)
+    origin_token = us.set_usage_origin(request.headers.get(us.ORIGIN_HEADER))
     request.state.principal = principal
+    request.state.desktop_local = desktop_local
     started = time.monotonic()
     status = 500
     try:
@@ -3461,6 +5934,8 @@ async def _engine_token_guard(request: Request, call_next):
                 }
             )
         _CURRENT_PRINCIPAL.reset(token)
+        _CURRENT_ACCESS_TOKEN.reset(access_state)
+        us.reset_usage_origin(origin_token)
 
 
 @app.get("/api/audit")
@@ -3716,11 +6191,28 @@ async def chat(request: Request):
     task_id = (payload.get("task_id") or "").strip() or \
         f"task-{int(time.time() * 1000)}"
     session = _get_or_create_session(task_id)
+    # 服务化按人隔离：跨用户访问他人任务直接拒绝（桌面/无令牌放行）
+    forbid = _stamp_or_check_session(session)
+    if forbid:
+        return JSONResponse(
+            {"ok": False, "taskId": task_id, "code": forbid["code"],
+             "message": forbid["message"]},
+            status_code=forbid["status"],
+        )
+    # 配额硬停：超月度 token 或并发上限时返回明确错误码，不进入执行
+    over_quota = _quota_error(current_principal())
+    if over_quota:
+        return JSONResponse(
+            {"ok": False, "taskId": task_id, "code": over_quota["code"],
+             "message": over_quota["message"]},
+            status_code=over_quota["status"],
+        )
     if goal:
         # 新一轮提交：旧检查点作废（同一 task 重试也不应恢复上一次的失败现场）
         session.checkpoint = ckpt.TaskCheckpoint(task_id)
         ckpt.delete_checkpoint(task_id)
         session.cancelled = False
+        session.cancel_reason = ""
         # 单阶段提交也要记住目标：断点续跑要用同一目标重新组装本轮用户消息
         session.goal = goal
     if model_binding:
@@ -3780,6 +6272,33 @@ async def chat(request: Request):
             session.work_dir = Path(work_dir_raw).expanduser()
         except Exception:
             session.work_dir = None
+    # 文件访问档位（对话输入框选择）：与 workDir 一起构成本轮的真实边界。
+    # 桌面端把「每会话选择 + 全局默认」解析成一个值随请求下发；未知值直接拒绝，
+    # 不静默回落到最保守档——用户以为选了完全访问、实际却被限制住更难排查。
+    perm_raw = payload.get("filePermission")
+    if perm_raw is not None and str(perm_raw).strip():
+        perm_value = str(perm_raw).strip().lower()
+        if perm_value not in sr.FILE_PERMISSION_MODES:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "code": "FILE_PERMISSION_INVALID",
+                    "message": (
+                        f"未知文件访问档位 {perm_raw}"
+                        f"（可用：{'/'.join(sr.FILE_PERMISSION_MODES)}）"
+                    ),
+                },
+                status_code=400,
+            )
+        session.file_permission = perm_value
+        # 顶层 runtime 键：Rust 装配的 runtime 里已有同键时以本次请求为准
+        # （approve 重跑不带该字段时，沿用这里盖进去的值）
+        rt = session.runtime if isinstance(session.runtime, dict) else {}
+        session.runtime = {**rt, "filePermission": perm_value}
+    elif not session.file_permission:
+        session.file_permission = str(
+            (session.runtime or {}).get("filePermission") or ""
+        ).strip().lower() or None
     # 安全工作环境开关（Rust 从设置读取后随提交下发，approve 重跑沿用）
     if payload.get("secureEnv") is not None:
         session.secure_env = bool(payload.get("secureEnv"))
@@ -3813,6 +6332,12 @@ async def chat(request: Request):
     # 浏览器直连与 IM 通道本就没有这两项。
     runtime_raw = payload.get("runtime")
     if isinstance(runtime_raw, dict) and runtime_raw:
+        guard = _runtime_guard_error(runtime_raw)
+        if guard:
+            return JSONResponse(
+                {"ok": False, "code": "RUNTIME_FORBIDDEN", "message": guard},
+                status_code=403,
+            )
         session.runtime = runtime_raw
     # 浏览器直连没有 Rust 装配的 runtime，效率策略随请求顶层下发；
     # runtime 里已有 agentPolicy（桌面端 settings_kv）时以它为权威，不被覆盖。
@@ -3892,21 +6417,19 @@ async def chat(request: Request):
     if parsed and parsed[0] == task_id:
         replay_from = session.replay_after(parsed[1])
 
-    sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-
     # 两阶段协议（核心闭环补齐）：stage=plan 仅生成计划待审阅；
     # 缺省保持旧契约全流程执行（向后兼容/Mock 测试触发器）
     if payload.get("stage") == "plan":
         return StreamingResponse(
             _plan_stream(session, task_id, goal),
             media_type="text/event-stream",
-            headers=sse_headers,
+            headers=SSE_HEADERS,
         )
 
     return StreamingResponse(
         _run_execution(session, task_id, goal, replay_from, model_binding, session.work_dir, history, model_config),
         media_type="text/event-stream",
-        headers=sse_headers,
+        headers=SSE_HEADERS,
     )
 
 
@@ -3952,13 +6475,33 @@ async def chat_review(request: Request):
             status_code=404,
         )
 
-    sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-    sse = _sse_formatter(session, task_id)
+    # 服务化按人隔离：审阅/执行/续跑前校验归属
+    forbid = _stamp_or_check_session(session)
+    if forbid:
+        return JSONResponse(
+            {"ok": False, "taskId": task_id, "code": forbid["code"],
+             "message": forbid["message"]},
+            status_code=forbid["status"],
+        )
+    # approve/resume 会真正执行模型调用，按配额硬停
+    if action in ("approve", "resume"):
+        over_quota = _quota_error(current_principal())
+        if over_quota:
+            return JSONResponse(
+                {"ok": False, "taskId": task_id, "code": over_quota["code"],
+                 "message": over_quota["message"]},
+                status_code=over_quota["status"],
+            )
 
     if action == "resume":
         # 断点续跑：从最近一次模型调用前的检查点继续同一任务（taskId 不变）
         # Rust 每次 resume 都重新下发模型配置与 runtime（磁盘里不保存密钥与网关令牌）
-        _apply_resume_overrides(session, payload)
+        runtime_error = _apply_resume_overrides(session, payload)
+        if runtime_error:
+            return JSONResponse(
+                {"ok": False, "taskId": task_id, "code": "RUNTIME_FORBIDDEN", "message": runtime_error},
+                status_code=403,
+            )
         if session.agent_task is not None and not session.agent_task.done():
             return JSONResponse(
                 {
@@ -3975,6 +6518,7 @@ async def chat_review(request: Request):
                 status_code=409,
             )
         session.cancelled = False
+        session.cancel_reason = ""
         return StreamingResponse(
             _run_execution(
                 session, task_id, session.goal or "", [],
@@ -3982,25 +6526,26 @@ async def chat_review(request: Request):
                 session.model_config, resume=True,
             ),
             media_type="text/event-stream",
-            headers=sse_headers,
+            headers=SSE_HEADERS,
         )
 
     if action == "approve":
         return StreamingResponse(
             _run_execution(session, task_id, session.goal or "", [], session.model_binding, session.work_dir, None, session.model_config),
             media_type="text/event-stream",
-            headers=sse_headers,
+            headers=SSE_HEADERS,
         )
 
     if action == "reject":
         async def reject_stream():
+            sse = _sse_formatter(session, task_id)
             yield sse("status_change", {
                 "taskId": task_id,
                 "status": "done",
                 "statusReasonCode": "REJECTED",
             })
             yield sse("done", {})
-        return StreamingResponse(reject_stream(), media_type="text/event-stream", headers=sse_headers)
+        return StreamingResponse(reject_stream(), media_type="text/event-stream", headers=SSE_HEADERS)
 
     if action == "modify":
         # 应用 patch：按 step_id 合并 name/description（不允许新增步骤，交互补设计 §5.2）
@@ -4019,10 +6564,11 @@ async def chat_review(request: Request):
         session.plan = steps
 
         async def modify_stream():
+            sse = _sse_formatter(session, task_id)
             yield sse("plan", {"plan_id": f"plan-{task_id}", "steps": steps})
             yield sse("status_change", {"taskId": task_id, "status": "pending_review"})
             yield sse("done", {})
-        return StreamingResponse(modify_stream(), media_type="text/event-stream", headers=sse_headers)
+        return StreamingResponse(modify_stream(), media_type="text/event-stream", headers=SSE_HEADERS)
 
     return JSONResponse({"ok": False, "code": "VALIDATION_ERROR", "message": f"未知 action: {action}"})
 
@@ -4048,12 +6594,19 @@ async def chat_checkpoint_query(request: Request):
         if len(task_ids) >= 200:
             break
     out: dict[str, dict] = {}
+    principal = current_principal()
     for task_id in task_ids:
         session = _TASK_SESSIONS.get(task_id)
         if session is not None:
+            if not _principal_can_access(principal, session.owner_sub):
+                continue
             info = _checkpoint_public(session)
         else:
             data = ckpt.load_checkpoint(task_id)
+            if data and not _principal_can_access(
+                principal, _checkpoint_owner(data)
+            ):
+                continue
             info = ckpt.public_info(task_id, data) if data else None
         if info:
             out[task_id] = info
@@ -4067,6 +6620,13 @@ async def events_replay(task_id: str = "", from_seq: int = 0):
     session = _TASK_SESSIONS.get(task_id)
     if session is None:
         return JSONResponse({"taskId": task_id, "events": [], "windowExpired": True})
+    forbid = _stamp_or_check_session(session)
+    if forbid:
+        return JSONResponse(
+            {"ok": False, "taskId": task_id, "code": forbid["code"],
+             "message": forbid["message"], "events": [], "windowExpired": False},
+            status_code=forbid["status"],
+        )
     entries = session.replay_after(from_seq)
     return JSONResponse({
         "taskId": task_id,
@@ -4087,13 +6647,31 @@ async def chat_cancel(request: Request):
         payload = {}
     task_id = (payload.get("task_id") or "").strip()
     session = _TASK_SESSIONS.get(task_id)
-    if session is None or session.agent_task is None:
+    if session is None:
+        return JSONResponse({"taskId": task_id, "cancelled": False, "reason": "TASK_NOT_FOUND"})
+    # 服务化按人隔离：先判归属，再暴露任务是否可取消
+    forbid = _stamp_or_check_session(session)
+    if forbid:
+        return JSONResponse(
+            {"ok": False, "taskId": task_id, "code": forbid["code"],
+             "message": forbid["message"], "cancelled": False},
+            status_code=forbid["status"],
+        )
+    if session.agent_task is None:
         return JSONResponse({"taskId": task_id, "cancelled": False, "reason": "TASK_NOT_FOUND"})
     if session.agent_task.done():
         return JSONResponse({"taskId": task_id, "cancelled": False, "reason": "TASK_ALREADY_FINISHED"})
     session.cancelled = True
+    # 成因码由调用方带（Rust 的预算拦停带 BUDGET_TASK_EXCEEDED，界面点「停止」不带）；
+    # 不在码表里的值不参与判定，按用户手动取消记账——取消本身绝不因一个说明字段而失败。
+    reason = str(payload.get("reason") or "").strip().upper()
+    session.cancel_reason = reason if reason in CANCEL_REASONS else ""
     session.agent_task.cancel()
-    return JSONResponse({"taskId": task_id, "cancelled": True})
+    return JSONResponse({
+        "taskId": task_id,
+        "cancelled": True,
+        "statusReasonCode": session.cancel_reason or "USER_CANCELLED",
+    })
 
 
 @app.post("/api/files/upload")
@@ -4114,11 +6692,22 @@ async def files_upload(request: Request):
             {"ok": False, "code": "VALIDATION_ERROR", "message": "fileName/dataBase64 必填"},
             status_code=400,
         )
+    # 先按 base64 长度估算，避免把超大请求整体解码进内存
+    if not isinstance(data_b64, str) or len(data_b64) > MAX_UPLOAD_BYTES * 4 // 3 + 8:
+        return JSONResponse(
+            {"ok": False, "code": "FILE_TOO_LARGE", "message": f"附件超过 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB 上限"},
+            status_code=413,
+        )
     try:
         raw = base64.b64decode(data_b64)
     except Exception:
         return JSONResponse(
             {"ok": False, "code": "VALIDATION_ERROR", "message": "base64 内容无效"}, status_code=400
+        )
+    if len(raw) > MAX_UPLOAD_BYTES:
+        return JSONResponse(
+            {"ok": False, "code": "FILE_TOO_LARGE", "message": f"附件超过 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB 上限"},
+            status_code=413,
         )
     # 文件名净化：去除路径分隔符，防止目录穿越
     safe_name = Path(file_name).name or "attachment.bin"
@@ -4137,11 +6726,18 @@ async def files_upload(request: Request):
 
 
 @app.get("/api/files/content")
-async def files_content(path: str = ""):
+async def files_content(request: Request, path: str = ""):
     """产物预览：返回文件文本内容（限 2MB，文本类文件），供前端点击产物打开预览"""
     p = Path(path)
     if not path or not p.exists() or not p.is_file():
         return JSONResponse({"ok": False, "message": "文件不存在或已移动"}, status_code=404)
+    # 非桌面壳（服务化/匿名直连）只允许读引擎工作目录与数据根，
+    # 避免通过本地端口读取任意本机文件（如 ~/.ssh、浏览器配置）。
+    if not _is_desktop_local(request) and not _path_within(p, _engine_data_roots()):
+        return JSONResponse(
+            {"ok": False, "code": "FILE_ACCESS_DENIED", "message": "该路径不在引擎数据目录内，拒绝读取"},
+            status_code=403,
+        )
     try:
         if p.stat().st_size > 2 * 1024 * 1024:
             return JSONResponse({"ok": False, "message": "文件超过 2MB，请用系统应用打开"}, status_code=413)
@@ -4217,11 +6813,9 @@ AWARENESS_DEFAULTS = {
 
 
 def _awareness_home() -> Path:
-    """意识目录：`TONGTIANWORK_HOME` 覆盖（与 Rust `awareness::dir()` 同规则），
-    缺省 `~/.tongtianwork`，两条通道因此读写同一份文件"""
-    root = str(os.environ.get("TONGTIANWORK_HOME") or "").strip()
-    base = Path(root) if root else Path.home() / ".tongtianwork"
-    return base / "awareness" / "main"
+    """意识目录：数据根由 `data_paths` 统一解析（与 Rust `awareness::dir()` 同规则），
+    两条通道因此读写同一份文件"""
+    return dp.awareness_main_dir()
 
 
 # 协作风格预设 id（与 Rust `awareness::STYLE_IDS`、contracts.ts 一致）
@@ -4431,6 +7025,336 @@ def _auto_memory_decision(runtime: dict | None, privacy: bool = False) -> tuple[
     return True, ""
 
 
+# ── 规则事实抽取（D-35 第二阶段） ──────────────────────────────
+#
+# 不额外调用模型：从本轮最终回复里抽少量可独立理解的陈述句，带
+# subject/predicate/object 与置信度。同 (subject, predicate) 的新取值由 Rust
+# 做冲突软退休；抽取失败只是少记一条，不影响任务结果。
+
+_FACT_CONNECTORS = ("采用", "使用", "位于", "属于", "需要", "支持", "决定", "约定", "是", "为")
+_FACT_SUBJECT_BLOCK = (
+    "本轮", "任务", "目标", "结论", "结果", "以上", "如下", "下面", "我们", "你们", "他们",
+    "这个", "那个", "这里", "那里", "本次", "当前",
+)
+_FACT_SUBJECT_PREFIX = ("这", "那", "它", "他", "她", "我", "你", "本")
+
+
+def _fact_sentence(raw) -> str:
+    """去 Markdown 标记并压成单行；空串/过短/过长会在调用处丢弃"""
+    text = " ".join(str(raw or "").split()).strip()
+    return text.lstrip("#>*-•0123456789.、)） ").strip()
+
+
+def _split_fact_verb(text: str):
+    """找最早的谓词连接词，返回 (主语, 谓词, 宾语)；「X 的 Y 是 Z」拆成 X / Y是 / Z"""
+    best = None
+    for conn in _FACT_CONNECTORS:
+        idx = text.find(conn)
+        if idx <= 0:
+            continue
+        if best is None or idx < best[0]:
+            best = (idx, conn)
+    if best is None:
+        return None
+    idx, conn = best
+    left = text[:idx].strip()
+    right = text[idx + len(conn):].strip()
+    if not left or not right:
+        return None
+    if "的" in left:
+        subject, attr = left.rsplit("的", 1)
+        subject, attr = subject.strip(), attr.strip()
+        if len(subject) >= 2 and 1 <= len(attr) <= 16:
+            return subject, attr + conn, right
+    return left, conn, right
+
+
+def _fact_subject_ok(subject: str) -> bool:
+    subject = subject.strip()
+    if not (2 <= len(subject) <= 40):
+        return False
+    if any(subject.startswith(prefix) for prefix in _FACT_SUBJECT_PREFIX):
+        return False
+    if any(word in subject for word in _FACT_SUBJECT_BLOCK):
+        return False
+    if re.fullmatch(r"[\d\s./:_-]+", subject):
+        return False
+    if subject.startswith(("http", "www", "file:")):
+        return False
+    return True
+
+
+def _fact_object_ok(obj: str) -> bool:
+    obj = obj.strip()
+    return 2 <= len(obj) <= 120 and not obj.startswith(("以下", "如下"))
+
+
+def _fact_kind(sentence: str) -> str:
+    if any(word in sentence for word in ("偏好", "喜欢", "习惯", "倾向", "希望", "不希望")):
+        return "preference"
+    if any(word in sentence for word in ("决定", "确定", "选定", "约定", "统一")):
+        return "decision"
+    return "fact"
+
+
+def _extract_fact_candidates(text, max_facts: int = 4) -> list[dict]:
+    """从最终回复抽事实候选；只做保守的句式匹配，宁可少记也不臆造。
+
+    显式「主体：谓词 取值」置信度 0.65，普通「主体谓词取值」0.55；
+    凭据过滤在调用方做，便于把「跳过几条」如实播报。
+    """
+    out: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for chunk in re.split(r"[。；;！!？?\n]+", str(text or "")):
+        sentence = _fact_sentence(chunk)
+        if not (6 <= len(sentence) <= 160):
+            continue
+        if "```" in sentence or sentence.startswith(("$", "Traceback", "Error:", "错误：")):
+            continue
+        parsed = None
+        colon = re.match(
+            r"^(?P<s>[^：:，,。；;]{2,40})[：:]\s*(?P<rest>.{2,140})$", sentence
+        )
+        if colon:
+            subject = colon.group("s").strip()
+            verb = _split_fact_verb(colon.group("rest").strip())
+            if verb and _fact_subject_ok(subject) and _fact_object_ok(verb[2]):
+                parsed = (subject, verb[1], verb[2], 0.65)
+        if parsed is None:
+            verb = _split_fact_verb(sentence)
+            if verb and _fact_subject_ok(verb[0]) and _fact_object_ok(verb[2]):
+                parsed = (verb[0], verb[1], verb[2], 0.55)
+        if parsed is None:
+            continue
+        subject, predicate, obj, confidence = parsed
+        key = (subject.lower(), predicate.lower(), obj.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "content": sentence,
+            "kind": _fact_kind(sentence),
+            "source": "auto",
+            "subject": subject,
+            "predicate": predicate,
+            "object": obj,
+            "confidence": confidence,
+        })
+        if len(out) >= max_facts:
+            break
+    return out
+
+
+# ── 模型事实抽取（D-35 第三阶段，可选） ───────────────────────
+#
+# 规则抽取覆盖常规陈述；用户打开「模型辅助抽取」后，任务收尾再跑一次结构化
+# 抽取，补上规则漏掉的隐含事实。默认关闭：多一次模型调用意味着额外成本与延迟，
+# 且本轮结论会再次发给模型（隐私模式与脱敏档位照常生效）。任何失败都只降级，
+# 不影响任务结果，也不阻断规则抽取。
+
+MODEL_MEMORY_MAX_FACTS = 4
+MODEL_MEMORY_PROMPT = (
+    "你是长期记忆抽取器。阅读「任务目标」和「本轮结论」，只抽取可长期复用、"
+    "脱离当前对话也能独立理解的事实（客户偏好、项目约定、关键决策、稳定配置）。\n"
+    "规则：\n"
+    "1. 不记录一次性步骤、临时路径、运行日志、报错堆栈和本轮产物清单；\n"
+    "2. 不记录任何凭据、密钥、令牌、密码、Cookie；\n"
+    "3. 每条一句话，主语明确，不使用「它 / 这个 / 上面」等指代；\n"
+    f"4. 最多 {MODEL_MEMORY_MAX_FACTS} 条，宁缺毋滥；\n"
+    "5. kind 只能是 task / fact / preference / decision；\n"
+    "6. subject / predicate / object 尽量填：主体、属性、取值（可为空串）。\n"
+    "只输出 JSON 数组，不要解释、不要 Markdown 代码块。字段：\n"
+    '[{"content":"...","kind":"fact","subject":"...","predicate":"...",'
+    '"object":"...","confidence":0.7}]'
+)
+
+
+def _model_memory_extract_enabled(runtime: dict | None, privacy: bool = False) -> bool:
+    """模型抽取只在桌面记忆库、自动记忆可用且用户显式打开时执行。"""
+    if privacy:
+        return False
+    enabled, _reason = _auto_memory_decision(runtime, privacy=False)
+    if not enabled:
+        return False
+    block = (runtime or {}).get("memory")
+    return isinstance(block, dict) and bool(block.get("modelExtract"))
+
+
+def _parse_model_facts(raw, max_facts: int = MODEL_MEMORY_MAX_FACTS) -> list[dict]:
+    """解析模型返回的 JSON 数组；只保留字段完整的条目，解析失败返回空列表。"""
+    text = str(raw or "")
+    start, end = text.find("["), text.rfind("]")
+    if start < 0 or end <= start:
+        return []
+    try:
+        data = json.loads(text[start:end + 1])
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in data[: max_facts * 2]:
+        if not isinstance(item, dict):
+            continue
+        content = _one_line(item.get("content") or "", 300)
+        if len(content) < 6:
+            continue
+        key = content.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        kind = str(item.get("kind") or "fact").strip().lower()
+        if kind not in ("task", "fact", "preference", "decision"):
+            kind = "fact"
+        try:
+            confidence = float(item.get("confidence"))
+        except (TypeError, ValueError):
+            confidence = 0.6
+        out.append({
+            "content": content,
+            "kind": kind,
+            "source": "auto",
+            "subject": _one_line(item.get("subject") or "", 80),
+            "predicate": _one_line(item.get("predicate") or "", 80),
+            "object": _one_line(item.get("object") or "", 300),
+            "confidence": max(0.0, min(1.0, confidence)),
+        })
+        if len(out) >= max_facts:
+            break
+    return out
+
+
+def _merge_memory_candidates(
+    base: list[dict], extra: list[dict], cap: int = 8
+) -> tuple[list[dict], int, int]:
+    """合并规则与模型候选：按内容与三元组去重、过滤凭据；返回 (列表, 新增, 跳过)。"""
+    out = list(base or [])
+    seen = {str(c.get("content") or "").strip().lower() for c in out}
+    triples = set()
+    for c in out:
+        triple = (
+            str(c.get("subject") or "").strip().lower(),
+            str(c.get("predicate") or "").strip().lower(),
+            str(c.get("object") or "").strip().lower(),
+        )
+        if all(triple):
+            triples.add(triple)
+    added = 0
+    skipped = 0
+    for candidate in extra or []:
+        content = _one_line(candidate.get("content") or "", 300)
+        if not content:
+            continue
+        key = content.lower()
+        if key in seen:
+            continue
+        triple = (
+            str(candidate.get("subject") or "").strip().lower(),
+            str(candidate.get("predicate") or "").strip().lower(),
+            str(candidate.get("object") or "").strip().lower(),
+        )
+        if all(triple) and triple in triples:
+            continue
+        if _looks_like_secret(content):
+            skipped += 1
+            continue
+        if len(out) >= cap:
+            break
+        merged = dict(candidate)
+        merged["content"] = content
+        out.append(merged)
+        seen.add(key)
+        if all(triple):
+            triples.add(triple)
+        added += 1
+    return out, added, skipped
+
+
+async def _model_fact_candidates(
+    goal: str,
+    final_text: str,
+    *,
+    model_binding: str | None = None,
+    model_config: dict | None = None,
+    pii_mode: str = "off",
+    on_usage=None,
+    timeout_s: float = 20.0,
+) -> tuple[list[dict], str]:
+    """一次非流式调用抽取事实；返回 (候选, 失败说明)。失败不抛出、不回滚任务。"""
+    text = str(final_text or "").strip()
+    if len(text) < 40:
+        return [], "结论过短，未运行模型抽取"
+    try:
+        model, formatter = build_model_and_formatter(
+            model_binding, model_config, stream=False,
+            on_usage=on_usage, pii_mode=pii_mode,
+        )
+        from agentscope.message import Msg
+        prompt = (
+            f"{MODEL_MEMORY_PROMPT}\n\n【任务目标】\n{_one_line(goal, 300)}"
+            f"\n\n【本轮结论】\n{text[:3000]}"
+        )
+        formatted = await formatter.format(
+            [Msg(name="user", content=prompt, role="user")]
+        )
+        resp = await asyncio.wait_for(model(formatted), timeout=timeout_s)
+        raw = _text_of(getattr(resp, "content", ""))
+    except asyncio.TimeoutError:
+        return [], f"模型抽取超时（>{int(timeout_s)}s），已保留规则抽取"
+    except Exception as exc:
+        return [], f"模型抽取未生效：{_one_line(exc, 120)}（已保留规则抽取）"
+    facts = _parse_model_facts(raw)
+    if not facts:
+        return [], "模型抽取没有产出可用事实（已保留规则抽取）"
+    return facts, ""
+
+
+def _auto_memory_candidates(runtime: dict | None, goal: str, final_text: str,
+                            artifacts: list, privacy: bool = False) -> tuple[list[dict], str]:
+    """桌面记忆库模式：任务摘要 + 规则事实候选，去重与落库由 Rust 完成。
+
+    返回 (候选列表, 可见说明)。写入结果由 Rust 在落库后统一播报。
+    """
+    enabled, reason = _auto_memory_decision(runtime, privacy=privacy)
+    if not enabled:
+        return [], reason
+    out: list[dict] = []
+    content = _auto_memory_content(goal, final_text, artifacts)
+    summary_skipped = False
+    if content:
+        if _looks_like_secret(content):
+            # 目标或结论里带凭据时连摘要一起放弃，但要把「为什么这一轮没记住」说清楚
+            summary_skipped = True
+        else:
+            out.append({
+                "content": content, "kind": "task", "source": "auto", "confidence": 0.5,
+            })
+    skipped = 0
+    for fact in _extract_fact_candidates(final_text):
+        if _looks_like_secret(fact["content"]):
+            skipped += 1
+            continue
+        if any(candidate["content"] == fact["content"] for candidate in out):
+            continue
+        out.append(fact)
+    notes: list[str] = []
+    if summary_skipped:
+        notes.append("本轮摘要疑似包含凭据，已跳过自动记忆（避免密钥落盘）")
+    if skipped:
+        notes.append(f"{skipped} 条事实疑似包含凭据，已跳过自动记忆（避免密钥落盘）")
+    return out, "；".join(notes)
+
+
+def _auto_memory_candidate(runtime: dict | None, goal: str, final_text: str,
+                           artifacts: list, privacy: bool = False) -> tuple[dict | None, str]:
+    """兼容旧调用：只取第一条候选（任务摘要）。新链路用 `_auto_memory_candidates`。"""
+    candidates, note = _auto_memory_candidates(
+        runtime, goal, final_text, artifacts, privacy=privacy
+    )
+    return (candidates[0] if candidates else None), note
+
+
 def _auto_memory_after_success(runtime: dict | None, goal: str, final_text: str,
                                artifacts: list, privacy: bool = False) -> tuple[bool, str]:
     """成功任务 → 追加一条 source=auto 的记忆；返回 (是否写入, 可见说明)。"""
@@ -4516,10 +7440,29 @@ _MODEL_KEY_PLACEHOLDER = "●●●●●●●●"
 
 
 def _models_config_path() -> Path:
-    """与意识目录同一套 `TONGTIANWORK_HOME` 规则，测试可整体隔离到临时目录"""
-    root = str(os.environ.get("TONGTIANWORK_HOME") or "").strip()
-    base = Path(root) if root else Path.home() / ".tongtianwork"
-    return base / "models.json"
+    """模型条目文件：与意识目录同一数据根（`data_paths`），测试可整体隔离到临时目录"""
+    return dp.models_config_file()
+
+
+# 桌面端拉起引擎时下发属主标记：模型配置的唯一权威是桌面库 `model_configs`，
+# 引擎此时只读不写，避免在引擎数据根下长出第二份 models.json。
+MODEL_STORE_OWNER_ENV = "TT_ENGINE_MODEL_STORE"
+
+
+def _model_store_owned_by_desktop() -> bool:
+    raw = str(os.environ.get(MODEL_STORE_OWNER_ENV) or "").strip().lower()
+    return raw in ("desktop", "1", "true", "yes", "on")
+
+
+def _model_store_desktop_owned_response() -> JSONResponse:
+    return JSONResponse(
+        {
+            "ok": False,
+            "code": "MODEL_STORE_DESKTOP_OWNED",
+            "message": "桌面端模型配置以本机数据库为准，请在模型中心修改；引擎 models.json 只服务浏览器直连调试",
+        },
+        status_code=409,
+    )
 
 
 def _models_load() -> list[dict]:
@@ -5021,14 +7964,19 @@ def _probe_ollama_root(root: str) -> dict:
 async def usage_get(period: str = "monthly", sub: str = ""):
     """模型用量（真实 token 台账）：daily=今日 / monthly=本月 / total=全部。
 
-    仅供浏览器直连模式读取（无 Rust 后端时的联调通道）；
-    Tauri 模式的权威数据在 Rust model_usage 表（按 usage 事件持久化）。
-    台账为进程内累计，引擎重启清零。JWT 非管理员只能看到自己的用量。"""
+    桌面通道另有 Rust `model_usage` 表（按 usage 事件持久化）；本接口读引擎台账，
+    浏览器直连、IM、CLI、定时任务的用量只有这里有。台账已落盘，重启后重放恢复，
+    响应里的 `persist` 如实披露落盘文件、待合并增量与最近一次写入失败。
+    JWT 非管理员只能看到自己的用量。"""
     p = period if period in ("daily", "monthly", "total") else "total"
     subject = _usage_scope(sub)
-    return JSONResponse(
-        {"ok": True, "period": p, "subject": subject, "rows": USAGE_LEDGER.aggregate(p, subject)}
-    )
+    return JSONResponse({
+        "ok": True,
+        "period": p,
+        "subject": subject,
+        "rows": USAGE_LEDGER.aggregate(p, subject),
+        "persist": USAGE_LEDGER.persist_status(),
+    })
 
 
 @app.get("/api/usage/report")
@@ -5047,8 +7995,33 @@ async def usage_report_get(period: str = "monthly", sub: str = ""):
             "models": models,
             "users": USAGE_LEDGER.users(p, subject),
             "totals": USAGE_LEDGER.totals(p, models),
+            "persist": USAGE_LEDGER.persist_status(),
         }
     )
+
+
+@app.get("/api/usage/export")
+async def usage_export_get(period: str = "total", sub: str = ""):
+    """按「用户 × 模型 × 日 × 来源」导出台账明细，供上报服务端或运维对账使用。
+
+    为什么保留来源维度：桌面 `model_usage` 与引擎台账会覆盖同一批调用，合并时必须只
+    排除明确来自桌面通道（`desktop`）的那部分，其余来源桌面根本没记，必须原样补入；
+    未带来源标记的调用记为 `unknown`（或由 `TT_ENGINE_USAGE_ORIGIN_DEFAULT` 声明默认来源），
+    单列披露，不做静默合并。JWT 非管理员只能导出自己的用量。
+    """
+    p = period if period in ("daily", "monthly", "total") else "total"
+    subject = _usage_scope(sub)
+    rows = USAGE_LEDGER.daily_rows(p, subject)
+    unattributed = sum(int(row["tokensUsed"]) for row in rows if row["origin"] == us.ORIGIN_UNKNOWN)
+    return JSONResponse({
+        "ok": True,
+        "period": p,
+        "subject": subject,
+        "schemaVersion": us.LEDGER_SCHEMA_VERSION,
+        "rows": rows,
+        "unattributedTokens": unattributed,
+        "persist": USAGE_LEDGER.persist_status(),
+    })
 
 
 @app.get("/api/tools")
@@ -5105,6 +8078,8 @@ async def models_list():
 @app.post("/api/models")
 async def models_create(request: Request):
     """新增模型（密钥保存在本机 models.json，读取视图不回传明文）"""
+    if _model_store_owned_by_desktop():
+        return _model_store_desktop_owned_response()
     try:
         raw = await request.json()
     except Exception:
@@ -5132,6 +8107,8 @@ async def models_create(request: Request):
 @app.post("/api/models/update")
 async def models_update(request: Request):
     """更新模型（apiKey 缺省/占位符=保留，空串=清除；其余字段按请求覆盖）"""
+    if _model_store_owned_by_desktop():
+        return _model_store_desktop_owned_response()
     try:
         raw = await request.json()
     except Exception:
@@ -5165,6 +8142,8 @@ async def models_update(request: Request):
 @app.post("/api/models/delete")
 async def models_delete(request: Request):
     """删除模型（只按 id 移除指定条目，不动清单内其他模型）"""
+    if _model_store_owned_by_desktop():
+        return _model_store_desktop_owned_response()
     try:
         raw = await request.json()
     except Exception:
@@ -5197,6 +8176,8 @@ async def models_delete(request: Request):
 @app.post("/api/models/default")
 async def models_set_default(request: Request):
     """设为默认模型（Auto 在浏览器直连模式下解析到它）"""
+    if _model_store_owned_by_desktop():
+        return _model_store_desktop_owned_response()
     try:
         raw = await request.json()
     except Exception:
@@ -5283,6 +8264,8 @@ async def models_config_get():
 @app.post("/api/models/config")
 async def models_config_set(request: Request):
     """旧版整表写入：按 id 逐条合并，缺省字段保持原值，密钥不回写占位符"""
+    if _model_store_owned_by_desktop():
+        return _model_store_desktop_owned_response()
     try:
         payload = await request.json()
     except Exception:
@@ -5665,8 +8648,24 @@ async def files_open_folder(request: Request):
         payload = await request.json()
     except Exception:
         payload = {}
+    # 服务化用户不允许在服务器桌面上弹窗口；匿名直连只允许打开引擎数据目录
+    if current_principal() is not None:
+        return JSONResponse(
+            {"ok": False, "code": "FILE_OPEN_DENIED", "message": "服务化模式不允许打开服务器上的文件夹"},
+            status_code=403,
+        )
     raw = str(payload.get("path") or "").strip() or str(_awareness_home())
     p = Path(raw).expanduser()
+    if not _is_desktop_local(request) and not _path_within(p, _engine_data_roots()):
+        return JSONResponse(
+            {"ok": False, "code": "FILE_ACCESS_DENIED", "message": "该路径不在引擎数据目录内，拒绝打开"},
+            status_code=403,
+        )
+    if p.exists() and not p.is_dir():
+        return JSONResponse(
+            {"ok": False, "code": "VALIDATION_ERROR", "message": "只能打开文件夹，不能直接打开文件"},
+            status_code=400,
+        )
     if not p.exists():
         try:
             p.mkdir(parents=True, exist_ok=True)
@@ -5743,6 +8742,37 @@ async def im_configure(kind: str, request: Request):
     except Exception as exc:
         return _im_error(exc)
     return JSONResponse({"ok": True, "account": account})
+
+
+@app.post("/api/im/{kind}/login/start")
+async def im_login_start(kind: str):
+    """扫码登录第一步（个人微信）：生成二维码。二维码内容原样给前端渲染，
+    登录令牌只在确认那一帧由引擎落盘，绝不经过这条响应。"""
+    try:
+        payload = await im_channels.runtime_of(kind).login_start()
+    except Exception as exc:
+        return _im_error(exc)
+    return JSONResponse({"ok": True, **payload})
+
+
+@app.post("/api/im/{kind}/login/poll")
+async def im_login_poll(kind: str, request: Request):
+    """扫码登录第二步：查一次状态；确认时凭据落盘并起连接（响应里没有 token）"""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "code": "VALIDATION_ERROR", "message": "无效 JSON"}, status_code=400)
+    ticket = str(payload.get("ticket") or "").strip()
+    if not ticket:
+        return JSONResponse(
+            {"ok": False, "code": "IM_LOGIN_TICKET_MISSING", "message": "未提供二维码票据"},
+            status_code=400,
+        )
+    try:
+        result = await im_channels.runtime_of(kind).login_poll(ticket, str(payload.get("verifyCode") or ""))
+    except Exception as exc:
+        return _im_error(exc)
+    return JSONResponse({"ok": True, **result})
 
 
 @app.post("/api/im/{kind}/start")
@@ -5825,6 +8855,475 @@ async def im_send(kind: str, request: Request):
     )
 
 
+# ── 工单执行体端点（D-48.7）──────────────────────────────────────
+# 薄包装：读请求体 → 调 ticket_worker_service → 原样回它给的字典。业务口径（槽位、保序、
+# 幂等、已读落账、看门狗、重启补查、耐久收件箱）都在那一层和它的 190 项自测里；这里再写
+# 一遍就是两份真相，改一处漏一处。
+#
+# 本机门槛（`_ticket_desktop_only`）：worker 回合会在工单目录里**起真实进程**（run_shell）。
+# 桌面壳发的唤醒是用户在自己机器上点的；服务化模式下带着账号 JWT / 静态服务令牌的远程调用方
+# 能投一条唤醒，等于把远程执行开了个口子。所以写面要么来自桌面壳（本机令牌），要么引擎根本没
+# 配服务凭据（未配置时 `_authenticate_engine_request` 回 (None, "", False)，那正是桌面/本机开发
+# 形态）。查询面（status/state/history/inbox/outbox/plan）不设这道门槛——它们不起进程。
+DEFAULT_GATEWAY_TOKEN_WAIT_SECONDS = 15.0
+TICKET_OUTBOX_LIMIT_MAX = 64
+TICKET_HISTORY_LIMIT_MAX = 500
+
+#: 工单回合的用量归属：后台线程没有请求上下文，`current_principal()` 在那里是空的。
+#: 记「最近一次带着登录身份调用工单写面的人」，比静默落到 local 更贴近事实；桌面版没有
+#: 身份时仍落 local（与 /api/chat 的既有口径一致）。
+_TICKET_USAGE_OWNER: dict[str, str] = {}
+
+
+def _ticket_error(code: str, message: str, status: int = 400) -> JSONResponse:
+    return JSONResponse({"ok": False, "code": code, "message": message}, status_code=status)
+
+
+async def _ticket_payload(request: Request) -> tuple[dict[str, Any], JSONResponse | None]:
+    """取 JSON 请求体：无效 JSON / 顶层不是对象一律 400，不猜成空对象继续往下投。"""
+    try:
+        payload = await request.json()
+    except Exception:
+        return {}, _ticket_error("VALIDATION_ERROR", "无效 JSON")
+    if not isinstance(payload, dict):
+        return {}, _ticket_error("VALIDATION_ERROR", f"请求体顶层要是对象（是 {type(payload).__name__}）")
+    return payload, None
+
+
+def _ticket_desktop_only(request: Request) -> JSONResponse | None:
+    principal = current_principal()
+    if _is_desktop_local(request) or principal is None:
+        return None
+    return JSONResponse(
+        {
+            "ok": False,
+            "code": "TICKET_WORKER_DESKTOP_ONLY",
+            "message": (
+                "工单执行体会在工单目录里起真实进程：唤醒、补查、改装配这类写操作只接受桌面壳"
+                "（本机令牌）发起；当前请求带着远程身份，请改用查询面"
+            ),
+        },
+        status_code=403,
+    )
+
+
+def _ticket_required(payload: dict[str, Any], *names: str) -> JSONResponse | None:
+    """必填字段只做「有没有」的裁决，语义（origin 合法吗、这个工单能不能投）留给服务层。"""
+    missing = [name for name in names if not str(payload.get(name) or "").strip()]
+    if missing:
+        return _ticket_error(
+            "TICKET_FIELD_MISSING",
+            f"缺少必填字段：{'、'.join(missing)}（工单端点不猜默认值，猜出来的 ticketId 会投到别人那一单）",
+        )
+    return None
+
+
+def _ticket_int(payload: dict[str, Any], name: str, default: int, *, low: int, high: int) -> tuple[int, JSONResponse | None]:
+    raw = payload.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default, None
+    try:
+        value = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return default, _ticket_error("TICKET_FIELD_INVALID", f"{name} 要是一个整数（收到 {raw!r}）")
+    if value < low or value > high:
+        return default, _ticket_error("TICKET_FIELD_INVALID", f"{name} 超出可用范围 {low}–{high}（收到 {value}）")
+    return value, None
+
+
+#: 工作区准备规格**不经 HTTP 暴露**（缺陷 D-48.8）：`repo` 类是「在桌面机器上按某个仓建
+#: worktree」，`command` 类更直接就是「起一条任意命令」。把它交给请求体，等于让远程主体挑
+#: 目录、挑进程——写面那道「只对本机」的闸门挡的是消息内容，不是「谁来指定执行体在哪份代码上干活」。
+#: 出现即拒，不静默忽略：静默会让配的人以为自己的 worktree 已经站上了，而执行体其实只在空目录里干活。
+TICKET_PREPARE_BODY_KEYS = ("prepare", "prepareSpec", "prepareFn", "workspacePrepare", "worktree")
+
+
+def _ticket_prepare_refused(payload: dict[str, Any]) -> JSONResponse | None:
+    hit = [name for name in TICKET_PREPARE_BODY_KEYS if name in payload]
+    if not hit:
+        return None
+    return _ticket_error(
+        "TICKET_FIELD_INVALID",
+        f"{'、'.join(hit)} 不经请求体设置：工单工作区的准备规格只认进程内 configure(prepare=…) "
+        f"与环境变量 {tws.PREPARE_ENV_VAR}（本机桌面壳自己设）。准备动作会在桌面机器上建目录、"
+        "跑 git 甚至跑一条任意命令，把它交给 HTTP 等于让远程主体挑目录。"
+        "这条请求没有改装配，也没有投递任何唤醒。",
+    )
+
+
+def _ticket_remember_owner() -> None:
+    principal = current_principal() or {}
+    sub = str(principal.get("sub") or "").strip()
+    if not sub:
+        return
+    _TICKET_USAGE_OWNER["sub"] = sub
+    _TICKET_USAGE_OWNER["org"] = str(principal.get("org") or "").strip()
+
+
+def _ticket_usage_hook(prices: dict | None) -> Callable[[dict[str, Any]], None]:
+    """通道 → 用量台账：工单回合的 tokens 与耗时记进同一份账（origin=ticket-worker）。
+
+    不接这一条，「今天用了多少」会把执行体那一整路算成零——模型真花了 token，只是没人记账。
+    台账写失败只出声不抛：用量记不上不该让已经花掉的调用变成一次失败回合。"""
+
+    def on_usage(usage: dict[str, Any]) -> None:
+        try:
+            prompt = int(usage.get("promptTokens") or 0)
+            completion = int(usage.get("completionTokens") or 0)
+            cost_micros, currency = cost_micros_of(prices, prompt, completion)
+            latency_raw = usage.get("latencyMs")
+            USAGE_LEDGER.add(
+                str(usage.get("model") or "unknown"),
+                prompt,
+                completion,
+                latency_ms=int(latency_raw) if latency_raw is not None else None,
+                cost_micros=cost_micros,
+                currency=currency,
+                priced=cost_micros is not None,
+                sub=_TICKET_USAGE_OWNER.get("sub"),
+                org=_TICKET_USAGE_OWNER.get("org"),
+                origin=tmc.USAGE_ORIGIN,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[engine][tickets] 工单回合用量没记上（不影响已完成的调用）：{type(exc).__name__}: {exc}", flush=True)
+
+    return on_usage
+
+
+def _ticket_gateway_token_provider(model_config: Any) -> Callable[[], str] | None:
+    """网关模式的换票件（每轮现取短期令牌）；非网关模式返回 None，交给通道按配置自己判定。
+
+    `GatewayTokenProvider.get()` 是协程（换票走引擎的 HTTP 会话），worker 回合是同步线程，
+    所以这里跨循环回投。拿不到循环（没走 lifespan 启动）或换票超时都**如实抛**：吞成空字符串
+    会让通道报「换取结果为空」，把「接线方式不对」说成「你登录失效了」。"""
+    try:
+        gateway = _gateway_of(model_config if isinstance(model_config, dict) else None)
+    except RuntimeError:
+        # 网关配置不完整：resolve_model_config 会给出 mode=none 与同一句理由，这里不重复报
+        return None
+    if gateway is None:
+        return None
+    provider = _gateway_provider(gateway)
+
+    def provide() -> str:
+        loop = _TICKET_LOOP
+        if loop is None:
+            raise RuntimeError("网关模式换票要有引擎事件循环：这套装配不是在 lifespan 里建的，无法跨循环换短期令牌")
+        future = asyncio.run_coroutine_threadsafe(provider.get(), loop)
+        try:
+            return str(future.result(DEFAULT_GATEWAY_TOKEN_WAIT_SECONDS) or "")
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            future.cancel()
+            raise RuntimeError(f"网关令牌 {DEFAULT_GATEWAY_TOKEN_WAIT_SECONDS} 秒没换到，本轮不起回合") from exc
+
+    return provide
+
+
+async def _ticket_call(fn: Callable[[], Any]) -> JSONResponse:
+    """把一次服务调用放到工作线程并包成响应。
+
+    这一层里 `run_outbox` 会同步等通道回话（最长 30 秒一条）、`submit` 要建目录并落耐久箱，
+    直接在事件循环里跑会把整个引擎按停；异常一律回中文理由而不是 500 页面——失败也说明白了，
+    比让调用方猜「到底投进去没有」强。"""
+    try:
+        result = await asyncio.to_thread(fn)
+    except Exception as exc:  # noqa: BLE001
+        return _ticket_error("TICKET_WORKER_ERROR", f"工单执行体调用失败：{type(exc).__name__}: {exc}", 500)
+    if not isinstance(result, dict):
+        return _ticket_error("TICKET_WORKER_ERROR", f"执行体返回的不是字典（是 {type(result).__name__}）", 500)
+    try:
+        body = tws.json_ready(result)
+    except (TypeError, ValueError) as exc:
+        # 回不出去的字典在这里撞上，比在 JSONResponse 里撞上便宜：那时盘上事实已经落了
+        return _ticket_error("TICKET_RESULT_UNSERIALIZABLE", f"执行体结果无法作为 JSON 返回：{type(exc).__name__}: {exc}", 500)
+    return JSONResponse(body)
+
+
+@app.get("/api/tickets/status")
+async def tickets_status():
+    """服务面板：模型模式 / 槽位 / 在飞回合 / 队列与收件箱条数 / 通道是否接线（不含密钥）。"""
+    return await _ticket_call(lambda: _ticket_runtime().status())
+
+
+@app.post("/api/tickets/config")
+async def tickets_config(request: Request):
+    """配置这套装配：模型（推给活通道，不重建）、并发口径、提示词目标、默认回话会话。
+
+    并发口径（槽位 / 并行回合数）与数据根是构造期事实，改了会重建并当场说明为什么；模型改了
+    只推。换票件与用量回调由引擎在这里现造——它们是「跑在引擎里」才有的东西，装配层不该认识
+    `gateway_token` 和 `UsageLedger`。登录态换了要重新推一次（换票件按 access token 摘要缓存）。
+
+    这里**没有**准备规格（在哪个仓起 worktree / 跑哪条准备命令）的口：那会在桌面机器上建目录、
+    跑 git 甚至跑一条任意命令，只认进程内 `configure(prepare=…)` 与环境变量
+    `TT_TICKET_WORKER_PREPARE`；请求体里出现 `prepare` / `prepareFn` 之类字段当场 400，不静默忽略。
+    """
+    denied = _ticket_desktop_only(request)
+    if denied is not None:
+        return denied
+    payload, err = await _ticket_payload(request)
+    if err is not None:
+        return err
+    refused = _ticket_prepare_refused(payload)
+    if refused is not None:
+        return refused
+    kwargs: dict[str, Any] = {}
+    if "modelConfig" in payload:
+        model_config = payload.get("modelConfig")
+        if model_config is not None and not isinstance(model_config, dict):
+            return _ticket_error("TICKET_FIELD_INVALID", "modelConfig 要是一个对象（或省略表示不改模型）")
+        kwargs["model_config"] = model_config if isinstance(model_config, dict) else {}
+        kwargs["token_provider"] = _ticket_gateway_token_provider(model_config)
+        kwargs["on_usage"] = _ticket_usage_hook(_prices_of(model_config))
+    for key, json_key, bounds in (
+        ("agent_slots", "agentSlots", (1, 16)),
+        ("human_extra", "humanExtraSlots", (0, 8)),
+        ("max_parallel_turns", "maxParallelTurns", (1, 16)),
+        ("max_followup_turns", "maxFollowupTurns", (1, 64)),
+        ("max_tool_rounds", "maxToolRounds", (1, 32)),
+    ):
+        if json_key in payload:
+            value, verr = _ticket_int(payload, json_key, 0, low=bounds[0], high=bounds[1])
+            if verr is not None:
+                return verr
+            kwargs[key] = value
+    for key, names in (("goal", ("goal",)), ("default_session_key", ("defaultSessionKey", "default_session_key"))):
+        for name in names:
+            if name in payload:
+                kwargs[key] = str(payload.get(name) or "")
+    if not kwargs:
+        return _ticket_error(
+            "TICKET_CONFIG_EMPTY",
+            "没有要改的项：modelConfig / agentSlots / goal / defaultSessionKey 至少给一个（空请求不该悄悄重建装配）",
+        )
+    _ticket_remember_owner()
+    return await _ticket_call(lambda: tws.configure(**kwargs))
+
+
+@app.post("/api/tickets/wakes")
+async def tickets_wake(request: Request):
+    """投一条唤醒（工单执行体的唯一入口）：槽位与模型通道都在投递之前裁决。
+
+    返回 `turn-scheduled` 只表示「这条已经进收件箱、起了或等着起一轮」，不表示模型已经回话；
+    回合结果去 /state 与 /history 看。被拒（槽满、模型没配）的原话就在这条响应里，那条唤醒
+    哪儿也没去。
+    """
+    denied = _ticket_desktop_only(request)
+    if denied is not None:
+        return denied
+    payload, err = await _ticket_payload(request)
+    if err is not None:
+        return err
+    missing = _ticket_required(payload, "ticketId", "message", "assignmentId")
+    if missing is not None:
+        return missing
+    refused = _ticket_prepare_refused(payload)
+    if refused is not None:
+        return refused
+    arrived_at, aerr = _ticket_int(payload, "arrivedAtMs", 0, low=0, high=2 ** 62)
+    if aerr is not None:
+        return aerr
+    runtime = _ticket_runtime()
+    _ticket_remember_owner()
+    return await _ticket_call(
+        lambda: runtime.submit(
+            ticket_id=str(payload.get("ticketId") or "").strip(),
+            message=str(payload.get("message") or ""),
+            assignment_id=str(payload.get("assignmentId") or "").strip(),
+            title=str(payload.get("title") or ""),
+            origin=str(payload.get("origin") or "human"),
+            prev_assignment_id=str(payload.get("prevAssignmentId") or ""),
+            arrived_at_ms=arrived_at,
+        )
+    )
+
+
+@app.get("/api/tickets/state")
+async def tickets_state(ticketId: str = ""):  # noqa: N803  （FastAPI 查询参数按前端约定的驼峰名）
+    """一单现在什么样：worker / 领取 / 在飞作业 / 未读唤醒 / 对外状态（waiting|working|…）。"""
+    if not ticketId.strip():
+        return _ticket_error("TICKET_FIELD_MISSING", "缺少必填字段：ticketId（状态查询要指明查哪一单）")
+    runtime = _ticket_runtime()
+    return await _ticket_call(lambda: runtime.state(ticketId.strip()))
+
+
+@app.get("/api/tickets/history")
+async def tickets_history(ticketId: str = "", limit: int = 50):  # noqa: N803
+    """回合历史：每轮一条（第几轮、消费了几条唤醒、怎么收的口）。"""
+    if limit < 1 or limit > TICKET_HISTORY_LIMIT_MAX:
+        return _ticket_error("TICKET_FIELD_INVALID", f"limit 超出可用范围 1–{TICKET_HISTORY_LIMIT_MAX}（收到 {limit}）")
+    runtime = _ticket_runtime()
+    return await _ticket_call(lambda: runtime.history(ticketId, limit=limit))
+
+
+@app.post("/api/tickets/kick")
+async def tickets_kick(request: Request):
+    """手动推进一轮（把收件箱里压着的、或滞留的唤醒带走）。
+
+    `prevAssignmentId` 是给「领取已经结束、要借旧一轮上下文」的那条路用的；不带就是就地踢
+    当前活领取。
+    """
+    denied = _ticket_desktop_only(request)
+    if denied is not None:
+        return denied
+    payload, err = await _ticket_payload(request)
+    if err is not None:
+        return err
+    missing = _ticket_required(payload, "ticketId")
+    if missing is not None:
+        return missing
+    runtime = _ticket_runtime()
+    _ticket_remember_owner()
+    return await _ticket_call(
+        lambda: runtime.kick(str(payload.get("ticketId") or "").strip(), prev_assignment_id=str(payload.get("prevAssignmentId") or ""))
+    )
+
+
+@app.get("/api/tickets/resume/plan")
+async def tickets_resume_plan(
+    ticketId: str = "",  # noqa: N803
+    prevAssignmentId: str = "",  # noqa: N803
+    candidateWakes: str = "",  # noqa: N803
+):
+    """重启补查的只读一面：哪些唤醒从没进过会话历史、哪些已读、哪些箱里还压着。
+
+    不动盘、不起回合，所以不设本机门槛。`candidateWakes` 是 JSON 数组字符串（服务端工单消息
+    表里的候选）；不填就只用耐久收件箱那份磁盘凭据。
+    """
+    if not ticketId.strip() or not prevAssignmentId.strip():
+        return _ticket_error("TICKET_FIELD_MISSING", "缺少必填字段：ticketId、prevAssignmentId（补查要知道补的是哪一单的哪一轮）")
+    candidates: list[Any] = []
+    if candidateWakes.strip():
+        try:
+            parsed = json.loads(candidateWakes)
+        except Exception as exc:
+            return _ticket_error("TICKET_FIELD_INVALID", f"candidateWakes 不是合法 JSON 数组：{type(exc).__name__}: {exc}")
+        if not isinstance(parsed, list):
+            return _ticket_error("TICKET_FIELD_INVALID", f"candidateWakes 顶层要是数组（是 {type(parsed).__name__}）")
+        candidates = parsed
+    runtime = _ticket_runtime()
+    return await _ticket_call(
+        lambda: runtime.plan(ticketId.strip(), prev_assignment_id=prevAssignmentId.strip(), candidate_wakes=candidates)
+    )
+
+
+@app.post("/api/tickets/resume")
+async def tickets_resume(request: Request):
+    """重启补查的写一面：把没喂进会话的唤醒投给**新**领取并起一轮。
+
+    只投未读、先投完整批再起轮；一条也没投出去时会如实说（槽满）。旧领取的上下文只借不结论。
+    """
+    denied = _ticket_desktop_only(request)
+    if denied is not None:
+        return denied
+    payload, err = await _ticket_payload(request)
+    if err is not None:
+        return err
+    missing = _ticket_required(payload, "ticketId", "prevAssignmentId", "newAssignmentId")
+    if missing is not None:
+        return missing
+    candidates = payload.get("candidateWakes")
+    if candidates is not None and not isinstance(candidates, list):
+        return _ticket_error("TICKET_FIELD_INVALID", f"candidateWakes 要是数组（是 {type(candidates).__name__}）")
+    runtime = _ticket_runtime()
+    _ticket_remember_owner()
+    return await _ticket_call(
+        lambda: runtime.resume_wakes(
+            str(payload.get("ticketId") or "").strip(),
+            prev_assignment_id=str(payload.get("prevAssignmentId") or "").strip(),
+            new_assignment_id=str(payload.get("newAssignmentId") or "").strip(),
+            candidate_wakes=candidates or [],
+            title=str(payload.get("title") or ""),
+            origin=str(payload.get("origin") or "human"),
+        )
+    )
+
+
+@app.get("/api/tickets/inbox")
+async def tickets_inbox(ticketId: str = ""):  # noqa: N803
+    """耐久收件箱：投递即落盘的那份日志；给 ticketId 时同时看这一单还欠着哪几条。"""
+    runtime = _ticket_runtime()
+    return await _ticket_call(lambda: runtime.inbox_state(ticketId))
+
+
+@app.get("/api/tickets/outbox")
+async def tickets_outbox():
+    """外发队列快照（含 statusCounts / 保序组 / 加载错误）。注意 records 是条数不是列表。"""
+    runtime = _ticket_runtime()
+    return await _ticket_call(lambda: runtime.outbox_state())
+
+
+@app.post("/api/tickets/outbox/run")
+async def tickets_outbox_run(request: Request):
+    """手动推一把已提交的外发（退避到点的、保序该放行下一块的）。
+
+    周期泵在 lifespan 里也在做同一件事；这个端点是给「刚配好通道，想立刻把欠的发出去」用的，
+    不是唯一出路——手动推和自动推走的是同一个 `run_pending`，不存在两条会分道的口径。
+    """
+    denied = _ticket_desktop_only(request)
+    if denied is not None:
+        return denied
+    payload, err = await _ticket_payload(request)
+    if err is not None:
+        return err
+    limit, lerr = _ticket_int(payload, "limit", 16, low=1, high=TICKET_OUTBOX_LIMIT_MAX)
+    if lerr is not None:
+        return lerr
+    runtime = _ticket_runtime()
+    return await _ticket_call(lambda: runtime.run_outbox(limit=limit))
+
+
+@app.post("/api/tickets/outbox/retry")
+async def tickets_outbox_retry(request: Request):
+    """把一条终态失败的外发改回待办（重试的那次仍走同一把幂等键，不会二次送达）。"""
+    denied = _ticket_desktop_only(request)
+    if denied is not None:
+        return denied
+    payload, err = await _ticket_payload(request)
+    if err is not None:
+        return err
+    missing = _ticket_required(payload, "recordId")
+    if missing is not None:
+        return missing
+    runtime = _ticket_runtime()
+    return await _ticket_call(lambda: runtime.retry_outbox(str(payload.get("recordId") or "").strip()))
+
+
+@app.post("/api/tickets/outbox/resolve")
+async def tickets_outbox_resolve(request: Request):
+    """保序组的逃生口：挡住后面那条要么 skip 放行，要么按原样重发。"""
+    denied = _ticket_desktop_only(request)
+    if denied is not None:
+        return denied
+    payload, err = await _ticket_payload(request)
+    if err is not None:
+        return err
+    missing = _ticket_required(payload, "recordId", "action")
+    if missing is not None:
+        return missing
+    runtime = _ticket_runtime()
+    return await _ticket_call(
+        lambda: runtime.resolve_outbox_block(str(payload.get("recordId") or "").strip(), str(payload.get("action") or "").strip())
+    )
+
+
+# ── #164 分片注册面（本文件唯一的路由挂载点）─────────────────────
+# 各窗口新增引擎端点写进 engine/routes_<domain>.py，不要再打开本文件。
+# 顺序即优先级：上面 61 条既有路由先注册，车道后挂；同名路径由既有路由赢，
+# 而「被既有通配吞掉」「越界占用别人前缀」「车道内重名」都会在 attach() 里直接抛，
+# 不带病启动（D-07.4 真机演练里那条通配吞掉 revoked.json 的缺陷，mock 永远测不出来）。
+ROUTE_LANES = (
+    routes_knowledge,
+    routes_artifact,
+    routes_workspace,
+    routes_exec,
+    routes_connect,
+    routes_orchestrate,
+    routes_voice,
+)
+
+ROUTE_LANE_REPORT = rln.attach(app, sys.modules[__name__], (lane.__name__ for lane in ROUTE_LANES))
+
+
 # ── 入口 ───────────────────────────────────────────────────────
 
 def main():
@@ -5884,6 +9383,9 @@ def main():
         f"audit-log={'yes' if os.environ.get('TT_ENGINE_AUDIT_LOG') else 'memory'})",
         flush=True,
     )
+    # D-28：先把主线程与工作线程的钩子挂上，再进 uvicorn——启动阶段自己炸了也得留现场。
+    # 事件循环那一半在 lifespan 里补（构造期拿不到循环对象），本函数幂等。
+    _crash_telemetry_bootstrap()
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

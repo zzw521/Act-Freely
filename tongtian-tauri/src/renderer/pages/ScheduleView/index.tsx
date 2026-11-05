@@ -41,22 +41,34 @@ import { useNavigate } from 'react-router-dom';
 import { IPC_CHANNELS } from '../../../shared/contracts';
 import type {
   ImChannelsSnapshot,
-  ScheduledTask,
-  ScheduleFreq,
   ScheduleRunStatus,
   WorkspaceInfo,
 } from '../../../shared/contracts';
+import type {
+  ScheduleCreateReqExtended,
+  ScheduleParseResultExtended,
+  ScheduledTaskExtended,
+} from '../../../shared/contracts_connect';
 import { errorTextOf } from '../../../shared/error-messages';
+import { clickableProps } from '../../lib/a11y';
 import { workspaceAPI } from '../../lib/api';
 import {
-  SCHEDULE_FREQS,
+  INTERVAL_UNITS,
+  SCHEDULE_FREQS_ALL,
   WEEKDAY_LABELS,
+  buildPreview,
   describeSchedule,
   formatLocalDateTime,
   freqLabel,
+  intervalToMinutes,
+  localDateFromMs,
+  localRunDateToUtcMs,
   localToUtcTime,
+  minutesToIntervalParts,
+  resolveParsedRunDate,
   utcToLocalTime,
 } from '../../lib/schedule-local';
+import type { IntervalUnit, LocalFreq } from '../../lib/schedule-local';
 import { useScheduleStore } from '../../stores/useScheduleStore';
 
 // ── 对话式创建的预置提示词 ──────────────────────────────────────────
@@ -70,7 +82,7 @@ interface Recommend {
   title: string;
   desc: string;
   schedule: string;
-  freq: ScheduleFreq;
+  freq: LocalFreq;
   time: string;
   weekday?: number;
 }
@@ -111,10 +123,10 @@ const RUN_STATUS_LABELS: Record<ScheduleRunStatus, string> = {
 };
 
 const RUN_STATUS_COLORS: Record<ScheduleRunStatus, { fg: string; bg: string }> = {
-  running: { fg: '#1D4ED8', bg: 'rgba(37, 99, 235, 0.10)' },
-  succeeded: { fg: '#047857', bg: 'rgba(5, 150, 105, 0.10)' },
-  failed: { fg: '#B91C1C', bg: 'rgba(220, 38, 38, 0.10)' },
-  blocked: { fg: '#B45309', bg: 'rgba(217, 119, 6, 0.12)' },
+  running: { fg: 'var(--tt-info)', bg: 'rgba(37, 99, 235, 0.10)' },
+  succeeded: { fg: 'var(--tt-success)', bg: 'rgba(5, 150, 105, 0.10)' },
+  failed: { fg: 'var(--tt-danger)', bg: 'rgba(220, 38, 38, 0.10)' },
+  blocked: { fg: 'var(--tt-warning)', bg: 'rgba(217, 119, 6, 0.12)' },
 };
 
 // ── 页面组件 ──────────────────────────────────────────────────────
@@ -142,8 +154,12 @@ const ScheduleView: React.FC = () => {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingScheduleId, setEditingScheduleId] = useState<string | null>(null);
   const [taskName, setTaskName] = useState('');
-  const [freq, setFreq] = useState<ScheduleFreq>('daily');
+  const [freq, setFreq] = useState<LocalFreq>('daily');
   const [time, setTime] = useState('09:00');
+  // D-30：间隔步长按「数值 + 单位」录入（落库仍是分钟数）；一次性任务存本地日期
+  const [intervalValue, setIntervalValue] = useState('60');
+  const [intervalUnit, setIntervalUnit] = useState<IntervalUnit>('minutes');
+  const [runDate, setRunDate] = useState(() => localDateFromMs(Date.now()));
   const [weekday, setWeekday] = useState(1);
   const [taskDesc, setTaskDesc] = useState('');
   const [saving, setSaving] = useState(false);
@@ -153,6 +169,13 @@ const ScheduleView: React.FC = () => {
   const [nlText, setNlText] = useState('');
   const [nlParsing, setNlParsing] = useState(false);
   const [nlNote, setNlNote] = useState<string | null>(null);
+  // 解析结果先预览再确认（D-30 验收项）：确认前不改动表单，用户看得见「将要执行什么」
+  const [pendingParse, setPendingParse] = useState<{
+    text: string;
+    parsed: ScheduleParseResultExtended;
+    runDate: string | null;
+    preview: string;
+  } | null>(null);
   const [notifyChannel, setNotifyChannel] = useState('');
   const [notifyTarget, setNotifyTarget] = useState('');
   const [imSnapshot, setImSnapshot] = useState<ImChannelsSnapshot | null>(null);
@@ -237,7 +260,7 @@ const ScheduleView: React.FC = () => {
     void loadKeepAwake();
   }, [loadKeepAwake]);
 
-  const openCreateDialog = (preset?: Partial<{ name: string; desc: string; freq: ScheduleFreq; time: string; weekday: number; workspaceId: string }>) => {
+  const openCreateDialog = (preset?: Partial<{ name: string; desc: string; freq: LocalFreq; time: string; weekday: number; workspaceId: string }>) => {
     setEditingScheduleId(null);
     setTaskName(preset?.name ?? '');
     setTaskDesc(preset?.desc ?? '');
@@ -251,13 +274,17 @@ const ScheduleView: React.FC = () => {
     setFormError(null);
     setNlText('');
     setNlNote(null);
+    setPendingParse(null);
+    setIntervalValue('60');
+    setIntervalUnit('minutes');
+    setRunDate(localDateFromMs(Date.now()));
     setNotifyChannel('');
     setNotifyTarget('');
     setDialogOpen(true);
   };
 
   /** 编辑已有任务：时刻按本地时区回显（存储为 UTC），工作空间沿用任务归属 */
-  const openEditDialog = (t: ScheduledTask) => {
+  const openEditDialog = (t: ScheduledTaskExtended) => {
     setEditingScheduleId(t.scheduleId);
     setTaskName(t.name);
     setTaskDesc(t.description ?? '');
@@ -271,12 +298,22 @@ const ScheduleView: React.FC = () => {
     setFormError(null);
     setNlText('');
     setNlNote(null);
+    setPendingParse(null);
+    const parts = minutesToIntervalParts(t.intervalMinutes);
+    setIntervalValue(String(parts.value || 60));
+    setIntervalUnit(parts.unit);
+    setRunDate(localDateFromMs(t.runAtMs) || localDateFromMs(Date.now()));
     setNotifyChannel(t.notifyChannel ?? '');
     setNotifyTarget(t.notifyTarget ?? '');
     setDialogOpen(true);
   };
 
-  /** 一句话解析：只回填能确定的字段；解析不出时间就如实报错，不替用户猜 */
+  /**
+   * 一句话解析：先出预览，确认后才回填表单（D-30 验收「复杂表达先预览」）。
+   * 解析不出时刻/日期就如实报错，不替用户猜一个值。
+   * 相对说法（明天 / 下周三）在这里按用户本地日重锚：后端只有 UTC，
+   * 凌晨到早晨说出「明天」会差一天，重锚后两条通道给出同一天。
+   */
   const handleParseNatural = async () => {
     const text = nlText.trim();
     if (!text || nlParsing) return;
@@ -284,26 +321,57 @@ const ScheduleView: React.FC = () => {
     setFormError(null);
     try {
       const parsed = await parseNatural(text);
-      setTaskName(parsed.name);
-      setFreq(parsed.freq);
-      setTime(parsed.timeOfDay);
-      if (parsed.weekday) setWeekday(parsed.weekday);
-      setTaskDesc((cur) => (cur.trim() ? cur : text));
-      setNlNote(
-        parsed.note ??
-          `已解析：${freqLabel(parsed.freq)}${
-            parsed.freq === 'weekly' && parsed.weekday
-              ? WEEKDAY_LABELS[parsed.weekday]
-              : ''
-          } ${parsed.timeOfDay}`,
-      );
+      const resolved = resolveParsedRunDate(parsed);
+      setPendingParse({ text, parsed, runDate: resolved.runDate, preview: resolved.preview });
+      setNlNote(null);
     } catch (err) {
+      setPendingParse(null);
       setNlNote(null);
       setFormError(errorTextOf(err, '一句话解析失败'));
     } finally {
       setNlParsing(false);
     }
   };
+
+  /** 确认预览：把解析结果回填表单（时刻按本地录入，保存时再换算 UTC） */
+  const applyPendingParse = () => {
+    if (!pendingParse) return;
+    const { parsed, runDate, text, preview } = pendingParse;
+    setTaskName(parsed.name);
+    setFreq(parsed.freq);
+    if (parsed.weekday) setWeekday(parsed.weekday);
+    if (parsed.freq === 'interval') {
+      const parts = minutesToIntervalParts(parsed.intervalMinutes);
+      setIntervalValue(String(parts.value));
+      setIntervalUnit(parts.unit);
+    } else {
+      setTime(parsed.timeOfDay);
+      if (parsed.freq === 'once' && runDate) setRunDate(runDate);
+    }
+    setTaskDesc((cur) => (cur.trim() ? cur : text));
+    setNlNote(`已按预览应用：${preview}${parsed.note ? `（${parsed.note}）` : ''}`);
+    setPendingParse(null);
+  };
+
+  /**
+   * 当前表单的计划回显（未提交）：手动填写也先看这一句再保存。
+   * 配置不完整/越界时直接把校验话术显示出来，不显示一个假预览。
+   */
+  const formPreviewText = (() => {
+    try {
+      if (freq === 'interval') {
+        const n = Number(intervalValue);
+        if (!Number.isInteger(n) || n <= 0) {
+          throw new Error('SCHEDULE_INVALID_FREQ: 间隔需是正整数');
+        }
+        return buildPreview('interval', '00:00', null, intervalToMinutes(n, intervalUnit), null);
+      }
+      if (freq === 'once') return buildPreview('once', time, null, null, runDate);
+      return buildPreview(freq, time, weekday, null, null);
+    } catch (err) {
+      return errorTextOf(err, '计划配置待补充');
+    }
+  })();
 
   // 通过对话创建：跳转新任务对话窗口并预置提示词
   const handleCreateByChat = () => {
@@ -316,18 +384,29 @@ const ScheduleView: React.FC = () => {
     if (!canSave || saving) return;
     setSaving(true);
     setFormError(null);
-    const plan = {
-      name: taskName.trim(),
-      description: taskDesc.trim(),
-      freq,
-      // 界面本地时刻 → UTC（Rust 侧按 UTC 存储与计算）
-      timeOfDay: localToUtcTime(time),
-      weekday: freq === 'weekly' ? weekday : null,
-      workspaceId,
-      // 空串＝不推送；编辑时显式传空可关闭已有推送
-      notifyChannel: notifyChannel.trim().toLowerCase(),
-      notifyTarget: notifyTarget.trim(),
-    };
+    let plan: ScheduleCreateReqExtended;
+    try {
+      plan = {
+        name: taskName.trim(),
+        description: taskDesc.trim(),
+        freq,
+        // 界面本地时刻 → UTC（Rust 侧按 UTC 存储与计算）；间隔任务没有时刻锚点，恒 00:00
+        timeOfDay: freq === 'interval' ? '00:00' : localToUtcTime(time),
+        weekday: freq === 'weekly' ? weekday : null,
+        // 非本频率即显式传 null：后端据此清空上一步留下的步长/时刻，不隐藏无效配置
+        intervalMinutes:
+          freq === 'interval' ? intervalToMinutes(Number(intervalValue), intervalUnit) : null,
+        runAtMs: freq === 'once' ? localRunDateToUtcMs(runDate, time) : null,
+        workspaceId,
+        // 空串＝不推送；编辑时显式传空可关闭已有推送
+        notifyChannel: notifyChannel.trim().toLowerCase(),
+        notifyTarget: notifyTarget.trim(),
+      };
+    } catch (err) {
+      setFormError(errorTextOf(err, '计划时间不完整'));
+      setSaving(false);
+      return;
+    }
     try {
       if (editingScheduleId) {
         const updated = await update({ scheduleId: editingScheduleId, ...plan });
@@ -395,7 +474,7 @@ const ScheduleView: React.FC = () => {
       <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 2 }}>
         <Box sx={{ flexGrow: 1, minWidth: 0 }}>
           <Typography variant="h5" sx={{ fontWeight: 700 }}>定时任务</Typography>
-          <Typography sx={{ fontSize: '13px', color: '#6B7280', mt: 0.5 }}>
+          <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-2)', mt: 0.5 }}>
             按计划自动执行任务，也可随时手动触发。在任意对话中描述你想定期做的事，即可快速创建
           </Typography>
         </Box>
@@ -405,8 +484,8 @@ const ScheduleView: React.FC = () => {
             startIcon={<ChatBubbleOutlineIcon />}
             onClick={handleCreateByChat}
             sx={{
-              color: '#374151',
-              borderColor: '#E5E7EB',
+              color: 'var(--tt-text-2)',
+              borderColor: 'var(--tt-border)',
               borderRadius: '10px',
               textTransform: 'none',
               fontSize: '13px',
@@ -420,13 +499,13 @@ const ScheduleView: React.FC = () => {
             variant="contained"
             onClick={() => openCreateDialog()}
             sx={{
-              bgcolor: '#111827',
+              bgcolor: 'var(--tt-cta-fill)',
               borderRadius: '10px',
               textTransform: 'none',
               fontSize: '13px',
               fontWeight: 600,
               px: 2,
-              '&:hover': { bgcolor: '#4F46E5' },
+              '&:hover': { bgcolor: 'var(--tt-cta-fill-hover)' },
             }}
           >
             + 新建定时任务
@@ -448,34 +527,34 @@ const ScheduleView: React.FC = () => {
           gap: 1,
         }}
       >
-        <InfoOutlinedIcon sx={{ fontSize: 16, color: '#3B82F6' }} />
+        <InfoOutlinedIcon sx={{ fontSize: 16, color: 'var(--tt-info)' }} />
         <Box sx={{ flexGrow: 1, minWidth: 0 }}>
-          <Typography sx={{ fontSize: '12.5px', color: '#1E40AF' }}>
+          <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-info)' }}>
             定时任务仅在电脑保持唤醒时运行
           </Typography>
           {keepAwake?.requested && !keepAwake.active && (
-            <Typography sx={{ fontSize: '11.5px', color: '#B45309', mt: 0.25 }}>
+            <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-warning)', mt: 0.25 }}>
               {keepAwake.supported
                 ? '唤醒约束未生效，到点执行可能被系统休眠中断'
                 : '当前平台不支持保持系统唤醒，请自行关闭系统休眠'}
             </Typography>
           )}
         </Box>
-        <Typography sx={{ fontSize: '12.5px', color: '#4B5563' }}>保持系统唤醒</Typography>
+        <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-2)' }}>保持系统唤醒</Typography>
         <Switch
           size="small"
           checked={Boolean(keepAwake?.requested)}
           onChange={(e) => void handleKeepAwake(e.target.checked)}
           inputProps={{ 'aria-label': '保持系统唤醒' }}
           sx={{
-            '& .MuiSwitch-switchBase.Mui-checked': { color: '#3B82F6' },
-            '& .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track': { backgroundColor: '#3B82F6' },
+            '& .MuiSwitch-switchBase.Mui-checked': { color: 'var(--tt-info)' },
+            '& .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track': { backgroundColor: 'var(--tt-info)' },
           }}
         />
       </Box>
 
       {/* 推荐示例 */}
-      <Typography sx={{ fontSize: '13.5px', fontWeight: 700, color: '#111827', mt: 3, mb: 1.25 }}>
+      <Typography sx={{ fontSize: '13.5px', fontWeight: 700, color: 'var(--tt-text-1)', mt: 3, mb: 1.25 }}>
         推荐示例
       </Typography>
       <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 1.5 }}>
@@ -485,11 +564,16 @@ const ScheduleView: React.FC = () => {
             onClick={() =>
               openCreateDialog({ name: r.title, desc: r.desc, freq: r.freq, time: r.time, weekday: r.weekday })
             }
+            {...clickableProps(
+              () =>
+                openCreateDialog({ name: r.title, desc: r.desc, freq: r.freq, time: r.time, weekday: r.weekday }),
+              `用示例新建定时任务：${r.title}`,
+            )}
             sx={{
-              border: '1px solid #EEF0F2',
+              border: '1px solid var(--tt-border)',
               borderRadius: '14px',
               p: 2,
-              background: '#FFFFFF',
+              background: 'var(--tt-surface)',
               cursor: 'pointer',
               display: 'flex',
               flexDirection: 'column',
@@ -498,11 +582,11 @@ const ScheduleView: React.FC = () => {
               '&:hover': { boxShadow: '0 6px 20px rgba(15, 23, 42, 0.07)', transform: 'translateY(-1px)' },
             }}
           >
-            <Typography sx={{ fontSize: '13.5px', fontWeight: 700, color: '#111827' }}>{r.title}</Typography>
+            <Typography sx={{ fontSize: '13.5px', fontWeight: 700, color: 'var(--tt-text-1)' }}>{r.title}</Typography>
             <Typography
               sx={{
                 fontSize: '12px',
-                color: '#6B7280',
+                color: 'var(--tt-text-2)',
                 lineHeight: 1.6,
                 flexGrow: 1,
                 display: '-webkit-box',
@@ -522,32 +606,56 @@ const ScheduleView: React.FC = () => {
                 px: 1,
                 py: 0.35,
                 borderRadius: '8px',
-                background: '#F3F4F6',
+                background: 'var(--tt-chip-neutral)',
               }}
             >
-              <AccessTimeIcon sx={{ fontSize: 13, color: '#6B7280' }} />
-              <Typography sx={{ fontSize: '11.5px', color: '#4B5563' }}>{r.schedule}</Typography>
+              <AccessTimeIcon sx={{ fontSize: 13, color: 'var(--tt-text-2)' }} />
+              <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-2)' }}>{r.schedule}</Typography>
             </Box>
           </Box>
         ))}
       </Box>
 
       {/* 我的定时任务 / 执行记录 */}
-      <Box sx={{ display: 'flex', gap: 3, mt: 3.5, borderBottom: '1px solid #F3F4F6' }}>
+      <Box
+        role="tablist"
+        aria-label="定时任务视图切换"
+        sx={{ display: 'flex', gap: 3, mt: 3.5, borderBottom: '1px solid var(--tt-border)' }}
+      >
         {([
           ['tasks', '我的定时任务'],
           ['records', '执行记录'],
-        ] as const).map(([key, label]) => (
+        ] as const).map(([key, label], idx, arr) => (
           <Box
             key={key}
+            role="tab"
+            aria-selected={tab === key}
+            tabIndex={tab === key ? 0 : -1}
             onClick={() => setTab(key)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar') {
+                event.preventDefault();
+                setTab(key);
+                return;
+              }
+              if (
+                event.key === 'ArrowLeft' ||
+                event.key === 'ArrowUp' ||
+                event.key === 'ArrowRight' ||
+                event.key === 'ArrowDown'
+              ) {
+                event.preventDefault();
+                const step = event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 1;
+                setTab(arr[(idx + step + arr.length) % arr.length][0]);
+              }
+            }}
             sx={{
               pb: 1,
               cursor: 'pointer',
-              borderBottom: tab === key ? '2px solid #111827' : '2px solid transparent',
+              borderBottom: tab === key ? '2px solid var(--tt-text-1)' : '2px solid transparent',
             }}
           >
-            <Typography sx={{ fontSize: '13.5px', fontWeight: tab === key ? 700 : 500, color: tab === key ? '#111827' : '#6B7280' }}>
+            <Typography sx={{ fontSize: '13.5px', fontWeight: tab === key ? 700 : 500, color: tab === key ? 'var(--tt-text-1)' : 'var(--tt-text-3)' }}>
               {label}
             </Typography>
           </Box>
@@ -561,9 +669,9 @@ const ScheduleView: React.FC = () => {
             <Box
               key={t.scheduleId}
               sx={{
-                border: '1px solid #EEF0F2',
+                border: '1px solid var(--tt-border)',
                 borderRadius: '14px',
-                background: '#FFFFFF',
+                background: 'var(--tt-surface)',
                 px: 2,
                 py: 1.5,
                 display: 'flex',
@@ -574,7 +682,7 @@ const ScheduleView: React.FC = () => {
             >
               <Box sx={{ flexGrow: 1, minWidth: 0 }}>
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
-                  <Typography sx={{ fontSize: '13.5px', fontWeight: 700, color: '#111827' }}>
+                  <Typography sx={{ fontSize: '13.5px', fontWeight: 700, color: 'var(--tt-text-1)' }}>
                     {t.name}
                   </Typography>
                   <Box
@@ -582,15 +690,21 @@ const ScheduleView: React.FC = () => {
                       px: 0.75,
                       py: 0.2,
                       borderRadius: '6px',
-                      background: '#F3F4F6',
+                      background: 'var(--tt-chip-neutral)',
                       display: 'flex',
                       alignItems: 'center',
                       gap: 0.4,
                     }}
                   >
-                    <AccessTimeIcon sx={{ fontSize: 12, color: '#6B7280' }} />
-                    <Typography sx={{ fontSize: '11.5px', color: '#4B5563' }}>
-                      {describeSchedule(t.freq, t.timeOfDay, t.weekday)}
+                    <AccessTimeIcon sx={{ fontSize: 12, color: 'var(--tt-text-2)' }} />
+                    <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-2)' }}>
+                      {describeSchedule(
+                        t.freq,
+                        t.timeOfDay,
+                        t.weekday,
+                        t.intervalMinutes,
+                        t.runAtMs,
+                      )}
                     </Typography>
                   </Box>
                   {t.lastStatus && (
@@ -616,7 +730,7 @@ const ScheduleView: React.FC = () => {
                         background: 'rgba(79, 70, 229, 0.08)',
                       }}
                     >
-                      <Typography sx={{ fontSize: '11.5px', color: '#4338CA' }}>
+                      <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-accent)' }}>
                         结果推送：{t.notifyChannel}
                       </Typography>
                     </Box>
@@ -625,7 +739,7 @@ const ScheduleView: React.FC = () => {
                 <Typography
                   sx={{
                     fontSize: '12px',
-                    color: '#6B7280',
+                    color: 'var(--tt-text-2)',
                     mt: 0.5,
                     display: '-webkit-box',
                     WebkitLineClamp: 2,
@@ -635,7 +749,7 @@ const ScheduleView: React.FC = () => {
                 >
                   {t.description || '（无描述）'}
                 </Typography>
-                <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF', mt: 0.5 }}>
+                <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mt: 0.5 }}>
                   {t.enabled
                     ? t.nextRunAtMs
                       ? `下次执行：${formatLocalDateTime(t.nextRunAtMs)}`
@@ -651,8 +765,8 @@ const ScheduleView: React.FC = () => {
                   startIcon={<PlayArrowIcon sx={{ fontSize: 15 }} />}
                   onClick={() => void handleRunNow(t.scheduleId, t.name)}
                   sx={{
-                    color: '#4B5563',
-                    border: '1px solid #E5E7EB',
+                    color: 'var(--tt-text-2)',
+                    border: '1px solid var(--tt-border)',
                     borderRadius: '8px',
                     textTransform: 'none',
                     fontSize: '12px',
@@ -668,8 +782,8 @@ const ScheduleView: React.FC = () => {
                   startIcon={<EditOutlinedIcon sx={{ fontSize: 15 }} />}
                   onClick={() => openEditDialog(t)}
                   sx={{
-                    color: '#4B5563',
-                    border: '1px solid #E5E7EB',
+                    color: 'var(--tt-text-2)',
+                    border: '1px solid var(--tt-border)',
                     borderRadius: '8px',
                     textTransform: 'none',
                     fontSize: '12px',
@@ -685,14 +799,14 @@ const ScheduleView: React.FC = () => {
                   startIcon={<DeleteOutlineIcon sx={{ fontSize: 15 }} />}
                   onClick={() => void handleDelete(t.scheduleId, t.name)}
                   sx={{
-                    color: '#B91C1C',
-                    border: '1px solid #FEE2E2',
+                    color: 'var(--tt-danger)',
+                    border: '1px solid var(--tt-danger)',
                     borderRadius: '8px',
                     textTransform: 'none',
                     fontSize: '12px',
                     px: 1.25,
                     minWidth: 0,
-                    '&:hover': { borderColor: '#FCA5A5', background: 'rgba(220, 38, 38, 0.05)' },
+                    '&:hover': { borderColor: 'var(--tt-danger)', background: 'rgba(220, 38, 38, 0.05)' },
                   }}
                 >
                   删除
@@ -703,8 +817,8 @@ const ScheduleView: React.FC = () => {
                   onChange={(e) => void handleToggle(t.scheduleId, e.target.checked)}
                   inputProps={{ 'aria-label': `启用 ${t.name}` }}
                   sx={{
-                    '& .MuiSwitch-switchBase.Mui-checked': { color: '#3B82F6' },
-                    '& .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track': { backgroundColor: '#3B82F6' },
+                    '& .MuiSwitch-switchBase.Mui-checked': { color: 'var(--tt-info)' },
+                    '& .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track': { backgroundColor: 'var(--tt-info)' },
                   }}
                 />
               </Box>
@@ -719,9 +833,9 @@ const ScheduleView: React.FC = () => {
             <Box
               key={r.runId}
               sx={{
-                border: '1px solid #EEF0F2',
+                border: '1px solid var(--tt-border)',
                 borderRadius: '12px',
-                background: '#FFFFFF',
+                background: 'var(--tt-surface)',
                 px: 2,
                 py: 1.25,
                 display: 'flex',
@@ -743,16 +857,16 @@ const ScheduleView: React.FC = () => {
                 </Typography>
               </Box>
               <Box sx={{ flexGrow: 1, minWidth: 0 }}>
-                <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#111827' }}>
+                <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-1)' }}>
                   {taskNameOf(r.scheduleId)}
                 </Typography>
-                <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF', mt: 0.25 }}>
+                <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mt: 0.25 }}>
                   {formatLocalDateTime(r.startedAtMs)}
                   {r.finishedAtMs ? ` · 耗时 ${Math.max(0, Math.round((r.finishedAtMs - r.startedAtMs) / 1000))}s` : ''}
                   {r.taskId ? ` · 任务 ${r.taskId.slice(0, 12)}` : ''}
                 </Typography>
                 {r.summary && (
-                  <Typography sx={{ fontSize: '11.5px', color: '#6B7280', mt: 0.4 }}>{r.summary}</Typography>
+                  <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-2)', mt: 0.4 }}>{r.summary}</Typography>
                 )}
               </Box>
             </Box>
@@ -766,8 +880,8 @@ const ScheduleView: React.FC = () => {
             mt: 2.5,
             py: 7,
             borderRadius: '16px',
-            border: '1px dashed #E5E7EB',
-            background: '#FBFCFD',
+            border: '1px dashed var(--tt-border)',
+            background: 'var(--tt-surface-2)',
             display: 'flex',
             flexDirection: 'column',
             alignItems: 'center',
@@ -775,7 +889,7 @@ const ScheduleView: React.FC = () => {
           }}
         >
           <ScheduleOutlinedIcon sx={{ fontSize: 40, color: '#C4CAD4' }} />
-          <Typography sx={{ fontSize: '14px', fontWeight: 600, color: '#374151' }}>
+          <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'var(--tt-text-2)' }}>
             {tab === 'tasks'
               ? tasksLoading
                 ? '正在加载定时任务…'
@@ -784,7 +898,7 @@ const ScheduleView: React.FC = () => {
                 ? '正在加载执行记录…'
                 : '暂无执行记录'}
           </Typography>
-          <Typography sx={{ fontSize: '12.5px', color: '#9CA3AF' }}>
+          <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-4)' }}>
             {tab === 'tasks' ? '创建定时任务来自动化执行周期性 AI 代理工作' : '定时任务运行后将在此展示执行结果'}
           </Typography>
           {tab === 'tasks' && (
@@ -793,13 +907,13 @@ const ScheduleView: React.FC = () => {
               onClick={() => openCreateDialog()}
               sx={{
                 mt: 1,
-                bgcolor: '#111827',
+                bgcolor: 'var(--tt-cta-fill)',
                 borderRadius: '10px',
                 textTransform: 'none',
                 fontSize: '13px',
                 fontWeight: 600,
                 px: 2,
-                '&:hover': { bgcolor: '#4F46E5' },
+                '&:hover': { bgcolor: 'var(--tt-cta-fill-hover)' },
               }}
             >
               + 新建定时任务
@@ -818,7 +932,7 @@ const ScheduleView: React.FC = () => {
           <Typography sx={{ fontSize: '16px', fontWeight: 700 }}>
             {editingScheduleId ? '编辑定时任务' : '新建定时任务'}
           </Typography>
-          <Typography sx={{ fontSize: '12.5px', color: '#9CA3AF', mt: 0.25 }}>
+          <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-4)', mt: 0.25 }}>
             {editingScheduleId
               ? '修改计划后将按当前时刻重新计算下次执行时间'
               : '按计划自动执行任务，也可随时手动触发。在任意对话中描述你想定期做的事，即可快速创建'}
@@ -836,7 +950,7 @@ const ScheduleView: React.FC = () => {
                 border: '1px solid rgba(79, 70, 229, 0.15)',
               }}
             >
-              <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#4338CA', mb: 0.75 }}>
+              <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-accent)', mb: 0.75 }}>
                 一句话创建
               </Typography>
               <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
@@ -853,7 +967,7 @@ const ScheduleView: React.FC = () => {
                   size="small"
                   placeholder="例如：每周一上午 9 点生成周报"
                   inputProps={{ 'aria-label': '一句话描述定时任务' }}
-                  sx={{ '& .MuiOutlinedInput-root': { fontSize: '13px', background: '#fff' } }}
+                  sx={{ '& .MuiOutlinedInput-root': { fontSize: '13px', background: 'var(--tt-surface)' } }}
                 />
                 <Button
                   variant="contained"
@@ -861,28 +975,69 @@ const ScheduleView: React.FC = () => {
                   onClick={() => void handleParseNatural()}
                   sx={{
                     flexShrink: 0,
-                    bgcolor: '#4F46E5',
+                    bgcolor: 'var(--tt-accent-fill)',
                     borderRadius: '9px',
                     textTransform: 'none',
                     fontSize: '12.5px',
                     fontWeight: 600,
                     px: 1.75,
-                    '&:hover': { bgcolor: '#4338CA' },
-                    '&.Mui-disabled': { bgcolor: '#E5E7EB', color: '#9CA3AF' },
+                    '&:hover': { bgcolor: 'var(--tt-accent-fill-hover)' },
+                    '&.Mui-disabled': { bgcolor: 'var(--tt-chip-neutral)', color: 'var(--tt-text-4)' },
                   }}
                 >
                   {nlParsing ? '解析中…' : '解析'}
                 </Button>
               </Box>
-              <Typography sx={{ fontSize: '11.5px', color: nlNote ? '#4338CA' : '#6B7280', mt: 0.75 }}>
+              <Typography sx={{ fontSize: '11.5px', color: nlNote ? 'var(--tt-accent)' : 'var(--tt-text-3)', mt: 0.75 }}>
                 {nlNote ??
-                  '支持每小时 / 每天 / 每周X / 每月 1 号 + 上午、下午、晚上等时刻；只写时间时按每天处理'}
+                  '支持每小时 / 每天 / 每周X / 每月 1 号，以及每 N 分钟、每 N 小时、每 N 天与「明天 3 月 8 日」这类一次性日期 + 上午、下午、晚上等时刻；只写时间时按每天处理'}
               </Typography>
+              {pendingParse && (
+                <Box
+                  sx={{
+                    mt: 1,
+                    p: 1,
+                    borderRadius: '10px',
+                    background: 'var(--tt-surface)',
+                    border: '1px solid rgba(79, 70, 229, 0.25)',
+                  }}
+                >
+                  <Typography sx={{ fontSize: '12px', fontWeight: 600, color: 'var(--tt-text-1)' }}>
+                    将按此计划执行：{pendingParse.preview}
+                  </Typography>
+                  {pendingParse.parsed.note && (
+                    <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-3)', mt: 0.5 }}>
+                      {pendingParse.parsed.note}
+                    </Typography>
+                  )}
+                  <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mt: 0.5 }}>
+                    任务名：{pendingParse.parsed.name} · 确认后才填入表单，仍可手动改
+                  </Typography>
+                  <Box sx={{ display: 'flex', gap: 1, mt: 0.75 }}>
+                    <Button
+                      size="small"
+                      variant="contained"
+                      onClick={applyPendingParse}
+                      sx={{ textTransform: 'none', fontSize: '12px', bgcolor: 'var(--tt-accent-fill)' }}
+                    >
+                      确认使用
+                    </Button>
+                    <Button
+                      size="small"
+                      variant="text"
+                      onClick={() => setPendingParse(null)}
+                      sx={{ textTransform: 'none', fontSize: '12px', color: 'var(--tt-text-2)' }}
+                    >
+                      放弃
+                    </Button>
+                  </Box>
+                </Box>
+              )}
             </Box>
           )}
 
           {/* 任务名称 */}
-          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>任务名称</Typography>
+          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 0.75 }}>任务名称</Typography>
           <TextField
             value={taskName}
             onChange={(e) => setTaskName(e.target.value)}
@@ -894,7 +1049,7 @@ const ScheduleView: React.FC = () => {
           />
 
           {/* 工作空间 */}
-          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>
+          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 0.75 }}>
             工作空间
           </Typography>
           {newWorkspace ? (
@@ -926,7 +1081,7 @@ const ScheduleView: React.FC = () => {
                   setNewWorkspaceId('');
                   setWorkspaceError(null);
                 }}
-                sx={{ flexShrink: 0, textTransform: 'none', fontSize: '13px', color: '#6B7280' }}
+                sx={{ flexShrink: 0, textTransform: 'none', fontSize: '13px', color: 'var(--tt-text-2)' }}
               >
                 取消
               </Button>
@@ -954,15 +1109,15 @@ const ScheduleView: React.FC = () => {
                 size="small"
                 variant="text"
                 onClick={() => setNewWorkspace(true)}
-                sx={{ flexShrink: 0, textTransform: 'none', fontSize: '13px', color: '#0D9488' }}
+                sx={{ flexShrink: 0, textTransform: 'none', fontSize: '13px', color: 'var(--tt-teal)' }}
               >
                 ＋ 新建
               </Button>
             </Box>
           )}
           <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center', mb: 2 }}>
-            <FolderOutlinedIcon sx={{ fontSize: 13, color: '#9CA3AF' }} />
-            <Typography sx={{ fontSize: '11.5px', color: workspaceError ? '#DC2626' : '#9CA3AF' }}>
+            <FolderOutlinedIcon sx={{ fontSize: 13, color: 'var(--tt-text-4)' }} />
+            <Typography sx={{ fontSize: '11.5px', color: workspaceError ? 'var(--tt-danger)' : 'var(--tt-text-4)' }}>
               {workspaceError ??
                 (selectedWorkspace
                   ? `${selectedWorkspace.rootPath}${selectedWorkspace.exists ? '' : ' · 目录尚未创建，首次执行时落地'}`
@@ -971,19 +1126,51 @@ const ScheduleView: React.FC = () => {
           </Box>
 
           {/* 计划时间 */}
-          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>计划时间</Typography>
+          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 0.75 }}>计划时间</Typography>
           <Box sx={{ display: 'flex', gap: 1, mb: 2, alignItems: 'center' }}>
             <Select
               value={freq}
-              onChange={(e) => setFreq(e.target.value as ScheduleFreq)}
+              onChange={(e) => setFreq(e.target.value as LocalFreq)}
               size="small"
               inputProps={{ 'aria-label': '执行频率' }}
               sx={{ width: 130, fontSize: '13px', borderRadius: '10px' }}
             >
-              {SCHEDULE_FREQS.map((f) => (
+              {SCHEDULE_FREQS_ALL.map((f) => (
                 <MenuItem key={f} value={f}>{freqLabel(f)}</MenuItem>
               ))}
             </Select>
+            {freq === 'interval' && (
+              <>
+                <TextField
+                  value={intervalValue}
+                  onChange={(e) => setIntervalValue(e.target.value.replace(/[^0-9]/g, ''))}
+                  size="small"
+                  inputProps={{ 'aria-label': '间隔数值', inputMode: 'numeric' }}
+                  sx={{ width: 90, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
+                />
+                <Select
+                  value={intervalUnit}
+                  onChange={(e) => setIntervalUnit(e.target.value as IntervalUnit)}
+                  size="small"
+                  inputProps={{ 'aria-label': '间隔单位' }}
+                  sx={{ width: 96, fontSize: '13px', borderRadius: '10px' }}
+                >
+                  {(Object.keys(INTERVAL_UNITS) as IntervalUnit[]).map((u) => (
+                    <MenuItem key={u} value={u}>{INTERVAL_UNITS[u]}</MenuItem>
+                  ))}
+                </Select>
+              </>
+            )}
+            {freq === 'once' && (
+              <TextField
+                value={runDate}
+                onChange={(e) => setRunDate(e.target.value)}
+                type="date"
+                size="small"
+                inputProps={{ 'aria-label': '执行日期' }}
+                sx={{ width: 160, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
+              />
+            )}
             {freq === 'weekly' && (
               <Select
                 value={weekday}
@@ -997,21 +1184,37 @@ const ScheduleView: React.FC = () => {
                 ))}
               </Select>
             )}
-            <TextField
-              value={time}
-              onChange={(e) => setTime(e.target.value)}
-              type="time"
-              size="small"
-              inputProps={{ 'aria-label': '执行时刻' }}
-              sx={{ width: 140, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
-            />
-            <Typography sx={{ fontSize: '11.5px', color: '#9CA3AF' }}>
-              {freq === 'hourly' ? '按分钟触发（时字段忽略）' : '按本地时间'}
+            {freq !== 'interval' && (
+              <TextField
+                value={time}
+                onChange={(e) => setTime(e.target.value)}
+                type="time"
+                size="small"
+                inputProps={{ 'aria-label': '执行时刻' }}
+                sx={{ width: 140, '& .MuiOutlinedInput-root': { fontSize: '13px' } }}
+              />
+            )}
+            <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)' }}>
+              {freq === 'hourly'
+                ? '按分钟触发（时字段忽略）'
+                : freq === 'interval'
+                  ? '从上次执行起算，不按固定时刻'
+                  : freq === 'once'
+                    ? '执行一次后自动停用'
+                    : '按本地时间'}
+            </Typography>
+          </Box>
+          {/* 计划回显：保存前先看清「将按什么跑」，与一句话解析的预览同一句口径 */}
+          <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center', mt: -1.25, mb: 2 }}>
+            <InfoOutlinedIcon sx={{ fontSize: 13, color: 'var(--tt-text-4)' }} />
+            <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-3)' }}>
+              预览：{formPreviewText}
+              {freq !== 'interval' && ' · 按本地时间录入，保存时换算为 UTC'}
             </Typography>
           </Box>
 
           {/* 任务描述 */}
-          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>
+          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 0.75 }}>
             让任我行帮你做什么...
           </Typography>
           <TextField
@@ -1026,7 +1229,7 @@ const ScheduleView: React.FC = () => {
           />
 
           {/* 执行结果推送（可选）：通道/会话来自引擎真实状态 */}
-          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#374151', mb: 0.75 }}>
+          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 0.75 }}>
             执行结果推送（可选）
           </Typography>
           <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', mb: 0.75 }}>
@@ -1092,7 +1295,7 @@ const ScheduleView: React.FC = () => {
           <Typography
             sx={{
               fontSize: '11.5px',
-              color: imError || (selectedChannel && !selectedChannel.configured) ? '#B45309' : '#9CA3AF',
+              color: imError || (selectedChannel && !selectedChannel.configured) ? 'var(--tt-warning)' : 'var(--tt-text-4)',
               mb: 2,
             }}
           >
@@ -1113,12 +1316,12 @@ const ScheduleView: React.FC = () => {
 
           {/* 工作目录 + 高级 */}
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 2 }}>
-            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, color: '#6B7280' }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, color: 'var(--tt-text-2)' }}>
               <FolderOutlinedIcon sx={{ fontSize: 15 }} />
               <Typography sx={{ fontSize: '12.5px' }}>默认工作目录</Typography>
             </Box>
             <Box sx={{ flexGrow: 1 }} />
-            <Typography sx={{ fontSize: '12.5px', color: '#6B7280' }}>到点自动批准执行</Typography>
+            <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-2)' }}>到点自动批准执行</Typography>
           </Box>
 
           {/* 取消 / 保存 */}
@@ -1126,8 +1329,8 @@ const ScheduleView: React.FC = () => {
             <Button
               onClick={() => setDialogOpen(false)}
               sx={{
-                color: '#4B5563',
-                border: '1px solid #E5E7EB',
+                color: 'var(--tt-text-2)',
+                border: '1px solid var(--tt-border)',
                 borderRadius: '10px',
                 textTransform: 'none',
                 fontSize: '13px',
@@ -1143,14 +1346,14 @@ const ScheduleView: React.FC = () => {
               disabled={!canSave || saving}
               onClick={() => void handleSave()}
               sx={{
-                bgcolor: canSave ? '#111827' : '#E5E7EB',
+                bgcolor: canSave ? 'var(--tt-accent-fill)' : 'var(--tt-chip-neutral)',
                 borderRadius: '10px',
                 textTransform: 'none',
                 fontSize: '13px',
                 fontWeight: 700,
                 px: 3,
-                '&:hover': { bgcolor: '#4F46E5' },
-                '&.Mui-disabled': { bgcolor: '#E5E7EB', color: '#9CA3AF' },
+                '&:hover': { bgcolor: 'var(--tt-accent-fill)' },
+                '&.Mui-disabled': { bgcolor: 'var(--tt-chip-neutral)', color: 'var(--tt-text-4)' },
               }}
             >
               {saving ? (editingScheduleId ? '保存中…' : '创建中…') : editingScheduleId ? '保存修改' : '创建任务'}

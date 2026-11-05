@@ -21,3 +21,25 @@ corresponding .dist-info/ directory.
 
 Other third-party dependencies remain under their respective licenses;
 see package-lock.json and src-tauri/Cargo.lock for the dependency sets.
+
+This product ships optional marketplace demo content under
+tongtian-server/app/demo_skills/. Ten of the bundled skills are unmodified
+copies of directories from open-source Agent Skills repositories discovered
+through the public skills.sh catalogue, each redistributed under its own
+license with a per-package copy (LICENSE.txt) and provenance record
+(SOURCE.txt) inside the directory:
+
+  obra/superpowers (MIT)                 skills/writing-plans,
+                                         skills/test-driven-development,
+                                         skills/systematic-debugging
+  coreyhaines31/marketingskills (MIT)    skills/analytics, skills/ab-testing,
+                                         skills/churn-prevention,
+                                         skills/copywriting,
+                                         skills/copy-editing
+  mattpocock/skills (MIT)                skills/misc/git-guardrails-claude-code
+  anthropics/skills (Apache-2.0,         skills/frontend-design
+    per-skill license file)
+
+Remaining entries (weekly-report, meeting-minutes) are original demo content
+licensed under the Apache License, Version 2.0, as part of this product.
+Set TT_SEED_DEMO=false to publish none of this content.

@@ -14,7 +14,8 @@ export default defineConfig({
   build: {
     outDir: '../../dist',
     emptyOutDir: true,
-    sourcemap: true,
+    // 安装包里不带源码映射：前端源码不该随安装包分发
+    sourcemap: false,
   },
   resolve: {
     alias: {

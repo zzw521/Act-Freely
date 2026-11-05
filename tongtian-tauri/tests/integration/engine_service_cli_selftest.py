@@ -179,36 +179,51 @@ def check_jwt_and_audit(client) -> None:
         check("审计可追加落盘", persisted.get("sub") == "u-1" and persisted.get("path") == "/api/models")
         os.environ.pop("TT_ENGINE_AUDIT_LOG", None)
 
-    engine_server.USAGE_LEDGER.add("audit-model", 10, 5, sub="u-1", org="acme")
-    engine_server.USAGE_LEDGER.add("audit-model", 20, 7, sub="u-2", org="acme")
-    all_rows = engine_server.USAGE_LEDGER.aggregate("total")
-    merged = next((r for r in all_rows if r["modelName"] == "audit-model"), {})
-    check("用量默认汇总全部用户", merged.get("tokensUsed") == 42, str(merged))
-    u1_rows = engine_server.USAGE_LEDGER.aggregate("total", "u-1")
-    u1_merged = next((r for r in u1_rows if r["modelName"] == "audit-model"), {})
-    check("用量可按用户过滤", u1_merged.get("tokensUsed") == 15, str(u1_merged))
-    users = engine_server.USAGE_LEDGER.users("total")
-    order = [row["sub"] for row in users]
-    check("用户汇总按 token 降序", order[:2] == ["u-2", "u-1"], str(users))
-    check("用户汇总带组织", next(r for r in users if r["sub"] == "u-1").get("org") == "acme")
+    # 用量台账自 D-43 起落盘并跨进程重放。这一段断言的是「本节的几条记录怎么聚合」，
+    # 所以把数据根指向临时目录并重置内存态：既不会读到本机真实用量（历史数据会把
+    # 精确数字全部撑爆），也不会把自测记录写进用户的台账。
+    with tempfile.TemporaryDirectory() as ledger_home:
+        prev_home = os.environ.get("TONGTIANWORK_HOME")
+        os.environ["TONGTIANWORK_HOME"] = ledger_home
+        engine_server.USAGE_LEDGER.reset()
+        try:
+            engine_server.USAGE_LEDGER.add("audit-model", 10, 5, sub="u-1", org="acme")
+            engine_server.USAGE_LEDGER.add("audit-model", 20, 7, sub="u-2", org="acme")
+            all_rows = engine_server.USAGE_LEDGER.aggregate("total")
+            merged = next((r for r in all_rows if r["modelName"] == "audit-model"), {})
+            check("用量默认汇总全部用户", merged.get("tokensUsed") == 42, str(merged))
+            u1_rows = engine_server.USAGE_LEDGER.aggregate("total", "u-1")
+            u1_merged = next((r for r in u1_rows if r["modelName"] == "audit-model"), {})
+            check("用量可按用户过滤", u1_merged.get("tokensUsed") == 15, str(u1_merged))
+            users = engine_server.USAGE_LEDGER.users("total")
+            order = [row["sub"] for row in users]
+            check("用户汇总按 token 降序", order[:2] == ["u-2", "u-1"], str(users))
+            check("用户汇总带组织", next(r for r in users if r["sub"] == "u-1").get("org") == "acme")
 
-    u1_usage = client.get("/api/usage?period=total&sub=u-2", headers=_bearer(u1)).json()
-    u1_row = next((r for r in u1_usage.get("rows") or [] if r["modelName"] == "audit-model"), {})
-    check(
-        "普通用户查询用量被强制收窄到自己",
-        u1_usage.get("subject") == "u-1" and u1_row.get("tokensUsed") == 15,
-        str(u1_usage)[:200],
-    )
-    admin_usage = client.get("/api/usage?period=total&sub=u-2", headers=_bearer(admin)).json()
-    admin_row = next((r for r in admin_usage.get("rows") or [] if r["modelName"] == "audit-model"), {})
-    check(
-        "管理员可按用户查询用量",
-        admin_usage.get("subject") == "u-2" and admin_row.get("tokensUsed") == 27,
-        str(admin_usage)[:200],
-    )
-    report = client.get("/api/usage/report?period=total", headers=_bearer(admin)).json()
-    subjects = {row.get("sub") for row in report.get("users") or []}
-    check("用量报表含用户汇总", {"u-1", "u-2"} <= subjects, str(subjects))
+            u1_usage = client.get("/api/usage?period=total&sub=u-2", headers=_bearer(u1)).json()
+            u1_row = next((r for r in u1_usage.get("rows") or [] if r["modelName"] == "audit-model"), {})
+            check(
+                "普通用户查询用量被强制收窄到自己",
+                u1_usage.get("subject") == "u-1" and u1_row.get("tokensUsed") == 15,
+                str(u1_usage)[:200],
+            )
+            admin_usage = client.get("/api/usage?period=total&sub=u-2", headers=_bearer(admin)).json()
+            admin_row = next((r for r in admin_usage.get("rows") or [] if r["modelName"] == "audit-model"), {})
+            check(
+                "管理员可按用户查询用量",
+                admin_usage.get("subject") == "u-2" and admin_row.get("tokensUsed") == 27,
+                str(admin_usage)[:200],
+            )
+            report = client.get("/api/usage/report?period=total", headers=_bearer(admin)).json()
+            subjects = {row.get("sub") for row in report.get("users") or []}
+            check("用量报表含用户汇总", {"u-1", "u-2"} <= subjects, str(subjects))
+        finally:
+            if prev_home is None:
+                os.environ.pop("TONGTIANWORK_HOME", None)
+            else:
+                os.environ["TONGTIANWORK_HOME"] = prev_home
+            # 复位到「没有本节记录」的干净态，后面的用例不会读到这 42 个 token
+            engine_server.USAGE_LEDGER.reset()
 
     _auth_env_clear()
     check("清理凭据后回到无鉴权桌面模式", client.get("/api/models").status_code == 200)

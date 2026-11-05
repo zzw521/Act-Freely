@@ -195,9 +195,9 @@ const ComputerUsePanel: React.FC<ComputerUsePanelProps> = ({ embedded = false })
       }}
     >
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-        <MonitorIcon sx={{ fontSize: 22, color: '#0D9488' }} />
+        <MonitorIcon sx={{ fontSize: 22, color: 'var(--tt-teal)' }} />
         <Typography sx={{ fontSize: '20px', fontWeight: 700, color: 'var(--tt-text-1)' }}>电脑操控</Typography>
-        {loading && <CircularProgress size={16} sx={{ color: '#0D9488' }} />}
+        {loading && <CircularProgress size={16} sx={{ color: 'var(--tt-teal)' }} />}
       </Box>
       <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-3)', mt: 0.5 }}>
         Windows 桌面执行器：AI 可截取屏幕观察界面，并在策略允许时点击、输入或按键。截屏与操作由本机执行并写入审计。
@@ -216,16 +216,16 @@ const ComputerUsePanel: React.FC<ComputerUsePanelProps> = ({ embedded = false })
         >
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
             {ready ? (
-              <CheckCircleIcon sx={{ fontSize: 18, color: '#0D9488' }} />
+              <CheckCircleIcon sx={{ fontSize: 18, color: 'var(--tt-teal)' }} />
             ) : (
-              <WarningAmberIcon sx={{ fontSize: 18, color: '#D97706' }} />
+              <WarningAmberIcon sx={{ fontSize: 18, color: 'var(--tt-warning)' }} />
             )}
-            <Typography sx={{ fontSize: '13.5px', fontWeight: 700, color: ready ? '#0D9488' : '#B45309' }}>
+            <Typography sx={{ fontSize: '13.5px', fontWeight: 700, color: ready ? 'var(--tt-teal)' : 'var(--tt-warning)' }}>
               {ready ? '执行器可用' : '执行器不可用'}
             </Typography>
             {caps && (
               <Box sx={{ px: 1, py: 0.2, borderRadius: '6px', bgcolor: 'rgba(107, 114, 128, 0.12)' }}>
-                <Typography sx={{ fontSize: '11px', fontWeight: 600, color: '#6B7280' }}>
+                <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-text-2)' }}>
                   {caps.platform}
                 </Typography>
               </Box>
@@ -252,11 +252,11 @@ const ComputerUsePanel: React.FC<ComputerUsePanelProps> = ({ embedded = false })
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 3, mb: 1 }}>
           <Typography sx={{ fontSize: '16px', fontWeight: 700, color: 'var(--tt-text-1)' }}>执行策略</Typography>
           <Box sx={{ px: 1, py: 0.2, borderRadius: '6px', bgcolor: 'rgba(13, 148, 136, 0.12)' }}>
-            <Typography sx={{ fontSize: '11px', fontWeight: 600, color: '#0D9488' }}>
+            <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-teal)' }}>
               当前：{policyLabel(activePolicy)}
             </Typography>
           </Box>
-          {savingBusy && <CircularProgress size={14} sx={{ color: '#0D9488' }} />}
+          {savingBusy && <CircularProgress size={14} sx={{ color: 'var(--tt-teal)' }} />}
         </Box>
         <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-3)', mb: 1.5 }}>
           {caps?.supported
@@ -283,23 +283,23 @@ const ComputerUsePanel: React.FC<ComputerUsePanelProps> = ({ embedded = false })
                 width: '100%',
                 gap: 1.5,
                 bgcolor: 'var(--tt-surface)',
-                border: selected ? '1.5px solid #14B8A6' : '1px solid var(--tt-border)',
+                border: selected ? '1.5px solid var(--tt-teal)' : '1px solid var(--tt-border)',
                 borderRadius: '14px',
                 px: 2,
                 py: 1.75,
                 mb: 1,
                 opacity: disabled && !selected ? 0.6 : 1,
                 cursor: disabled ? 'default' : 'pointer',
-                '&:hover': disabled ? {} : { borderColor: '#14B8A6' },
+                '&:hover': disabled ? {} : { borderColor: 'var(--tt-teal)' },
               }}
             >
               {selected ? (
-                <CheckCircleIcon sx={{ fontSize: 18, color: '#0D9488' }} />
+                <CheckCircleIcon sx={{ fontSize: 18, color: 'var(--tt-teal)' }} />
               ) : (
-                <RadioButtonUncheckedIcon sx={{ fontSize: 18, color: '#D1D5DB' }} />
+                <RadioButtonUncheckedIcon sx={{ fontSize: 18, color: 'var(--tt-text-4)' }} />
               )}
               <Box>
-                <Typography sx={{ fontSize: '13.5px', fontWeight: 600, color: selected ? '#0D9488' : 'var(--tt-text-1)' }}>
+                <Typography sx={{ fontSize: '13.5px', fontWeight: 600, color: selected ? 'var(--tt-teal)' : 'var(--tt-text-1)' }}>
                   {p.label}
                 </Typography>
                 <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-3)', mt: 0.25 }}>{p.desc}</Typography>
@@ -327,7 +327,7 @@ const ComputerUsePanel: React.FC<ComputerUsePanelProps> = ({ embedded = false })
               startIcon={capturing ? <CircularProgress size={14} sx={{ color: '#fff' }} /> : <PhotoCameraIcon />}
               disabled={!canCapture || capturing}
               onClick={() => void runCapture()}
-              sx={{ textTransform: 'none', bgcolor: '#0D9488', '&:hover': { bgcolor: '#0F766E' } }}
+              sx={{ textTransform: 'none', bgcolor: 'var(--tt-teal-fill)', '&:hover': { bgcolor: '#0F766E' } }}
             >
               {capturing ? '正在截屏…' : '截取当前屏幕'}
             </Button>
@@ -395,13 +395,13 @@ const ComputerUsePanel: React.FC<ComputerUsePanelProps> = ({ embedded = false })
                       width: 26,
                       height: 26,
                       borderRadius: '50%',
-                      bgcolor: '#F0FDFA',
+                      bgcolor: 'var(--tt-chip-success)',
                       display: 'flex',
                       alignItems: 'center',
                       justifyContent: 'center',
                     }}
                   >
-                    <Icon sx={{ fontSize: 15, color: '#0D9488' }} />
+                    <Icon sx={{ fontSize: 15, color: 'var(--tt-teal)' }} />
                   </Box>
                   <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)' }}>
                     {i + 1}. {t.title}
@@ -438,18 +438,18 @@ const ComputerUsePanel: React.FC<ComputerUsePanelProps> = ({ embedded = false })
           sx={{
             mt: 3,
             mb: 2,
-            bgcolor: '#FFFBEB',
+            bgcolor: 'var(--tt-chip-warning)',
             border: '1px solid rgba(217, 119, 6, 0.25)',
             borderRadius: '14px',
             p: 2,
           }}
         >
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mb: 1 }}>
-            <WarningAmberIcon sx={{ fontSize: 17, color: '#D97706' }} />
-            <Typography sx={{ fontSize: '13px', fontWeight: 700, color: '#B45309' }}>使用注意</Typography>
+            <WarningAmberIcon sx={{ fontSize: 17, color: 'var(--tt-warning)' }} />
+            <Typography sx={{ fontSize: '13px', fontWeight: 700, color: 'var(--tt-warning)' }}>使用注意</Typography>
           </Box>
           {warnings.map((w) => (
-            <Typography key={w} sx={{ fontSize: '12px', color: '#92400E', mb: 0.75, lineHeight: 1.6 }}>
+            <Typography key={w} sx={{ fontSize: '12px', color: 'var(--tt-warning)', mb: 0.75, lineHeight: 1.6 }}>
               · {w}
             </Typography>
           ))}

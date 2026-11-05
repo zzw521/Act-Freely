@@ -120,7 +120,8 @@ fn run_inner(opts: &RunOptions) -> Result<i32, (i32, String)> {
         }
     }
 
-    let resolved = resolve_program(&opts.program, &opts.args).map_err(|e| (127, e))?;
+    let resolved = resolve_program(&opts.program, &opts.args, opts.raw_command_line)
+        .map_err(|e| (127, e))?;
     launch(&profile, resolved, opts).map_err(|e| (126, e))
 }
 
@@ -419,8 +420,13 @@ struct Resolved {
 }
 
 /// 解析可执行文件：绝对路径直接用；裸命令名按 PATH + PATHEXT 查找；
-/// `.cmd` / `.bat` 交给 `cmd.exe /C`（AppContainer 不能直接执行批处理）
-fn resolve_program(program: &str, args: &[String]) -> Result<Resolved, String> {
+/// `.cmd` / `.bat` 交给 `cmd.exe /C`（AppContainer 不能直接执行批处理）。
+///
+/// `raw_command_line=true` 时**跳过逐参数加引号**，参数按原文拼进命令行——
+/// 给 `cmd.exe /d /s /c "<整条命令>"` 这类不吃 MSVCRT argv 转义的壳用（D-48.4c）：
+/// 逐个转义会把 `"` 变成 `\"`，壳收到的是反斜杠，命令 rc=0 但静默没跑。
+/// 程序定位、批处理改写、失败退出码这些仍然照做，改的只是引号，不是隔离边界。
+fn resolve_program(program: &str, args: &[String], raw: bool) -> Result<Resolved, String> {
     let direct = Path::new(program);
     let candidate = if direct.is_absolute() || program.contains('/') || program.contains('\\') {
         if direct.is_file() {
@@ -440,22 +446,24 @@ fn resolve_program(program: &str, args: &[String]) -> Result<Resolved, String> {
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
+    let tail: Vec<String> = if raw {
+        args.to_vec()
+    } else {
+        args.iter().map(|a| quote_arg(a)).collect()
+    };
     if ext == "cmd" || ext == "bat" {
         let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
         let mut line = quote_arg(&app.to_string_lossy());
-        for a in args {
+        for a in &tail {
             line.push(' ');
-            line.push_str(&quote_arg(a));
+            line.push_str(a);
         }
         return Ok(Resolved {
             app: PathBuf::from(comspec),
             argv: vec!["/C".to_string(), line],
         });
     }
-    Ok(Resolved {
-        app,
-        argv: args.iter().map(|a| quote_arg(a)).collect(),
-    })
+    Ok(Resolved { app, argv: tail })
 }
 
 pub(super) fn find_in_path(program: &str) -> Option<PathBuf> {
@@ -819,6 +827,56 @@ mod tests {
         assert_eq!(quote_arg("python.exe"), "python.exe");
         assert_eq!(quote_arg("a b"), "\"a b\"");
         assert_eq!(quote_arg("a\"b"), "\"a\\\"b\"");
+    }
+
+    fn this_test_exe() -> String {
+        std::env::current_exe()
+            .expect("测试里拿不到自身路径")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn raw_command_line_keeps_the_shell_tail_verbatim() {
+        // D-48.4c：cmd.exe 的命令行必须是调用方拼好的那一条原文。
+        // 开了 --raw-command-line 之后，`echo "a b"` 不许被转义成 `echo \"a b\"`，
+        // 否则容器里的 cmd 收到的是反斜杠，命令 rc=0 但静默没跑。
+        let resolved = resolve_program(
+            &this_test_exe(),
+            &[
+                "/d".to_string(),
+                "/s".to_string(),
+                "/c".to_string(),
+                "echo \"a b\"".to_string(),
+            ],
+            true,
+        )
+        .expect("raw 模式解析失败");
+        assert_eq!(resolved.argv.len(), 4);
+        assert_eq!(resolved.argv[3], "echo \"a b\"");
+        assert_eq!(resolved.argv[0], "/d");
+    }
+
+    #[test]
+    fn without_raw_command_line_quoting_is_unchanged() {
+        // 默认路径逐字保持改造前行为：终端 / MCP / ACP / Hooks 都不带这一档
+        let resolved = resolve_program(
+            &this_test_exe(),
+            &["a b".to_string(), "x\"y".to_string()],
+            false,
+        )
+        .expect("普通模式解析失败");
+        assert_eq!(resolved.argv, vec!["\"a b\"", "\"x\\\"y\""]);
+    }
+
+    #[test]
+    fn raw_command_line_still_rejects_a_missing_program() {
+        // 引号可以放权，程序定位不放权：找不到程序仍然 fail-closed
+        let err = match resolve_program("tt-definitely-not-installed-9e1f.exe", &[], true) {
+            Ok(_) => panic!("不存在的程序不该解析成功"),
+            Err(e) => e,
+        };
+        assert!(err.contains("SANDBOX_PROGRAM_NOT_FOUND"));
     }
 
     #[test]

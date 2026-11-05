@@ -27,6 +27,7 @@ Rust 每次提交任务随 `runtime.knowledge` 下发启用中的知识库：
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -51,6 +52,11 @@ DEFAULT_READ_CHARS = 8000
 MAX_READ_CHARS = 20000
 MIN_READ_CHARS = 500
 MAX_DOC_CANDIDATES = 8
+# 检索模式：lexical 只走 FTS5/逐块匹配（改造前的行为）；hybrid 再加向量召回与重排。
+# 缺向量来源时 hybrid 自动退回词法，并在 notes 里说明原因。
+RETRIEVAL_ENV = "TT_KNOWLEDGE_RETRIEVAL"
+RETRIEVAL_MODES = ("lexical", "hybrid")
+DEFAULT_RETRIEVAL = "hybrid"
 
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 WORD_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*")
@@ -359,8 +365,65 @@ def _rank_rows(rows: list[tuple[str, int, str, float]], tokens: list[str]) -> li
     return [(doc, seq, body, score) for score, doc, seq, body in ranked]
 
 
-def search_base(base_dir: Path, query: str, top_k: int = DEFAULT_TOP_K) -> tuple[list[dict], list[str]]:
-    """单库检索：返回 [{doc, seq, text, score, citation}] 与说明"""
+def retrieval_mode(explicit: str = "") -> str:
+    """本次检索走词法还是混合；环境变量决定默认值。"""
+    raw = str(explicit or os.environ.get(RETRIEVAL_ENV) or DEFAULT_RETRIEVAL).strip().lower()
+    return raw if raw in RETRIEVAL_MODES else DEFAULT_RETRIEVAL
+
+
+def _hybrid_rank(
+    conn: sqlite3.Connection, candidates: dict, tokens: list[str],
+    provider, top_k: int, notes: list[str],
+) -> list[tuple[str, int, str, float, str]] | None:
+    """混合重排：向量召回并集 + 库内共现扩展 + 混合打分。
+
+    返回 [(doc, seq, body, score, 命中来源)]；任何一步不可用就返回 None，
+    调用方继续用词法结果——向量是加分项，不能因为它让检索整体失效。
+    """
+    import knowledge_vector_runtime as kv
+
+    found, recall_notes = kv.recall_vectors(conn, provider, " ".join(tokens))
+    notes.extend(recall_notes)
+    fused = kv.fuse_candidates(list(candidates.values()), found)
+    if not fused:
+        return None
+    peak = max((float(slot["lex"]) for slot in fused.values()), default=0.0) or 1.0
+    ordered = sorted(fused.values(), key=lambda s: -float(s["lex"]))
+    expanded = kv.expansion_terms(
+        tokens, [str(s["body"]) for s in ordered[:kv.EXPANSION_CANDIDATE_CHUNKS]]
+    )
+    if expanded:
+        notes.append("检索词按库内共现自动扩展：" + "、".join(expanded))
+    scored = [
+        (
+            kv.hybrid_score(slot, peak, tokens, expanded, _coverage),
+            slot["doc"], slot["seq"], str(slot["body"]),
+            (
+                "hybrid" if slot["lex"] and slot["vec"]
+                else ("vector" if slot["vec"] else "lexical")
+            ),
+        )
+        for slot in fused.values()
+    ]
+    scored.sort(key=lambda r: (-r[0], r[1], r[2]))
+    # 同一文档最多两段：多样性由这条老规则负责，混合打分只决定先后
+    results: list[tuple[str, int, str, float, str]] = []
+    per_doc: dict[str, int] = {}
+    for score, doc, seq, body, origin in scored:
+        if per_doc.get(doc, 0) >= MAX_CHUNKS_PER_DOC:
+            continue
+        per_doc[doc] = per_doc.get(doc, 0) + 1
+        results.append((doc, seq, body, score, origin))
+        if len(results) >= top_k:
+            break
+    return results
+
+
+def search_base(
+    base_dir: Path, query: str, top_k: int = DEFAULT_TOP_K,
+    retrieval: str = "", provider=None,
+) -> tuple[list[dict], list[str]]:
+    """单库检索：返回 [{doc, seq, text, score, retrieval, citation}] 与说明"""
     tokens = query_tokens(query)
     if not tokens:
         return [], ["检索词里没有可用的中英文内容"]
@@ -369,6 +432,8 @@ def search_base(base_dir: Path, query: str, top_k: int = DEFAULT_TOP_K) -> tuple
         return [], notes
     limit = max(top_k * 6, 12)
     candidates: dict[tuple[str, int], tuple[str, int, str, float]] = {}
+    mode = retrieval_mode(retrieval)
+    hybrid_ranked: list[tuple[str, int, str, float, str]] | None = None
     try:
         fts = _fts_available(conn)
         rows: list[tuple[str, int, str, float]] = []
@@ -390,12 +455,36 @@ def search_base(base_dir: Path, query: str, top_k: int = DEFAULT_TOP_K) -> tuple
         # 标题命中补回正文索引召回不到的段落
         for doc, seq, body, _score in _title_chunks(conn, tokens, limit):
             candidates.setdefault((doc, seq), (doc, seq, body, 0.0))
+        if mode == "hybrid":
+            import knowledge_vector_runtime as kv
+
+            chosen = provider
+            if chosen is None:
+                chosen, provider_notes = kv.resolve_provider()
+                notes.extend(provider_notes)
+            if chosen is not None:
+                hybrid_ranked = _hybrid_rank(conn, candidates, tokens, chosen, top_k, notes)
+            else:
+                notes.append("按配置关闭向量召回，本轮只用词法检索")
     finally:
         conn.close()
 
+    if hybrid_ranked:
+        results: list[dict] = []
+        for doc, seq, body, score, origin in hybrid_ranked:
+            results.append({
+                "doc": doc,
+                "seq": seq,
+                "text": _excerpt(str(body), tokens),
+                "score": round(score, 4),
+                "retrieval": origin,
+            })
+        if results:
+            return results, notes
+
     ranked = _rank_rows(list(candidates.values()), tokens)
     # 同一文档最多 MAX_CHUNKS_PER_DOC 段，保证来源多样
-    results: list[dict] = []
+    results = []
     per_doc: dict[str, int] = {}
     for doc, seq, body, score in ranked:
         if per_doc.get(doc, 0) >= MAX_CHUNKS_PER_DOC:
@@ -406,6 +495,7 @@ def search_base(base_dir: Path, query: str, top_k: int = DEFAULT_TOP_K) -> tuple
             "seq": seq,
             "text": _excerpt(str(body), tokens),
             "score": round(score, 4),
+            "retrieval": "lexical",
         })
         if len(results) >= top_k:
             break
@@ -460,6 +550,18 @@ def _doc_candidates(base_dir: Path, query: str) -> list[str]:
 
 
 # ── 运行时 ────────────────────────────────────────────────────
+
+
+def _scanned_note(base_dir: Path, base_name: str) -> str:
+    """扫描件/图片型 PDF 的诚实状态：抽不出正文就点名是哪几篇，而不是让模型以为库里没有。"""
+    try:
+        import knowledge_vector_runtime as kv
+    except Exception:  # noqa: BLE001
+        return ""
+    note = kv.scanned_note(base_dir)
+    if not note:
+        return ""
+    return note.replace(f"知识库「{base_dir.name}」", f"知识库「{base_name}」", 1)
 
 
 @dataclass
@@ -587,6 +689,9 @@ class KnowledgeRuntime:
                     "citation": f"【{base.name} / {row['doc']} #{row['seq'] + 1}】",
                 })
                 results.append(row)
+            scanned = _scanned_note(Path(base.dir), base.name)
+            if scanned:
+                notes.append(scanned)
         results.sort(key=lambda r: r.get("score", 0), reverse=True)
         results = results[:k]
         if not results:

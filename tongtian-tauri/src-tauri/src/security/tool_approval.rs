@@ -70,21 +70,54 @@ fn clean(raw: &str, limit: usize) -> String {
 
 /// 询问用户是否允许本次工具调用；用户取消即拒绝（返回带错误码的原因）。
 pub fn confirm(description: &str) -> Result<(), String> {
-    confirm_dialog(description)
+    confirm_dialog(&ASK_TOOL, description)
+}
+
+/// 一次系统确认框的全部文案。同一套平台实现服务两种确认：
+/// 逐工具审批（`toolApprovalMode`）与文件访问档位（`filePermission`）——
+/// 两者的拒绝都必须是真的没执行，但标题与「去哪儿改」的指引不能混。
+pub struct Ask {
+    pub caption: &'static str,
+    pub lead: &'static str,
+    pub hint: &'static str,
+    pub denied_code: &'static str,
+    pub denied_text: &'static str,
+}
+
+pub const ASK_TOOL: Ask = Ask {
+    caption: "通天办公 · 工具审批",
+    lead: "通天办公请求执行一个工具：",
+    hint: "可在「设置 → 系统设置 → 工具审批」调整档位",
+    denied_code: "TOOL_APPROVAL_DENIED_BY_USER",
+    denied_text: "用户拒绝了本次工具调用",
+};
+
+pub const ASK_FILE: Ask = Ask {
+    caption: "通天办公 · 文件访问确认",
+    lead: "文件访问档位为「每次询问」，通天办公请求在真实目录里改动文件：",
+    hint: "档位可在对话输入框里 + 号旁的盾牌处调整",
+    denied_code: "FILE_PERMISSION_DENIED_BY_USER",
+    denied_text: "用户拒绝了本次文件操作",
+};
+
+/// 文件访问档位（「每次询问」）的确认框：走同一套系统弹窗，只换文案与拒绝码
+pub fn confirm_file_action(description: &str) -> Result<(), String> {
+    confirm_dialog(&ASK_FILE, description)
 }
 
 #[cfg(windows)]
-fn confirm_dialog(description: &str) -> Result<(), String> {
+fn confirm_dialog(ask: &Ask, description: &str) -> Result<(), String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         MessageBoxW, MB_ICONWARNING, MB_OKCANCEL, MB_SETFOREGROUND, MB_TOPMOST,
     };
 
     let text = format!(
-        "通天办公请求执行一个工具：\n\n{description}\n\n允许这一次操作吗？\n\
-         （可在「设置 → 系统设置 → 工具审批」调整档位；拒绝后模型不会执行该操作）"
+        "{}\n\n{description}\n\n允许这一次操作吗？\n\
+         （{}；拒绝后模型不会执行该操作）",
+        ask.lead, ask.hint
     );
     let text = wide(&text);
-    let caption = wide("通天办公 · 工具审批");
+    let caption = wide(ask.caption);
     let ret = unsafe {
         MessageBoxW(
             std::ptr::null_mut(),
@@ -96,7 +129,7 @@ fn confirm_dialog(description: &str) -> Result<(), String> {
     if ret == 1 {
         Ok(())
     } else {
-        Err("TOOL_APPROVAL_DENIED_BY_USER: 用户拒绝了本次工具调用".into())
+        Err(format!("{}: {}", ask.denied_code, ask.denied_text))
     }
 }
 
@@ -110,13 +143,14 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 #[cfg(target_os = "macos")]
-fn confirm_dialog(description: &str) -> Result<(), String> {
+fn confirm_dialog(ask: &Ask, description: &str) -> Result<(), String> {
     use std::process::Command;
 
     let escaped = description.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!(
-        "display dialog \"通天办公请求执行一个工具：\\n\\n{escaped}\\n\\n允许这一次操作吗？\" \
-         buttons {{\"拒绝\", \"允许\"}} default button \"允许\" with icon caution"
+        "display dialog \"{}\\n\\n{escaped}\\n\\n允许这一次操作吗？\" \
+         buttons {{\"拒绝\", \"允许\"}} default button \"允许\" with icon caution",
+        ask.lead
     );
     let out = Command::new("osascript")
         .arg("-e")
@@ -127,7 +161,7 @@ fn confirm_dialog(description: &str) -> Result<(), String> {
     if out.status.success() && stdout.contains("允许") {
         Ok(())
     } else if out.status.success() {
-        Err("TOOL_APPROVAL_DENIED_BY_USER: 用户拒绝了本次工具调用".into())
+        Err(format!("{}: {}", ask.denied_code, ask.denied_text))
     } else {
         Err(format!(
             "TOOL_APPROVAL_CONFIRM_UNAVAILABLE: 系统确认框未完成：{}",
@@ -137,14 +171,15 @@ fn confirm_dialog(description: &str) -> Result<(), String> {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn confirm_dialog(description: &str) -> Result<(), String> {
+fn confirm_dialog(ask: &Ask, description: &str) -> Result<(), String> {
     use std::process::Command;
 
-    let text = format!("通天办公请求执行一个工具：\n\n{description}\n\n允许这一次操作吗？");
+    let text = format!("{}\n\n{description}\n\n允许这一次操作吗？", ask.lead);
+    let title = format!("--title={}", ask.caption);
     if let Ok(status) = Command::new("zenity")
         .args([
             "--question",
-            "--title=通天办公 · 工具审批",
+            &title,
             "--ok-label=允许",
             "--cancel-label=拒绝",
             &format!("--text={text}"),
@@ -154,17 +189,17 @@ fn confirm_dialog(description: &str) -> Result<(), String> {
         return if status.success() {
             Ok(())
         } else {
-            Err("TOOL_APPROVAL_DENIED_BY_USER: 用户拒绝了本次工具调用".into())
+            Err(format!("{}: {}", ask.denied_code, ask.denied_text))
         };
     }
     if let Ok(status) = Command::new("kdialog")
-        .args(["--yesno", &text, "--title", "通天办公 · 工具审批"])
+        .args(["--yesno", &text, "--title", ask.caption])
         .status()
     {
         return if status.success() {
             Ok(())
         } else {
-            Err("TOOL_APPROVAL_DENIED_BY_USER: 用户拒绝了本次工具调用".into())
+            Err(format!("{}: {}", ask.denied_code, ask.denied_text))
         };
     }
     Err("TOOL_APPROVAL_CONFIRM_UNAVAILABLE: 当前平台没有可用的系统确认框（需要 zenity 或 kdialog）".into())
@@ -211,8 +246,19 @@ mod tests {
     }
 
     #[test]
-    fn describe_strips_control_chars_and_caps_length() {
-        let long = "x".repeat(MAX_DESCRIPTION + 50);
+    fn file_permission_ask_has_its_own_code_and_points_at_the_tier_switch() {
+        // 两种确认共用一套弹窗，但拒绝码与「去哪儿改」的指引必须分开：
+        // 文件档位是在对话输入框切的，把它指到「工具审批」会让人改错开关
+        assert_eq!(ASK_TOOL.denied_code, "TOOL_APPROVAL_DENIED_BY_USER");
+        assert_eq!(ASK_FILE.denied_code, "FILE_PERMISSION_DENIED_BY_USER");
+        assert_ne!(ASK_TOOL.denied_text, ASK_FILE.denied_text);
+        assert!(ASK_FILE.lead.contains("每次询问"), "{}", ASK_FILE.lead);
+        assert!(ASK_FILE.hint.contains("盾牌"), "{}", ASK_FILE.hint);
+        assert!(!ASK_TOOL.hint.contains("盾牌"));
+    }
+
+    #[test]
+    fn describe_strips_control_chars_and_caps_length() {        let long = "x".repeat(MAX_DESCRIPTION + 50);
         let text = describe("write\u{0}_file", &format!("文件：a.md\r\n正文 {}", long));
         assert!(!text.contains('\u{0}') && !text.contains('\r'), "{text}");
         assert!(text.chars().count() <= MAX_DESCRIPTION + 12, "{text}");

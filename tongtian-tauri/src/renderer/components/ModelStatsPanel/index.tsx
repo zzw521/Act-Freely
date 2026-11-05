@@ -28,6 +28,7 @@ import {
   Warning as WarningIcon,
 } from '@mui/icons-material';
 import type { UsageCost } from '../../../shared/contracts';
+import { clickableProps } from '../../lib/a11y';
 
 // ── 类型定义 ──────────────────────────────────────────────────────
 
@@ -128,7 +129,7 @@ const ModelStatsPanel: React.FC<ModelStatsPanelProps> = ({ stats, onSetLimit }) 
               sx={{
                 height: '8px',
                 borderRadius: '4px',
-                backgroundColor: '#e0e0e0',
+                backgroundColor: 'var(--tt-surface-3)',
               }}
             />
           </Tooltip>
@@ -136,7 +137,7 @@ const ModelStatsPanel: React.FC<ModelStatsPanelProps> = ({ stats, onSetLimit }) 
 
         {/* 警告提示 */}
         {stats.usagePercent >= 90 && (
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 2, p: 1, bgcolor: '#fff3cd', borderRadius: '4px' }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 2, p: 1, bgcolor: 'var(--tt-chip-warning)', borderRadius: '4px' }}>
             <WarningIcon color="warning" fontSize="small" />
             <Typography variant="body2" color="warning.dark">
               用量已接近限额，请及时升级套餐
@@ -225,6 +226,7 @@ const ModelStatsPanel: React.FC<ModelStatsPanelProps> = ({ stats, onSetLimit }) 
             <Typography
               variant="body2"
               color="primary"
+              {...clickableProps(() => onSetLimit(stats.modelId), `为 ${stats.modelName} 设置使用限额`)}
               sx={{ cursor: 'pointer', '&:hover': { textDecoration: 'underline' } }}
               onClick={() => onSetLimit(stats.modelId)}
             >

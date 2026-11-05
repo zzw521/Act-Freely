@@ -137,6 +137,10 @@ function validateSandboxPolicy(p: Record<string, unknown>): void {
       `POLICY_INVALID_COMMAND: 命令「${String(badCommand)}」非法（仅裸命令名，不能带路径或 shell 元字符）`,
     );
   }
+  // 通用 shell：默认关闭，且必须与命令执行授权同时开启（与 Rust `policy::set_sandbox` 同边界）
+  if (p.shellEnabled === true && p.execEnabled !== true) {
+    throw new Error('POLICY_INVALID_SHELL: 通用 shell 依赖受控命令执行授权，请先开启命令执行');
+  }
   const hosts = p.networkAllowlist ?? [];
   if (!Array.isArray(hosts) || hosts.length > 64) {
     throw new Error('POLICY_INVALID_HOST: 联网白名单必须是不超过 64 项的数组');
@@ -399,6 +403,7 @@ export function handleLocalSecurityChannel(channel: string, args: unknown[]): Lo
       ...policy,
       execEnabled: policy.execEnabled === true,
       execAllowlist,
+      shellEnabled: policy.shellEnabled === true && policy.execEnabled === true,
       networkEnabled: policy.networkEnabled === true,
       networkAllowlist,
     };
@@ -406,10 +411,11 @@ export function handleLocalSecurityChannel(channel: string, args: unknown[]): Lo
     sandboxPolicies[ws] = normalized;
     record(
       'config_change',
-      normalized.execEnabled || normalized.networkEnabled ? 'warning' : 'info',
+      normalized.execEnabled || normalized.networkEnabled || normalized.shellEnabled ? 'warning' : 'info',
       `sandbox:${ws}`,
       `沙箱策略更新：级别=${normalized.executionLevel} CPU≤${normalized.maxCpuPercent}% 内存≤${normalized.maxMemoryMB}MB 写盘≤${normalized.maxDiskWriteMbps}MB/s；`
         + `命令执行=${normalized.execEnabled ? `开启（${execAllowlist.length} 项）` : '关闭'}；`
+        + `通用shell=${normalized.shellEnabled ? '开启' : '关闭'}；`
         + `联网=${normalized.networkEnabled ? `开启（${networkAllowlist.length} 项）` : '关闭'}`,
     );
     return { handled: true, value: sandboxPolicies[ws] };

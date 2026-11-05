@@ -3,7 +3,12 @@
 @tailwind utilities;
 
 /* ── 双主题语义色变量：亮色默认，[data-theme="dark"] 全局覆盖 ──
-   组件内表面/边框/文字统一引用 var(--tt-*)，暗色模式全局生效 */
+   组件内表面/边框/文字统一引用 var(--tt-*)，暗色模式全局生效
+
+   文字四档的取值不是审美刻度，而是 WCAG 1.4.3 的算出来的下限：
+   四档在本皮肤的四张表面（bg / surface / surface-2 / surface-3）上都 ≥4.5:1，
+   且亮度逐档递减（见 tests/unit/appearance/theme-contrast-contract.test.ts）。
+   --tt-focus 是焦点环专用色，按 1.4.11 要求对同块所有表面 ≥3:1，且与文字色不同色相。 */
 :root {
   --tt-bg: #f7f8fa;
   --tt-surface: #ffffff;
@@ -13,14 +18,63 @@
   --tt-border-soft: #eef2f6;
   --tt-text-1: #111827;
   --tt-text-2: #374151;
-  --tt-text-3: #6b7280;
-  --tt-text-4: #9ca3af;
+  --tt-text-3: #576072;
+  --tt-text-4: #656c77;
+  --tt-focus: #2563eb;
+  /* 正文里的链接：亮色下品牌绿 600 压白底只有 3.3:1，取 700 档才够 5.0:1 */
+  --tt-link: #15803d;
+  /* 品牌色当文字/图标用时的档位：#4F46E5 压白底只有 4.1:1，12px 正文不达标；
+     这里给同色相的 700 档，暗色皮肤另给 300 档（见下） */
+  --tt-accent: #4338ca;
+  /* 同族的紫罗兰档（原 #8B5CF6 当文字用只有 3.4:1），保持色相不统一到靛蓝 */
+  --tt-accent-violet: #6d28d9;
+  /* 语义色「当文字用」的档位：组件里原来直接写 #EF4444/#0D9488 这类 500-600 档，
+     压白底只有 3.4:1，红字报错其实读不清。这里按 1.4.3 取到 700/800 档，
+     暗色皮肤另给 300-400 档（见下）。图形/描边/进度条仍可继续用原 500 档（1.4.11 只要求 3:1）。 */
+  --tt-danger: #b91c1c;
+  --tt-success: #166534;
+  --tt-warning: #92400e;
+  --tt-info: #0369a1;
+  --tt-teal: #0f766e;
+  /* 语义色「实心填充 + 白字」的档位（按钮、徽标）：
+     #EF4444 上的白字只有 3.76:1、#4F46E5 只有 4.10:1、#0D9488 只有 3.58:1，
+     12-14px 的按钮文案都不达标；这里取「白字 ≥4.5」的同色相加深档。 */
+  --tt-danger-fill: #dc2626;
+  --tt-teal-fill: #0f766e;
+  --tt-accent-fill: #4338ca;
+  /* 停止/暂停键的琥珀底：#F59E0B 上的白字只有 2.2:1，连非文本的 3:1 都不到 */
+  --tt-warning-fill: #b45309;
+  /* 悬停档：按钮 hover 要有反馈，但组件里再写一个十六进制就逃过「实心底 + 令牌文字」的审查。
+     比 accent-fill 深一档，白字在亮暗两侧都 ≥9:1（契约测试按 fill 档一起算）。 */
+  --tt-accent-fill-hover: #3730a3;
+  /* 柔和底（chip / 选中行 / 状态块）：亮色沿用原来的浅粉彩，暗色换成同色相压深的实心档。
+     原来组件里直接写 #F3F4F6 / #DCFCE7 这类浅底 + var(--tt-text-*) 文字，
+     翻到暗色就是「浅字压浅底」（实测最低 1.3:1）；底不跟着皮肤变，文字令牌白给。
+     这些底进契约测试的表面清单，四档文字 + 五个语义色 × 八套配色全部 ≥4.5:1。 */
+  --tt-chip-neutral: #f3f4f6;
+  --tt-chip-info: #e0f2fe;
+  --tt-chip-success: #dcfce7;
+  --tt-chip-teal: #e6f7f4;
+  --tt-chip-warning: #fef3c7;
+  --tt-chip-danger: #fdeaea;
+  --tt-chip-accent: #eef2ff;
+  /* 主操作按钮（黑色胶囊）成对令牌：亮色黑底白字，暗色翻成浅底深字。
+     组件里再写死 #111827 的话，暗色下这颗按钮压在 #0f172a 的页面上等于不存在。 */
+  --tt-cta-fill: #111827;
+  --tt-cta-fill-hover: #1f2937;
+  --tt-cta-ink: #ffffff;
   --tt-shadow-card: 0 1px 3px rgba(15, 23, 42, 0.06);
   --tt-sidebar-bg: linear-gradient(180deg, #fbfcff 0%, #f6f8fe 55%, #f4f7fd 100%);
   /* 对话区表面：暗色/皮肤下不能再用写死的白，否则浅字压白底看不清 */
   --tt-chat-assistant-bg: #ffffff;
   --tt-chat-process-bg: #fbfcfd;
   --tt-chat-code-bg: #f8fafc;
+  /* 密度（设置页「界面密度」）：默认标准档，ThemedApp 写 data-density 覆盖 */
+  --tt-density-scale: 1;
+  --tt-row-pad-y: 8px;
+  --tt-row-pad-x: 12px;
+  --tt-gap: 12px;
+  --tt-scrollbar: 6px;
   /* 对话正文与输入框字体（设置页「对话字体」） */
   --tt-chat-font: 'PingFang SC', 'Microsoft YaHei', -apple-system, BlinkMacSystemFont, 'Segoe UI',
     Roboto, 'Helvetica Neue', Arial, sans-serif;
@@ -34,9 +88,39 @@ html[data-theme='dark'] {
   --tt-border: #334155;
   --tt-border-soft: #2c3a52;
   --tt-text-1: #f1f5f9;
-  --tt-text-2: #cbd5e1;
-  --tt-text-3: #94a3b8;
-  --tt-text-4: #64748b;
+  --tt-text-2: #dbe4f0;
+  --tt-text-3: #b5c4d8;
+  --tt-text-4: #9db0c6;
+  --tt-focus: #60a5fa;
+  --tt-link: #4ade80;
+  --tt-accent: #a5b4fc;
+  --tt-accent-violet: #c4b5fd;
+  /* 暗色反过来要提亮：#B91C1C 压深底只有 2.3:1，取同色相 300-400 档 */
+  --tt-danger: #fca5a5;
+  --tt-success: #4ade80;
+  --tt-warning: #fcd34d;
+  --tt-info: #7dd3fc;
+  --tt-teal: #5eead4;
+  /* 填充档反过来不能跟着提亮：按钮上写的是白字，#FCA5A5 上的白字只有 1.5:1。
+     暗色里继续用深色实心（对页面底仍有区分度），白字照样 ≥4.5:1。 */
+  --tt-danger-fill: #b91c1c;
+  --tt-teal-fill: #0f766e;
+  --tt-accent-fill: #4338ca;
+  /* 暗色的柔和底：同色相往深里走一档，而不是低透明度叠亮。
+     实测 rgba(…, 0.16) 这类叠底把最亮的 --tt-surface-3 抬到 L≈0.06，
+     最弱档文字（--tt-text-4）压上去只剩 3.6–4.1:1；改实心深底后四档文字与五个
+     语义色在全部皮肤上重新 ≥4.5:1（这些底已进契约测试的表面清单一起算）。 */
+  --tt-chip-neutral: #273449;
+  --tt-chip-info: #082f49;
+  --tt-chip-success: #052e16;
+  --tt-chip-teal: #042f2e;
+  --tt-chip-warning: #451a03;
+  --tt-chip-danger: #450a0a;
+  --tt-chip-accent: #1e1b4b;
+  /* 主操作按钮反过来：浅底 + 深字（#E5E7EB 上的深字 14.4:1，对页面底 14:1，边界也够 3:1） */
+  --tt-cta-fill: #e5e7eb;
+  --tt-cta-fill-hover: #f1f5f9;
+  --tt-cta-ink: #0f172a;
   --tt-shadow-card: 0 1px 3px rgba(0, 0, 0, 0.35);
   --tt-sidebar-bg: linear-gradient(180deg, #16213a 0%, #131c31 55%, #101828 100%);
   --tt-chat-assistant-bg: #1e293b;
@@ -59,6 +143,9 @@ html[data-ui-style='glass'] {
   --tt-surface-3: rgba(241, 245, 249, 0.62);
   --tt-border: rgba(148, 163, 184, 0.28);
   --tt-border-soft: rgba(148, 163, 184, 0.18);
+  --tt-text-3: #576072;
+  --tt-text-4: #656c77;
+  --tt-focus: #1d4ed8;
   --tt-shadow-card: 0 10px 30px rgba(15, 23, 42, 0.1);
   --tt-sidebar-bg: linear-gradient(
     180deg,
@@ -78,6 +165,9 @@ html[data-theme='dark'][data-ui-style='glass'] {
   --tt-surface-3: rgba(43, 58, 85, 0.62);
   --tt-border: rgba(148, 163, 184, 0.26);
   --tt-border-soft: rgba(148, 163, 184, 0.16);
+  --tt-text-3: #b5c4d8;
+  --tt-text-4: #9fb2c8;
+  --tt-focus: #7dd3fc;
   --tt-shadow-card: 0 12px 34px rgba(0, 0, 0, 0.34);
   --tt-sidebar-bg: linear-gradient(
     180deg,
@@ -99,8 +189,11 @@ html[data-ui-style='classic'] {
   --tt-border-soft: #d1d5db;
   --tt-text-1: #111827;
   --tt-text-2: #1f2937;
-  --tt-text-3: #4b5563;
-  --tt-text-4: #6b7280;
+  --tt-text-3: #464f5d;
+  --tt-text-4: #5c6675;
+  --tt-focus: #1d4ed8;
+  /* 正文绿 (#f0f0f0) 比默认底更暗，同档链接色压上去只剩 4.2:1，往深一档到 800 档 */
+  --tt-link: #166534;
   --tt-shadow-card: none;
   --tt-sidebar-bg: #e8e8e8;
   --tt-chat-assistant-bg: #ffffff;
@@ -108,13 +201,23 @@ html[data-ui-style='classic'] {
   --tt-chat-code-bg: #f0f0f0;
 }
 
+/* 皮肤亮块与 html[data-theme='dark'] 基座同特异性、又写在它后面，
+   所以亮块里每新增一个变量，暗色皮肤块必须同步覆盖，否则暗色会继承到亮色档。 */
 html[data-theme='dark'][data-ui-style='classic'] {
+  --tt-link: #4ade80;
   --tt-bg: #111827;
   --tt-surface: #1f2937;
   --tt-surface-2: #273244;
   --tt-surface-3: #303c50;
   --tt-border: #4b5563;
   --tt-border-soft: #374151;
+  /* 经典皮肤暗色必须自己声明四档文字：上面亮色块写的是深字，
+     不覆盖就是「黑字压黑底」（实测 1.0:1，整页不可读） */
+  --tt-text-1: #f9fafb;
+  --tt-text-2: #e5e7eb;
+  --tt-text-3: #c6cedb;
+  --tt-text-4: #aeb8c8;
+  --tt-focus: #93c5fd;
   --tt-sidebar-bg: #182132;
   --tt-chat-assistant-bg: #1f2937;
   --tt-chat-process-bg: #182132;
@@ -129,14 +232,18 @@ html[data-ui-style='parchment'] {
   --tt-border: #d8c3a0;
   --tt-border-soft: #e6d6ba;
   --tt-text-1: #3b2f23;
-  --tt-text-2: #52432f;
-  --tt-text-3: #7a6650;
-  --tt-text-4: #9b866d;
+  --tt-text-2: #4a3b2b;
+  --tt-text-3: #63513c;
+  --tt-text-4: #6f5d46;
+  --tt-focus: #1d4ed8;
   --tt-shadow-card: 0 2px 8px rgba(90, 66, 38, 0.12);
   --tt-sidebar-bg: linear-gradient(180deg, #f7eeda 0%, #efe0c4 100%);
   --tt-chat-assistant-bg: #fdf7ea;
   --tt-chat-process-bg: #f8efdd;
   --tt-chat-code-bg: #f2e6cf;
+  /* 暖米底比默认白暗一档，700 档的链接绿/青压上去只有 3.9–4.4:1，取 800/900 档 */
+  --tt-link: #166534;
+  --tt-teal: #115e59;
 }
 
 html[data-theme='dark'][data-ui-style='parchment'] {
@@ -147,15 +254,119 @@ html[data-theme='dark'][data-ui-style='parchment'] {
   --tt-border: #5b4a36;
   --tt-border-soft: #4a3b2b;
   --tt-text-1: #f3e7d3;
-  --tt-text-2: #ddcbb0;
-  --tt-text-3: #bfa98b;
-  --tt-text-4: #9a866c;
+  --tt-text-2: #e3d3ba;
+  --tt-text-3: #cbb594;
+  --tt-text-4: #b9a183;
+  --tt-focus: #fbbf24;
+  /* 亮块里新覆盖过的变量在这里必须给回暗色档（同特异性，见经典皮肤块的注释） */
+  --tt-link: #4ade80;
+  --tt-teal: #5eead4;
+  /* 羊皮纸暗色是暖棕底：靛蓝 300 会显脏，改用同族琥珀 300（对四张表面都 ≥7:1） */
+  --tt-accent: #fcd34d;
+  /* 柔和底跟着换暖色相：默认的靛蓝/天蓝 chip 压在棕底上像贴了张冷色便利贴。
+     全部往暗里走，最弱档文字（--tt-text-4 #b9a183）照样 ≥4.5:1。 */
+  --tt-chip-neutral: #43341f;
+  --tt-chip-info: #1f3a3d;
+  --tt-chip-success: #26351a;
+  --tt-chip-teal: #1f3833;
+  --tt-chip-warning: #45210a;
+  --tt-chip-danger: #4a1710;
+  --tt-chip-accent: #3f3212;
   --tt-shadow-card: 0 2px 10px rgba(0, 0, 0, 0.4);
   --tt-sidebar-bg: linear-gradient(180deg, #2b2219 0%, #221b14 100%);
   --tt-chat-assistant-bg: #352b20;
   --tt-chat-process-bg: #2c241b;
   --tt-chat-code-bg: #241d16;
 }
+
+/* ── 界面密度（设置页「界面密度」，D-25）─────────────────────────
+   MUI 的 spacing 因子在 theme.ts 里按档位缩放（sx 的 p/m/gap 全跟着走），
+   这里补的是不吃 theme.spacing 的那部分：Markdown 正文的行距与块间距、
+   滚动条粗细。data-density 由 ThemedApp 写在 <html> 上。 */
+html[data-density='compact'] {
+  --tt-density-scale: 0.85;
+  --tt-row-pad-y: 6px;
+  --tt-row-pad-x: 10px;
+  --tt-gap: 10px;
+  --tt-scrollbar: 5px;
+}
+
+html[data-density='roomy'] {
+  --tt-density-scale: 1.15;
+  --tt-row-pad-y: 11px;
+  --tt-row-pad-x: 16px;
+  --tt-gap: 16px;
+  --tt-scrollbar: 9px;
+}
+
+/* ── 焦点可见（WCAG 2.4.7 / 2.4.11）──────────────────────────────
+   只在键盘导航时出现；环色 --tt-focus 对所在皮肤的每张表面都 ≥3:1。
+   用 :is() 而不是 :where()：前者的特异性跟着最specific的参数走，
+   组件里随手写的 outline: none（Emotion 单类名）压不住它。
+   这条由 tests/unit/appearance/a11y-surface-contract.test.ts 全量扫描钉住。
+
+   反向也成立，而且这正是以前踩过的坑：正因为压不住，组件里写的
+   `textarea:focus-visible { outline: none }`（(2,1,0)）与 `&:focus-visible` 单类名
+   （(2,0,0)）全都敌不过这条 (3,0,0)，输入卡里的蓝环与 chip 外的浮环一直没被改掉——
+   看着像「改了没生效」。所以不走特异性军备竞赛，改成在这里点名排除：
+   - data-tt-ring='container' 标在容器上：它内部控件的焦点信号由容器自己画
+     （输入卡的聚焦实心环即此类），内层不再叠第二圈；
+   - data-tt-ring='self' 标在控件上：它自己声明了 :focus-visible 环（贴边 inward），
+     不要这条带 2px 外偏移的全局环。
+   两个标记都不减少焦点可见性，只决定环由谁画。别把它们当「去掉环」的开关用，
+   契约测试会核对带 container 标记的文件确实有一条 focused 驱动的容器侧环。 */
+:is(
+  a,
+  button,
+  input,
+  select,
+  textarea,
+  summary,
+  [role='button'],
+  [role='link'],
+  [role='menuitem'],
+  [role='option'],
+  [role='tab'],
+  [role='checkbox'],
+  [role='switch'],
+  [role='radio'],
+  [role='textbox'],
+  [tabindex]:not([tabindex='-1'])
+):not([data-tt-ring='container'] *, [data-tt-ring='self']):focus-visible {
+  outline: 2px solid var(--tt-focus);
+  outline-offset: 2px;
+}
+
+/* 半透明皮肤上的焦点环再加一圈对比色描边，避免环与玻璃底糊在一起 */
+html[data-ui-style='glass']
+  :is(a, button, [role='button'], [role='menuitem'], [tabindex]:not([tabindex='-1'])):not([data-tt-ring='container'] *, [data-tt-ring='self']):focus-visible {
+  outline: 2px solid var(--tt-focus);
+  box-shadow: 0 0 0 4px rgba(15, 23, 42, 0.28);
+}
+
+/* ── 跳转链接（2.4.1 绕过重复的侧边栏）──────────────────────────
+   平时移出屏幕，Tab 第一下即出现，回车落到 <main id="tt-main">。 */
+.tt-skip-link {
+  position: fixed;
+  top: -80px;
+  left: 0;
+  z-index: 1300;
+  padding: 10px 16px;
+  background: var(--tt-surface);
+  color: var(--tt-text-1);
+  border: 1px solid var(--tt-focus);
+  border-radius: 0 0 12px 0;
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.tt-skip-link:focus {
+  top: 0;
+}
+
+/* ── 动效偏好（2.3.3）：全局复位在文件末尾与熊猫动画块合并为一条，
+   同一个 @media 里只留一处，避免后来人只改一边。 */
 
 /* 皮肤级的全局表面处理：只动外壳，不重排组件 */
 html[data-ui-style='glass'] .MuiDrawer-paper,
@@ -220,8 +431,8 @@ html[data-ui-style] body {
 
   /* ── 精致滚动条 ─────────────────────────────────────── */
   ::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
+    width: var(--tt-scrollbar);
+    height: var(--tt-scrollbar);
   }
 
   ::-webkit-scrollbar-track {
@@ -244,18 +455,18 @@ html[data-ui-style] body {
 }
 
 @layer components {
+  /* 按钮底色用 700 档而不是 600：白字压 #16A34A 只有 3.3:1，
+     压 #15803D 才有 5.0:1（WCAG 1.4.3 正文下限），品牌绿只深一档。 */
   .btn-primary {
-    @apply bg-primary-600 text-white px-4 py-2 rounded-[10px]
-           hover:bg-primary-700 active:bg-primary-800
-           transition-colors duration-150 ease-in-out
-           focus:outline-none focus:ring-2 focus:ring-primary-400 focus:ring-offset-2;
+    @apply bg-primary-700 text-white px-4 py-2 rounded-[10px]
+           hover:bg-primary-800 active:bg-primary-900
+           transition-colors duration-150 ease-in-out;
   }
 
   .btn-secondary {
-    @apply bg-secondary-500 text-white px-4 py-2 rounded-[10px]
-           hover:bg-secondary-600 active:bg-secondary-700
-           transition-colors duration-150 ease-in-out
-           focus:outline-none focus:ring-2 focus:ring-secondary-400 focus:ring-offset-2;
+    @apply bg-secondary-700 text-white px-4 py-2 rounded-[10px]
+           hover:bg-secondary-800 active:bg-secondary-900
+           transition-colors duration-150 ease-in-out;
   }
 
   .card {
@@ -263,15 +474,16 @@ html[data-ui-style] body {
   }
 
   .input-field {
-    @apply w-full px-3 py-2 border border-gray-300 rounded-[10px]
-           focus:outline-none focus:ring-2 focus:ring-primary-400 focus:border-primary-400
-           placeholder:text-gray-400 text-gray-900 bg-surface;
+    @apply w-full px-3 py-2 rounded-[10px] text-[13px]
+           border border-[color:var(--tt-border)] bg-[color:var(--tt-surface)]
+           text-[color:var(--tt-text-1)] placeholder:text-[color:var(--tt-text-4)];
   }
 
   /* ── Markdown 内容样式（聊天消息内） ─────────────────── */
+  /* 块间距随密度缩放：em 只跟字号走，紧凑档要看的是「行与行之间」也收 */
   .markdown-body {
     font-size: 14px;
-    line-height: 1.7;
+    line-height: calc(1.7 / (0.85 + 0.15 * var(--tt-density-scale)));
     word-break: break-word;
     font-family: var(--tt-chat-font);
   }
@@ -285,31 +497,31 @@ html[data-ui-style] body {
   }
 
   .markdown-body p {
-    margin: 0.4em 0;
+    margin: calc(0.4em * var(--tt-density-scale)) 0;
   }
 
   .markdown-body h1,
   .markdown-body h2,
   .markdown-body h3,
   .markdown-body h4 {
-    margin: 0.8em 0 0.4em;
+    margin: calc(0.8em * var(--tt-density-scale)) 0 calc(0.4em * var(--tt-density-scale));
     font-weight: 600;
     line-height: 1.4;
   }
 
   .markdown-body ul,
   .markdown-body ol {
-    margin: 0.4em 0;
+    margin: calc(0.4em * var(--tt-density-scale)) 0;
     padding-left: 1.4em;
   }
 
   .markdown-body li {
-    margin: 0.2em 0;
+    margin: calc(0.2em * var(--tt-density-scale)) 0;
   }
 
   .markdown-body pre {
-    margin: 0.6em 0;
-    padding: 12px 14px;
+    margin: calc(0.6em * var(--tt-density-scale)) 0;
+    padding: calc(12px * var(--tt-density-scale)) calc(14px * var(--tt-density-scale));
     border-radius: 10px;
     background: #0f172a;
     color: #e2e8f0;
@@ -362,12 +574,9 @@ html[data-ui-style] body {
   }
 
   .markdown-body a {
-    color: #16a34a;
-    text-decoration: none;
-  }
-
-  .markdown-body a:hover {
+    color: var(--tt-link);
     text-decoration: underline;
+    text-underline-offset: 2px;
   }
 
   .markdown-body hr {
@@ -451,6 +660,16 @@ html[data-ui-style] body {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  /* 全局复位：所有 transition/animation/平滑滚动一起关掉 */
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  /* 类选择器压过 *，无限循环的 sway/tilt/shake 才会真的停住而不是转一圈 */
   .tt-panda-sway,
   .tt-panda-tilt,
   .tt-panda-shake,

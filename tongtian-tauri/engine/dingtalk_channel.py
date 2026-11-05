@@ -11,6 +11,12 @@ frames.py / chatbot.py / handlers.py，不是凭记忆）：
 - 回执：{code, headers:{messageId, contentType}, message, data} —— data 还要再序列化一次
 - SYSTEM + topic=disconnect：钉钉主动要求换地址重连
 - 回贴：POST 消息自带的 sessionWebhook，载荷 {msgtype, text:{content}, at:{atUserIds}}
+- 群聊还是单聊：ChatbotMessage.conversation_type（SDK 自己也是按 '2' 判群聊，见它的
+  chatbot.py:723），是否被 @ 看 isInAtList（钉钉在回调里直接给这个布尔，不用猜 @ 名单）
+- 收附件：picture 的 content.downloadCode、richText 每一项的 downloadCode（SDK 的
+  get_image_list 就是按这两个字段取的）→ POST {openapi}/v1.0/robot/messageFiles/download
+  体 {robotCode, downloadCode}、头 x-acs-dingtalk-access-token，返回体里的 downloadUrl
+  才是下载地址（SDK 的 get_image_download_url 走同一个接口同一个字段）
 
 为什么不跑 SDK 的 DingTalkStreamClient.start()：它自带 while True + websockets 客户端
 + 阻塞 requests，和引擎的 uvicorn 循环、以及框架已有的退避重连/台账/状态机会变成
@@ -27,8 +33,10 @@ clientSecret 只在换地址那一次进请求体，绝不进视图、日志或�
 import os
 import platform
 import time
+from dataclasses import replace
 from urllib.parse import quote_plus
 
+import im_media as imedia
 from im_channels import CredentialField, ImChannel, ImError, InboundEvent, OpenTicket, register
 
 try:  # 官方 SDK 是这条通道的协议来源；随包运行时缺它就不能假装支持
@@ -104,9 +112,30 @@ class DingTalkStreamChannel(ImChannel):
         ),
     )
 
+    # ── D-41 能力位（按 SDK 建模过的形状说实话，不替钉钉猜载荷） ─────────
+    # 收：picture 与 richText 里的 downloadCode 有官方换址接口，能落到本机；
+    #     file / audio / video 在 SDK 的 ChatbotMessage 里没有对应模型，本通道不猜字段名。
+    supports_media_in = True
+    media_in_note = (
+        "钉钉可收图片与图文混排里的图片（downloadCode → 官方换址接口 → 本机落盘）；"
+        "文件/语音/视频在官方 SDK 的机器人回调模型里没有对应字段，本通道不猜载荷，只以文字说明呈现"
+    )
+    # 发：回贴只有 sessionWebhook 的文本载荷（SDK 的 reply_text/reply_markdown 也是这两种），
+    # 图片要先上传换 mediaId 再拼钉钉自己的附件载荷，本通道没验过那个载荷，不假装能发
+    supports_media_out = False
+    media_out_note = (
+        "钉钉回贴走消息自带的 sessionWebhook，本通道只用官方 SDK 建模过的文本载荷："
+        "任务产出的图片/文件不会被发到钉钉，请在通天办公的工作区里查看"
+    )
+    # 钉钉在回调里直接给 isInAtList（机器人是否在 @ 名单里），群策略因此有确定答案
+    mention_note = "钉钉回调帧自带 isInAtList（机器人是否在 @ 名单里）与 conversationType（1 单聊/2 群聊），答案取自帧本身"
+
     def __init__(self):
         # conversationId -> 该会话最后一次下发的回贴地址
         self._reply_targets: dict[str, dict] = {}
+        # accessToken 缓存：换附件地址每张图都要带它，不缓存等于每条消息多一次往返
+        self._token: str = ""
+        self._token_expires_at: float = 0.0
 
     @property
     def unsupported_reason(self) -> str:
@@ -221,21 +250,122 @@ class DingTalkStreamChannel(ImChannel):
         if msg.headers.topic != ChatbotMessage.TOPIC:
             return InboundEvent(kind="ignore")
         bot = ChatbotMessage.from_dict(msg.data or {})
+        raw = msg.data if isinstance(msg.data, dict) else {}
         conversation_id = str(bot.conversation_id or "").strip()
-        text = self._text_of(bot)
-        if not conversation_id or not text:
+        parts = self._parts_of(bot, raw)
+        if not conversation_id or not parts:
+            # 没有任何可消费的部分（未知 msgtype、空文本、机器人自己的其它通知）才忽略；
+            # 「只有图片没有文字」从 D-41 起是一条正经消息，不再当噪声丢掉
             return InboundEvent(kind="ignore")
         if bot.sender_id and bot.sender_id == bot.chatbot_user_id:
             # 机器人自己贴回去的消息不能触发第二个任务
             return InboundEvent(kind="ignore")
         self._remember_reply_target(conversation_id, bot)
+        text = "\n".join(str(p.text or "").strip() for p in parts if p.kind == "text" and p.text.strip()).strip()
         return InboundEvent(
             kind="inbound",
             text=text,
             conversation_id=conversation_id,
             user_id=str(bot.sender_staff_id or bot.sender_id or ""),
             message_id=str(bot.message_id or ""),
+            parts=parts,
+            is_group=str(bot.conversation_type or "") == "2",
+            mentioned_me=self._mentioned(bot),
+            at_ms=int(getattr(bot, "create_at", 0) or 0),
         )
+
+    @staticmethod
+    def _mentioned(bot) -> bool | None:
+        """钉钉的 isInAtList 就是「机器人有没有被 @」；缺字段返回 None 让框架拒判"""
+        value = getattr(bot, "is_in_at_list", None)
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes")
+        return bool(value)
+
+    def _parts_of(self, bot, raw: dict) -> list:
+        """一条回调 → ContentPart 列表（字段名全部取自 SDK 的 ChatbotMessage）"""
+        msgtype = str(getattr(bot, "message_type", "") or "")
+        parts: list[imedia.ContentPart] = []
+        if msgtype == "text":
+            text = self._text_of(bot)
+            if text:
+                parts.append(imedia.ContentPart(kind="text", text=text))
+        elif msgtype == "picture":
+            content = raw.get("content") if isinstance(raw.get("content"), dict) else {}
+            code = str(content.get("downloadCode") or "")
+            if code:
+                # 图片没有平台给的文件名：留空让媒体层按响应的 Content-Type 定后缀，
+                # 比在这里猜一个 .jpg 更接近用户最后看到的东西
+                parts.append(imedia.ContentPart(kind="image", ref=code))
+        elif msgtype == "richText":
+            for item in getattr(getattr(bot, "rich_text_content", None), "rich_text_list", None) or []:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text") or "").strip()
+                code = str(item.get("downloadCode") or "")
+                if text:
+                    parts.append(imedia.ContentPart(kind="text", text=text))
+                elif code:
+                    parts.append(imedia.ContentPart(kind="image", ref=code))
+        return parts
+
+    # ── D-41 收附件：downloadCode → downloadUrl → 字节 ────────────────
+
+    async def _access_token(self, creds: dict) -> str:
+        """与 verify 同一个接口，带过期缓存：换附件地址时不该每条消息都换一次 token"""
+        now = time.time()
+        if self._token and now < self._token_expires_at:
+            return self._token
+        client_id, client_secret = self._require(creds)
+        data = await self.post_json(
+            f"{openapi_base()}/v1.0/oauth2/accessToken",
+            payload={"appKey": client_id, "appSecret": client_secret},
+            extra_headers=self._sdk_headers(),
+        )
+        self._check(data, "获取 accessToken（附件下载换址）")
+        token = str(data.get("accessToken") or "")
+        if not token:
+            raise ImError("IM_BAD_RESPONSE", "钉钉没有返回 accessToken")
+        self._token = token
+        # 提前 60 秒刷新，避免卡在过期边界上（与飞书通道同一口径）
+        self._token_expires_at = now + max(60, int(data.get("expireIn") or 7200)) - 60
+        return token
+
+    async def resolve_media(self, creds: dict, parts: list) -> list:
+        """把 downloadCode 换成带签名的 downloadUrl（SDK 的 get_image_download_url 同一接口）
+
+        换不到的那一个只在自己身上记中文原因，不影响同一条消息里的其它附件。
+        换到的地址**只在本次下载里存在**：它带签名，进台账或界面就等于把凭据抄给别人。
+        """
+        token = await self._access_token(creds)
+        client_id, _ = self._require(creds)
+        out: list[imedia.ContentPart] = []
+        for part in parts:
+            copy = replace(part)
+            out.append(copy)
+            if copy.kind == "text" or copy.url or not copy.ref:
+                continue
+            try:
+                data = await self.post_json(
+                    f"{openapi_base()}/v1.0/robot/messageFiles/download",
+                    payload={"robotCode": client_id, "downloadCode": copy.ref},
+                    extra_headers={**self._sdk_headers(), "x-acs-dingtalk-access-token": token},
+                )
+            except ImError as exc:
+                copy.note = f"下载地址换取失败：{exc.detail or exc.code}"
+                continue
+            url = str(data.get("downloadUrl") or "")
+            if url.startswith(("http://", "https://")):
+                copy.url = url
+            else:
+                copy.note = "钉钉没有返回可用的下载地址（downloadUrl 缺失或不是绝对地址）"
+        return out
+
+    async def download(self, creds: dict, url: str) -> tuple[int, str, bytes]:
+        """downloadUrl 本身带签名，按 SDK 的做法直接 GET，不再附加任何凭据头"""
+        return await self.fetch_bytes(url)
 
     @staticmethod
     def _text_of(bot) -> str:

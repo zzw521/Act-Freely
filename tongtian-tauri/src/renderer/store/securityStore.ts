@@ -11,6 +11,7 @@
 
 import { create } from 'zustand';
 import { IPC_CHANNELS } from '../../shared/contracts';
+import { errorTextOf } from '../../shared/error-messages';
 import type {
   ComplianceDomainControl,
   CompliancePatch,
@@ -175,7 +176,7 @@ export const useSecurityStore = create<SecurityState>((set) => ({
           : null),
       });
     } catch (err) {
-      set({ complianceLoading: false, complianceError: `加载合规状态失败: ${err}` });
+      set({ complianceLoading: false, complianceError: `加载合规状态失败: ${errorTextOf(err, '原因未知')}` });
     }
   },
 
@@ -204,7 +205,7 @@ export const useSecurityStore = create<SecurityState>((set) => ({
       )) as AuditLogEntry[];
       set({ auditLogs: logs ?? [], logLoading: false });
     } catch (err) {
-      set({ logError: `加载日志失败: ${err}`, logLoading: false });
+      set({ logError: `加载日志失败: ${errorTextOf(err, '原因未知')}`, logLoading: false });
       throw err;
     }
   },

@@ -25,7 +25,8 @@ export function handleLocalConversationChannel(
 ): LocalConversationResult {
   if (channel === IPC_CHANNELS.CHAT_CONVERSATIONS) {
     const limit = Number(args[0] ?? 0) || 50;
-    return { handled: true, value: localConversations(limit) };
+    const workspaceId = String(args[1] ?? '').trim() || undefined;
+    return { handled: true, value: localConversations(limit, workspaceId) };
   }
   if (channel === IPC_CHANNELS.CHAT_MESSAGES) {
     const convId = String(args[0] ?? '');

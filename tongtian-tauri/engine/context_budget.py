@@ -13,8 +13,9 @@
 
 边界必须如实写进用户可见说明：
 
-* 阈值按上下文窗口的比例估算，工具 schema 不计入 AgentScope 的压缩计数，
-  所以预留了较大余量；它不是厂商 tokenizer 的精确值。
+* 阈值 = 窗口 − 动态预留，预留是 `max(窗口×5%, 4096)`。AgentScope 只统计
+  system + 待压缩消息，不统计 tools，预留覆盖的就是这块加上一轮模型输出；
+  它不是厂商 tokenizer 的精确值。
 * 压缩本身要额外调用一次模型生成摘要，摘要质量取决于模型；
   模型不支持结构化输出时 AgentScope 只记警告、不做压缩，任务不会因此中断。
 * 上下文窗口没填时按 8192 估算，不假装知道真实值。
@@ -35,10 +36,12 @@ DEFAULT_CONTEXT_WINDOW = 8192
 MIN_CONTEXT_WINDOW = 1024
 MAX_CONTEXT_WINDOW = 2_000_000
 
-# 预算比例：给系统提示、工具 schema、模型输出留出约 40% 余量。
-# AgentScope 只统计 system + 消息，不统计 tools，这个余量不能省。
-COMPRESSION_RATIO = 0.6
-COMPRESSION_RESERVE_TOKENS = 512
+# 压缩触发按「窗口 − 动态预留」算：AgentScope 在每个迭代开头、把新一轮消息
+# 计入之后才计数，所以预留只需覆盖没被计入的部分——工具 schema、上一条模型
+# 输出、请求开销。小窗口里这些占比高，用下限兜住；百万级窗口占比极低，
+# 5% 就够，不该像旧的固定 60% 那样把四成窗口当废纸。
+COMPRESSION_RESERVE_FRACTION = 0.05
+COMPRESSION_RESERVE_MIN_TOKENS = 4096
 MIN_TRIGGER_THRESHOLD = 512
 KEEP_RECENT_MESSAGES = 3
 
@@ -54,8 +57,24 @@ class AgentPolicy:
     keep_recent: int = KEEP_RECENT_MESSAGES
     config_notes: tuple[str, ...] = field(default_factory=tuple)
 
-    def notes(self, mcp_server_count: int = 0) -> list[str]:
-        """给用户看的真实口径；不返回空话，每条都能对应一个执行事实。"""
+    def compression_reserve(self) -> int:
+        """动态预留：窗口的 5%，下限 4096；工具 schema 与上一条模型输出靠它兜底。"""
+        return max(
+            int(self.context_window * COMPRESSION_RESERVE_FRACTION),
+            COMPRESSION_RESERVE_MIN_TOKENS,
+        )
+
+    def notes(
+        self,
+        mcp_server_count: int = 0,
+        mcp_tool_count: int = 0,
+        lazy_effective: bool | None = None,
+    ) -> list[str]:
+        """给用户看的真实口径；不返回空话，每条都能对应一个执行事实。
+
+        `lazy_effective` 是「本轮到底会不会按需载入」的最终判定（策略开着 + 工具数过阈值）；
+        不传时退回旧口径（只看策略开关），避免调用方没升级时读到空说明。
+        """
         out = [
             f"单轮工具循环上限：{self.max_iters} 轮；达到上限时会请求模型总结当前进展"
             "并结束本轮（不会继续调用工具），已产生的文件与结果不受影响。"
@@ -67,10 +86,13 @@ class AgentPolicy:
                 "可在「设置 → 模型与用量」中填写真实值。"
             )
         if self.auto_compress:
+            pct = self.trigger_threshold * 100 // self.context_window
             out.append(
-                f"上下文压缩已开启：按 {self.context_window} tokens 窗口的 "
-                f"{int(COMPRESSION_RATIO * 100)}% 估算，约 {self.trigger_threshold} tokens "
-                f"触发，保留最近 {self.keep_recent} 条消息。压缩会额外调用一次模型生成摘要；"
+                f"上下文压缩已开启：按 {self.context_window} tokens 窗口预留 "
+                f"{self.compression_reserve()} tokens（窗口×5%，下限 "
+                f"{COMPRESSION_RESERVE_MIN_TOKENS}），约 {self.trigger_threshold} "
+                f"tokens（≈{pct}%）触发，保留最近 {self.keep_recent} 条消息。"
+                "压缩会额外调用一次模型生成摘要；"
                 "模型不支持结构化输出时 AgentScope 只记警告、不做压缩，任务不会因此中断。"
                 + (f" {window_note}" if window_note else "")
             )
@@ -80,10 +102,20 @@ class AgentPolicy:
                 "请缩短任务或换更大窗口的模型。"
                 + (f" {window_note}" if window_note else "")
             )
-        if mcp_server_count > 0 and self.lazy_mcp_tools:
+        lazy = self.lazy_mcp_tools if lazy_effective is None else lazy_effective
+        if mcp_server_count > 0 and lazy:
+            tools_text = f"{mcp_server_count} 个连接器的 {mcp_tool_count} 个工具" if mcp_tool_count else f"{mcp_server_count} 个连接器的工具"
             out.append(
-                f"连接器工具按需载入：本轮 {mcp_server_count} 个连接器的工具默认不占上下文，"
-                "需要时先调用 search_tools 按关键词搜索并启用。"
+                f"连接器工具按需载入：本轮 {tools_text} 默认不占上下文，"
+                "需要时先调用 search_tools 按关键词搜索；"
+                "命中后只载入被检索到的那几个，同连接器未命中的工具继续不占上下文。"
+            )
+        elif mcp_server_count > 0 and self.lazy_mcp_tools:
+            # 策略开着但没过阈值：说清为什么这轮没走按需，而不是假装一切照常
+            out.append(
+                f"连接器工具直接载入：本轮 {mcp_server_count} 个连接器"
+                + (f"共 {mcp_tool_count} 个工具" if mcp_tool_count else "")
+                + f"，未超过按需阈值，全部进上下文（搜工具这步省掉）。"
             )
         out.extend(self.config_notes)
         return out
@@ -187,7 +219,10 @@ def resolve(runtime: dict | None, model_config: dict | None = None) -> AgentPoli
 
     trigger = max(
         MIN_TRIGGER_THRESHOLD,
-        int(window * COMPRESSION_RATIO) - COMPRESSION_RESERVE_TOKENS,
+        window - max(
+            int(window * COMPRESSION_RESERVE_FRACTION),
+            COMPRESSION_RESERVE_MIN_TOKENS,
+        ),
     )
     return AgentPolicy(
         max_iters=max_iters,

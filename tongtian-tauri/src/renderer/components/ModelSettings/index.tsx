@@ -38,11 +38,14 @@ import StarOutlineIcon from '@mui/icons-material/StarOutline';
 import FolderOpenOutlinedIcon from '@mui/icons-material/FolderOpenOutlined';
 import BarChartOutlinedIcon from '@mui/icons-material/BarChartOutlined';
 import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
+import TokenBudgetPanel from '../TokenBudgetPanel';
 import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward';
 import { useNavigate } from 'react-router-dom';
 import { type ModelConfig, ModelSource, type ModelTestResp } from '../../../shared/types';
 import LocalModelDetect from '../LocalModelDetect';
 import { api } from '../../lib/api';
+import { useI18n } from '../../i18n';
+import { clickableProps } from '../../lib/a11y';
 import { resolveEngineBaseUrl } from '../../lib/engine-endpoint';
 import { engineFetch } from '../../lib/engine-http';
 import { errorTextOf } from '../../../shared/error-messages';
@@ -180,9 +183,9 @@ const SectionLabel: React.FC<{ children: React.ReactNode; required?: boolean }> 
   children,
   required,
 }) => (
-  <Typography sx={{ fontSize: '13px', fontWeight: 600, color: '#374151', mb: 1 }}>
+  <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-2)', mb: 1 }}>
     {children}
-    {required && <Box component="span" sx={{ color: '#EF4444', ml: 0.5 }}>*</Box>}
+    {required && <Box component="span" sx={{ color: 'var(--tt-danger)', ml: 0.5 }}>*</Box>}
   </Typography>
 );
 
@@ -197,6 +200,7 @@ interface ModelDialogProps {
 }
 
 const ModelDialog: React.FC<ModelDialogProps> = ({ open, editing, models, onClose, onSaved }) => {
+  const { t: tr } = useI18n();
   const isEdit = Boolean(editing?.id);
   const [name, setName] = useState('');
   const [source, setSource] = useState<ModelSource>(ModelSource.OPENAI_COMPAT);
@@ -350,20 +354,21 @@ const ModelDialog: React.FC<ModelDialogProps> = ({ open, editing, models, onClos
     <Dialog
       open={open}
       onClose={saving ? undefined : onClose}
+      aria-labelledby="tt-model-edit-title"
       maxWidth="sm"
       fullWidth
       PaperProps={{ sx: { borderRadius: '16px', p: 3, maxHeight: '90vh', overflowY: 'auto' } }}
     >
       <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', mb: 2.5 }}>
         <Box>
-          <Typography sx={{ fontSize: '17px', fontWeight: 700, color: '#111827' }}>
+          <Typography id="tt-model-edit-title" sx={{ fontSize: '17px', fontWeight: 700, color: 'var(--tt-text-1)' }}>
             {isEdit ? '编辑模型' : '添加模型'}
           </Typography>
-          <Typography sx={{ fontSize: '12px', color: '#9CA3AF', mt: 0.5 }}>
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mt: 0.5 }}>
             仅支持 OpenAI 兼容协议 API，保存后下一轮对话生效
           </Typography>
         </Box>
-        <IconButton size="small" onClick={onClose} disabled={saving} sx={{ color: '#9CA3AF' }}>
+        <IconButton size="small" aria-label={tr('关闭模型设置弹窗')} onClick={onClose} disabled={saving} sx={{ color: 'var(--tt-text-4)' }}>
           <CloseIcon sx={{ fontSize: 20 }} />
         </IconButton>
       </Box>
@@ -409,8 +414,8 @@ const ModelDialog: React.FC<ModelDialogProps> = ({ open, editing, models, onClos
           sx={{
             borderRadius: '10px',
             fontSize: '13px',
-            color: '#111827',
-            '& .MuiOutlinedInput-notchedOutline': { borderColor: '#E5E7EB' },
+            color: 'var(--tt-text-1)',
+            '& .MuiOutlinedInput-notchedOutline': { borderColor: 'var(--tt-border)' },
             '& .MuiSelect-select': { py: 1.1, pl: 1.5, pr: 4 },
           }}
         >
@@ -434,7 +439,7 @@ const ModelDialog: React.FC<ModelDialogProps> = ({ open, editing, models, onClos
             sx: { borderRadius: '10px', fontSize: '13px', fontFamily: 'Consolas, monospace' },
           }}
         />
-        <Typography sx={{ fontSize: '11px', color: '#9CA3AF', mt: 0.5 }}>
+        <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)', mt: 0.5 }}>
           OpenAI 兼容 baseUrl；本地 Ollama 通常是 http://127.0.0.1:11434/v1
         </Typography>
       </Box>
@@ -452,14 +457,14 @@ const ModelDialog: React.FC<ModelDialogProps> = ({ open, editing, models, onClos
             sx: { borderRadius: '10px', fontSize: '13px' },
             endAdornment: (
               <InputAdornment position="end">
-                <IconButton size="small" onClick={() => setShowKey(!showKey)} sx={{ color: '#9CA3AF' }}>
+                <IconButton size="small" aria-label={showKey ? tr('隐藏 API Key') : tr('显示 API Key')} onClick={() => setShowKey(!showKey)} sx={{ color: 'var(--tt-text-4)' }}>
                   {showKey ? <VisibilityOffIcon sx={{ fontSize: 18 }} /> : <VisibilityIcon sx={{ fontSize: 18 }} />}
                 </IconButton>
               </InputAdornment>
             ),
           }}
         />
-        <Typography sx={{ fontSize: '11px', color: '#9CA3AF', mt: 0.5 }}>{keyHint}</Typography>
+        <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)', mt: 0.5 }}>{keyHint}</Typography>
       </Box>
 
       <Box sx={{ display: 'flex', gap: 2, mb: 2.5 }}>
@@ -528,18 +533,19 @@ const ModelDialog: React.FC<ModelDialogProps> = ({ open, editing, models, onClos
           />
         </Box>
       </Box>
-      <Typography sx={{ fontSize: '11px', color: '#9CA3AF', mb: 2 }}>
+      <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)', mb: 2 }}>
         单价用于成本台账；留空表示未配置，不会按 0 元估算。0 表示确实免费。
       </Typography>
 
       {/* 故障转移链：主模型失败且未输出内容时按顺序切换 */}
       <Box sx={{ mb: 2.5 }}>
         <SectionLabel>故障转移链（可选，最多 3 个）</SectionLabel>
-        <Typography sx={{ fontSize: '11px', color: '#9CA3AF', mb: 1, lineHeight: 1.6 }}>
+        <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)', mb: 1, lineHeight: 1.6 }}>
           主模型调用失败且尚未输出内容时，按顺序切换到下一个模型；需与主模型使用同一种接入方式（自定义端点）。
         </Typography>
         {fallbackIds.map((id, index) => {
           const target = models.find((m) => m.id === id);
+          const fallbackName = target?.name || target?.modelName || id;
           return (
             <Box
               key={id}
@@ -547,7 +553,7 @@ const ModelDialog: React.FC<ModelDialogProps> = ({ open, editing, models, onClos
                 display: 'flex',
                 alignItems: 'center',
                 gap: 0.5,
-                border: '1px solid #E5E7EB',
+                border: '1px solid var(--tt-border)',
                 borderRadius: '10px',
                 pl: 1.25,
                 pr: 0.5,
@@ -555,39 +561,42 @@ const ModelDialog: React.FC<ModelDialogProps> = ({ open, editing, models, onClos
                 mb: 0.75,
               }}
             >
-              <Box component="span" sx={{ fontSize: '12px', color: '#9CA3AF', width: 16 }}>
+              <Box component="span" sx={{ fontSize: '12px', color: 'var(--tt-text-4)', width: 16 }}>
                 {index + 1}
               </Box>
               <Box sx={{ flexGrow: 1, minWidth: 0 }}>
-                <Typography sx={{ fontSize: '13px', color: '#111827' }} noWrap>
+                <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-1)' }} noWrap>
                   {target?.name || (target ? target.modelName : `已失效目标 ${id}`)}
                 </Typography>
                 {target && (
-                  <Typography sx={{ fontSize: '11px', color: '#9CA3AF' }} noWrap>
+                  <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }} noWrap>
                     {target.modelName}
                   </Typography>
                 )}
               </Box>
               <IconButton
                 size="small"
+                aria-label={tr('上移备用模型：{name}', { name: fallbackName })}
                 disabled={index === 0}
                 onClick={() => moveFallback(index, -1)}
-                sx={{ color: '#9CA3AF' }}
+                sx={{ color: 'var(--tt-text-4)' }}
               >
                 <ArrowUpwardIcon sx={{ fontSize: 16 }} />
               </IconButton>
               <IconButton
                 size="small"
+                aria-label={tr('下移备用模型：{name}', { name: fallbackName })}
                 disabled={index === fallbackIds.length - 1}
                 onClick={() => moveFallback(index, 1)}
-                sx={{ color: '#9CA3AF' }}
+                sx={{ color: 'var(--tt-text-4)' }}
               >
                 <ArrowDownwardIcon sx={{ fontSize: 16 }} />
               </IconButton>
               <IconButton
                 size="small"
+                aria-label={tr('移除备用模型：{name}', { name: fallbackName })}
                 onClick={() => setFallbackIds(fallbackIds.filter((v) => v !== id))}
-                sx={{ color: '#9CA3AF', '&:hover': { color: '#EF4444' } }}
+                sx={{ color: 'var(--tt-text-4)', '&:hover': { color: 'var(--tt-danger)' } }}
               >
                 <DeleteOutlineIcon sx={{ fontSize: 16 }} />
               </IconButton>
@@ -605,12 +614,12 @@ const ModelDialog: React.FC<ModelDialogProps> = ({ open, editing, models, onClos
               width: '100%',
               borderRadius: '10px',
               fontSize: '13px',
-              color: '#374151',
-              '& .MuiOutlinedInput-notchedOutline': { borderColor: '#E5E7EB' },
+              color: 'var(--tt-text-2)',
+              '& .MuiOutlinedInput-notchedOutline': { borderColor: 'var(--tt-border)' },
               '& .MuiSelect-select': { py: 1, pl: 1.5, pr: 4 },
             }}
           >
-            <MenuItem value="" disabled sx={{ fontSize: '13px', color: '#9CA3AF' }}>
+            <MenuItem value="" disabled sx={{ fontSize: '13px', color: 'var(--tt-text-4)' }}>
               添加备用模型…
             </MenuItem>
             {fallbackCandidates.map((m) => (
@@ -621,12 +630,12 @@ const ModelDialog: React.FC<ModelDialogProps> = ({ open, editing, models, onClos
           </Select>
         )}
         {fallbackIds.length === 0 && fallbackCandidates.length === 0 && (
-          <Typography sx={{ fontSize: '11px', color: '#9CA3AF' }}>
+          <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
             需要先保存至少两个模型，才能配置故障转移。
           </Typography>
         )}
         {fallbackIds.length >= 3 && (
-          <Typography sx={{ fontSize: '11px', color: '#9CA3AF' }}>已达上限 3 个。</Typography>
+          <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>已达上限 3 个。</Typography>
         )}
       </Box>
 
@@ -638,11 +647,11 @@ const ModelDialog: React.FC<ModelDialogProps> = ({ open, editing, models, onClos
           sx={{
             borderRadius: '10px',
             px: 2,
-            color: '#374151',
-            border: '1px solid #E5E7EB',
+            color: 'var(--tt-text-2)',
+            border: '1px solid var(--tt-border)',
             fontSize: '13px',
             fontWeight: 600,
-            '&:hover': { background: '#F9FAFB', border: '1px solid #D1D5DB' },
+            '&:hover': { background: 'var(--tt-chip-neutral)', border: '1px solid var(--tt-border)' },
           }}
         >
           {testing ? '测试中…' : '测试连接'}
@@ -654,11 +663,11 @@ const ModelDialog: React.FC<ModelDialogProps> = ({ open, editing, models, onClos
             sx={{
               borderRadius: '10px',
               px: 2.5,
-              color: '#374151',
-              border: '1px solid #E5E7EB',
+              color: 'var(--tt-text-2)',
+              border: '1px solid var(--tt-border)',
               fontSize: '13px',
               fontWeight: 600,
-              '&:hover': { background: '#F9FAFB', border: '1px solid #D1D5DB' },
+              '&:hover': { background: 'var(--tt-chip-neutral)', border: '1px solid var(--tt-border)' },
             }}
           >
             取消
@@ -667,15 +676,15 @@ const ModelDialog: React.FC<ModelDialogProps> = ({ open, editing, models, onClos
             variant="contained"
             onClick={handleSave}
             disabled={saving}
-            startIcon={saving ? <CircularProgress size={14} sx={{ color: '#fff' }} /> : undefined}
+            startIcon={saving ? <CircularProgress size={14} sx={{ color: 'var(--tt-cta-ink)' }} /> : undefined}
             sx={{
               borderRadius: '10px',
               px: 2.5,
-              bgcolor: '#111827',
-              color: '#fff',
+              bgcolor: 'var(--tt-cta-fill)',
+              color: 'var(--tt-cta-ink)',
               fontSize: '13px',
               fontWeight: 600,
-              '&:hover': { bgcolor: '#1F2937' },
+              '&:hover': { bgcolor: 'var(--tt-cta-fill-hover)' },
             }}
           >
             {saving ? '保存中…' : '保存'}
@@ -690,6 +699,7 @@ const ModelDialog: React.FC<ModelDialogProps> = ({ open, editing, models, onClos
 
 const ModelSettings: React.FC = () => {
   const navigate = useNavigate();
+  const { t: tr } = useI18n();
   const [models, setModels] = useState<ModelConfig[]>([]);
   const [store, setStore] = useState<ModelStoreInfo | null>(null);
   const [loading, setLoading] = useState(true);
@@ -795,8 +805,8 @@ const ModelSettings: React.FC = () => {
     <Box>
       <Box sx={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 2, mb: 3 }}>
         <Box>
-          <Typography sx={{ fontSize: '18px', fontWeight: 700, color: '#111827' }}>模型</Typography>
-          <Typography sx={{ fontSize: '13px', color: '#9CA3AF', mt: 0.5 }}>
+          <Typography sx={{ fontSize: '18px', fontWeight: 700, color: 'var(--tt-text-1)' }}>模型</Typography>
+          <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-4)', mt: 0.5 }}>
             管理对话可用的模型供应商与自定义模型；token 用量与费用按真实台账统计
           </Typography>
         </Box>
@@ -807,11 +817,11 @@ const ModelSettings: React.FC = () => {
             flexShrink: 0,
             borderRadius: '10px',
             px: 2,
-            color: '#374151',
-            border: '1px solid #E5E7EB',
+            color: 'var(--tt-text-2)',
+            border: '1px solid var(--tt-border)',
             fontSize: '13px',
             fontWeight: 600,
-            '&:hover': { background: '#F9FAFB', border: '1px solid #D1D5DB' },
+            '&:hover': { background: 'var(--tt-chip-neutral)', border: '1px solid var(--tt-border)' },
           }}
         >
           用量统计
@@ -833,14 +843,14 @@ const ModelSettings: React.FC = () => {
 
       <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1.2fr', gap: 2 }}>
         {/* ── 数据源说明卡 ─────────────────────── */}
-        <Box sx={{ bgcolor: '#FFFFFF', border: '1px solid #E5E7EB', borderRadius: '14px', p: 3 }}>
-          <Typography sx={{ fontSize: '15px', fontWeight: 600, color: '#111827', mb: 1.5 }}>
+        <Box sx={{ bgcolor: 'var(--tt-surface)', border: '1px solid var(--tt-border)', borderRadius: '14px', p: 3 }}>
+          <Typography sx={{ fontSize: '15px', fontWeight: 600, color: 'var(--tt-text-1)', mb: 1.5 }}>
             数据源
           </Typography>
-          <Typography sx={{ fontSize: '13px', color: '#374151', fontWeight: 600 }}>
+          <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-2)', fontWeight: 600 }}>
             {store?.title ?? '读取中…'}
           </Typography>
-          <Typography sx={{ fontSize: '12px', color: '#6B7280', lineHeight: 1.8, mt: 0.75 }}>
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-2)', lineHeight: 1.8, mt: 0.75 }}>
             {store?.detail ?? '正在确认当前运行通道的模型存储位置。'}
           </Typography>
 
@@ -849,9 +859,10 @@ const ModelSettings: React.FC = () => {
               <Box
                 component="span"
                 onClick={() => void openConfigFolder()}
+                {...clickableProps(() => void openConfigFolder(), tr('打开配置文件所在目录：{path}', { path: store.path }))}
                 title="点击打开配置文件所在目录"
                 sx={{
-                  color: '#0EA5E9',
+                  color: 'var(--tt-info)',
                   cursor: 'pointer',
                   fontFamily: 'Consolas, monospace',
                   fontSize: '12px',
@@ -862,23 +873,23 @@ const ModelSettings: React.FC = () => {
                 {store.path}
               </Box>
               <Tooltip title="打开所在目录">
-                <IconButton size="small" onClick={() => void openConfigFolder()} sx={{ color: '#6B7280' }}>
+                <IconButton size="small" aria-label={tr('打开配置文件所在目录')} onClick={() => void openConfigFolder()} sx={{ color: 'var(--tt-text-2)' }}>
                   <FolderOpenOutlinedIcon sx={{ fontSize: 17 }} />
                 </IconButton>
               </Tooltip>
-              {folderMsg && <Box component="span" sx={{ fontSize: '11px', color: '#0D9488' }}>{folderMsg}</Box>}
+              {folderMsg && <Box component="span" sx={{ fontSize: '11px', color: 'var(--tt-teal)' }}>{folderMsg}</Box>}
             </Box>
           )}
 
-          <Typography sx={{ fontSize: '12px', color: '#9CA3AF', mt: 2, lineHeight: 1.7 }}>
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mt: 2, lineHeight: 1.7 }}>
             在这里添加或修改后，下一轮对话立即生效，无需重启应用。
           </Typography>
         </Box>
 
         {/* ── 已保存模型卡 ─────────────────────────── */}
-        <Box sx={{ bgcolor: '#FFFFFF', border: '1px solid #E5E7EB', borderRadius: '14px', p: 3 }}>
+        <Box sx={{ bgcolor: 'var(--tt-surface)', border: '1px solid var(--tt-border)', borderRadius: '14px', p: 3 }}>
           <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-            <Typography sx={{ fontSize: '15px', fontWeight: 600, color: '#111827' }}>已保存模型</Typography>
+            <Typography sx={{ fontSize: '15px', fontWeight: 600, color: 'var(--tt-text-1)' }}>已保存模型</Typography>
             <Button
               startIcon={<AddIcon sx={{ fontSize: 16 }} />}
               onClick={() => {
@@ -888,11 +899,11 @@ const ModelSettings: React.FC = () => {
               sx={{
                 borderRadius: '10px',
                 px: 2,
-                color: '#374151',
-                border: '1px solid #E5E7EB',
+                color: 'var(--tt-text-2)',
+                border: '1px solid var(--tt-border)',
                 fontSize: '13px',
                 fontWeight: 600,
-                '&:hover': { background: '#F9FAFB', border: '1px solid #D1D5DB' },
+                '&:hover': { background: 'var(--tt-chip-neutral)', border: '1px solid var(--tt-border)' },
               }}
             >
               添加模型
@@ -902,7 +913,7 @@ const ModelSettings: React.FC = () => {
           {loading ? (
             <LinearProgress sx={{ borderRadius: 1, mt: 1 }} />
           ) : models.length === 0 ? (
-            <Typography sx={{ fontSize: '13px', color: '#9CA3AF', py: 4, textAlign: 'center' }}>
+            <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-4)', py: 4, textAlign: 'center' }}>
               暂无已保存模型
             </Typography>
           ) : (
@@ -921,7 +932,7 @@ const ModelSettings: React.FC = () => {
                     alignItems: 'center',
                     gap: 1.5,
                     py: 1.5,
-                    borderTop: '1px solid #F3F4F6',
+                    borderTop: '1px solid var(--tt-border)',
                   }}
                 >
                   <Box
@@ -929,8 +940,8 @@ const ModelSettings: React.FC = () => {
                       width: 34,
                       height: 34,
                       borderRadius: '50%',
-                      bgcolor: '#E0F2FE',
-                      color: '#0369A1',
+                      bgcolor: 'var(--tt-chip-info)',
+                      color: 'var(--tt-info)',
                       display: 'flex',
                       alignItems: 'center',
                       justifyContent: 'center',
@@ -944,25 +955,25 @@ const ModelSettings: React.FC = () => {
 
                   <Box sx={{ flexGrow: 1, minWidth: 0 }}>
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexWrap: 'wrap' }}>
-                      <Typography sx={{ fontSize: '14px', fontWeight: 600, color: '#111827' }}>
+                      <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'var(--tt-text-1)' }}>
                         {m.name || m.modelName}
                       </Typography>
                       {m.isDefault && (
                         <Chip
                           label="默认"
                           size="small"
-                          sx={{ height: 18, fontSize: '10px', bgcolor: '#DCFCE7', color: '#166534' }}
+                          sx={{ height: 18, fontSize: '10px', bgcolor: 'var(--tt-chip-success)', color: 'var(--tt-success)' }}
                         />
                       )}
                     </Box>
-                    <Typography sx={{ fontSize: '12px', color: '#9CA3AF' }}>
+                    <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)' }}>
                       {modelSourceLabel(m.source)} · {m.modelName} · {keyState}
                     </Typography>
                     {m.baseUrl && (
                       <Typography
                         sx={{
                           fontSize: '11px',
-                          color: '#B0B7C3',
+                          color: 'var(--tt-text-4)',
                           fontFamily: 'Consolas, monospace',
                           overflow: 'hidden',
                           textOverflow: 'ellipsis',
@@ -979,14 +990,14 @@ const ModelSettings: React.FC = () => {
                           <Chip
                             label={price}
                             size="small"
-                            sx={{ height: 18, fontSize: '10px', bgcolor: '#F3F4F6', color: '#4B5563' }}
+                            sx={{ height: 18, fontSize: '10px', bgcolor: 'var(--tt-chip-neutral)', color: 'var(--tt-text-2)' }}
                           />
                         )}
                         {fallbackNames.length > 0 && (
                           <Chip
                             label={`容灾：${fallbackNames.join(' → ')}`}
                             size="small"
-                            sx={{ height: 18, fontSize: '10px', bgcolor: '#EFF6FF', color: '#1D4ED8' }}
+                            sx={{ height: 18, fontSize: '10px', bgcolor: 'var(--tt-chip-info)', color: 'var(--tt-info)' }}
                           />
                         )}
                       </Box>
@@ -994,15 +1005,16 @@ const ModelSettings: React.FC = () => {
                   </Box>
 
                   {busyId === m.id ? (
-                    <CircularProgress size={18} sx={{ color: '#9CA3AF', mx: 1 }} />
+                    <CircularProgress size={18} sx={{ color: 'var(--tt-text-4)', mx: 1 }} />
                   ) : (
                     <>
                       {!m.isDefault && (
                         <Tooltip title="设为默认模型（输入框选 Auto 时使用）">
                           <IconButton
                             size="small"
+                            aria-label={tr('设为默认模型：{name}', { name: m.name || m.modelName })}
                             onClick={() => void handleSetDefault(m)}
-                            sx={{ color: '#9CA3AF', '&:hover': { color: '#D97706' } }}
+                            sx={{ color: 'var(--tt-text-4)', '&:hover': { color: 'var(--tt-warning)' } }}
                           >
                             <StarOutlineIcon sx={{ fontSize: 18 }} />
                           </IconButton>
@@ -1011,11 +1023,12 @@ const ModelSettings: React.FC = () => {
                       <Tooltip title="编辑">
                         <IconButton
                           size="small"
+                          aria-label={tr('编辑模型：{name}', { name: m.name || m.modelName })}
                           onClick={() => {
                             setEditing(m);
                             setDialogOpen(true);
                           }}
-                          sx={{ color: '#9CA3AF', '&:hover': { color: '#374151' } }}
+                          sx={{ color: 'var(--tt-text-4)', '&:hover': { color: 'var(--tt-text-2)' } }}
                         >
                           <EditOutlinedIcon sx={{ fontSize: 18 }} />
                         </IconButton>
@@ -1023,8 +1036,9 @@ const ModelSettings: React.FC = () => {
                       <Tooltip title="删除">
                         <IconButton
                           size="small"
+                          aria-label={tr('删除模型：{name}', { name: m.name || m.modelName })}
                           onClick={() => setDeleting(m)}
-                          sx={{ color: '#9CA3AF', '&:hover': { color: '#EF4444' } }}
+                          sx={{ color: 'var(--tt-text-4)', '&:hover': { color: 'var(--tt-danger)' } }}
                         >
                           <DeleteOutlineIcon sx={{ fontSize: 18 }} />
                         </IconButton>
@@ -1038,6 +1052,8 @@ const ModelSettings: React.FC = () => {
         </Box>
       </Box>
 
+      <TokenBudgetPanel />
+
       <ModelDialog
         open={dialogOpen}
         editing={editing}
@@ -1050,14 +1066,15 @@ const ModelSettings: React.FC = () => {
       <Dialog
         open={Boolean(deleting)}
         onClose={() => (busyId ? undefined : setDeleting(null))}
+        aria-labelledby="tt-model-delete-title"
         maxWidth="xs"
         fullWidth
         PaperProps={{ sx: { borderRadius: '14px', p: 3 } }}
       >
-        <Typography sx={{ fontSize: '16px', fontWeight: 700, color: '#111827', mb: 1 }}>
+        <Typography id="tt-model-delete-title" sx={{ fontSize: '16px', fontWeight: 700, color: 'var(--tt-text-1)', mb: 1 }}>
           删除模型
         </Typography>
-        <Typography sx={{ fontSize: '13px', color: '#6B7280', lineHeight: 1.7 }}>
+        <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-2)', lineHeight: 1.7 }}>
           确认删除「{deleting?.name || deleting?.modelName}」？该条目及其在本机保存的密钥会一并移除，其他模型转移链里对它的引用也会自动摘除。
         </Typography>
         <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1.5, mt: 3 }}>
@@ -1067,8 +1084,8 @@ const ModelSettings: React.FC = () => {
             sx={{
               borderRadius: '10px',
               px: 2.5,
-              color: '#374151',
-              border: '1px solid #E5E7EB',
+              color: 'var(--tt-text-2)',
+              border: '1px solid var(--tt-border)',
               fontSize: '13px',
               fontWeight: 600,
             }}

@@ -144,7 +144,12 @@ def toolkit_checks(tmp: Path) -> None:
     ok = tool_text(write(str(outside / "ok.txt"), "hi"))
     check("白名单目录可写", "已成功写入" in ok, ok[:120])
     bad = tool_text(write(str(tmp.parent / "nope.txt"), "x"))
-    check("白名单外写入被拒", "沙箱拒绝" in bad, bad[:160])
+    # 白名单外的写入有两道闸：文件访问档位先判（缺省「每次询问」的边界=绑定目录∪白名单），
+    # 沙箱策略再判。这一条锁的是「无论如何写不出去」，档位那一道单独由
+    # tests/integration/engine_file_permission_selftest.py 逐条锁。
+    check("白名单外写入被拒",
+          ("沙箱拒绝" in bad or "文件访问权限拒绝" in bad) and not (tmp.parent / "nope.txt").exists(),
+          bad[:160])
     secret = tool_text(view(str(outside / "secret.txt")))
     check("黑名单文件读取被拒", "沙箱拒绝" in secret, secret[:160])
 

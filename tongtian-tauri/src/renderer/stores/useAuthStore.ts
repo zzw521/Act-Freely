@@ -11,6 +11,7 @@
 
 import { create } from 'zustand';
 import type { AuthProfile } from '../../shared/contracts';
+import { errorTextOf } from '../../shared/error-messages';
 import { authAPI } from '../lib/api';
 
 /** localStorage 兜底键（引擎直连模式下 IPC 返回空的降级数据源） */
@@ -110,7 +111,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       writeFallback(resp.profile);
       return true;
     } catch (e) {
-      set({ busy: false, error: e instanceof Error ? e.message : String(e) });
+      set({ busy: false, error: errorTextOf(e, '登录失败') });
       return false;
     }
   },

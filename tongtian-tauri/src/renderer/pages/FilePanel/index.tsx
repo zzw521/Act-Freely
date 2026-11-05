@@ -58,8 +58,7 @@ const FilePanel: React.FC = () => {
       setItems(list);
       setCurrentPath(dirPath);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(msg);
+      setError(errorTextOf(e, '目录读取失败'));
       setItems([]);
     } finally {
       setLoading(false);

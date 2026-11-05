@@ -12,13 +12,18 @@
 #   docker run --rm -p 18000:18000 -e TT_ENGINE_TOKEN=<令牌> -v tt-data:/data tongtian-office:dev
 
 # ── 前端构建：VITE_MOCK=false 才会进入引擎直连通道 ──
-FROM node:22-slim AS web
+# node 大版本必须与开发机一致（npm 11）：node:22 自带的 npm 10 会对 tailwindcss 的
+# 可选 peer `yaml@^2.4.2` 做严格 lock 校验，报 "Missing: yaml@2.9.1 from lock file"
+# 而 npm 11 认为同一份 lock 是完整的，构建因此在 web 阶段直接失败。
+FROM node:24-slim AS web
 WORKDIR /app
 COPY package.json package-lock.json vite.config.ts postcss.config.js tailwind.config.js ./
 RUN npm ci
 COPY src ./src
 ENV VITE_MOCK=false
-RUN npm run build
+# 不走 `npm run build`：那条命令前置了桌面打包步骤（清引擎字节码缓存、stage 随包 Python），
+# 容器构建阶段既没有 scripts/ 也不该复制桌面产物，直接调 vite build（vite 根在 src/renderer）。
+RUN npx vite build
 
 # ── 运行时：Python 引擎 + 构建产物 ──
 FROM python:3.12-slim

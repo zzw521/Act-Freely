@@ -8,7 +8,7 @@
  * 引擎地址：VITE_ENGINE_URL 可覆盖，默认 http://127.0.0.1:18000
  */
 
-import type { AgentPolicy, ChatEvent, PiiOutboundMode, PptxTemplatesPayload } from '../../shared/types';
+import type { AgentPolicy, ChatEvent, FilePermissionMode, PiiOutboundMode, PptxTemplatesPayload } from '../../shared/types';
 import { appVersion } from '../../shared/app-version';
 import type {
   AwarenessView,
@@ -31,10 +31,12 @@ import { handleLocalMarketChannel } from './market-local';
 import { handleLocalConversationChannel } from './conversation-local';
 import { handleLocalMcpChannel } from './mcp-local';
 import { handleLocalCollabChannel } from './collab-local';
+import { handleLocalSuperagentChannel } from './superagent-local';
 import { handleLocalPermissionChannel } from './permissions-local';
 import { extractReport, extractUsageRows, normalizePeriod, statsFromRows } from './usage-local';
 import { ENGINE_DIRECT_URL } from './engine-endpoint';
 import { engineFetch } from './engine-http';
+import { normalizeEngineEvent } from './engine-events';
 
 const ENGINE_URL = ENGINE_DIRECT_URL;
 
@@ -121,8 +123,9 @@ async function pumpSSE(body: ReadableStream<Uint8Array>): Promise<void> {
       if (!dataStr) continue; // keepalive 注释行 / 纯 id 行
       try {
         const data = JSON.parse(dataStr);
-        // 引擎 SSE 的事件类型在 event: 行（data 内无 type），合并后发射
-        const merged = { ...data, type: data.type ?? evType };
+        // 引擎 SSE 的事件类型在 event: 行（data 内无 type），合并后发射；
+        // 键名先归一成渲染层契约（引擎侧 step_id/plan_id 是 snake_case）
+        const merged = normalizeEngineEvent({ ...data, type: data.type ?? evType });
         if (merged.type) emit(merged as ChatEvent);
       } catch {
         // 解析失败忽略，不阻断流
@@ -250,6 +253,31 @@ const jsonPost = (body: unknown): RequestInit => ({
   body: JSON.stringify(body ?? {}),
 });
 
+/**
+ * 浏览器直连的引擎仍以 MEMORY.md 为事实来源，只回四字段。
+ * 补成与桌面记忆库同形的条目：文件里的条目都是全局的，类型按来源推断。
+ */
+function normalizeEngineMemory(raw: unknown): MemoryEntry {
+  const row = (raw ?? {}) as Record<string, unknown>;
+  const source = row.source === 'auto' || row.source === 'reflection' ? row.source : 'manual';
+  const createdAt = String(row.createdAt ?? '');
+  return {
+    id: String(row.id ?? ''),
+    content: String(row.content ?? ''),
+    source,
+    createdAt,
+    scope: 'global',
+    workspaceId: '',
+    kind: source === 'auto' ? 'task' : 'fact',
+    taskId: null,
+    taskTitle: null,
+    updatedAt: String(row.updatedAt ?? createdAt),
+    lastUsedAt: null,
+    useCount: 0,
+    occurrences: 1,
+  };
+}
+
 async function handleEngineAwarenessChannel(channel: string, args: unknown[]): Promise<unknown> {
   switch (channel) {
     case 'awareness:get':
@@ -257,18 +285,32 @@ async function handleEngineAwarenessChannel(channel: string, args: unknown[]): P
     case 'awareness:update':
       return callAwareness<AwarenessView>('/api/awareness', jsonPost(args[0]));
     case 'awareness:memories': {
-      const data = await callAwareness<{ entries?: MemoryEntry[] }>('/api/awareness/memories');
-      return data.entries ?? [];
+      const data = await callAwareness<{ entries?: unknown[] }>('/api/awareness/memories');
+      return (data.entries ?? []).map(normalizeEngineMemory);
     }
     case 'awareness:memoryAdd': {
-      const data = await callAwareness<{ entry?: MemoryEntry }>(
+      const data = await callAwareness<{ entry?: unknown }>(
         '/api/awareness/memories',
         jsonPost(args[0]),
       );
-      return data.entry;
+      return data.entry ? normalizeEngineMemory(data.entry) : null;
     }
     case 'awareness:memoryDelete':
       return callAwareness('/api/awareness/memories/delete', jsonPost(args[0]));
+    // 复核 / 实体页 / 导出导入依赖桌面库（Rust 独有存储）。浏览器直连没有这个库，
+    // 必须显式拒绝：假成功会让用户以为记忆已归档或已备份。
+    case 'awareness:memoryReview':
+    case 'awareness:memoryEntities':
+    case 'awareness:memoryExport':
+    case 'awareness:memoryImport':
+    case 'awareness:memoryCompact':
+    case 'awareness:memoryDocSync':
+    case 'awareness:memoryExportPackage':
+    case 'awareness:memoryImportPackage':
+      throw new Error(
+        'MEMORY_DESKTOP_ONLY: 长期记忆库的复核、实体页与导入导出只在桌面版可用' +
+          '（浏览器直连没有桌面数据库，不提供假成功）',
+      );
     default:
       throw new Error(
         `IPC_CHANNEL_UNHANDLED: 引擎直连通道未实现 ${channel}（已阻止静默返回空结果）`,
@@ -314,6 +356,15 @@ async function handleEngineImChannel(channel: string, args: unknown[]): Promise<
       return callIm(`/api/im/${kind}/stop`, jsonPost({}));
     case 'im:forget':
       return callIm(`/api/im/${kind}/forget`, jsonPost({}));
+    case 'im:loginStart':
+      return callIm(`/api/im/${kind}/login/start`, jsonPost({}));
+    case 'im:loginPoll': {
+      const login = (args[0] ?? {}) as { ticket?: string; verifyCode?: string };
+      return callIm(
+        `/api/im/${kind}/login/poll`,
+        jsonPost({ ticket: login.ticket ?? '', verifyCode: login.verifyCode ?? '' }),
+      );
+    }
     case 'im:send':
       return callIm(
         `/api/im/${kind}/send`,
@@ -391,6 +442,8 @@ export const engineAPI = {
     /** 负责人专家：浏览器直连没有专家注册表，引擎会明确拒绝而不是静默降级 */
     expertId?: string;
     workDir?: string;
+    /** 文件访问档位（引擎按它决定能写到哪、能不能删；缺省由引擎归一到最保守档） */
+    filePermission?: FilePermissionMode;
     history?: Array<{ role: 'user' | 'assistant'; content: string }>;
     secureEnv?: boolean;
     // 浏览器直连没有 Rust 侧 runtime 装配，脱敏档位只能随请求下发
@@ -412,6 +465,7 @@ export const engineAPI = {
       modelId: req.modelId,
       expertId: req.expertId,
       workDir: req.workDir,
+      filePermission: req.filePermission,
       history: req.history,
       secureEnv: req.secureEnv,
       piiOutboundMode: req.piiOutboundMode,
@@ -517,6 +571,9 @@ export const engineAPI = {
     // 项目协作：需要桌面端的系统凭据库与持 Authorization 的本机客户端，浏览器通道如实拒绝
     const collab = handleLocalCollabChannel(channel);
     if (collab.handled) return collab.value;
+    // Super-agent 主动候选：账本与巡检都在桌面主进程本机，浏览器通道不编造第二份候选清单
+    const superagent = handleLocalSuperagentChannel(channel);
+    if (superagent.handled) return superagent.value;
     // 系统权限：引擎侧只有浏览器宿主，清单按当前平台如实给出，去授权拒绝
     const permission = handleLocalPermissionChannel(channel, args);
     if (permission.handled) return permission.value;

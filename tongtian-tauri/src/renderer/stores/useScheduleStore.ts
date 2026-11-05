@@ -14,18 +14,20 @@ import { create } from 'zustand';
 import { IPC_CHANNELS } from '../../shared/contracts';
 import type {
   KeepAwakeStatus,
-  ScheduleCreateReq,
-  ScheduleParseResult,
   ScheduleRun,
-  ScheduledTask,
-  ScheduleUpdateReq,
 } from '../../shared/contracts';
+import type {
+  ScheduleCreateReqExtended,
+  ScheduleParseResultExtended,
+  ScheduleUpdateReqExtended,
+  ScheduledTaskExtended,
+} from '../../shared/contracts_connect';
 import { errorTextOf } from '../../shared/error-messages';
 import { setSettings, getSettings } from '../lib/alignment-api';
 import { extractRunRows, extractScheduleRows } from '../lib/schedule-local';
 
 interface ScheduleState {
-  tasks: ScheduledTask[];
+  tasks: ScheduledTaskExtended[];
   runs: ScheduleRun[];
   keepAwake: KeepAwakeStatus | null;
   tasksLoading: boolean;
@@ -35,9 +37,9 @@ interface ScheduleState {
   loadTasks: () => Promise<void>;
   loadRuns: (scheduleId?: string) => Promise<void>;
   /** 一句话解析（本地规则；失败时抛带错误码的异常） */
-  parse: (text: string) => Promise<ScheduleParseResult>;
-  create: (req: ScheduleCreateReq) => Promise<ScheduledTask>;
-  update: (req: ScheduleUpdateReq) => Promise<ScheduledTask>;
+  parse: (text: string) => Promise<ScheduleParseResultExtended>;
+  create: (req: ScheduleCreateReqExtended) => Promise<ScheduledTaskExtended>;
+  update: (req: ScheduleUpdateReqExtended) => Promise<ScheduledTaskExtended>;
   toggle: (scheduleId: string, enabled: boolean) => Promise<void>;
   remove: (scheduleId: string) => Promise<void>;
   runNow: (scheduleId: string) => Promise<void>;
@@ -86,19 +88,25 @@ export const useScheduleStore = create<ScheduleState>((set) => ({
     const result = (await getAPI().invoke(
       IPC_CHANNELS.SCHEDULE_PARSE,
       text,
-    )) as ScheduleParseResult;
+    )) as ScheduleParseResultExtended;
     return result;
   },
 
   create: async (req) => {
-    const task = (await getAPI().invoke(IPC_CHANNELS.SCHEDULE_CREATE, req)) as ScheduledTask;
+    const task = (await getAPI().invoke(
+      IPC_CHANNELS.SCHEDULE_CREATE,
+      req,
+    )) as ScheduledTaskExtended;
     await useScheduleStore.getState().loadTasks();
     return task;
   },
 
   /** 编辑任务：缺省字段沿用原配置，启用中的任务由后端按当前时刻重算下次执行时间 */
   update: async (req) => {
-    const task = (await getAPI().invoke(IPC_CHANNELS.SCHEDULE_UPDATE, req)) as ScheduledTask;
+    const task = (await getAPI().invoke(
+      IPC_CHANNELS.SCHEDULE_UPDATE,
+      req,
+    )) as ScheduledTaskExtended;
     await useScheduleStore.getState().loadTasks();
     return task;
   },

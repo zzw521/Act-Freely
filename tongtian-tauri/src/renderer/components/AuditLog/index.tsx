@@ -150,13 +150,15 @@ const AuditLog: React.FC<AuditLogProps> = ({
       schedule_run: '⏰ 定时执行',
       hook_run: '🪝 Hook 执行',
       market_install: '📦 市场安装',
+      market_upgrade: '📦 市场升级',
+      market_revoke: '⛔ 市场撤销',
       compliance_check: '🧭 合规校验',
       data_check: '🔍 数据分级',
       terminal_session: '⌨️ 终端会话',
       terminal_input: '⌨️ 终端输入',
       terminal_ai: '⌨️ 终端建议',
       acp_config: '🔌 ACP 配置',
-      remote_session: '🖥️ 远程桌面',
+      remote_session: '🖥️ 本机画面',
     };
     return labels[action] || action;
   };
@@ -323,6 +325,7 @@ const AuditLog: React.FC<AuditLogProps> = ({
           <Tooltip title="刷新日志">
             <span>
               <IconButton
+                aria-label="刷新审计日志"
                 onClick={() => void onRefresh?.()}
                 disabled={!onRefresh || isLoading}
               >
@@ -392,7 +395,7 @@ const AuditLog: React.FC<AuditLogProps> = ({
                   </TableCell>
                   <TableCell align="center">
                     <Tooltip title="查看详情">
-                      <IconButton size="small">
+                      <IconButton size="small" aria-label={`查看第 ${idx + 1} 行日志详情`}>
                         <VisibilityIcon fontSize="small" />
                       </IconButton>
                     </Tooltip>

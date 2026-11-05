@@ -1,0 +1,7 @@
+来源仓库：coreyhaines31/marketingskills（MIT License，见随包 LICENSE.txt）
+上游路径：skills/ab-testing/SKILL.md（含同目录 references/ 等配套文件）
+上游提交：88c79f6528a9347420e57ceb1fff9a60de651768
+条目页：https://skills.sh/coreyhaines31/marketingskills/ab-testing
+获取时间：2026-11-02
+说明：本目录是通天办公市场演示数据，整目录镜像上游、未作改写；
+      市场卡片上的中文摘要与分类由服务端发布参数提供，不属于上游内容。

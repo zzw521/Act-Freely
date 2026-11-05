@@ -40,6 +40,8 @@ const META_FILE: &str = "meta.json";
 const TRASH_DIR: &str = ".trash";
 /// 引擎落索引的位置（Rust 不读，只在界面提示时使用）
 const INDEX_FILE: &str = ".index.sqlite";
+/// 归属：所有工作区共享；`workspace:<id>` 只在该工作区的执行面可见
+const SCOPE_GLOBAL: &str = "global";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -48,6 +50,8 @@ pub struct Meta {
     pub name: String,
     pub description: String,
     pub enabled: bool,
+    /// 归属：`global`=所有项目共享；`workspace:<id>`=仅该项目（缺省 global，与老数据一致）
+    pub scope: String,
     pub created_at: i64,
     pub updated_at: i64,
     /// 软删除时间；有值即不再出现在列表与执行面
@@ -61,6 +65,7 @@ impl Default for Meta {
             name: String::new(),
             description: String::new(),
             enabled: true,
+            scope: SCOPE_GLOBAL.to_string(),
             created_at: 0,
             updated_at: 0,
             deleted_at: None,
@@ -84,6 +89,8 @@ pub struct View {
     pub name: String,
     pub description: String,
     pub enabled: bool,
+    /// 归属（`global` / `workspace:<id>`），界面据此显示「共享 / 仅当前项目」
+    pub scope: String,
     pub created_at: String,
     pub updated_at: String,
     pub dir: String,
@@ -240,6 +247,11 @@ fn view_of(dir: &Path) -> Result<View, String> {
         name: meta.name,
         description: meta.description,
         enabled: meta.enabled,
+        scope: if meta.scope.trim().is_empty() {
+            SCOPE_GLOBAL.to_string()
+        } else {
+            meta.scope
+        },
         created_at: iso8601_utc(meta.created_at),
         updated_at: iso8601_utc(meta.updated_at),
         dir: dir.to_string_lossy().to_string(),
@@ -277,9 +289,35 @@ fn list_in(root: &Path) -> Result<Vec<View>, String> {
     Ok(out)
 }
 
-fn create_in(root: &Path, name: &str, description: &str) -> Result<View, String> {
+/// 归属校验：只接受 global 或 workspace:<工作区 id>，工作区 id 规则与 workspace 模块一致
+fn normalize_scope(raw: Option<&str>) -> Result<String, String> {
+    let scope = raw.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(SCOPE_GLOBAL);
+    if scope == SCOPE_GLOBAL {
+        return Ok(SCOPE_GLOBAL.to_string());
+    }
+    let ws = scope.strip_prefix("workspace:").unwrap_or("");
+    if ws.is_empty()
+        || ws.len() > 64
+        || !ws
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        return Err(
+            "KNOWLEDGE_INVALID_SCOPE: 归属只能是 global 或 workspace:<工作区 id>".to_string(),
+        );
+    }
+    Ok(scope.to_string())
+}
+
+fn create_in(
+    root: &Path,
+    name: &str,
+    description: &str,
+    scope: Option<&str>,
+) -> Result<View, String> {
     let name = validate_name(name)?;
     let description = validate_desc(description)?;
+    let scope = normalize_scope(scope)?;
     let existing = list_in(root)?;
     if existing
         .iter()
@@ -304,6 +342,7 @@ fn create_in(root: &Path, name: &str, description: &str) -> Result<View, String>
             name,
             description,
             enabled: true,
+            scope,
             created_at: ts,
             updated_at: ts,
             deleted_at: None,
@@ -318,6 +357,7 @@ fn update_in(
     name: Option<&str>,
     description: Option<&str>,
     enabled: Option<bool>,
+    scope: Option<&str>,
 ) -> Result<View, String> {
     let dir = base_dir(root, id)?;
     let mut meta = read_meta(&dir)?;
@@ -332,6 +372,9 @@ fn update_in(
     }
     if let Some(enabled) = enabled {
         meta.enabled = enabled;
+    }
+    if let Some(scope) = scope {
+        meta.scope = normalize_scope(Some(scope))?;
     }
     meta.updated_at = now_ms();
     write_meta(&dir, &meta)?;
@@ -513,14 +556,22 @@ fn remove_doc_in(root: &Path, id: &str, doc: &str) -> Result<View, String> {
 }
 
 /// 执行面输入：启用且有正文的知识库（路径 + 名称 + 文档数）
-pub fn runtime_bases(root: &Path) -> Value {
+///
+/// 只下发「global + 当前工作区私有」两档；其他项目的私有库不进入本项目的检索面。
+pub fn runtime_bases(root: &Path, workspace_id: &str) -> Value {
     let views = match list_in(root) {
         Ok(v) => v,
         Err(e) => return json!({ "bases": [], "error": e }),
     };
+    let own = if workspace_id.trim().is_empty() {
+        String::new()
+    } else {
+        format!("workspace:{}", workspace_id.trim())
+    };
     let bases: Vec<Value> = views
         .into_iter()
         .filter(|v| v.enabled)
+        .filter(|v| v.scope == SCOPE_GLOBAL || (!own.is_empty() && v.scope == own))
         .map(|v| {
             json!({
                 "id": v.id,
@@ -543,8 +594,17 @@ pub async fn knowledge_list() -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn knowledge_create(name: String, description: Option<String>) -> Result<Value, String> {
-    let v = create_in(&root(), &name, description.as_deref().unwrap_or(""))?;
+pub async fn knowledge_create(
+    name: String,
+    description: Option<String>,
+    scope: Option<String>,
+) -> Result<Value, String> {
+    let v = create_in(
+        &root(),
+        &name,
+        description.as_deref().unwrap_or(""),
+        scope.as_deref(),
+    )?;
     Ok(serde_json::to_value(v)
         .map_err(|e| format!("KNOWLEDGE_SAVE_FAILED: 序列化失败：{e}"))?)
 }
@@ -555,6 +615,7 @@ pub async fn knowledge_update(
     name: Option<String>,
     description: Option<String>,
     enabled: Option<bool>,
+    scope: Option<String>,
 ) -> Result<Value, String> {
     let v = update_in(
         &root(),
@@ -562,6 +623,7 @@ pub async fn knowledge_update(
         name.as_deref(),
         description.as_deref(),
         enabled,
+        scope.as_deref(),
     )?;
     Ok(serde_json::to_value(v)
         .map_err(|e| format!("KNOWLEDGE_SAVE_FAILED: 序列化失败：{e}"))?)
@@ -617,7 +679,7 @@ mod tests {
     #[test]
     fn create_list_update_and_soft_delete() {
         let root = temp_root("crud");
-        let v = create_in(&root, "产品手册", "售后与定价").unwrap();
+        let v = create_in(&root, "产品手册", "售后与定价", None).unwrap();
         assert!(v.id.starts_with("kb-"), "{}", v.id);
         assert_eq!(v.enabled, true);
         assert!(PathBuf::from(&v.dir).join("docs").is_dir());
@@ -626,7 +688,7 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "产品手册");
 
-        let updated = update_in(&root, &v.id, Some("产品资料"), None, Some(false)).unwrap();
+        let updated = update_in(&root, &v.id, Some("产品资料"), None, Some(false), None).unwrap();
         assert_eq!(updated.name, "产品资料");
         assert_eq!(updated.enabled, false);
 
@@ -640,8 +702,8 @@ mod tests {
     #[test]
     fn duplicate_name_is_rejected() {
         let root = temp_root("dup");
-        create_in(&root, "制度", "").unwrap();
-        let err = create_in(&root, " 制度 ", "").unwrap_err();
+        create_in(&root, "制度", "", None).unwrap();
+        let err = create_in(&root, " 制度 ", "", None).unwrap_err();
         assert!(err.starts_with("KNOWLEDGE_EXISTS"), "{err}");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -649,7 +711,7 @@ mod tests {
     #[test]
     fn add_text_docs_extracts_and_indexes_sidecar() {
         let root = temp_root("add");
-        let v = create_in(&root, "差旅制度", "").unwrap();
+        let v = create_in(&root, "差旅制度", "", None).unwrap();
         let src = root.join("差旅报销标准.md");
         std::fs::write(&src, "# 差旅\n\n住宿标准：一线城市 600 元/晚。").unwrap();
         let r = add_docs_in(&root, &v.id, &[src.to_string_lossy().to_string()]).unwrap();
@@ -665,7 +727,7 @@ mod tests {
     #[test]
     fn duplicate_and_unsupported_docs_report_per_file_errors_without_half_writes() {
         let root = temp_root("partial");
-        let v = create_in(&root, "资料", "").unwrap();
+        let v = create_in(&root, "资料", "", None).unwrap();
         let a = root.join("a.md");
         std::fs::write(&a, "正文 A").unwrap();
         let b = root.join("b.bin");
@@ -691,7 +753,7 @@ mod tests {
     #[test]
     fn remove_doc_moves_to_trash_and_drops_index() {
         let root = temp_root("remove");
-        let v = create_in(&root, "资料", "").unwrap();
+        let v = create_in(&root, "资料", "", None).unwrap();
         let a = root.join("a.md");
         std::fs::write(&a, "正文 A").unwrap();
         add_docs_in(&root, &v.id, &[a.to_string_lossy().to_string()]).unwrap();
@@ -713,7 +775,7 @@ mod tests {
     #[test]
     fn path_traversal_doc_name_is_reduced_to_file_name() {
         let root = temp_root("traversal");
-        let v = create_in(&root, "资料", "").unwrap();
+        let v = create_in(&root, "资料", "", None).unwrap();
         let nested = root.join("sub");
         std::fs::create_dir_all(&nested).unwrap();
         let file = nested.join("note.md");
@@ -727,10 +789,10 @@ mod tests {
     #[test]
     fn runtime_bases_only_include_enabled_live_bases() {
         let root = temp_root("runtime");
-        let a = create_in(&root, "A", "描述 A").unwrap();
-        let b = create_in(&root, "B", "").unwrap();
-        update_in(&root, &b.id, None, None, Some(false)).unwrap();
-        let block = runtime_bases(&root);
+        let a = create_in(&root, "A", "描述 A", None).unwrap();
+        let b = create_in(&root, "B", "", None).unwrap();
+        update_in(&root, &b.id, None, None, Some(false), None).unwrap();
+        let block = runtime_bases(&root, "default");
         let bases = block["bases"].as_array().unwrap();
         assert_eq!(bases.len(), 1, "{block}");
         assert_eq!(bases[0]["id"], a.id);
@@ -740,10 +802,57 @@ mod tests {
     }
 
     #[test]
+    fn runtime_bases_respect_workspace_scope() {
+        let root = temp_root("scope");
+        let shared = create_in(&root, "共享手册", "", None).unwrap();
+        let own = create_in(&root, "项目 A 资料", "", Some("workspace:ws-a")).unwrap();
+        let other = create_in(&root, "项目 B 资料", "", Some("workspace:ws-b")).unwrap();
+        assert_eq!(shared.scope, "global");
+
+        // 项目 A 只看到共享库 + 自己的私有库
+        let block = runtime_bases(&root, "ws-a");
+        let ids: Vec<&str> = block["bases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&shared.id.as_str()), "{block}");
+        assert!(ids.contains(&own.id.as_str()), "{block}");
+        assert!(!ids.contains(&other.id.as_str()), "{block}");
+
+        // 改归属后立即生效；老库未写 scope 时按 global 处理
+        update_in(&root, &other.id, None, None, None, Some("workspace:ws-a")).unwrap();
+        let ids: Vec<String> = runtime_bases(&root, "ws-a")["bases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["id"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert!(ids.contains(&other.id));
+        assert!(runtime_bases(&root, "ws-b")["bases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["id"].as_str() != Some(other.id.as_str())));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn invalid_scope_is_rejected() {
+        let root = temp_root("bad-scope");
+        for bad in ["everyone", "workspace:", "workspace:WS-A", "workspace:a/b"] {
+            let err = create_in(&root, "X", "", Some(bad)).unwrap_err();
+            assert!(err.starts_with("KNOWLEDGE_INVALID_SCOPE"), "{bad}: {err}");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn invalid_ids_and_names_are_rejected() {
         let root = temp_root("invalid");
-        assert!(create_in(&root, "  ", "").unwrap_err().starts_with("KNOWLEDGE_INVALID_NAME"));
-        assert!(create_in(&root, "a/b", "").unwrap_err().starts_with("KNOWLEDGE_INVALID_NAME"));
+        assert!(create_in(&root, "  ", "", None).unwrap_err().starts_with("KNOWLEDGE_INVALID_NAME"));
+        assert!(create_in(&root, "a/b", "", None).unwrap_err().starts_with("KNOWLEDGE_INVALID_NAME"));
         assert!(base_dir(&root, "../x").is_err());
         assert_eq!(safe_doc_name("../../etc/passwd").unwrap(), "passwd");
         std::fs::remove_dir_all(&root).ok();

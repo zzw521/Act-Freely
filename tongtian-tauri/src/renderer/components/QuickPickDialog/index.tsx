@@ -69,6 +69,7 @@ const QuickPickDialog: React.FC = () => {
     <Dialog
       open={open}
       onClose={close}
+      aria-labelledby="tt-quick-pick-title"
       fullWidth
       maxWidth="sm"
       PaperProps={{
@@ -89,13 +90,13 @@ const QuickPickDialog: React.FC = () => {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            background: 'linear-gradient(135deg, #6366F1, #22D3EE)',
+            background: 'linear-gradient(135deg, #4338CA, #0E7490)',
             flexShrink: 0,
           }}
         >
           <BoltIcon sx={{ fontSize: 16, color: '#fff' }} />
         </Box>
-        <Typography sx={{ fontSize: '13px', fontWeight: 700, color: 'var(--tt-text-1)', flexGrow: 1 }}>
+        <Typography id="tt-quick-pick-title" sx={{ fontSize: '13px', fontWeight: 700, color: 'var(--tt-text-1)', flexGrow: 1 }}>
           {tr('快速任务')}
         </Typography>
         <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
@@ -111,7 +112,7 @@ const QuickPickDialog: React.FC = () => {
             bgcolor: 'var(--tt-surface-2)',
             px: 1.5,
             py: 1.25,
-            '&:focus-within': { borderColor: '#6366F1' },
+            '&:focus-within': { borderColor: 'var(--tt-accent)' },
           }}
         >
           <InputBase
@@ -152,7 +153,7 @@ const QuickPickDialog: React.FC = () => {
               fontSize: '12.5px',
               fontWeight: 600,
               fontFamily: 'inherit',
-              background: 'linear-gradient(135deg, #4F46E5, #06B6D4)',
+              background: 'linear-gradient(135deg, #4338CA, #155E75)',
             }}
           >
             {submitting ? <CircularProgress size={12} sx={{ color: '#fff' }} /> : null}

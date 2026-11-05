@@ -5,8 +5,8 @@ IM 频道自测 —— 企业微信智能机器人长连接（官方 aibot SDK �
 分三段，A/B 全部打真实网络（对端是本机起的假企业微信，不是 Mock 返回值）：
 
 A. HTTP 契约面：企业微信在 /api/im/channels 里从「尚未接入」变成 supported=True 且带两项凭据
-   字段（BotID + 长连接 Secret，不是回调地址模式的 Token）；未接入的微信仍如实
-   IM_UNSUPPORTED；凭据缺失/带空格/被拒各报各的码，格式没过时一条帧都不发出去。
+   字段（BotID + 长连接 Secret，不是回调地址模式的 Token）；六个通道全部 supported；
+   凭据缺失/带空格/被拒各报各的码，格式没过时一条帧都不发出去。
 B. 长连接全链路：假网关只做官方那几件事（认订阅帧、回 errcode、推回调、回贴要在同一条
    socket 上等回执、新连接顶掉旧连接），验证「连固定地址 → 带内订阅 → 收消息 → 透传
    req_id 回贴 → 等 errcode → 应用层心跳 → 被顶掉后不再重连」，并检查重复 msgid、
@@ -120,8 +120,8 @@ def phase_ab(client_fake: FakeWeCom) -> None:
         channels = {c["kind"]: c for c in body["channels"]}
         supported = [c["kind"] for c in body["channels"] if c["supported"]]
         check(
-            "清单仍是五个通道",
-            {"slack", "dingtalk", "feishu", "wecom", "wechat"} == set(channels),
+            "清单仍是六个通道",
+            {"slack", "dingtalk", "feishu", "wecom", "wechat", "yuanbao"} == set(channels),
             str(sorted(channels)),
         )
         check("已接入的通道全部排在未接入之前", list(channels)[: len(supported)] == supported, str(list(channels)))
@@ -140,12 +140,12 @@ def phase_ab(client_fake: FakeWeCom) -> None:
             "只允许一条有效长连接" in wc["setupNote"],
             wc["setupNote"][:200],
         )
-        # 飞书已接入（第三个官方 SDK 通道），清单里只剩微信还是「尚未接入」
-        wx = channels["wechat"]
         check(
-            "微信仍未接入且有可读原因",
-            wx["supported"] is False and wx["unsupportedReason"] and not wx["fields"],
-            str(wx)[:160],
+            "个人微信与腾讯元宝都已接入，清单里没有「尚未接入」的通道",
+            channels["wechat"]["supported"] is True
+            and channels["yuanbao"]["supported"] is True
+            and all(c["supported"] for c in channels.values()),
+            str(sorted((k, v["supported"]) for k, v in channels.items())),
         )
         check(
             "飞书已接入且首次连接要加载 SDK 这件事写在指引里",
@@ -153,8 +153,6 @@ def phase_ab(client_fake: FakeWeCom) -> None:
             str(channels["feishu"])[:200],
         )
 
-        neg = client.post("/api/im/wechat/config", json={"credentials": {"botId": "x"}}).json()
-        check("未接入通道拒绝写凭据（IM_UNSUPPORTED）", neg.get("code") == "IM_UNSUPPORTED", str(neg)[:160])
         start = client.post("/api/im/wecom/start").json()
         check("未配置就启动报 IM_NOT_CONFIGURED", start.get("code") == "IM_NOT_CONFIGURED", str(start)[:160])
         unknown = client.post("/api/im/qq/start").json()

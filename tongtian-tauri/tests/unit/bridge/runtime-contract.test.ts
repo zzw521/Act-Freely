@@ -30,8 +30,9 @@ describe('装配端：Rust 把磁盘事实打包成 runtime + attachments', () =
   it('提交时真的装配并塞进请求体（不是只存库）', () => {
     const agent = rustAgent();
     expect(rustBridgeMod()).toContain('pub mod runtime;');
-    // 组装 runtime 时必须带上本次目标 workspace：沙箱策略与文件边界按 workspace 取
-    expect(agent).toContain('super::runtime::build(store.as_deref(), &ws, &raw)');
+    // 组装 runtime 时必须带上本次目标 workspace：沙箱策略与文件边界按 workspace 取；
+    // 本轮目标一并传入，长期记忆据此检索（不是把整库塞给引擎）
+    expect(agent).toContain('super::runtime::build_for_task(store.as_deref(), &ws, &raw, &query)');
     expect(agent).toContain('map.insert("runtime".into(), rt.clone());');
     expect(agent).toContain('overrides.runtime = Some(bundle.runtime);');
     expect(agent).toContain('stream_chat(app, task_id, goal, port, bundle.attachments, overrides, p0)');
@@ -54,14 +55,16 @@ describe('装配端：Rust 把磁盘事实打包成 runtime + attachments', () =
 
   it('套件指令正文进入 runtime.skills，与技能同路消费', () => {
     const src = rustRuntime();
-    expect(src).toContain('suite::runtime_commands(skills_base)');
+    // 套件侧同样吃「用户停用 + 市场撤销」合并后的清单：撤销不靠用户开关
+    expect(src).toContain('suite::runtime_commands(skills_base, &suite_disabled)');
+    expect(src).toContain('ids.extend(blocked_suites.iter().cloned());');
     expect(src).toContain('"suiteNotes": suite_notes');
     expect(src).toContain('"kind": "skill"');
     // 已安装技能优先：同名套件指令跳过并留说明
     expect(src).toContain('本轮以已安装技能为准');
 
     const suite = rustSuite();
-    expect(suite).toContain('pub fn runtime_commands(base: &Path) -> RuntimeCommands');
+    expect(suite).toContain('pub fn runtime_commands(base: &Path, disabled: &[String]) -> RuntimeCommands');
     expect(suite).toContain('"kind": "command"');
     expect(suite).toContain('&["content", "prompt", "body", "instructions"]');
     expect(suite).toContain('format!("commands/{segment}.md")');
@@ -221,7 +224,10 @@ describe('MCP 连接器：配置事实 → 引擎工具面', () => {
 describe('渲染层：附件对象字段名与 Rust 取值对齐', () => {
   it('fileName 与 stagedPath 是跨端约定字段', () => {
     expect(sharedTypes()).toContain('stagedPath: string;');
-    expect(chatInput()).toContain('{ fileName: att.fileName, stagedPath: att.srcPath');
+    // 暂存必须走真实通道：浏览器读内容上传、桌面逐个暂存；不再用 srcPath 伪造 stagedPath
+    expect(chatInput()).toContain('meta = await chatAPI.fileUpload({');
+    expect(chatInput()).toContain('meta = await apiObj.fileStageAttachment(');
+    expect(chatInput()).not.toContain('stagedPath: att.srcPath');
     const src = rustRuntime();
     expect(src).toContain('.get("fileName")');
     expect(src).toContain('att.get("stagedPath")');

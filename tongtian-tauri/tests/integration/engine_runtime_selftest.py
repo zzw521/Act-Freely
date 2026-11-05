@@ -4,7 +4,7 @@
 
 锁住「用户装了什么 → 模型实际收到什么」这条链，防止再退回「只落库不生效」：
 1. 意识四文件进 system prompt；开关关闭 / 目录读取失败时不注入，并留下可见说明
-2. 启用技能进技能清单，use_skill 工具随启停出现（内置三件套清单不受影响）
+2. 启用技能进技能清单，use_skill 工具随启停出现（内置文件工具清单不受影响）
 3. /api/chat 的 runtime + attachments 真的进入模型消息（用假模型捕获实收内容）
 4. 附件抽取失败、图片只暂存 → 以步骤事件摊出来，不静默少给
 5. 两阶段协议 approve 重跑沿用同一份 runtime / attachments（会话态）
@@ -172,6 +172,51 @@ def pure_checks() -> None:
     check("只有无关记忆时不留下空的记忆段",
           "## 用户意识" not in empty_memory and empty_notes == [], empty_memory[-120:])
 
+    # 桌面记忆库：条目由 Rust 检索下发；文件里结构化行不再重复注入，手写正文保留
+    store_rt = {
+        "awareness": {"mode": True, "files": {
+            "MEMORY.md": (
+                "# 长期记忆\n\n我自己的约定：周五清收件箱\n"
+                "- m-file · manual · 2026-10-01T00:00:00Z · 这条已入库不应重复\n"
+            )
+        }},
+        "memory": {
+            "store": "desktop",
+            "workspaceId": "ws-a",
+            "entries": [{
+                "id": "mem-store-1",
+                "content": "周报模板采用三段式结构",
+                "kind": "task",
+                "source": "auto",
+                "updatedAt": "2026-10-02T00:00:00Z",
+            }],
+            "total": 1,
+        },
+    }
+    store_prompt, store_notes = rc.compose_system_prompt("BASE", store_rt, query="帮我写周报")
+    check("桌面记忆库条目进入 prompt",
+          "周报模板采用三段式结构" in store_prompt and "[记忆:mem-store-1]" in store_prompt,
+          store_prompt[-300:])
+    check("桌面记忆库标注来源与总数", "来自桌面记忆库" in store_prompt and "共 1 条" in store_prompt)
+    check("桌面模式下不重复注入文件里的结构化行", "这条已入库不应重复" not in store_prompt)
+    check("桌面模式下保留 MEMORY.md 手写正文", "周五清收件箱" in store_prompt)
+    check("桌面记忆库正常装配无说明", store_notes == [], str(store_notes))
+
+    empty_store_prompt, _ = rc.compose_system_prompt(
+        "BASE",
+        {"awareness": {"mode": True, "files": {}},
+         "memory": {"store": "desktop", "entries": [], "total": 0}},
+        query="随便聊聊",
+    )
+    check("记忆库没有条目时不塞空段落", "桌面记忆库" not in empty_store_prompt)
+
+    store_err_notes = rc.context_notes(
+        {"awareness": {"mode": True, "files": {}},
+         "memory": {"store": "desktop", "entries": [], "total": 0, "error": "MEMORY_LIST_FAILED: x"}}
+    )
+    check("记忆库读取失败 → 说明带原因",
+          any("MEMORY_LIST_FAILED" in n for n in store_err_notes), str(store_err_notes))
+
     prompt_off, notes_off = rc.compose_system_prompt("BASE", runtime_bundle(with_awareness=False))
     check("意识开关关闭 → 不注入", SOUL_MARK not in prompt_off and "用户意识" not in prompt_off)
     check("意识开关关闭 → 说明可见", any("意识开关已关闭" in n for n in notes_off), str(notes_off))
@@ -298,9 +343,20 @@ def toolkit_checks() -> None:
     engine_server.WORK_DIR = work_dir
     try:
         plain = engine_server.build_agent(None, work_dir, None, runtime={"skills": []})
-        check("没有启用技能时只有三个内置文件工具",
-              sorted(plain.toolkit.tools.keys()) == ["insert_text_file", "view_text_file", "write_text_file"],
+        # 内置文件面此后按产品事实长过：目录列举与文档读取也是无技能的默认能力
+        # 通用模式还带办公写入件（D-33）：用户最常在最普通的对话里直接说「把这个做成 Excel」
+        check("没有启用技能时只有内置文件工具与办公写入件（没有 use_skill 与连接器工具）",
+              sorted(plain.toolkit.tools.keys()) == [
+                  "delete_text_file", "generate_docx", "generate_xlsx", "insert_text_file",
+                  "list_directory", "read_document", "view_text_file", "write_text_file",
+              ],
               str(sorted(plain.toolkit.tools.keys())))
+        # 办公写入件是条件注册：设计模式的画布只认 HTML，多给两个 Office 写入件只会诱导跑偏
+        design_agent = engine_server.build_agent(None, work_dir, None, runtime={"skills": []}, mode="design")
+        check("设计模式不注册办公写入件",
+              "generate_xlsx" not in design_agent.toolkit.tools
+              and "generate_docx" not in design_agent.toolkit.tools,
+              str(sorted(design_agent.toolkit.tools.keys())))
         with_skill = engine_server.build_agent(None, work_dir, None, runtime=runtime_bundle())
         check("启用技能后 use_skill 注册进 Toolkit", "use_skill" in with_skill.toolkit.tools,
               str(sorted(with_skill.toolkit.tools.keys())))
@@ -460,6 +516,28 @@ def memory_checks() -> None:
         check("疑似凭据跳过写入", not ok3 and "凭据" in note3, note3)
         check("凭据没有落盘", "sk-test-123456" not in memory_file.read_text(encoding="utf-8"))
 
+        # 桌面记忆库模式：只产出候选交给 Rust，不碰 MEMORY.md
+        desktop_rt = {
+            "awareness": {"mode": True, "autoMemory": True},
+            "memory": {"store": "desktop", "workspaceId": "ws-a", "entries": [], "total": 0},
+        }
+        cand, cand_note = engine_server._auto_memory_candidate(
+            desktop_rt, "桌面候选专用目标", "已完成", ["/tmp/cand.md"],
+        )
+        check("桌面模式只产出候选且不报原因", cand is not None and cand_note == "", str(cand))
+        check("候选带 kind/source",
+              bool(cand) and cand.get("kind") == "task" and cand.get("source") == "auto", str(cand))
+        check("桌面模式候选不落 MEMORY.md",
+              "桌面候选专用目标" not in memory_file.read_text(encoding="utf-8"))
+        blocked, blocked_note = engine_server._auto_memory_candidate(
+            desktop_rt, "配置 API key：sk-test-999", "已完成", [],
+        )
+        check("桌面模式凭据候选被拦截", blocked is None and "凭据" in blocked_note, blocked_note)
+        off_cand, off_note = engine_server._auto_memory_candidate(
+            {"awareness": {"mode": False, "autoMemory": True}}, "目标", "结论", [],
+        )
+        check("桌面模式尊重意识开关", off_cand is None and "意识模式已关闭" in off_note, off_note)
+
         ok4, note4 = engine_server._auto_memory_after_success(
             {"awareness": {"mode": False, "autoMemory": True}}, "目标", "结论", [],
         )
@@ -516,6 +594,214 @@ def memory_checks() -> None:
         else:
             os.environ["TONGTIANWORK_HOME"] = prev
         shutil.rmtree(home, ignore_errors=True)
+
+
+def memory_tool_checks() -> None:
+    print("--- 3b. 长期记忆工具与规则事实抽取（D-35 二期） ---")
+    try:
+        import memory_tools as mt
+        from agentscope.tool import Toolkit
+    except Exception as exc:  # agentscope 缺失时跳过这一节，不影响前两节结论
+        print(f"SKIP: 记忆工具检查不可用（{exc}）")
+        return
+
+    catalog = [
+        {"id": "mem-a1", "content": "用户负责的集群是 prod-hz", "kind": "fact",
+         "source": "manual", "updatedAt": "2026-10-02T00:00:00Z"},
+        {"id": "mem-b1", "content": "主库选择 PostgreSQL 16", "kind": "decision",
+         "source": "auto", "updatedAt": "2026-10-01T00:00:00Z",
+         "subject": "数据库", "predicate": "选型", "object": "PostgreSQL 16"},
+        {"id": "mem-c1", "content": "周报在每周五 17:00 前提交", "kind": "preference",
+         "source": "auto", "updatedAt": "2026-10-03T00:00:00Z",
+         "taskTitle": "整理季度周报"},
+    ]
+    desktop_rt = {"memory": {"store": "desktop", "tooling": True, "catalog": catalog}}
+    plain_rt = {"awareness": {"mode": True}}
+
+    check("非桌面通道不注册记忆工具",
+          mt.install(Toolkit(), plain_rt, lambda *a: None) is False)
+    check("未开启工具面时不注册记忆工具",
+          mt.install(Toolkit(), {"memory": {"store": "desktop"}}, lambda *a: None) is False)
+
+    tk = Toolkit()
+    emitted: list = []
+    installed = mt.install(tk, desktop_rt, lambda ev, data: emitted.append((ev, data)))
+    check("桌面通道注册三个记忆工具",
+          installed and {"memory_search", "memory_get", "memory_save"} <= set(tk.tools),
+          str(sorted(tk.tools)))
+
+    rows, total = mt.search(desktop_rt, "prod-hz 扩容", 5)
+    check("记忆检索按词面命中", [r["id"] for r in rows] == ["mem-a1"] and total == 3, str(rows))
+    check("无关问题不硬凑记忆", mt.search(desktop_rt, "写一首关于秋天的诗", 5)[0] == [])
+    struct_rows, _ = mt.search(desktop_rt, "数据库", 5)
+    check("结构化事实可被主体词命中", [r["id"] for r in struct_rows] == ["mem-b1"], str(struct_rows))
+    check("空问题按更新时间倒序返回", mt.search(desktop_rt, "", 2)[0][0]["id"] == "mem-c1")
+    check("检索条数受工具上限约束",
+          len(mt.search(desktop_rt, "", 99)[0]) <= mt.MAX_TOOL_LIMIT)
+
+    check("按完整 id 读取", mt.get(desktop_rt, "mem-a1")[0]["content"].endswith("prod-hz"))
+    check("按唯一前缀读取", mt.get(desktop_rt, "mem-c")[0]["id"] == "mem-c1")
+    ambiguous, reason = mt.get(desktop_rt, "mem-")
+    check("前缀歧义时如实要求完整 id", ambiguous is None and "多条" in reason, reason)
+    missing, missing_reason = mt.get(desktop_rt, "mem-zzz")
+    check("读不到时不编造内容", missing is None and "没有" in missing_reason, missing_reason)
+
+    payload, why = mt.save_payload(" 客户要求周报在周五 17:00 前提交 ")
+    check("工具写入压缩空白并带 kind/source/confidence",
+          payload is not None and payload["content"].startswith("客户要求")
+          and payload["kind"] == "fact" and payload["confidence"] == 0.8, str(payload))
+    check("空内容拒绝写入", mt.save_payload("   ")[0] is None)
+    check("超长内容拒绝写入", mt.save_payload("字" * (mt.MAX_SAVE_CHARS + 1))[0] is None)
+    check("疑似凭据拒绝写入", mt.save_payload("接口密钥 token=abcd1234")[0] is None)
+    check("非法 kind 拒绝写入", mt.save_payload("正常内容", kind="diary")[0] is None)
+    check("事实字段超长拒绝写入",
+          mt.save_payload("正常内容", subject="主" * (mt.MAX_SUBJECT_CHARS + 1))[0] is None)
+
+    save = tk.tools["memory_save"].original_func
+    save("客户要求周报在周五 17:00 前提交", "preference", "周报", "提交时间", "周五 17:00 前")
+    check("memory_save 以事件交回桌面端", len(emitted) == 1 and emitted[0][0] == "memory_save",
+          str(emitted))
+    check("写入事件带结构化字段与来源",
+          bool(emitted) and emitted[0][1].get("subject") == "周报"
+          and emitted[0][1].get("tool") == "memory_save", str(emitted))
+    saved_text = save("客户要求周报在周五 17:00 前提交").content[0]["text"]
+    check("未开待审时说明已提交落库", "已提交桌面记忆库" in saved_text, saved_text)
+    review_tk = Toolkit()
+    mt.install(review_tk, {**desktop_rt, "memory": {**desktop_rt["memory"], "review": True}},
+               lambda *a: None)
+    review_text = review_tk.tools["memory_save"].original_func(
+        "客户要求周报在周五 17:00 前提交"
+    ).content[0]["text"]
+    check("开启待审时说明需确认", "待审" in review_text, review_text)
+    blocked_text = save("配置 token=abcd1234").content[0]["text"]
+    check("工具写入同样挡住凭据", "MEMORY_SECRET_BLOCKED" in blocked_text, blocked_text)
+    check("凭据没有变成写入事件", len(emitted) == 2, str(len(emitted)))
+    check("system hint 说明写入前待审",
+          "待审" in mt.system_hint({**desktop_rt, "memory": {**desktop_rt["memory"], "review": True}}))
+
+    # 规则事实抽取：保守句式、主体过滤、置信度分层
+    facts = engine_server._extract_fact_candidates(
+        "数据库选型：主库使用 PostgreSQL 16。"
+        "周报模板采用三段式结构。"
+        "这个方案需要再确认。"
+        "客户偏好是每周五下午开会。"
+        "团队决定统一使用飞书文档。"
+    )
+    triples = [(f["subject"], f["predicate"], f["object"]) for f in facts]
+    check("冒号句式抽出主体/谓词/取值",
+          ("数据库选型", "使用", "PostgreSQL 16") in triples, str(triples))
+    check("普通句式抽出事实", ("周报模板", "采用", "三段式结构") in triples, str(triples))
+    check("指代类主语不臆造事实", all("这个方案" not in s for s, _, _ in triples), str(triples))
+    check("冒号句式置信度高于普通句式",
+          any(f["confidence"] == 0.65 for f in facts)
+          and any(f["confidence"] == 0.55 for f in facts), str(facts))
+    check("偏好类句子归为 preference",
+          any(f["kind"] == "preference" and "每周五" in f["object"] for f in facts), str(facts))
+    check("决定类句子归为 decision",
+          any(f["kind"] == "decision" for f in facts), str(facts))
+    check("抽取条数有上限",
+          len(engine_server._extract_fact_candidates(
+              "".join(f"甲系统采用方案{i}。" for i in range(20))
+          )) == 4)
+    check("代码块与报错行不抽成事实",
+          engine_server._extract_fact_candidates("```bash\nnpm run build\n```") == []
+          and engine_server._extract_fact_candidates("Error: 构建失败是因为缺依赖") == [])
+
+    cands, cand_note = engine_server._auto_memory_candidates(
+        desktop_rt, "整理季度周报",
+        "周报模板采用三段式结构。客户偏好是每周五下午开会。", ["/tmp/report.md"],
+    )
+    check("一轮产出摘要 + 多条事实",
+          len(cands) >= 3 and cands[0]["kind"] == "task"
+          and any(c["kind"] == "preference" for c in cands), str(cands))
+    check("摘要仍压成单行并带产物", "\n" not in cands[0]["content"]
+          and "report.md" in cands[0]["content"], cands[0]["content"] if cands else "")
+    check("事实候选带结构化字段",
+          all({"subject", "predicate", "object", "confidence"} <= set(c) for c in cands[1:]),
+          str(cands))
+    check("全部候选带 source=auto", all(c["source"] == "auto" for c in cands))
+
+    secret_cands, secret_note = engine_server._auto_memory_candidates(
+        desktop_rt, "配置访问",
+        "周报模板采用三段式结构。" + "补充说明" * 50 + "。接口密钥采用 sk-test-123456 开头。",
+        [],
+    )
+    check("含凭据的事实被跳过并如实计数",
+          any(c["kind"] == "task" for c in secret_cands) and "1 条事实" in secret_note,
+          f"{secret_cands} / {secret_note}")
+    check("凭据没有进入候选", all("sk-test" not in c["content"] for c in secret_cands))
+    privacy_cands, privacy_note = engine_server._auto_memory_candidates(
+        desktop_rt, "整理周报", "周报模板采用三段式结构。", [], privacy=True
+    )
+    check("隐私模式不产出候选", privacy_cands == [] and "隐私模式" in privacy_note, privacy_note)
+    off_cands, off_note = engine_server._auto_memory_candidates(
+        {"awareness": {"mode": False, "autoMemory": True}}, "目标", "结论", [],
+    )
+    check("意识关闭时一轮零候选且说明原因", off_cands == [] and "意识模式已关闭" in off_note, off_note)
+
+    # ── 3c. 模型事实抽取（D-35 三期，可选开关） ──
+    print("--- 3c. 模型事实抽取（D-35 三期） ---")
+    rt_base = {
+        "awareness": {"mode": True, "autoMemory": True},
+        "memory": {"store": "desktop", "tooling": True},
+    }
+    rt_model = {
+        "awareness": {"mode": True, "autoMemory": True},
+        "memory": {"store": "desktop", "tooling": True, "modelExtract": True},
+    }
+    check("模型抽取默认关闭",
+          engine_server._model_memory_extract_enabled(rt_base) is False)
+    check("显式开启后才运行模型抽取",
+          engine_server._model_memory_extract_enabled(rt_model) is True)
+    check("隐私模式拒绝模型抽取",
+          engine_server._model_memory_extract_enabled(rt_model, True) is False)
+    check("自动记忆关闭时不跑模型抽取",
+          engine_server._model_memory_extract_enabled({
+              "awareness": {"mode": True, "autoMemory": False},
+              "memory": {"store": "desktop", "modelExtract": True},
+          }) is False)
+
+    parsed = engine_server._parse_model_facts(
+        '```json\n[{"content":"客户偏好每周五下午开会",'
+        '"kind":"preference","subject":"客户","predicate":"会议时间",'
+        '"object":"每周五下午","confidence":1.7}]\n```'
+    )
+    check("模型返回可带代码块并解析",
+          len(parsed) == 1 and parsed[0]["kind"] == "preference", str(parsed))
+    check("模型置信度被夹到 0–1", parsed[0]["confidence"] == 1.0, str(parsed))
+    check("模型候选带结构化字段与 source=auto",
+          {"subject", "predicate", "object", "source"} <= set(parsed[0])
+          and parsed[0]["source"] == "auto", str(parsed))
+    check("非 JSON 返回零候选",
+          engine_server._parse_model_facts("没有可抽取的事实") == [])
+    check("非法 kind 归一为 fact",
+          engine_server._parse_model_facts(
+              '[{"content":"周报模板采用三段式","kind":"secret"}]'
+          )[0]["kind"] == "fact")
+    many = json.dumps([
+        {"content": f"甲系统采用方案{i}号配置", "kind": "fact", "confidence": 0.6}
+        for i in range(10)
+    ], ensure_ascii=False)
+    check("模型候选条数有上限",
+          len(engine_server._parse_model_facts(many))
+          == engine_server.MODEL_MEMORY_MAX_FACTS)
+
+    rule = [{"content": "周报模板采用三段式结构", "kind": "fact",
+             "source": "auto", "subject": "周报模板",
+             "predicate": "采用", "object": "三段式结构", "confidence": 0.55}]
+    model_facts = [
+        {"content": "周报模板采用三段式结构", "kind": "fact", "source": "auto"},
+        {"content": "客户偏好每周五下午开会", "kind": "preference", "source": "auto"},
+        {"content": "接口密钥采用 sk-test-123456", "kind": "fact", "source": "auto"},
+    ]
+    merged, added, skipped = engine_server._merge_memory_candidates(rule, model_facts)
+    check("合并时按内容去重并过滤凭据",
+          len(merged) == 2 and added == 1 and skipped == 1, str(merged))
+    check("合并保留规则候选", merged[0]["content"] == rule[0]["content"])
+    check("合并结果上限为 8",
+          len(engine_server._merge_memory_candidates(
+              rule, [{"content": f"事实{i}采用方案{i}", "kind": "fact"} for i in range(20)]
+          )[0]) == 8)
 
 
 def http_checks() -> None:
@@ -646,6 +932,7 @@ def main() -> None:
         pure_checks()
         toolkit_checks()
         memory_checks()
+        memory_tool_checks()
         http_checks()
     finally:
         if prev_home is None:

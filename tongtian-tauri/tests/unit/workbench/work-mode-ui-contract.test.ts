@@ -61,18 +61,26 @@ describe('按模式挑选画布产物', () => {
     expect(picked.map((p) => p.srcPath)).toEqual(['/work/汇报.pptx', '/work/网页版.html']);
   });
 
-  it('写作认 Markdown / 纯文本，扩展名大小写不敏感', () => {
+  it('写作认 Markdown / 纯文本 / Word / Excel 真件，扩展名大小写不敏感', () => {
     const picked = pickCanvasArtifacts('writing', [
       op('/work/周报.md'),
       op('/work/笔记.MARKDOWN'),
       op('/work/导出.txt'),
       op('/work/看板.xlsx'),
+      op('/work/正文.DOCX'),
+      // 无关产物仍然不许上画布：幻灯片是幻灯片模式的交付物
+      op('/work/演示.pptx'),
     ]);
     expect(picked.map((p) => p.srcPath)).toEqual([
       '/work/周报.md',
       '/work/笔记.MARKDOWN',
       '/work/导出.txt',
+      '/work/看板.xlsx',
+      '/work/正文.DOCX',
     ]);
+    // Office 文件不是文本，画布只能交给系统默认应用，不能声称在页面里预览
+    expect(canvasKindOf('/work/看板.xlsx')).toBe('external');
+    expect(canvasKindOf('/work/正文.docx')).toBe('external');
   });
 
   it('通用模式没有画布；同一路径重复交付只留一件；空路径忽略', () => {

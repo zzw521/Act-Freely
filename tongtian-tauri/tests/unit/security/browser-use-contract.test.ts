@@ -194,3 +194,143 @@ describe('浏览器 AI+ 页面消费真实能力视图', () => {
     expect(src).toContain('当前通道没有受控浏览器');
   });
 });
+
+// ── D-36（#145）：引擎侧新工具与桌面壳网关的口径 ──────────────────────
+// 这一组不测行为（行为在 tests/integration/engine_browser_selftest.py），
+// 只钉「跨语言的两半现在到底认到哪儿」：引擎能说什么动作、网关认哪些路径、
+// 哪些动作今天必须由能力位挡住。Rust 侧扩表时这里会红——那是要的：
+// 红的时候两边一起看，而不是引擎悄悄注册出一个必被拒绝的按钮。
+
+describe('D-36 引擎工具与桌面壳网关的动作口径', () => {
+  /** Rust `is_known_action` 认识的动作名（网关 `/approve` 的白名单） */
+  const rustKnownActions = (): string[] => {
+    const src = rustBrowser();
+    const start = src.indexOf('pub fn is_known_action');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const body = src.slice(start, src.indexOf('\n}', start));
+    return [...body.matchAll(/"([a-z]+)"/g)].map((m) => m[1] as string);
+  };
+
+  /** Rust `features()` 报给 runtime 的能力位 */
+  const rustFeatureKeys = (): string[] => {
+    const src = rustBrowser();
+    const start = src.indexOf('pub fn features() -> Value');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const body = src.slice(start, src.indexOf('\n}', start));
+    return [...body.matchAll(/"([a-z]+)": true/g)].map((m) => m[1] as string);
+  };
+
+  /** 引擎实际向 `/approve` 报过的动作名 */
+  const engineApproveActions = (): string[] =>
+    [...engineBrowser().matchAll(/self\._approve\(\s*"([a-z]+)"/g)].map((m) => m[1] as string);
+
+  /** 引擎里「只有网关认识才注册」的那几个能力位 */
+  const engineGatedFeatures = (): string[] => {
+    const src = engineBrowser();
+    const start = src.indexOf('FEATURE_ONLY_ACTIONS = {');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const body = src.slice(start, src.indexOf('\n}', start));
+    return [...body.matchAll(/^\s{4}"([a-z]+)": \(/gm)].map((m) => m[1] as string);
+  };
+
+  it('Rust 白名单仍是那 7 个；引擎报出去的动作要么在白名单里，要么在显式门控清单里', () => {
+    const known = [...new Set(rustKnownActions())].sort();
+    expect(known).toEqual(['click', 'open', 'screenshot', 'scroll', 'select', 'snapshot', 'type']);
+
+    const gated = [...new Set(engineGatedFeatures())].sort();
+    expect(gated).toEqual(['evaluate', 'hover', 'press', 'tabs']);
+
+    for (const action of new Set(engineApproveActions())) {
+      expect(known.includes(action) || gated.includes(action), action).toBe(true);
+    }
+    // 门控清单成立的前提：这几个动作今天确实不在 Rust 白名单里。
+    // Rust 补上任意一个时本用例应转红，并把对应的 `describe_action` 文案一起补上。
+    for (const action of gated) {
+      expect(known, action).not.toContain(action);
+    }
+  });
+
+  it('能力位缺失 ⇒ 工具不注册：引擎用 has_feature 挡，界面画不出必被拒绝的按钮', () => {
+    const feats = rustFeatureKeys();
+    expect(feats).toContain('navigation');
+    for (const name of engineGatedFeatures()) {
+      expect(feats, name).not.toContain(name);
+    }
+    const engine = engineBrowser();
+    for (const name of ['hover', 'press', 'evaluate', 'tabs']) {
+      expect(engine).toContain(`if self.has_feature("${name}"):`);
+    }
+    expect(engine).toContain('桌面壳的浏览器网关还没有登记它们');
+  });
+
+  it('网关路径：ensure/approve/status 两侧同名；tabs 只有引擎在喊，Rust 没有这条路', () => {
+    const gate = rustGate();
+    expect(gate).toContain('"/browser/ensure" | "/browser/approve" | "/browser/status"');
+    expect(gate).not.toContain('/browser/tabs');
+    const engine = engineBrowser();
+    expect(engine).toContain('self._post("/tabs"');
+    expect(engine).toContain('桌面壳的浏览器网关没有实现标签页接口');
+    expect(engine).toContain('引擎不会假装成功');
+    // `/ensure` 会把 tabId 带出去，但桌面半边现在既不读它也不按它取地址
+    // ⇒ 切换标签页必须复核 targetId 真的变了。
+    expect(engine).toContain('payload["tabId"] = self._tab_id');
+    expect(gate).not.toContain('tabId');
+    expect(engine).toContain('切换标签页没有生效');
+  });
+
+  it('DOM 分级：四档与默认档在引擎，档位仍走网关认识的 snapshot 动作', () => {
+    const engine = engineBrowser();
+    const block = engine.match(/SNAPSHOT_LEVELS = \(([^)]*)\)/);
+    expect(block).not.toBeNull();
+    const levels = [...(block?.[1] ?? '').matchAll(/"([a-z]+)"/g)].map((m) => m[1] as string);
+    expect(levels).toEqual(['minimal', 'interactive', 'structured', 'full']);
+    expect(engine).toContain('async def browser_snapshot(level: str = "interactive"):');
+    expect(engine).toContain('await self._approve("snapshot", target, f"档位 {lvl}"');
+    // 每档预算全部由既有常量导出，分级不另立数字
+    const profiles = engine.slice(engine.indexOf('SNAPSHOT_LEVEL_PROFILES'), engine.indexOf('\n}', engine.indexOf('SNAPSHOT_LEVEL_PROFILES')));
+    expect(profiles).toContain('MAX_ELEMENTS');
+    expect(profiles).toContain('MAX_PAGE_TEXT');
+    expect(profiles).not.toMatch(/: \d{2,}/);
+  });
+
+  it('录制只写语义步骤：正文不落盘、草案走技能注册表、引擎不自己转正', () => {
+    const engine = engineBrowser();
+    expect(engine).toContain('step["hasValue"] = bool(value)');
+    expect(engine).toContain('drafts.add_draft(');
+    expect(engine).not.toContain('promote_draft');
+    expect(engine).toContain('def _looks_secret');
+    expect(engine).toContain('def _record(');
+    expect(engine).toContain('def _step_value');
+    for (const name of ['browser_wait', 'browser_record', 'browser_replay']) {
+      expect(engine).toContain(`async def ${name}(`);
+    }
+    const install = engine.slice(engine.indexOf('def install(self, toolkit'), engine.indexOf('def _open_tool'));
+    for (const name of ['_wait_tool', '_record_tool', '_replay_tool']) {
+      expect(install).toContain(`self.${name}(emit, task_id)`);
+    }
+  });
+
+  it('browser_wait 不问网关也不碰页面：只轮询自己的就绪状态', () => {
+    const engine = engineBrowser();
+    const start = engine.indexOf('async def browser_wait(');
+    expect(start).toBeGreaterThan(0);
+    const body = engine.slice(start, engine.indexOf('async def ', start + 10));
+    expect(body).not.toContain('self._approve(');
+    expect(body).not.toContain('self._post(');
+    expect(engine).toContain('MAX_WAIT_SECONDS = 10.0');
+    expect(body).toContain('self._current_page()');
+  });
+
+  it('回放复用已放行的动作：不新增动作名，也不绕过确认框', () => {
+    const engine = engineBrowser();
+    const start = engine.indexOf('async def browser_replay(');
+    expect(start).toBeGreaterThan(0);
+    const body = engine.slice(start);
+    expect(body.slice(0, body.indexOf('return browser_replay'))).not.toContain('self._approve(');
+    for (const name of ['self._open_tool', 'self._click_tool', 'self._type_tool', 'self._scroll_tool']) {
+      expect(body).toContain(`${name}(emit, task_id)`);
+    }
+    expect(engine).toContain('def _step_value');
+    expect(engine).toContain('不会代填');
+  });
+});

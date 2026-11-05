@@ -10,6 +10,8 @@ import { create } from 'zustand';
 
 export interface PreferenceState {
   theme: string;
+  /** 界面密度：标准 / 紧凑 / 宽松（D-25），驱动 MUI spacing 因子与 data-density */
+  density: string;
   frostedGlass: boolean;
   chatFontSize: string;
   chatWidth: string;
@@ -22,6 +24,7 @@ const STORAGE_KEY = 'tt-preferences';
 
 const defaults = {
   theme: '亮色',
+  density: '标准',
   frostedGlass: true,
   chatFontSize: '中',
   chatWidth: '超宽',
@@ -43,11 +46,11 @@ export const usePreferenceStore = create<PreferenceState>((set, get) => ({
   ...loadInitial(),
   set: (patch) => {
     set(patch);
-    const { theme, frostedGlass, chatFontSize, chatWidth, previewMode, promptSuggestions } = get();
+    const { theme, density, frostedGlass, chatFontSize, chatWidth, previewMode, promptSuggestions } = get();
     try {
       localStorage.setItem(
         STORAGE_KEY,
-        JSON.stringify({ theme, frostedGlass, chatFontSize, chatWidth, previewMode, promptSuggestions }),
+        JSON.stringify({ theme, density, frostedGlass, chatFontSize, chatWidth, previewMode, promptSuggestions }),
       );
     } catch {
       // ignore

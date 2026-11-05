@@ -1,4 +1,4 @@
-//! 远程桌面（本机实时画面）
+//! 本机画面（本机实时画面）
 //!
 //! 边界先说清楚：当前版本只做「本机桌面 → 当前窗口」的受控实时画面，
 //! 不做跨主机转发、不做远程键鼠注入——那需要中继服务与主机配对，尚未提供。
@@ -23,11 +23,11 @@ pub const FRAME_MIN_INTERVAL_MS: u64 = 700;
 
 pub const REMOTE_UNSUPPORTED: &str =
     "REMOTE_UNSUPPORTED: 当前平台没有桌面截屏执行器（仅支持 Windows）";
-pub const REMOTE_NO_SESSION: &str = "REMOTE_NO_SESSION: 远程桌面会话未开启或已结束";
+pub const REMOTE_NO_SESSION: &str = "REMOTE_NO_SESSION: 本机画面会话未开启或已结束";
 pub const REMOTE_SESSION_EXPIRED: &str =
-    "REMOTE_SESSION_EXPIRED: 远程桌面会话已到期（单次最长 10 分钟），请重新开启";
+    "REMOTE_SESSION_EXPIRED: 本机画面会话已到期（单次最长 10 分钟），请重新开启";
 pub const REMOTE_DISABLED: &str =
-    "REMOTE_DISABLED: 电脑操控档位为禁用，远程桌面无法开启；请先在「电脑操控」页调整档位";
+    "REMOTE_DISABLED: 电脑操控档位为禁用，本机画面无法开启；请先在「电脑操控」页调整档位";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
@@ -159,7 +159,7 @@ pub async fn remote_desktop_capabilities() -> Result<Value, String> {
         "reason": if supported {
             ""
         } else {
-            "当前平台没有桌面截屏执行器，远程桌面仅在 Windows 桌面版可用"
+            "当前平台没有桌面截屏执行器，本机画面仅在 Windows 桌面版可用"
         },
         "crossHost": cross_host_boundary(),
     }))
@@ -200,7 +200,7 @@ pub async fn remote_desktop_start(
     }
 
     let (policy, _) = computer::read_policy(&p0.store)
-        .map_err(|e| format!("REMOTE_DISABLED: 电脑操控档位不可用，远程桌面无法开启：{e}"))?;
+        .map_err(|e| format!("REMOTE_DISABLED: 电脑操控档位不可用，本机画面无法开启：{e}"))?;
     if policy == "disabled" {
         return Err(REMOTE_DISABLED.into());
     }
@@ -256,7 +256,7 @@ pub async fn remote_desktop_frame(
         audit_session(
             &p0,
             crate::security::audit::SEV_WARNING,
-            &format!("远程桌面会话到期自动结束（共 {} 帧）", s.frames),
+            &format!("本机画面会话到期自动结束（共 {} 帧）", s.frames),
         );
         return Err(REMOTE_SESSION_EXPIRED.into());
     }
@@ -301,7 +301,7 @@ pub async fn remote_desktop_frame(
         audit_session(
             &p0,
             crate::security::audit::SEV_WARNING,
-            &format!("远程桌面会话到期自动结束（共 {} 帧）", s.frames),
+            &format!("本机画面会话到期自动结束（共 {} 帧）", s.frames),
         );
         return Err(REMOTE_SESSION_EXPIRED.into());
     }

@@ -47,12 +47,23 @@ pub struct Bundle {
 
 /// 装配执行面输入。`store` 缺失（Mock / 单测）时技能清单为空，其余照常。
 pub fn build(store: Option<&Store>, workspace_id: &str, attachments: &[Value]) -> Bundle {
-    build_in(
+    build_for_task(store, workspace_id, attachments, "")
+}
+
+/// 带本轮目标的装配：长期记忆按目标检索，只下发命中的条目。
+pub fn build_for_task(
+    store: Option<&Store>,
+    workspace_id: &str,
+    attachments: &[Value],
+    query: &str,
+) -> Bundle {
+    build_in_query(
         &awareness::dir(),
         &python_env::base_dir(),
         store,
         workspace_id,
         attachments,
+        query,
     )
 }
 
@@ -64,6 +75,17 @@ fn build_in(
     workspace_id: &str,
     attachments: &[Value],
 ) -> Bundle {
+    build_in_query(awareness_dir, skills_base, store, workspace_id, attachments, "")
+}
+
+fn build_in_query(
+    awareness_dir: &Path,
+    skills_base: &Path,
+    store: Option<&Store>,
+    workspace_id: &str,
+    attachments: &[Value],
+    query: &str,
+) -> Bundle {
     let (skills, suite_notes) = skills_block(skills_base, store);
     // knowledge 目录与意识目录同根：{home}/awareness/main → {home}/knowledge
     let knowledge_root = awareness_dir
@@ -71,12 +93,11 @@ fn build_in(
         .and_then(Path::parent)
         .map(|home| home.join("knowledge"))
         .unwrap_or_else(knowledge::root);
-    Bundle {
-        runtime: json!({
+    let mut runtime = json!({
             "awareness": awareness_block(awareness_dir),
             "skills": skills,
             // 本地知识库：引擎据此建索引并注册检索/读全文工具
-            "knowledge": knowledge::runtime_bases(&knowledge_root),
+            "knowledge": knowledge::runtime_bases(&knowledge_root, workspace_id),
             // 套件指令没能进入执行面的原因（重名跳过 / 正文缺失由条目 error 携带）
             "suiteNotes": suite_notes,
             // 专家团队：主 Agent 的派发清单（每个专家的模型配置只随请求下发给本机引擎）
@@ -99,8 +120,84 @@ fn build_in(
             // ACP 委派：外部编码 Agent 的启动命令、审批档位与审计路径；
             // 引擎只在本机拉起该命令，模型只能给任务描述，不能改命令
             "acp": crate::terminal::acp_block(store),
-        }),
+        });
+    // 跨任务记忆：Rust 按目标检索后只下发命中条目，引擎不再自己扫文件挑记忆
+    if let Some(block) = memory_block(store, workspace_id, query) {
+        if let Some(map) = runtime.as_object_mut() {
+            map.insert("memory".to_string(), block);
+        }
+    }
+    Bundle {
+        runtime,
         attachments: attachments.iter().map(hydrate).collect(),
+    }
+}
+
+/// 记忆下发的口径：`store=desktop` 时引擎不写 MEMORY.md，候选经 deliver 回到 Rust 落库。
+/// store 缺失（Mock / 单测）时整块不下发，引擎保持旧的文件通道行为。
+/// 记忆工具一次能检索的目录上限：足够覆盖单个项目的长期事实，
+/// 又不至于把整库塞进每个请求（按目标召回的 5 条仍在 entries 里）。
+const MEMORY_CATALOG_LIMIT: usize = 200;
+
+fn memory_entry_json(row: &crate::store::memories::MemoryRow) -> Value {
+    json!({
+        "id": row.id,
+        "scope": row.scope,
+        "workspaceId": row.workspace_id,
+        "content": row.content,
+        "kind": row.kind,
+        "source": row.source,
+        "status": row.status,
+        "updatedAt": row.updated_at,
+        "subject": row.subject,
+        "predicate": row.predicate,
+        "object": row.object,
+        "confidence": row.confidence,
+    })
+}
+
+fn memory_block(store: Option<&Store>, workspace_id: &str, query: &str) -> Option<Value> {
+    let store = store?;
+    let now = crate::security::audit::iso8601_utc(crate::bridge::event_store::now_ms() as i64);
+    // 待审与归档条目不参与召回；但复核开关要下发，引擎据此说明「新记忆先待审」
+    let review = crate::awareness::review_enabled(&crate::awareness::dir());
+    // 模型抽取是可选项：默认关闭，开关随意识画像落盘；引擎只据此决定是否多跑一次抽取
+    let model_extract = crate::awareness::model_extract_enabled(&crate::awareness::dir());
+    // memory_search / memory_get 的检索面：当前项目可见的活跃条目，Rust 已按归属过滤，
+    // 引擎不自行扫目录或跨项目拼接。
+    let catalog = crate::store::memories::list(
+        store,
+        crate::store::memories::ListFilter {
+            workspace_id: Some(workspace_id),
+            scope: None,
+            status: Some(crate::store::memories::STATUS_ACTIVE),
+            limit: Some(MEMORY_CATALOG_LIMIT),
+        },
+    )
+    .unwrap_or_default();
+    match crate::store::memories::retrieve(store, workspace_id, query, None, &now) {
+        Ok(result) => Some(json!({
+            "store": "desktop",
+            "workspaceId": workspace_id,
+            "review": review,
+            "modelExtract": model_extract,
+            // 工具只在桌面通道可用：引擎直连没有 Rust 落库通道
+            "tooling": true,
+            "entries": result.rows.iter().map(memory_entry_json).collect::<Vec<_>>(),
+            "catalog": catalog.iter().map(memory_entry_json).collect::<Vec<_>>(),
+            "total": result.total,
+        })),
+        Err(error) => Some(json!({
+            "store": "desktop",
+            "workspaceId": workspace_id,
+            "review": review,
+            "modelExtract": model_extract,
+            "tooling": true,
+            "entries": [],
+            "catalog": catalog.iter().map(memory_entry_json).collect::<Vec<_>>(),
+            "total": 0,
+            "error": error,
+        })),
     }
 }
 
@@ -117,6 +214,7 @@ fn awareness_block(dir: &Path) -> Value {
             json!({
                 "mode": v.mode,
                 "autoMemory": v.auto_memory,
+                "memoryReview": v.memory_review,
                 "style": v.style,
                 "files": Value::Object(files),
             })
@@ -135,8 +233,24 @@ fn awareness_block(dir: &Path) -> Value {
 /// 不让两套流程抢同一个 `/名称` 引用。技能目录不存在时只是空清单，不是错误。
 fn skills_block(skills_base: &Path, store: Option<&Store>) -> (Vec<Value>, Vec<String>) {
     let disabled = store.map(skill::disabled_ids).unwrap_or_default();
+    // 市场撤销是外部权威的判断：不走用户能拨动的禁用开关，单独拦一道
+    let blocked_skills = store
+        .map(|s| crate::market::installed::blocked_ids(s, crate::market::KIND_SKILL))
+        .unwrap_or_default();
+    let blocked_suites = store
+        .map(|s| crate::market::installed::blocked_ids(s, crate::market::KIND_SUITE))
+        .unwrap_or_default();
+    let mut notes: Vec<String> = Vec::new();
     let mut skills: Vec<Value> = skill::enabled_with_body(skills_base, &disabled)
         .into_iter()
+        .filter(|v| {
+            let id = v.get("id").and_then(Value::as_str).unwrap_or_default();
+            if blocked_skills.iter().any(|b| b == id) {
+                notes.push(format!("技能「{id}」已被市场撤销，本轮未进入执行面"));
+                return false;
+            }
+            true
+        })
         .map(|v| {
             json!({
                 "id": v.get("id").cloned().unwrap_or(Value::Null),
@@ -159,8 +273,13 @@ fn skills_block(skills_base: &Path, store: Option<&Store>) -> (Vec<Value>, Vec<S
         }
     }
 
-    let suite_runtime = suite::runtime_commands(skills_base);
-    let mut notes = suite_runtime.notes;
+    let suite_disabled = {
+        let mut ids = store.map(suite::disabled_ids).unwrap_or_default();
+        ids.extend(blocked_suites.iter().cloned());
+        ids
+    };
+    let suite_runtime = suite::runtime_commands(skills_base, &suite_disabled);
+    notes.extend(suite_runtime.notes);
     for entry in suite_runtime.skills.into_iter().chain(suite_runtime.commands) {
         let id = entry
             .get("id")
@@ -264,6 +383,8 @@ fn sandbox_block(store: Option<&Store>, workspace_id: &str) -> Value {
         // 执行授权默认关闭：引擎据此不注册 run_command / fetch_url
         "execEnabled": false,
         "execAllowlist": [],
+        // 通用 shell 默认关闭，且必须与 execEnabled 同时为真
+        "shellEnabled": false,
         "networkEnabled": false,
         "networkAllowlist": [],
     });
@@ -281,6 +402,7 @@ fn sandbox_block(store: Option<&Store>, workspace_id: &str) -> Value {
             "fileBlocklist": p.file_blocklist,
             "execEnabled": p.exec_enabled,
             "execAllowlist": p.exec_allowlist,
+            "shellEnabled": p.shell_enabled,
             "networkEnabled": p.network_enabled,
             "networkAllowlist": p.network_allowlist,
         }),
@@ -980,6 +1102,74 @@ mod tests {
     }
 
     #[test]
+    fn market_revoked_entries_are_cut_from_the_execution_surface() {
+        // 撤销标记独立于用户开关：技能文件在盘上、也没进禁用清单，仍然不得进上下文
+        let home = temp_home("revoked-runtime");
+        for id in ["alpha", "evil-beta"] {
+            let d = home.join("skills").join(id);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SKILL.md"),
+                format!("---\nname: {id}\ndescription: {id} 技能\n---\n正文\n"),
+            )
+            .unwrap();
+        }
+        for suite_id in ["finance-suite", "risk-suite"] {
+            let dir = home.join("suites").join(suite_id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("manifest.json"),
+                json!({
+                    "name": suite_id,
+                    "commands": [{ "name": "run", "description": "执行", "content": "按步骤执行" }]
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+
+        let store = crate::store::Store::open(home.join("t.db")).unwrap();
+        crate::store::settings::set(
+            &store,
+            "market.revoked",
+            r#"[{"kind":"skill","itemId":"evil-beta","version":"1.2.0","reason":"包含恶意行为","markedAtMs":1},{"kind":"suite","itemId":"risk-suite","reason":"下架整改","markedAtMs":1}]"#,
+        )
+        .unwrap();
+
+        let bundle = build_in(&home.join("awareness"), &home, Some(&store), "default", &[]);
+        let skills = bundle.runtime["skills"].as_array().unwrap();
+        let ids: Vec<&str> = skills
+            .iter()
+            .map(|v| v["id"].as_str().unwrap_or_default())
+            .collect();
+        assert!(ids.contains(&"alpha"), "{ids:?}");
+        assert!(!ids.contains(&"evil-beta"), "已撤销技能仍进了执行面：{ids:?}");
+        assert!(
+            !ids.iter().any(|id| id.starts_with("suite:risk-suite:")),
+            "已撤销套件指令仍进了执行面：{ids:?}"
+        );
+        assert!(
+            ids.contains(&"suite:finance-suite:run"),
+            "未撤销的套件指令被一起挡掉了：{ids:?}"
+        );
+
+        let notes = bundle.runtime["suiteNotes"].as_array().unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.as_str().unwrap_or_default().contains("技能「evil-beta」已被市场撤销")),
+            "{notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.as_str().unwrap_or_default().contains("套件「risk-suite」已禁用")),
+            "{notes:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
     fn suite_commands_reach_runtime_with_body_and_metadata() {
         let home = temp_home("suite-runtime");
         let suite_dir = home.join("suites/finance-suite");
@@ -1174,6 +1364,7 @@ mod tests {
                 tool_blocklist: vec!["write_text_file".to_string()],
                 exec_enabled: true,
                 exec_allowlist: vec!["python".to_string(), "git".to_string()],
+                shell_enabled: true,
                 network_enabled: true,
                 network_allowlist: vec!["api.example.com".to_string()],
                 max_cpu_percent: 50,
@@ -1194,6 +1385,7 @@ mod tests {
         assert_eq!(sb["fileBlocklist"], json!(["C:/Windows"]));
         assert_eq!(sb["execEnabled"], true);
         assert_eq!(sb["execAllowlist"], json!(["python", "git"]));
+        assert_eq!(sb["shellEnabled"], true);
         assert_eq!(sb["networkEnabled"], true);
         assert_eq!(sb["networkAllowlist"], json!(["api.example.com"]));
 

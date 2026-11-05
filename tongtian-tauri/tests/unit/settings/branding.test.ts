@@ -41,7 +41,9 @@ describe('默认品牌：任我行 / 北京通天云计算有限公司', () => {
     expect(conf.productName).toBe('任我行');
     // 二进制名保持 ASCII：开机自启、current_exe 与既有测试都依赖它
     expect(conf.mainBinaryName).toBe('tongtian-tauri');
-    expect(conf.app.windows[0].title).toBe('任我行');
+    // 主窗口在 Rust 侧创建（导航守卫只能挂在 Builder 上），标题以 navigation.rs 为准
+    expect(conf.app?.windows ?? []).toEqual([]);
+    expect(read('../../../src-tauri/src/system/navigation.rs')).toContain('.title("任我行")');
     expect(conf.bundle.publisher).toBe('北京通天云计算有限公司');
     expect(conf.bundle.copyright).toContain('北京通天云计算有限公司');
     expect(read('../../../src/renderer/index.html')).toContain('<title>任我行</title>');

@@ -8,7 +8,7 @@
  * 支持 ?s=xxx 深度链接
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, createContext, useContext } from 'react';
 import { Box, Typography, IconButton, Switch, Slider, TextField, Button, Chip, CircularProgress, Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions, Tooltip } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
@@ -48,7 +48,7 @@ import BrowserUsePanel from '../../pages/BrowserUsePanel';
 import TerminalPanel from '../../pages/Terminal';
 import ComputerUsePanel from '../../pages/ComputerUsePanel';
 import RemoteDesktopPanel from '../../pages/RemoteDesktopPanel';
-import { getSettings, setSettings, getProxyStatus, getAutostartStatus, getSystemPermissionStatus, openSystemPermissionSettings, getAwareness, updateAwareness, listMemories, addMemory, deleteMemory, getImPreferences, setImPreferences, getTerminalCapabilities, setTerminalEnabled, getAcpConfig, setAcpConfig, getAcpStatus } from '../../lib/alignment-api';
+import { getSettings, setSettings, getProxyStatus, getAutostartStatus, getSystemPermissionStatus, openSystemPermissionSettings, getAwareness, updateAwareness, listMemories, addMemory, deleteMemory, reviewMemory, listMemoryEntities, exportMemories, importMemories, compactMemories, syncMemoryDoc, exportMemoryPackage, importMemoryPackage, supportsMemoryManagement, getImPreferences, setImPreferences, getTerminalCapabilities, setTerminalEnabled, getAcpConfig, setAcpConfig, getAcpStatus } from '../../lib/alignment-api';
 import { parseProxyMode } from '../../lib/proxy-local';
 import { permissionLabel } from '../../lib/permissions-local';
 import {
@@ -82,8 +82,12 @@ import type { AuthServerProbe } from '../../../shared/contracts';
 import { resolveEngineBaseUrl } from '../../lib/engine-endpoint';
 import { engineFetch } from '../../lib/engine-http';
 import { useI18n } from '../../i18n';
+import { getActiveWorkspaceId } from '../../store/workspaceStore';
+import { clickableProps, disclosureProps, anchorMenuProps } from '../../lib/a11y';
+import { AVATAR_COLORS, avatarInk, normalizeAvatarColor } from '../../lib/avatarColors';
+import { FILE_PERMISSION_DEFS, DEFAULT_FILE_PERMISSION, filePermissionDef, normalizeFileMode } from '../../lib/file-permission';
 import brandLogo from '../../assets/brand-logo.png';
-import type { AppSettingsData, AcpConfigState, AcpServerStatus, AutostartStatus, AwarenessView, AwarenessPatch, AwarenessFileEntry, AwarenessFileName, AwarenessProfile, AwarenessStyleId, BrandingInfo, ImPreferences, MemoryEntry, PermissionState, PiiOutboundMode, ProxyStatus, SandboxEnvUsage, SystemCapability, SystemPermissionStatus, SystemSandboxView, TerminalCapabilities, ToolApprovalMode } from '../../../shared/contracts';
+import type { AppSettingsData, AcpConfigState, AcpServerStatus, AutostartStatus, AwarenessView, AwarenessPatch, AwarenessFileEntry, AwarenessFileName, AwarenessProfile, AwarenessStyleId, BrandingInfo, FilePermissionMode, ImPreferences, MemoryEntityPage, MemoryEntry, MemoryReviewAction, MemoryStatus, PermissionState, PiiOutboundMode, ProxyStatus, SandboxEnvUsage, SystemCapability, SystemPermissionStatus, SystemSandboxView, TerminalCapabilities, ToolApprovalMode } from '../../../shared/contracts';
 
 // ── 三分组分区定义 ─────────────────────────────────────────────────
 
@@ -127,7 +131,7 @@ const sectionGroups: SectionGroup[] = [
       { id: 'browser-use', label: '浏览器 AI+', icon: LanguageOutlinedIcon },
       { id: 'terminal-ai', label: '终端 AI+', icon: TerminalOutlinedIcon },
       { id: 'computer-use', label: '电脑操控', icon: MonitorOutlinedIcon },
-      { id: 'remote-desktop', label: '远程桌面', icon: DesktopWindowsOutlinedIcon },
+      { id: 'remote-desktop', label: '本机画面', icon: DesktopWindowsOutlinedIcon },
     ],
   },
   {
@@ -143,8 +147,8 @@ const sectionGroups: SectionGroup[] = [
 const allSections = sectionGroups.flatMap((g) => g.sections);
 
 const tealSwitch = {
-  '& .MuiSwitch-switchBase.Mui-checked': { color: '#14B8A6' },
-  '& .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track': { backgroundColor: '#14B8A6' },
+  '& .MuiSwitch-switchBase.Mui-checked': { color: 'var(--tt-teal)' },
+  '& .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track': { backgroundColor: 'var(--tt-teal)' },
 };
 
 // ── 通用小组件 ─────────────────────────────────────────────────────
@@ -171,36 +175,44 @@ const UnavailableTag: React.FC = () => {
   );
 };
 
+/**
+ * 行标签向下传递：PrefSelect 是原生 <select>，读屏必须有自己的名字。
+ * 每个设置行都手写一遍 aria-label 会漏，所以由 SettingRow 提供、控件消费。
+ */
+const SettingLabelContext = createContext<string>('');
+
 const SettingRow: React.FC<{
   label: string;
   sub?: string;
   control: React.ReactNode;
   unavailable?: boolean;
 }> = ({ label, sub, control, unavailable }) => (
-  <Box
-    sx={{
-      display: 'flex',
-      alignItems: 'center',
-      justifyContent: 'space-between',
-      bgcolor: 'var(--tt-surface)',
-      border: '1px solid var(--tt-border)',
-      borderRadius: '14px',
-      px: 2.5,
-      py: 2,
-      mb: 1.5,
-    }}
-  >
-    <Box sx={{ minWidth: 0, pr: 2 }}>
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
-        <Typography sx={{ fontSize: '14px', fontWeight: 500, color: 'var(--tt-text-1)' }}>{label}</Typography>
-        {unavailable && <UnavailableTag />}
+  <SettingLabelContext.Provider value={label}>
+    <Box
+      sx={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        bgcolor: 'var(--tt-surface)',
+        border: '1px solid var(--tt-border)',
+        borderRadius: '14px',
+        px: 2.5,
+        py: 2,
+        mb: 1.5,
+      }}
+    >
+      <Box sx={{ minWidth: 0, pr: 2 }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+          <Typography sx={{ fontSize: '14px', fontWeight: 500, color: 'var(--tt-text-1)' }}>{label}</Typography>
+          {unavailable && <UnavailableTag />}
+        </Box>
+        {sub && (
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mt: 0.25 }}>{sub}</Typography>
+        )}
       </Box>
-      {sub && (
-        <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mt: 0.25 }}>{sub}</Typography>
-      )}
+      {control}
     </Box>
-    {control}
-  </Box>
+  </SettingLabelContext.Provider>
 );
 
 const PrefSelect: React.FC<{
@@ -208,13 +220,17 @@ const PrefSelect: React.FC<{
   options: string[];
   onChange: (v: string) => void;
   disabled?: boolean;
-}> = ({ value, options, onChange, disabled }) => {
+  /** 覆盖行标签提供的名字（同一行放两个控件时用） */
+  ariaLabel?: string;
+}> = ({ value, options, onChange, disabled, ariaLabel }) => {
   const { t: tr } = useI18n();
+  const rowLabel = useContext(SettingLabelContext);
   return (
   <Box
     component="select"
     value={value}
     disabled={disabled}
+    aria-label={ariaLabel ?? (rowLabel || undefined)}
     onChange={(e: React.ChangeEvent<HTMLSelectElement>) => onChange(e.target.value)}
     sx={{
       appearance: 'none',
@@ -229,14 +245,13 @@ const PrefSelect: React.FC<{
       color: 'var(--tt-text-1)',
       cursor: disabled ? 'not-allowed' : 'pointer',
       opacity: disabled ? 0.55 : 1,
-      outline: 'none',
+      // 下拉箭头是「这里可以选」的唯一提示，压白底与压暗底都要 ≥3:1，取一个两头都过的灰
       backgroundImage:
-        "url(\"data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%239CA3AF'%3e%3cpath d='M7.41 8.59 12 13.17l4.59-4.58L18 10l-6 6-6-6 1.41-1.41z'/%3e%3c/svg%3e\")",
+        "url(\"data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%237E8896'%3e%3cpath d='M7.41 8.59 12 13.17l4.59-4.58L18 10l-6 6-6-6 1.41-1.41z'/%3e%3c/svg%3e\")",
       backgroundRepeat: 'no-repeat',
       backgroundPosition: 'right 8px center',
       backgroundSize: '18px',
-      '&:hover': { borderColor: '#D1D5DB' },
-      '&:focus': { borderColor: '#14B8A6' },
+      '&:hover': { borderColor: 'var(--tt-border)' },
     }}
   >
     {options.map((opt) => (
@@ -285,7 +300,16 @@ const PreferencesPanel: React.FC = () => {
         sub={tr('English 已覆盖侧边栏、工作台、输入框、对话与偏好设置；其余功能页仍显示中文原文')}
         control={<PrefSelect value={language} options={['中文', 'English']} onChange={(v) => updateAppSettings({ language: v })} />}
       />
-      <SettingRow label={tr('主题亮暗')} control={<PrefSelect value={prefs.theme} options={['亮色', '暗色', '跟随系统']} onChange={(v) => prefs.set({ theme: v })} />} />
+      <SettingRow
+        label={tr('主题亮暗')}
+        sub={tr('四套皮肤都各自校准过文字对比度（WCAG AA），暗色下不会出现浅字压浅底')}
+        control={<PrefSelect value={prefs.theme} options={['亮色', '暗色', '跟随系统']} onChange={(v) => prefs.set({ theme: v })} />}
+      />
+      <SettingRow
+        label={tr('界面密度')}
+        sub={tr('紧凑档只收内边距与字号间隔，按钮与菜单项的点击目标仍不小于 36px')}
+        control={<PrefSelect value={prefs.density} options={['标准', '紧凑', '宽松']} onChange={(v) => prefs.set({ density: v })} />}
+      />
       <SettingRow
         label={tr('界面风格')}
         sub={tr('四套皮肤即时生效；皮肤同时适配亮色与暗色主题')}
@@ -418,9 +442,9 @@ const ImToolProcessSetting: React.FC = () => {
 // ── 分区二：个人资料 ───────────────────────────────────────────────
 
 const ProfilePanel: React.FC = () => {
-  const avatarColors = ['#3B82F6', '#14B8A6', '#F59E0B', '#EF4444', '#8B5CF6', '#EC4899', '#06B6D4', '#84CC16', '#F97316', '#6366F1', '#111827'];
+  const { t: tr } = useI18n();
   const [appSettings, updateAppSettings] = useAppSettings();
-  const color = (appSettings.avatarColor as string) ?? '#3B82F6';
+  const color = normalizeAvatarColor(appSettings.avatarColor as string) || AVATAR_COLORS[0];
   const setColor = (c: string) => updateAppSettings({ avatarColor: c });
 
   // 账号登录态（网页验证登录 · Loopback 方案）
@@ -507,9 +531,11 @@ const ProfilePanel: React.FC = () => {
         control={
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
             <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, maxWidth: 170, justifyContent: 'flex-end' }}>
-              {avatarColors.map((c) => (
+              {AVATAR_COLORS.map((c) => (
                 <Box
                   key={c}
+                  {...clickableProps(() => setColor(c), tr('选择头像背景色 {color}', { color: c }))}
+                  aria-pressed={color === c}
                   onClick={() => setColor(c)}
                   title={c}
                   sx={{
@@ -518,7 +544,7 @@ const ProfilePanel: React.FC = () => {
                     borderRadius: '50%',
                     bgcolor: c,
                     cursor: 'pointer',
-                    border: color === c ? '2px solid #111827' : '2px solid transparent',
+                    border: color === c ? '2px solid var(--tt-text-1)' : '2px solid transparent',
                   }}
                 />
               ))}
@@ -534,7 +560,7 @@ const ProfilePanel: React.FC = () => {
                 justifyContent: 'center',
               }}
             >
-              <Typography sx={{ color: '#fff', fontSize: '15px', fontWeight: 600 }}>{avatarChar}</Typography>
+              <Typography sx={{ color: avatarInk(color), fontSize: '15px', fontWeight: 600 }}>{avatarChar}</Typography>
             </Box>
           </Box>
         }
@@ -553,6 +579,7 @@ const ProfilePanel: React.FC = () => {
                 <IconButton
                   size="small"
                   disabled={!loggedIn || !profile?.uid}
+                  aria-label={tr('复制账户 UID')}
                   onClick={() => void copyUid()}
                   sx={{ color: 'var(--tt-text-3)' }}
                 >
@@ -604,6 +631,7 @@ const ProfilePanel: React.FC = () => {
             </Typography>
             {!mockMode && (
               <Box
+                {...clickableProps(() => !probeBusy && void probeServer())}
                 onClick={() => !probeBusy && void probeServer()}
                 sx={{
                   px: 1.25,
@@ -632,7 +660,7 @@ const ProfilePanel: React.FC = () => {
             border: '1px solid rgba(239,68,68,0.2)',
           }}
         >
-          <Typography sx={{ fontSize: '12px', color: '#B91C1C', lineHeight: 1.6 }}>
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-danger)', lineHeight: 1.6 }}>
             {serverProbe.error}
           </Typography>
         </Box>
@@ -644,10 +672,11 @@ const ProfilePanel: React.FC = () => {
           sub="在此设备退出登录，可随时重新登录"
           control={
             <Box
+              {...clickableProps(() => !authBusy && setLogoutConfirmOpen(true))}
               onClick={() => !authBusy && setLogoutConfirmOpen(true)}
-              sx={{ px: 1.75, py: 0.5, borderRadius: '8px', border: '1px solid #FCA5A5', cursor: authBusy ? 'not-allowed' : 'pointer', opacity: authBusy ? 0.6 : 1 }}
+              sx={{ px: 1.75, py: 0.5, borderRadius: '8px', border: '1px solid var(--tt-danger)', cursor: authBusy ? 'not-allowed' : 'pointer', opacity: authBusy ? 0.6 : 1 }}
             >
-              <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#EF4444' }}>{authBusy ? '退出中…' : '退出登录'}</Typography>
+              <Typography sx={{ fontSize: '12px', fontWeight: 600, color: 'var(--tt-danger)' }}>{authBusy ? '退出中…' : '退出登录'}</Typography>
             </Box>
           }
         />
@@ -663,8 +692,9 @@ const ProfilePanel: React.FC = () => {
           }
           control={
             <Box
+              {...clickableProps(() => !authBusy && void handleLogin())}
               onClick={() => !authBusy && void handleLogin()}
-              sx={{ px: 1.75, py: 0.5, borderRadius: '8px', background: 'linear-gradient(120deg, #6366F1 0%, #8B5CF6 100%)', cursor: authBusy ? 'not-allowed' : 'pointer', opacity: authBusy ? 0.6 : 1 }}
+              sx={{ px: 1.75, py: 0.5, borderRadius: '8px', background: 'linear-gradient(120deg, #4338CA 0%, #6D28D9 100%)', cursor: authBusy ? 'not-allowed' : 'pointer', opacity: authBusy ? 0.6 : 1 }}
             >
               <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#fff' }}>{authBusy ? '登录中…' : '登录 / 注册'}</Typography>
             </Box>
@@ -682,7 +712,7 @@ const ProfilePanel: React.FC = () => {
         </DialogContent>
         <DialogActions sx={{ px: 3, pb: 2 }}>
           <Button onClick={() => setLogoutConfirmOpen(false)} sx={{ color: 'var(--tt-text-3)', fontSize: '13px' }}>取消</Button>
-          <Button onClick={() => void handleLogout()} disabled={authBusy} variant="contained" sx={{ fontSize: '13px', bgcolor: '#EF4444', '&:hover': { bgcolor: '#DC2626' } }}>退出登录</Button>
+          <Button onClick={() => void handleLogout()} disabled={authBusy} variant="contained" sx={{ fontSize: '13px', bgcolor: 'var(--tt-danger-fill)', '&:hover': { bgcolor: '#DC2626' } }}>退出登录</Button>
         </DialogActions>
       </Dialog>
     </Box>
@@ -812,7 +842,7 @@ const ProxySetting: React.FC = () => {
           sx={{
             fontSize: '12px',
             mt: 1.5,
-            color: error ? '#EF4444' : tip ? '#0D9488' : '#D97706',
+            color: error ? 'var(--tt-danger)' : tip ? 'var(--tt-teal)' : 'var(--tt-warning)',
           }}
         >
           {error || tip || `${status?.staleEngines} 个运行中的引擎仍在使用旧代理，重启该工作空间后切换`}
@@ -821,12 +851,13 @@ const ProxySetting: React.FC = () => {
 
       <Box sx={{ display: 'flex', justifyContent: 'flex-end', mt: 1.5 }}>
         <Box
+          {...clickableProps(() => !saving && !needUrl && void handleSave())}
           onClick={() => !saving && !needUrl && void handleSave()}
           sx={{
             px: 1.75,
             py: 0.5,
             borderRadius: '8px',
-            background: saving || needUrl ? 'var(--tt-surface-2, #F3F4F6)' : 'linear-gradient(120deg, #14B8A6 0%, #0EA5E9 100%)',
+            background: saving || needUrl ? 'var(--tt-surface-2, #F3F4F6)' : 'linear-gradient(120deg, #0F766E 0%, #0369A1 100%)',
             opacity: saving || needUrl ? 0.6 : 1,
             cursor: saving || needUrl ? 'not-allowed' : 'pointer',
           }}
@@ -844,8 +875,8 @@ const ProxySetting: React.FC = () => {
 type PermissionTone = 'granted' | 'denied' | 'muted';
 
 const PERMISSION_TONE: Record<PermissionTone, { color: string; bg: string }> = {
-  granted: { color: '#0D9488', bg: '#E6F7F4' },
-  denied: { color: '#B91C1C', bg: '#FEF2F2' },
+  granted: { color: 'var(--tt-teal)', bg: 'var(--tt-chip-teal)' },
+  denied: { color: 'var(--tt-danger)', bg: 'var(--tt-chip-danger)' },
   muted: { color: 'var(--tt-text-4)', bg: 'transparent' },
 };
 
@@ -884,6 +915,7 @@ function permissionCellOf(item: SystemCapability, state: PermissionState | undef
  * 状态只取系统能真实回答的探测（通知 / 麦克风），「去授权」拉起对应隐私设置面板。
  */
 const SystemPermissionSection: React.FC = () => {
+  const { t: tr } = useI18n();
   const [view, setView] = useState<SystemPermissionStatus | null>(null);
   const [error, setError] = useState('');
   const [tip, setTip] = useState('');
@@ -922,6 +954,7 @@ const SystemPermissionSection: React.FC = () => {
       <Box sx={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', mt: 3, mb: 1.5 }}>
         <Typography sx={{ fontSize: '14px', fontWeight: 700, color: 'var(--tt-text-1)' }}>系统权限</Typography>
         <Box
+          {...clickableProps(() => !pending && void load())}
           onClick={() => !pending && void load()}
           sx={{ px: 1.25, py: 0.35, borderRadius: '8px', border: '1px solid var(--tt-border)', cursor: 'pointer' }}
         >
@@ -954,6 +987,7 @@ const SystemPermissionSection: React.FC = () => {
                 )}
                 {cell.actionable ? (
                   <Box
+                    {...clickableProps(() => void handleOpen(item), tr('打开「{name}」的系统授权设置', { name: item.label }))}
                     onClick={() => void handleOpen(item)}
                     sx={{
                       px: 1.5,
@@ -982,7 +1016,7 @@ const SystemPermissionSection: React.FC = () => {
       ) : null}
 
       {(error || tip) && (
-        <Typography sx={{ fontSize: '12px', mt: 1, color: error ? '#EF4444' : '#0D9488' }}>
+        <Typography sx={{ fontSize: '12px', mt: 1, color: error ? 'var(--tt-danger)' : 'var(--tt-teal)' }}>
           {error || tip}
         </Typography>
       )}
@@ -1257,6 +1291,24 @@ const TOOL_APPROVAL_VALUES: Record<string, ToolApprovalMode> = {
   所有工具: 'all',
 };
 
+// 文件访问默认档位：选项与文案直接取自对话框里那三档的同一张表，
+// 免得设置页与工作台的档位说明各写一份、改一处漏一处。
+const FILE_PERMISSION_OPTIONS = FILE_PERMISSION_DEFS.map((def) => def.name);
+const FILE_PERMISSION_LABELS = FILE_PERMISSION_DEFS.reduce(
+  (acc, def) => {
+    acc[def.id] = def.name;
+    return acc;
+  },
+  {} as Record<FilePermissionMode, string>,
+);
+const FILE_PERMISSION_VALUES = FILE_PERMISSION_DEFS.reduce(
+  (acc, def) => {
+    acc[def.name] = def.id;
+    return acc;
+  },
+  {} as Record<string, FilePermissionMode>,
+);
+
 const SystemPanel: React.FC = () => {
   const [appSettings, updateAppSettings] = useAppSettings();
   const keepAwake = appSettings.keepAwake !== false;
@@ -1270,6 +1322,21 @@ const SystemPanel: React.FC = () => {
     appSettings.toolApprovalMode === 'sensitive' || appSettings.toolApprovalMode === 'all'
       ? appSettings.toolApprovalMode
       : 'off';
+  // 存量脏值同样归一到最保守档：默认档位不能因为台账里写过未知字符串就变成放开
+  const filePermissionDefault = normalizeFileMode(appSettings.filePermissionDefault);
+  // 红色确认没走完之前不落库：pendingFilePerm 只是「用户点到了完全访问」，不等于「用户批准了完全访问」
+  const [pendingFilePerm, setPendingFilePerm] = useState<FilePermissionMode | null>(null);
+  const pendingFilePermDef = pendingFilePerm ? filePermissionDef(pendingFilePerm) : null;
+
+  const handleFilePermissionDefaultChange = (label: string) => {
+    const mode = FILE_PERMISSION_VALUES[label] ?? DEFAULT_FILE_PERMISSION;
+    if (mode === filePermissionDefault) return;
+    if (filePermissionDef(mode).danger) {
+      setPendingFilePerm(mode);
+      return;
+    }
+    updateAppSettings({ filePermissionDefault: mode });
+  };
 
   return (
     <Box sx={{ maxWidth: 860 }}>
@@ -1348,6 +1415,78 @@ const SystemPanel: React.FC = () => {
           开启后网关不可用会中止任务而不是跳过审批；放行与否都写入安全审计。
         </Typography>
       </Box>
+
+      <SettingRow
+        label="文件访问默认档位"
+        sub={
+          filePermissionDefault === 'full_access'
+            ? '完全访问：未单独表态的会话可以直接读写工作目录之外的本机路径并删除文件；家目录、系统关键目录与应用数据目录仍然硬拒'
+            : filePermissionDefault === 'auto_approve'
+              ? '自动审批：未单独表态的会话只在绑定的工作目录内直接写盘；写到目录外仍拒绝，删除仍需切到完全访问'
+              : '每次询问：未单独表态的会话每次创建、更新、删除都先问你一次；越出绑定工作目录仍然拒绝'
+        }
+        control={
+          <PrefSelect
+            value={FILE_PERMISSION_LABELS[filePermissionDefault]}
+            options={FILE_PERMISSION_OPTIONS}
+            onChange={handleFilePermissionDefaultChange}
+          />
+        }
+      />
+      <Box sx={{ mb: 2, px: 0.25 }}>
+        <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', lineHeight: 1.7 }}>
+          这条管「能写到哪、能不能删」，和上面的「工具执行审批」不是一回事：那条管要不要逐个工具问你，
+          本条管目录边界与删除权限，两者同时生效。会话里在对话框切换的档位只对那一个会话有效，
+          且优先于这里的默认值。「每次询问」的确认框由桌面端的本机网关提供，
+          用浏览器直连引擎时没有网关，此时目录内写盘不弹窗、直接执行，越出目录仍按档位拒绝。
+          {filePermissionDefault === 'full_access'
+            ? ' 当前默认就是「完全访问」：新建会话一上来就能删文件，用完记得切回。'
+            : ''}
+        </Typography>
+      </Box>
+
+      <Dialog
+        open={pendingFilePerm !== null}
+        onClose={() => setPendingFilePerm(null)}
+        aria-labelledby="settings-file-permission-title"
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle id="settings-file-permission-title" sx={{ fontSize: '16px', fontWeight: 700 }}>
+          {pendingFilePermDef ? `把默认档位设为「${pendingFilePermDef.name}」？` : '把默认档位设为「完全访问」？'}
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText component="div" sx={{ fontSize: '13px', lineHeight: 1.8 }}>
+            <Box sx={{ color: 'var(--tt-danger)', fontWeight: 700, mb: 1 }}>
+              默认档位会影响此后每一个没有单独表态的会话：AI 可以直接读写工作目录之外的本机路径，
+              并且删除文件，不再逐次询问。
+            </Box>
+            <Box sx={{ mb: 1 }}>
+              删除是不可逆操作：文件会先复制进应用回收目录并记下原路径与原因，但找回仍需手动操作。
+              建议只在核对过执行计划的会话里临时开启，用完切回「每次询问」。
+            </Box>
+            <Box sx={{ color: 'var(--tt-danger)', fontWeight: 600 }}>
+              家目录、系统关键目录与应用数据目录始终硬拒：完全访问放开的是目录边界，不是整台电脑。
+            </Box>
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setPendingFilePerm(null)} sx={{ textTransform: 'none' }}>
+            取消
+          </Button>
+          <Button
+            variant="contained"
+            onClick={() => {
+              const mode = pendingFilePerm ?? 'full_access';
+              setPendingFilePerm(null);
+              updateAppSettings({ filePermissionDefault: mode });
+            }}
+            sx={{ textTransform: 'none', bgcolor: 'var(--tt-danger-fill)', '&:hover': { bgcolor: '#B91C1C' } }}
+          >
+            我已了解，设为默认
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 };
@@ -1419,7 +1558,7 @@ const SnapshotPanel: React.FC = () => {
       />
       <GlobalTriggerRow label="全局快捷键" combo="Alt+S" />
       <Box sx={{ bgcolor: 'rgba(217,119,6,0.08)', border: '1px solid rgba(217,119,6,0.25)', borderRadius: '12px', p: 1.75 }}>
-        <Typography sx={{ fontSize: '12px', color: '#B45309', lineHeight: 1.6 }}>
+        <Typography sx={{ fontSize: '12px', color: 'var(--tt-warning)', lineHeight: 1.6 }}>
           能力提供后：快照内容将作为上下文上送模型，受数据分级策略约束——检测为机密级的内容不会上送云端模型。
         </Typography>
       </Box>
@@ -1447,6 +1586,7 @@ function shortcutStatusOf(
 }
 
 const ShortcutsPanel: React.FC = () => {
+  const { t: tr } = useI18n();
   const [appSettings, updateAppSettings] = useAppSettings();
   const quickPickOn = Boolean(appSettings.quickPickEnabled);
   const qpMode = (appSettings.quickPickMode as string) ?? '组合键';
@@ -1509,6 +1649,12 @@ const ShortcutsPanel: React.FC = () => {
             const combo = combos[a.id] ?? a.defaultCombo ?? '';
             const customized = Boolean(overrides[a.id]);
             const isRecording = recording === a.id;
+            const resetShortcut = () => {
+              const next: ShortcutOverrides = { ...overrides };
+              delete next[a.id];
+              persist(next);
+              setNotice('');
+            };
             return (
               <SettingRow
                 key={a.id}
@@ -1516,17 +1662,20 @@ const ShortcutsPanel: React.FC = () => {
                 sub={a.note}
                 control={
                   <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, justifyContent: 'flex-end' }}>
-                    <Typography sx={{ fontSize: '11.5px', color: status.active ? '#0D9488' : 'var(--tt-text-4)' }}>
+                    <Typography sx={{ fontSize: '11.5px', color: status.active ? 'var(--tt-teal)' : 'var(--tt-text-4)' }}>
                       {status.text}
                     </Typography>
                     <Box
+                      {...(status.recordable
+                        ? { ...clickableProps(() => { setNotice(''); setRecording(isRecording ? '' : a.id); }, tr('录制「{name}」快捷键', { name: a.label })), 'aria-pressed': isRecording }
+                        : {})}
                       onClick={status.recordable ? () => { setNotice(''); setRecording(isRecording ? '' : a.id); } : undefined}
                       sx={{
                         px: 1.5,
                         py: 0.5,
                         borderRadius: '8px',
-                        border: isRecording ? '1px solid #0D9488' : status.recordable ? '1px dashed #D1D5DB' : '1px solid var(--tt-border)',
-                        bgcolor: isRecording ? '#E6F7F4' : 'var(--tt-surface-2)',
+                        border: isRecording ? '1px solid var(--tt-teal)' : status.recordable ? '1px dashed var(--tt-border)' : '1px solid var(--tt-border)',
+                        bgcolor: isRecording ? 'var(--tt-chip-teal)' : 'var(--tt-surface-2)',
                         cursor: status.recordable ? 'pointer' : 'default',
                         minWidth: 108,
                         textAlign: 'center',
@@ -1538,12 +1687,8 @@ const ShortcutsPanel: React.FC = () => {
                     </Box>
                     {customized ? (
                       <Box
-                        onClick={() => {
-                          const next: ShortcutOverrides = { ...overrides };
-                          delete next[a.id];
-                          persist(next);
-                          setNotice('');
-                        }}
+                        {...clickableProps(resetShortcut, tr('恢复「{name}」默认快捷键', { name: a.label }))}
+                        onClick={resetShortcut}
                         sx={{ px: 1, py: 0.4, borderRadius: '8px', cursor: 'pointer' }}
                       >
                         <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)' }}>恢复默认</Typography>
@@ -1558,7 +1703,7 @@ const ShortcutsPanel: React.FC = () => {
       ))}
 
       {notice ? (
-        <Typography sx={{ fontSize: '12px', color: '#EF4444', mb: 1.5 }}>{notice}</Typography>
+        <Typography sx={{ fontSize: '12px', color: 'var(--tt-danger)', mb: 1.5 }}>{notice}</Typography>
       ) : null}
 
       <Typography sx={{ fontSize: '14px', fontWeight: 700, color: 'var(--tt-text-1)', mt: 3, mb: 1.5 }}>
@@ -1593,7 +1738,7 @@ const ShortcutsPanel: React.FC = () => {
         sub="应用内快捷键：仅当任我行窗口位于前台时生效；系统级全局热键尚未提供"
         control={
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, justifyContent: 'flex-end' }}>
-            <Typography sx={{ fontSize: '11.5px', color: quickPickOn ? '#0D9488' : 'var(--tt-text-4)' }}>
+            <Typography sx={{ fontSize: '11.5px', color: quickPickOn ? 'var(--tt-teal)' : 'var(--tt-text-4)' }}>
               {quickPickOn ? '已注册' : '未启用'}
             </Typography>
             <Box sx={{ px: 1.5, py: 0.6, borderRadius: '8px', border: '1px solid var(--tt-border)', bgcolor: 'var(--tt-surface-2)', minWidth: 108, textAlign: 'center' }}>
@@ -1755,7 +1900,7 @@ const AWARENESS_FILES: AwarenessFileDef[] = [
     file: 'WORK_MANUAL.md',
     title: '工作手册',
     desc: '规范与行为准则，可自定义',
-    icon: <MenuBookOutlinedIcon sx={{ fontSize: 18, color: '#6366F1' }} />,
+    icon: <MenuBookOutlinedIcon sx={{ fontSize: 18, color: 'var(--tt-accent)' }} />,
     defaultContent: '# 工作手册\n\n## 工作规范\n- （在此补充你的规范）\n\n## 常用流程\n- （在此补充常用流程）',
   },
   {
@@ -1763,7 +1908,7 @@ const AWARENESS_FILES: AwarenessFileDef[] = [
     file: 'USER_PROFILE.md',
     title: '用户画像',
     desc: '记录基本信息、偏好与习惯',
-    icon: <PersonOutlineIcon sx={{ fontSize: 18, color: '#F59E0B' }} />,
+    icon: <PersonOutlineIcon sx={{ fontSize: 18, color: 'var(--tt-warning)' }} />,
     defaultContent: '# 用户画像\n\n## 基本信息\n- 称呼：\n\n## 偏好\n- （待补充）\n\n## 习惯\n- （待补充）',
   },
   {
@@ -1781,7 +1926,32 @@ function fmtAwarenessSize(content: string): string {
   return bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`;
 }
 
+const MEMORY_SOURCE_LABELS: Record<MemoryEntry['source'], string> = {
+  auto: '自动',
+  manual: '手动',
+  reflection: '复盘',
+};
+const MEMORY_KIND_LABELS: Record<MemoryEntry['kind'], string> = {
+  task: '任务',
+  fact: '事实',
+  preference: '偏好',
+  decision: '决策',
+};
+const MEMORY_STATUS_LABELS: Record<MemoryStatus, string> = {
+  active: '生效',
+  pending: '待审',
+  archived: '已归档',
+};
+/** 复核动作 → 按钮文案（与 Rust `REVIEW_ACTIONS` 一一对应） */
+const MEMORY_ACTION_LABELS: Record<MemoryReviewAction, string> = {
+  confirm: '确认',
+  reject: '驳回',
+  archive: '归档',
+  restore: '恢复',
+};
+
 const AwarenessPanel: React.FC = () => {
+  const { t: tr } = useI18n();
   /** 意识视图（awareness:get）：画像 + 目录 + 四个能力文件，真实来源在意识目录 */
   const [view, setView] = useState<AwarenessView | null>(null);
   const [memories, setMemories] = useState<MemoryEntry[]>([]);
@@ -1796,11 +1966,26 @@ const AwarenessPanel: React.FC = () => {
   const [styleSel, setStyleSel] = useState<AwarenessStyleId>('efficient');
   const [styleContent, setStyleContent] = useState('');
 
-  // 长期记忆条目新增输入
+  // 长期记忆条目新增输入与归属筛选
   const [memoryDraft, setMemoryDraft] = useState('');
   const [memoryBusy, setMemoryBusy] = useState(false);
+  const [memoryScope, setMemoryScope] = useState<MemoryEntry['scope']>('workspace');
+  const [memoryFilter, setMemoryFilter] = useState<'all' | 'project' | 'global'>('all');
+  /** 状态筛选：默认只看生效条目，待审与归档各自独立查看 */
+  const [memoryStatusFilter, setMemoryStatusFilter] = useState<'active' | 'pending' | 'archived' | 'all'>('active');
+  /** 实体页（按事实主体聚合） */
+  const [memoryEntities, setMemoryEntities] = useState<MemoryEntityPage[]>([]);
+  /** 导出/导入/维护的结果说明（成功路径也要有反馈） */
+  const [memoryMsg, setMemoryMsg] = useState('');
+  const [importOpen, setImportOpen] = useState(false);
+  const [importText, setImportText] = useState('');
+  const [importBusy, setImportBusy] = useState(false);
+  const importFileRef = useRef<HTMLInputElement | null>(null);
+  /** 浏览器直连引擎没有桌面记忆库：复核/实体页/导入导出入口不显示 */
+  const canManageMemory = supportsMemoryManagement();
+  const workspaceId = getActiveWorkspaceId() || 'default';
 
-  const cfg = view ?? { mode: true, autoMemory: true, style: 'efficient' as AwarenessStyleId, updatedAt: '', dir: null, files: {} };
+  const cfg = view ?? { mode: true, autoMemory: true, memoryReview: false, memoryModelExtract: false, style: 'efficient' as AwarenessStyleId, updatedAt: '', dir: null, files: {} };
   const currentStyleId: string = cfg.style;
   const currentStyle = STYLE_PRESETS.find((s) => s.id === currentStyleId) ?? STYLE_PRESETS[0];
 
@@ -1809,15 +1994,20 @@ const AwarenessPanel: React.FC = () => {
 
   const reload = React.useCallback(async () => {
     try {
-      const [v, rows] = await Promise.all([getAwareness(), listMemories()]);
+      const [v, rows, pages] = await Promise.all([
+        getAwareness(),
+        listMemories(),
+        canManageMemory ? listMemoryEntities(workspaceId) : Promise.resolve([] as MemoryEntityPage[]),
+      ]);
       setView(v);
       setMemories(rows);
+      setMemoryEntities(pages);
       if (v.dir) setAwarenessPath(v.dir);
       setLoadError('');
     } catch (e) {
       setLoadError(errorTextOf(e, '意识内容读取失败'));
     }
-  }, []);
+  }, [canManageMemory, workspaceId]);
 
   useEffect(() => {
     void reload();
@@ -1829,6 +2019,7 @@ const AwarenessPanel: React.FC = () => {
       const next = await updateAwareness(patch);
       setView(next);
       setMemories(await listMemories());
+      if (canManageMemory) setMemoryEntities(await listMemoryEntities(workspaceId));
       if (next.dir) setAwarenessPath(next.dir);
       setSaveError('');
       return true;
@@ -1868,7 +2059,7 @@ const AwarenessPanel: React.FC = () => {
     Boolean(view?.files?.[def.file as AwarenessFileName]) &&
     getEntry(def).content.trim() !== def.defaultContent.trim();
 
-  const patchCfg = (patch: Partial<Pick<AwarenessProfile, 'mode' | 'autoMemory'>>) => {
+  const patchCfg = (patch: Partial<Pick<AwarenessProfile, 'mode' | 'autoMemory' | 'memoryReview' | 'memoryModelExtract'>>) => {
     void applyPatch(patch);
   };
 
@@ -1915,14 +2106,14 @@ const AwarenessPanel: React.FC = () => {
     void applyPatch({ files: { [editingDef.file as AwarenessFileName]: template } });
   };
 
-  /** 新增一条长期记忆（awareness:memoryAdd，空内容由后端拒绝） */
+  /** 新增一条长期记忆（awareness:memoryAdd，空内容/非法归属由后端拒绝） */
   const submitMemory = async () => {
     const text = memoryDraft.trim();
     if (!text || memoryBusy) return;
     setMemoryBusy(true);
     try {
-      await addMemory(text);
-      setMemories(await listMemories());
+      await addMemory(text, 'manual', memoryScope, memoryScope === 'workspace' ? workspaceId : undefined);
+      await reload();
       setMemoryDraft('');
       setSaveError('');
     } catch (e) {
@@ -1938,7 +2129,7 @@ const AwarenessPanel: React.FC = () => {
     setMemoryBusy(true);
     try {
       await deleteMemory(id);
-      setMemories(await listMemories());
+      await reload();
       setSaveError('');
     } catch (e) {
       setSaveError(errorTextOf(e, '记忆条目删除失败'));
@@ -1947,7 +2138,169 @@ const AwarenessPanel: React.FC = () => {
     }
   };
 
+  /**
+   * 复核一条记忆：确认 / 驳回 / 归档 / 恢复。
+   * 只改状态不删正文；失败（如已被新事实取代）如实显示后端原因。
+   */
+  const review = async (id: string, action: MemoryReviewAction) => {
+    if (memoryBusy) return;
+    setMemoryBusy(true);
+    try {
+      await reviewMemory(id, action);
+      await reload();
+      setSaveError('');
+    } catch (e) {
+      setSaveError(errorTextOf(e, `记忆${MEMORY_ACTION_LABELS[action]}失败`));
+    } finally {
+      setMemoryBusy(false);
+    }
+  };
+
+  /** 导出全部记忆；返回真实落盘路径（Mock 通道标注为 localStorage） */
+  const exportAll = async () => {
+    if (memoryBusy) return;
+    setMemoryBusy(true);
+    try {
+      const result = await exportMemories();
+      setMemoryMsg(`已导出 ${result.count} 条记忆 → ${result.path}`);
+      setSaveError('');
+    } catch (e) {
+      setSaveError(errorTextOf(e, '记忆导出失败'));
+    } finally {
+      setMemoryBusy(false);
+    }
+  };
+
+  /** 导入 JSON：桌面端导入前自动备份，按内容去重（重复只累加次数） */
+  const submitImport = async () => {
+    const raw = importText.trim();
+    if (!raw || importBusy) return;
+    setImportBusy(true);
+    try {
+      const result = await importMemories(raw);
+      setMemoryMsg(
+        `已导入：新增 ${result.inserted} 条，合并 ${result.merged} 条，跳过 ${result.skipped} 条` +
+          `（导入前已备份 → ${result.backupPath}）`,
+      );
+      setImportOpen(false);
+      setImportText('');
+      setSaveError('');
+      await reload();
+    } catch (e) {
+      setSaveError(errorTextOf(e, '记忆导入失败'));
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
+  /** 从本地文件读取导入内容：.hmpkg 直接导入迁移包，.json 先放进文本框确认 */
+  const pickImportFile = async (file: File | null) => {
+    if (!file) return;
+    const name = file.name.toLowerCase();
+    try {
+      if (name.endsWith('.hmpkg')) {
+        setImportBusy(true);
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        let binary = '';
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+          binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+        }
+        const result = await importMemoryPackage(btoa(binary));
+        setMemoryMsg(
+          `已从迁移包导入：新增 ${result.inserted} 条，合并 ${result.merged} 条，跳过 ${result.skipped} 条` +
+            `（包版本 v${result.packageVersion}${result.exportedAt ? `，导出于 ${fmtAwarenessUpdatedAt(result.exportedAt)}` : ''}；` +
+            `导入前已备份 → ${result.backupPath}）`,
+        );
+        setImportOpen(false);
+        setSaveError('');
+        await reload();
+        return;
+      }
+      setImportText(await file.text());
+    } catch (e) {
+      setSaveError(errorTextOf(e, '导入文件读取失败'));
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
+  /** 与 MEMORY.md 对账：只导入文件里有、库里没有的条目，不改文件 */
+  const docSync = async () => {
+    if (memoryBusy) return;
+    setMemoryBusy(true);
+    try {
+      const result = await syncMemoryDoc();
+      setMemoryMsg(
+        result.fileCount === 0
+          ? 'MEMORY.md 里没有可对账的结构化条目'
+          : `MEMORY.md 对账：文件 ${result.fileCount} 条，新导入 ${result.imported} 条，已存在 ${result.existing} 条` +
+              (result.skipped ? `，跳过 ${result.skipped} 条` : ''),
+      );
+      setSaveError('');
+      await reload();
+    } catch (e) {
+      setSaveError(errorTextOf(e, 'MEMORY.md 对账失败'));
+    } finally {
+      setMemoryBusy(false);
+    }
+  };
+
+  /** 导出 .hmpkg 迁移包（zip + manifest 校验；导入时仍会强制备份） */
+  const exportPackage = async () => {
+    if (memoryBusy) return;
+    setMemoryBusy(true);
+    try {
+      const result = await exportMemoryPackage();
+      setMemoryMsg(`已导出迁移包（${result.count} 条）→ ${result.path}`);
+      setSaveError('');
+    } catch (e) {
+      setSaveError(errorTextOf(e, '迁移包导出失败'));
+    } finally {
+      setMemoryBusy(false);
+    }
+  };
+
+  /** 维护：归档超出保留条数的旧自动任务摘要（不删正文，可恢复） */
+  const compactAll = async () => {
+    if (memoryBusy) return;
+    setMemoryBusy(true);
+    try {
+      const result = await compactMemories();
+      setMemoryMsg(
+        result.archived > 0
+          ? `已归档 ${result.archived} 条旧任务摘要（每个归属保留最近 ${result.keepPerScope} 条，可在「已归档」恢复）`
+          : `没有需要归档的条目（每个归属保留 ${result.keepPerScope} 条）`,
+      );
+      setSaveError('');
+      await reload();
+    } catch (e) {
+      setSaveError(errorTextOf(e, '记忆维护失败'));
+    } finally {
+      setMemoryBusy(false);
+    }
+  };
+
   const editingDef = AWARENESS_FILES.find((f) => f.key === editingKey) ?? null;
+
+  const projectMemories = memories.filter(
+    (m) => m.scope === 'workspace' && m.workspaceId === workspaceId,
+  );
+  const globalMemories = memories.filter((m) => m.scope === 'global');
+  const statusOf = (m: MemoryEntry): MemoryStatus => m.status ?? 'active';
+  const pendingCount = memories.filter((m) => statusOf(m) === 'pending').length;
+  const archivedCount = memories.filter((m) => statusOf(m) === 'archived').length;
+  const activeCount = memories.length - pendingCount - archivedCount;
+  const scopedMemories =
+    memoryFilter === 'project'
+      ? projectMemories
+      : memoryFilter === 'global'
+        ? globalMemories
+        : memories;
+  const shownMemories =
+    memoryStatusFilter === 'all'
+      ? scopedMemories
+      : scopedMemories.filter((m) => statusOf(m) === memoryStatusFilter);
 
   return (
     <Box sx={{ maxWidth: 860 }}>
@@ -1955,7 +2308,7 @@ const AwarenessPanel: React.FC = () => {
 
       {(loadError || saveError) && (
         <Box sx={{ bgcolor: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '10px', px: 2, py: 1.25, mb: 1.5 }}>
-          <Typography sx={{ fontSize: '12px', color: '#EF4444' }}>{loadError || saveError}</Typography>
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-danger)' }}>{loadError || saveError}</Typography>
         </Box>
       )}
 
@@ -1966,8 +2319,18 @@ const AwarenessPanel: React.FC = () => {
       />
       <SettingRow
         label="自动记忆"
-        sub="任务成功后，把目标、结论与产物摘要写入 MEMORY.md；疑似凭据不写入，可在下方查看和删除"
+        sub="任务成功后，把目标、结论与产物摘要写入记忆库（同内容自动合并）；疑似凭据不写入，可在下方查看和删除"
         control={<Switch checked={cfg.autoMemory} onChange={(e) => patchCfg({ autoMemory: e.target.checked })} sx={tealSwitch} />}
+      />
+      <SettingRow
+        label="写入前待审"
+        sub="自动写入与模型主动保存的记忆先进「待审」，确认后才参与召回；驳回只归档不删除。手动录入不受影响"
+        control={<Switch checked={cfg.memoryReview} onChange={(e) => patchCfg({ memoryReview: e.target.checked })} sx={tealSwitch} />}
+      />
+      <SettingRow
+        label="模型辅助抽取"
+        sub="任务收尾额外调用一次模型补充事实（会多一次调用与延迟，本轮结论会再次发给模型）；关闭时只用规则抽取"
+        control={<Switch checked={cfg.memoryModelExtract} onChange={(e) => patchCfg({ memoryModelExtract: e.target.checked })} sx={tealSwitch} />}
       />
 
       <Box sx={{ opacity: cfg.mode ? 1 : 0.45, pointerEvents: cfg.mode ? 'auto' : 'none' }}>
@@ -2008,9 +2371,10 @@ const AwarenessPanel: React.FC = () => {
           </Box>
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexShrink: 0 }}>
             {openMsg && (
-              <Typography sx={{ fontSize: '11px', color: '#0D9488' }}>{openMsg}</Typography>
+              <Typography sx={{ fontSize: '11px', color: 'var(--tt-teal)' }}>{openMsg}</Typography>
             )}
             <Box
+              {...clickableProps(openAwarenessFolder)}
               onClick={openAwarenessFolder}
               sx={{
                 display: 'flex',
@@ -2021,7 +2385,7 @@ const AwarenessPanel: React.FC = () => {
                 borderRadius: '8px',
                 border: '1px solid var(--tt-border)',
                 cursor: 'pointer',
-                '&:hover': { borderColor: '#14B8A6' },
+                '&:hover': { borderColor: 'var(--tt-teal)' },
               }}
             >
               <FolderOpenOutlinedIcon sx={{ fontSize: 14, color: 'var(--tt-text-3)' }} />
@@ -2037,6 +2401,7 @@ const AwarenessPanel: React.FC = () => {
           return (
             <Box
               key={def.key}
+              {...clickableProps(() => (def.key === 'style' ? openStyleDialog() : openFile(def)), tr('查看能力文件 {title}', { title: def.title }))}
               onClick={() => (def.key === 'style' ? openStyleDialog() : openFile(def))}
               sx={{
                 display: 'flex',
@@ -2050,7 +2415,7 @@ const AwarenessPanel: React.FC = () => {
                 mb: 1.5,
                 cursor: 'pointer',
                 transition: 'border-color 0.15s ease',
-                '&:hover': { borderColor: '#14B8A6' },
+                '&:hover': { borderColor: 'var(--tt-teal)' },
               }}
             >
               <Box
@@ -2075,7 +2440,7 @@ const AwarenessPanel: React.FC = () => {
                 <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-3)', fontFamily: 'Consolas, monospace' }}>
                   {def.key === 'style' ? `${def.file} · ${currentStyle.name}` : def.file} · {fmtAwarenessSize(entry.content)} · {fmtAwarenessUpdatedAt(entry.updatedAt)}
                 </Typography>
-                <Typography sx={{ fontSize: '11px', color: customized ? '#0D9488' : 'var(--tt-text-4)', mt: 0.25 }}>
+                <Typography sx={{ fontSize: '11px', color: customized ? 'var(--tt-teal)' : 'var(--tt-text-4)', mt: 0.25 }}>
                   {customized ? '已定制' : '系统默认'} · 查看 ›
                 </Typography>
               </Box>
@@ -2084,43 +2449,213 @@ const AwarenessPanel: React.FC = () => {
         })}
 
         {/* 长期记忆条目 */}
-        <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'var(--tt-text-1)', mt: 2.5, mb: 1 }}>
-          长期记忆条目
+        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mt: 2.5, mb: 0.5, gap: 1, flexWrap: 'wrap' }}>
+          <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'var(--tt-text-1)' }}>
+            长期记忆条目
+          </Typography>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+            <PrefSelect
+              value={
+                memoryStatusFilter === 'pending'
+                  ? '待审'
+                  : memoryStatusFilter === 'archived'
+                    ? '已归档'
+                    : memoryStatusFilter === 'all'
+                      ? '全部'
+                      : '生效'
+              }
+              options={['生效', '待审', '已归档', '全部']}
+              ariaLabel="记忆状态筛选"
+              onChange={(v) =>
+                setMemoryStatusFilter(
+                  v === '待审' ? 'pending' : v === '已归档' ? 'archived' : v === '全部' ? 'all' : 'active',
+                )
+              }
+            />
+            <PrefSelect
+              value={memoryFilter === 'project' ? '本项目' : memoryFilter === 'global' ? '全局' : '全部'}
+              options={['所有归属', '本项目', '全局']}
+              ariaLabel="记忆归属筛选"
+              onChange={(v) =>
+                setMemoryFilter(v === '本项目' ? 'project' : v === '全局' ? 'global' : 'all')
+              }
+            />
+          </Box>
+        </Box>
+        <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mb: 1 }}>
+          共 {memories.length} 条 · 生效 {activeCount} · 待审 {pendingCount} · 已归档 {archivedCount}；
+          本项目 {projectMemories.length} 条 · 全局 {globalMemories.length} 条。任务收尾自动写入，相同内容合并为一条
         </Typography>
-        {memories.length === 0 && (
-          <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mb: 1.5 }}>
-            暂无记忆条目，可在下方手动新增
+        {canManageMemory ? (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1.5, flexWrap: 'wrap' }}>
+            <Button size="small" onClick={() => void exportAll()} disabled={memoryBusy} sx={{ color: 'var(--tt-text-2)', fontSize: '12px', minWidth: 0 }}>
+              导出 JSON
+            </Button>
+            <Button size="small" onClick={() => void exportPackage()} disabled={memoryBusy} sx={{ color: 'var(--tt-text-2)', fontSize: '12px', minWidth: 0 }}>
+              导出迁移包
+            </Button>
+            <Button size="small" onClick={() => setImportOpen(true)} disabled={memoryBusy} sx={{ color: 'var(--tt-text-2)', fontSize: '12px', minWidth: 0 }}>
+              导入
+            </Button>
+            <Button size="small" onClick={() => void docSync()} disabled={memoryBusy} sx={{ color: 'var(--tt-text-3)', fontSize: '12px', minWidth: 0 }}>
+              与 MEMORY.md 对账
+            </Button>
+            <Button size="small" onClick={() => void compactAll()} disabled={memoryBusy} sx={{ color: 'var(--tt-text-3)', fontSize: '12px', minWidth: 0 }}>
+              归档旧摘要
+            </Button>
+            <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)', flexGrow: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {memoryMsg}
+            </Typography>
+          </Box>
+        ) : (
+          <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mb: 1.5 }}>
+            当前为浏览器直连通道：复核、实体页与导入导出只在桌面版可用（引擎只读 MEMORY.md，不提供假成功）
           </Typography>
         )}
-        {memories.map((m) => (
-          <Box
-            key={m.id}
-            sx={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 1.5,
-              bgcolor: 'var(--tt-surface)',
-              border: '1px solid var(--tt-border)',
-              borderRadius: '10px',
-              px: 2,
-              py: 1.25,
-              mb: 0.75,
-            }}
-          >
-            <Box sx={{ flexGrow: 1, minWidth: 0 }}>
-              <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {m.content}
-              </Typography>
-              <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)', mt: 0.25 }}>
-                {m.source} · {fmtAwarenessUpdatedAt(m.createdAt)}
-              </Typography>
+        {shownMemories.length === 0 && (
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mb: 1.5 }}>
+            {memories.length === 0
+              ? '暂无记忆条目，可在下方手动新增'
+              : memoryStatusFilter === 'pending'
+                ? '没有待审记忆：开启「写入前待审」后，自动写入会先进入这里'
+                : memoryStatusFilter === 'archived'
+                  ? '没有已归档的记忆：驳回、归档或软退休的条目会保留在这里'
+                  : '该归属/状态下暂无记忆条目'}
+          </Typography>
+        )}
+        {shownMemories.map((m) => {
+          const status = statusOf(m);
+          const superseded = Boolean(m.supersededBy);
+          return (
+            <Box
+              key={m.id}
+              sx={{
+                display: 'flex',
+                alignItems: 'flex-start',
+                gap: 1.5,
+                bgcolor: 'var(--tt-surface)',
+                border: status === 'pending' ? '1px solid rgba(245,158,11,0.45)' : '1px solid var(--tt-border)',
+                borderRadius: '10px',
+                px: 2,
+                py: 1.25,
+                mb: 0.75,
+                opacity: status === 'archived' ? 0.72 : 1,
+              }}
+            >
+              <Box sx={{ flexGrow: 1, minWidth: 0 }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mb: 0.25, flexWrap: 'wrap' }}>
+                  <Box
+                    component="span"
+                    sx={{
+                      fontSize: '10.5px',
+                      px: 0.75,
+                      py: '1px',
+                      borderRadius: '6px',
+                      bgcolor: m.scope === 'global' ? 'rgba(20,184,166,0.12)' : 'rgba(99,102,241,0.12)',
+                      color: 'var(--tt-text-1)',
+                    }}
+                  >
+                    {m.scope === 'global' ? '全局' : '本项目'}
+                  </Box>
+                  <Box
+                    component="span"
+                    sx={{
+                      fontSize: '10.5px',
+                      px: 0.6,
+                      py: '1px',
+                      borderRadius: '6px',
+                      border: '1px solid var(--tt-border)',
+                      color: 'var(--tt-text-3)',
+                    }}
+                  >
+                    {MEMORY_KIND_LABELS[m.kind] ?? m.kind}
+                  </Box>
+                  <Box
+                    component="span"
+                    sx={{
+                      fontSize: '10.5px',
+                      px: 0.6,
+                      py: '1px',
+                      borderRadius: '6px',
+                      bgcolor:
+                        status === 'pending'
+                          ? 'rgba(245,158,11,0.14)'
+                          : status === 'archived'
+                            ? 'rgba(148,163,184,0.16)'
+                            : 'rgba(34,197,94,0.12)',
+                      color: 'var(--tt-text-2)',
+                    }}
+                  >
+                    {MEMORY_STATUS_LABELS[status]}
+                  </Box>
+                  <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
+                    {MEMORY_SOURCE_LABELS[m.source] ?? m.source} · {fmtAwarenessUpdatedAt(m.updatedAt || m.createdAt)}
+                    {m.occurrences > 1 ? ` · 重复 ${m.occurrences} 次` : ''}
+                    {m.useCount > 0 ? ` · 引用 ${m.useCount} 次` : ''}
+                    {(m.confidence ?? 1) < 1 ? ` · 置信 ${Math.round((m.confidence ?? 1) * 100)}%` : ''}
+                  </Typography>
+                </Box>
+                <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {m.content}
+                </Typography>
+                {(m.subject || m.predicate || m.object) && (
+                  <Typography sx={{ fontSize: '10.5px', color: 'var(--tt-text-3)', mt: 0.2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    事实：{m.subject || '—'} / {m.predicate || '—'} / {m.object || '—'}
+                  </Typography>
+                )}
+                {m.taskTitle && (
+                  <Typography sx={{ fontSize: '10.5px', color: 'var(--tt-text-4)', mt: 0.2 }}>
+                    来源任务：{m.taskTitle}
+                  </Typography>
+                )}
+                {superseded && (
+                  <Typography sx={{ fontSize: '10.5px', color: 'var(--tt-warning, #D97706)', mt: 0.2 }}>
+                    已被更新的同类事实取代（{m.supersededBy}）
+                  </Typography>
+                )}
+              </Box>
+              {canManageMemory && (
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.25, flexShrink: 0 }}>
+                  {status === 'pending' && (
+                    <>
+                      <Button size="small" disabled={memoryBusy} onClick={() => void review(m.id, 'confirm')} sx={{ fontSize: '11.5px', minWidth: 0, px: 1 }}>
+                        确认
+                      </Button>
+                      <Button size="small" disabled={memoryBusy} onClick={() => void review(m.id, 'reject')} sx={{ fontSize: '11.5px', minWidth: 0, px: 1, color: 'var(--tt-danger)' }}>
+                        驳回
+                      </Button>
+                    </>
+                  )}
+                  {status === 'archived' && (
+                    <Button
+                      size="small"
+                      disabled={memoryBusy || superseded}
+                      onClick={() => void review(m.id, 'restore')}
+                      sx={{ fontSize: '11.5px', minWidth: 0, px: 1 }}
+                    >
+                      恢复
+                    </Button>
+                  )}
+                  {status === 'active' && (
+                    <IconButton
+                      size="small"
+                      aria-label={tr('归档记忆条目「{content}」', { content: m.content })}
+                      disabled={memoryBusy}
+                      onClick={() => void review(m.id, 'archive')}
+                      sx={{ color: 'var(--tt-text-4)', '&:hover': { color: 'var(--tt-text-2)' } }}
+                    >
+                      <ArchiveOutlinedIcon sx={{ fontSize: 16 }} />
+                    </IconButton>
+                  )}
+                  <IconButton size="small" aria-label={tr('删除记忆条目「{content}」', { content: m.content })} onClick={() => void removeMemory(m.id)} disabled={memoryBusy} sx={{ color: 'var(--tt-text-4)', '&:hover': { color: 'var(--tt-danger)' } }}>
+                    <DeleteOutlineIcon sx={{ fontSize: 16 }} />
+                  </IconButton>
+                </Box>
+              )}
             </Box>
-            <IconButton size="small" onClick={() => void removeMemory(m.id)} disabled={memoryBusy} sx={{ color: 'var(--tt-text-4)', '&:hover': { color: '#EF4444' } }}>
-              <DeleteOutlineIcon sx={{ fontSize: 16 }} />
-            </IconButton>
-          </Box>
-        ))}
-        <Box sx={{ display: 'flex', gap: 1, mt: 1 }}>
+          );
+        })}
+        <Box sx={{ display: 'flex', gap: 1, mt: 1, alignItems: 'center' }}>
           <TextField
             size="small"
             fullWidth
@@ -2130,6 +2665,13 @@ const AwarenessPanel: React.FC = () => {
             onKeyDown={(e) => { if (e.key === 'Enter') void submitMemory(); }}
             disabled={memoryBusy}
             sx={{ '& .MuiInputBase-input': { fontSize: '12.5px' } }}
+          />
+          <PrefSelect
+            value={memoryScope === 'global' ? '全局' : '本项目'}
+            options={['本项目', '全局']}
+            ariaLabel="新增记忆的归属"
+            disabled={memoryBusy}
+            onChange={(v) => setMemoryScope(v === '全局' ? 'global' : 'workspace')}
           />
           <Button
             size="small"
@@ -2141,6 +2683,56 @@ const AwarenessPanel: React.FC = () => {
             添加
           </Button>
         </Box>
+
+        {/* 实体页：按事实主体聚合活跃条目（没有 subject 的摘要不参与） */}
+        {canManageMemory && (
+          <>
+            <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'var(--tt-text-1)', mt: 2.5, mb: 0.5 }}>
+              记忆实体
+            </Typography>
+            <Typography sx={{ fontSize: '11.5px', color: 'var(--tt-text-4)', mb: 1 }}>
+              按事实主体聚合当前项目可见的生效条目；同一主体同属性的旧取值在写入新事实时自动退休
+            </Typography>
+            {memoryEntities.length === 0 ? (
+              <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mb: 1.5 }}>
+                暂无结构化事实。任务收尾抽取到「主体 / 属性 / 取值」后，这里会按主体归类
+              </Typography>
+            ) : (
+              memoryEntities.slice(0, 8).map((page) => (
+                <Box
+                  key={page.subject}
+                  sx={{
+                    bgcolor: 'var(--tt-surface)',
+                    border: '1px solid var(--tt-border)',
+                    borderRadius: '10px',
+                    px: 2,
+                    py: 1.25,
+                    mb: 0.75,
+                  }}
+                >
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexWrap: 'wrap' }}>
+                    <Typography sx={{ fontSize: '13px', fontWeight: 600, color: 'var(--tt-text-1)' }}>
+                      {page.subject}
+                    </Typography>
+                    <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
+                      {page.count} 条 · {page.kinds.map((k) => MEMORY_KIND_LABELS[k] ?? k).join(' / ')} ·{' '}
+                      {fmtAwarenessUpdatedAt(page.latest)}
+                    </Typography>
+                  </Box>
+                  {page.entries.map((entry) => (
+                    <Typography
+                      key={entry.id}
+                      sx={{ fontSize: '12px', color: 'var(--tt-text-2)', mt: 0.35, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                    >
+                      {entry.predicate ? `${entry.predicate}：` : ''}
+                      {entry.object || entry.content}
+                    </Typography>
+                  ))}
+                </Box>
+              ))
+            )}
+          </>
+        )}
       </Box>
       <Dialog open={Boolean(editingDef)} onClose={() => setEditingKey(null)} maxWidth="md" fullWidth>
         <DialogTitle sx={{ fontSize: '15px', fontWeight: 700 }}>
@@ -2157,7 +2749,7 @@ const AwarenessPanel: React.FC = () => {
           />
         </DialogContent>
         <DialogActions sx={{ px: 3, pb: 2 }}>
-          <Button size="small" onClick={resetFile} sx={{ color: '#EF4444', fontSize: '12px' }}>
+          <Button size="small" onClick={resetFile} sx={{ color: 'var(--tt-danger)', fontSize: '12px' }}>
             重置为默认
           </Button>
           <Box sx={{ flexGrow: 1 }} />
@@ -2183,18 +2775,20 @@ const AwarenessPanel: React.FC = () => {
             {STYLE_PRESETS.map((s) => (
               <Box
                 key={s.id}
+                {...clickableProps(() => selectStyleTab(s.id))}
+                aria-pressed={styleSel === s.id}
                 onClick={() => selectStyleTab(s.id)}
                 sx={{
                   px: 1.75,
                   py: 0.75,
                   borderRadius: '999px',
-                  border: styleSel === s.id ? '1.5px solid #14B8A6' : '1px solid var(--tt-border)',
+                  border: styleSel === s.id ? '1.5px solid var(--tt-teal)' : '1px solid var(--tt-border)',
                   bgcolor: styleSel === s.id ? 'rgba(20, 184, 166, 0.08)' : 'var(--tt-surface-2)',
                   cursor: 'pointer',
                   transition: 'border-color 0.15s ease',
                 }}
               >
-                <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: styleSel === s.id ? '#0D9488' : 'var(--tt-text-2)' }}>
+                <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: styleSel === s.id ? 'var(--tt-teal)' : 'var(--tt-text-2)' }}>
                   {s.name}
                 </Typography>
               </Box>
@@ -2218,6 +2812,71 @@ const AwarenessPanel: React.FC = () => {
           </Button>
           <Button size="small" variant="contained" onClick={saveStyle} sx={{ bgcolor: 'var(--tt-text-1)', fontSize: '12px' }}>
             保存
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* 导入记忆：.hmpkg 直接导入迁移包；.json 先读取再确认，桌面端写入前自动备份 */}
+      <Dialog open={importOpen} onClose={() => (importBusy ? undefined : setImportOpen(false))} maxWidth="md" fullWidth>
+        <DialogTitle sx={{ fontSize: '15px', fontWeight: 700 }}>导入长期记忆</DialogTitle>
+        <DialogContent sx={{ pt: '8px !important' }}>
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', mb: 1 }}>
+            支持迁移包（.hmpkg，校验 manifest 与 sha256 后直接导入）或导出文件
+            （format=tongtian.memories）/ 记忆条目数组；按「归属 + 内容」去重，
+            重复条目只累加出现次数。写入前会自动备份当前记忆库。
+          </Typography>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+            <Button
+              size="small"
+              variant="outlined"
+              disabled={importBusy}
+              onClick={() => importFileRef.current?.click()}
+              sx={{ fontSize: '12px', color: 'var(--tt-text-2)' }}
+            >
+              选择 .hmpkg / .json 文件
+            </Button>
+            <Typography sx={{ fontSize: '11px', color: 'var(--tt-text-4)' }}>
+              {importBusy
+                ? '正在导入…'
+                : importText
+                  ? `已读取 ${importText.length} 字符，确认无误后点「导入」`
+                  : '未选择文件时可直接粘贴 JSON'}
+            </Typography>
+            <input
+              ref={importFileRef}
+              type="file"
+              accept="application/json,.json,.hmpkg,application/zip"
+              hidden
+              aria-label="选择记忆导出文件或迁移包"
+              onChange={(e) => {
+                void pickImportFile(e.target.files?.[0] ?? null);
+                e.target.value = '';
+              }}
+            />
+          </Box>
+          <TextField
+            fullWidth
+            multiline
+            minRows={10}
+            value={importText}
+            onChange={(e) => setImportText(e.target.value)}
+            placeholder='{"format":"tongtian.memories","version":1,"entries":[…]}'
+            disabled={importBusy}
+            sx={{ '& .MuiInputBase-input': { fontSize: '12px', fontFamily: 'Consolas, monospace', lineHeight: 1.6 } }}
+          />
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button size="small" onClick={() => setImportOpen(false)} disabled={importBusy} sx={{ color: 'var(--tt-text-3)', fontSize: '12px' }}>
+            取消
+          </Button>
+          <Button
+            size="small"
+            variant="contained"
+            onClick={() => void submitImport()}
+            disabled={importBusy || !importText.trim()}
+            sx={{ bgcolor: 'var(--tt-text-1)', fontSize: '12px' }}
+          >
+            导入
           </Button>
         </DialogActions>
       </Dialog>
@@ -2280,7 +2939,7 @@ const BrandMark: React.FC<{ name: string; icon: string | null; size?: number }> 
         alignItems: 'center',
         justifyContent: 'center',
         flexShrink: 0,
-        bgcolor: '#fff',
+        bgcolor: 'var(--tt-surface)',
         border: '1px solid var(--tt-border-soft)',
       }}
     >
@@ -2538,7 +3197,7 @@ const BrandingPanel: React.FC = () => {
           </Box>
 
           {info.platform === 'mock' && (
-            <Typography sx={{ fontSize: '12px', color: '#B45309', mt: 1 }}>
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-warning)', mt: 1 }}>
               {tr('Mock 模式：修改只保存在浏览器内存，不写入窗口标题或系统图标')}
             </Typography>
           )}
@@ -2551,7 +3210,7 @@ const BrandingPanel: React.FC = () => {
               sx={{
                 textTransform: 'none',
                 borderRadius: '9px',
-                background: 'linear-gradient(90deg, #14B8A6 0%, #06B6D4 100%)',
+                background: 'linear-gradient(90deg, #0F766E 0%, #0E7490 100%)',
                 '&.Mui-disabled': { background: 'rgba(148, 163, 184, 0.25)' },
               }}
             >
@@ -2564,7 +3223,7 @@ const BrandingPanel: React.FC = () => {
             )}
           </Box>
           {error && (
-            <Typography sx={{ fontSize: '12.5px', color: '#DC2626', mt: 1.5 }}>{error}</Typography>
+            <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-danger)', mt: 1.5 }}>{error}</Typography>
           )}
         </Box>
       )}
@@ -2684,6 +3343,7 @@ const UpdatePanel: React.FC = () => {
  * 选中项写入 app settings（桌面端即 settings_kv），Rust runtime 与引擎读同一个 id。
  */
 const PptxTemplatesSection: React.FC = () => {
+  const { t: tr } = useI18n();
   const { desktop, loading, error, templates, selectedId, root, notes, select, importFile, remove } =
     usePptxTemplates();
   const [busyId, setBusyId] = useState('');
@@ -2782,12 +3442,12 @@ const PptxTemplatesSection: React.FC = () => {
 
       {banner && (
         <Box sx={{ bgcolor: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '10px', px: 2, py: 1.25, mb: 1.5 }}>
-          <Typography sx={{ fontSize: '12px', color: '#EF4444' }}>{banner}</Typography>
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-danger)' }}>{banner}</Typography>
         </Box>
       )}
       {info && (
         <Box sx={{ bgcolor: 'rgba(20,184,166,0.08)', border: '1px solid rgba(20,184,166,0.3)', borderRadius: '10px', px: 2, py: 1.25, mb: 1.5 }}>
-          <Typography sx={{ fontSize: '12px', color: '#0D9488' }}>{info}</Typography>
+          <Typography sx={{ fontSize: '12px', color: 'var(--tt-teal)' }}>{info}</Typography>
         </Box>
       )}
 
@@ -2840,7 +3500,7 @@ const PptxTemplatesSection: React.FC = () => {
                 }}
               >
                 <Box sx={{ height: 9, bgcolor: tpl.theme?.accent ?? '#9CA3AF' }} />
-                <Box sx={{ flex: 1, bgcolor: tpl.theme?.background ?? '#FFFFFF' }} />
+                <Box sx={{ flex: 1, bgcolor: tpl.theme?.background ?? 'var(--tt-surface)' }} />
               </Box>
               <Box sx={{ minWidth: 0, flex: 1 }}>
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexWrap: 'wrap' }}>
@@ -2854,11 +3514,11 @@ const PptxTemplatesSection: React.FC = () => {
                     <Chip
                       size="small"
                       label="文件不可用"
-                      sx={{ height: 20, fontSize: '10.5px', bgcolor: 'rgba(239,68,68,0.1)', color: '#EF4444' }}
+                      sx={{ height: 20, fontSize: '10.5px', bgcolor: 'rgba(239,68,68,0.1)', color: 'var(--tt-danger)' }}
                     />
                   )}
                 </Box>
-                <Typography sx={{ fontSize: '12px', color: tpl.available ? 'var(--tt-text-4)' : '#EF4444', mt: 0.25 }}>
+                <Typography sx={{ fontSize: '12px', color: tpl.available ? 'var(--tt-text-4)' : 'var(--tt-danger)', mt: 0.25 }}>
                   {tpl.available ? meta : tpl.error || '模板文件已不存在，请重新导入'}
                 </Typography>
               </Box>
@@ -2866,7 +3526,7 @@ const PptxTemplatesSection: React.FC = () => {
                 <Chip
                   size="small"
                   label="使用中"
-                  sx={{ flexShrink: 0, height: 24, fontSize: '11.5px', bgcolor: 'rgba(20,184,166,0.12)', color: '#0D9488', fontWeight: 600 }}
+                  sx={{ flexShrink: 0, height: 24, fontSize: '11.5px', bgcolor: 'rgba(20,184,166,0.12)', color: 'var(--tt-teal)', fontWeight: 600 }}
                 />
               ) : (
                 <Button
@@ -2882,7 +3542,7 @@ const PptxTemplatesSection: React.FC = () => {
               {!tpl.builtin && (
                 <Tooltip title="删除模板（文件移入模板目录 .trash/）">
                   <span>
-                    <IconButton size="small" disabled={deleting} onClick={() => setPendingDelete(tpl)}>
+                    <IconButton size="small" aria-label={tr('删除模板「{name}」', { name: tpl.name })} disabled={deleting} onClick={() => setPendingDelete(tpl)}>
                       <DeleteOutlineIcon sx={{ fontSize: 18 }} />
                     </IconButton>
                   </span>
@@ -3099,7 +3759,7 @@ const SandboxPanel: React.FC = () => {
       ? `${sysStatus.platform} 不支持操作系统级隔离，当前只有策略沙箱：工具调用受工作区边界与白名单约束，进程不受限制`
       : sysEnabled
         ? sysStatus.effective
-          ? `已生效（AppContainer · ${sysStatus.profile}）：终端、MCP stdio 与 ACP 子进程以容器令牌运行，写操作限制在工作区，读不到数据根里的会话库与密钥文件${sysNetwork ? '；允许出网' : '；阻断出网（回环与局域网同样不可达）'}`
+          ? `已生效（AppContainer · ${sysStatus.profile}）：终端、MCP stdio、ACP 与 Hooks 子进程以容器令牌运行，写操作限制在工作区（Hooks 的工作目录只读，落盘只能写沙箱临时目录），读不到数据根里的会话库与密钥文件${sysNetwork ? '；允许出网' : '；阻断出网（回环与局域网同样不可达）'}`
           : `已请求但未生效：${sysStatus.error ?? 'AppContainer profile 未就绪'}`
         : '未启用：子进程以当前用户权限运行，只有策略沙箱拦截越界工具调用。启用后需重新启动任务才会作用于新引擎进程';
 
@@ -3121,7 +3781,7 @@ const SandboxPanel: React.FC = () => {
         <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-2)' }}>
           策略沙箱：L0 只读 / L1 受限 / L2 可执行，按工作区策略限制工具与路径
         </Typography>
-        <Typography sx={{ fontSize: '12px', color: sysEnabled && sysStatus?.effective ? '#0D9488' : 'var(--tt-text-3)' }}>
+        <Typography sx={{ fontSize: '12px', color: sysEnabled && sysStatus?.effective ? 'var(--tt-teal)' : 'var(--tt-text-3)' }}>
           系统隔离：{sysStatus?.supported ? (sysEnabled && sysStatus.effective ? '已生效' : sysEnabled ? '未生效' : '未启用') : '平台不支持'}
         </Typography>
       </Box>
@@ -3136,7 +3796,7 @@ const SandboxPanel: React.FC = () => {
             mb: 1.5,
           }}
         >
-          <Typography sx={{ fontSize: '12px', color: envError ? '#EF4444' : '#0D9488' }}>
+          <Typography sx={{ fontSize: '12px', color: envError ? 'var(--tt-danger)' : 'var(--tt-teal)' }}>
             {envError || envMessage}
           </Typography>
         </Box>
@@ -3189,17 +3849,18 @@ const SandboxPanel: React.FC = () => {
         }
         control={
           <Box
+            {...clickableProps(() => canClear && setConfirmOpen(true))}
             onClick={() => canClear && setConfirmOpen(true)}
             sx={{
               px: 1.75,
               py: 0.5,
               borderRadius: '8px',
-              border: '1px solid #FCA5A5',
+              border: '1px solid var(--tt-danger)',
               cursor: canClear ? 'pointer' : 'not-allowed',
               opacity: canClear ? 1 : 0.5,
             }}
           >
-            <Typography sx={{ fontSize: '12px', fontWeight: 600, color: '#EF4444' }}>
+            <Typography sx={{ fontSize: '12px', fontWeight: 600, color: 'var(--tt-danger)' }}>
               {clearing
                 ? '清理中…'
                 : usage && !usage.supported
@@ -3228,7 +3889,7 @@ const SandboxPanel: React.FC = () => {
             disabled={clearing}
             variant="contained"
             startIcon={clearing ? <CircularProgress size={14} color="inherit" /> : undefined}
-            sx={{ fontSize: '13px', bgcolor: '#EF4444', '&:hover': { bgcolor: '#DC2626' } }}
+            sx={{ fontSize: '13px', bgcolor: 'var(--tt-danger-fill)', '&:hover': { bgcolor: '#DC2626' } }}
           >
             确认清理
           </Button>
@@ -3381,7 +4042,7 @@ const TerminalAcpPanel: React.FC = () => {
 
       {loadError && (
         <Box sx={{ mb: 2, p: 1.25, borderRadius: '10px', bgcolor: 'rgba(217, 119, 6, 0.1)' }}>
-          <Typography sx={{ fontSize: '12.5px', color: '#92400E' }}>{loadError}</Typography>
+          <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-warning)' }}>{loadError}</Typography>
         </Box>
       )}
 
@@ -3421,7 +4082,7 @@ const TerminalAcpPanel: React.FC = () => {
       )}
       {!supported && (
         <Box sx={{ mb: 2, p: 1.5, borderRadius: '12px', bgcolor: 'rgba(217, 119, 6, 0.08)', border: '1px solid rgba(217, 119, 6, 0.3)' }}>
-          <Typography sx={{ fontSize: '12.5px', color: '#92400E', lineHeight: 1.7 }}>
+          <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-warning)', lineHeight: 1.7 }}>
             {caps?.reason || '终端 AI+ 只在桌面版可用；浏览器/Mock 通道没有本机进程'}。
             这里的开关不可修改，避免出现「能点、能保存、实际不生效」。
           </Typography>
@@ -3492,7 +4153,7 @@ const TerminalAcpPanel: React.FC = () => {
         }
       />
       {acpError && (
-        <Typography sx={{ fontSize: '12.5px', color: '#B91C1C', mb: 1 }}>{acpError}</Typography>
+        <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-danger)', mb: 1 }}>{acpError}</Typography>
       )}
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 1 }}>
         <Button
@@ -3500,7 +4161,7 @@ const TerminalAcpPanel: React.FC = () => {
           size="small"
           disabled={!supported || savingAcp || loading}
           onClick={() => void saveAcp()}
-          sx={{ textTransform: 'none', bgcolor: '#0D9488', '&:hover': { bgcolor: '#0F766E' } }}
+          sx={{ textTransform: 'none', bgcolor: 'var(--tt-teal-fill)', '&:hover': { bgcolor: '#0F766E' } }}
         >
           {savingAcp ? '正在保存…' : '保存 ACP 配置'}
         </Button>
@@ -3553,8 +4214,8 @@ const TerminalAcpPanel: React.FC = () => {
             m: 0,
             p: 1.25,
             borderRadius: '8px',
-            bgcolor: '#0B1220',
-            color: '#E5E7EB',
+            bgcolor: 'var(--tt-chat-code-bg)',
+            color: 'var(--tt-text-4)',
             fontSize: '12px',
             fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
             whiteSpace: 'pre-wrap',
@@ -3739,6 +4400,7 @@ const RepairHistoryRow: React.FC = () => {
         sub={error || message || '如果历史对话出现消息缺失或重复，可按会话正文库重建显示（不修改对话内容）'}
         control={
           <Box
+            {...clickableProps(() => !running && setOpen(true))}
             onClick={() => !running && setOpen(true)}
             sx={{
               px: 1.75,
@@ -3859,7 +4521,7 @@ const Settings: React.FC = () => {
         <Typography sx={{ fontSize: '20px', fontWeight: 700, color: 'var(--tt-text-1)', flexGrow: 1 }}>
           {tr('设置')}
         </Typography>
-        <IconButton size="small" onClick={() => navigate('/')} sx={{ color: 'var(--tt-text-3)' }}>
+        <IconButton size="small" aria-label={tr('关闭设置并返回工作台')} onClick={() => navigate('/')} sx={{ color: 'var(--tt-text-3)' }}>
           <CloseIcon sx={{ fontSize: 22 }} />
         </IconButton>
       </Box>
@@ -3878,6 +4540,8 @@ const Settings: React.FC = () => {
                 return (
                   <Box
                     key={sec.id}
+                    {...clickableProps(() => handleSectionClick(sec.id))}
+                    aria-current={isActive ? 'true' : undefined}
                     onClick={() => handleSectionClick(sec.id)}
                     sx={{
                       display: 'flex',
@@ -3888,17 +4552,17 @@ const Settings: React.FC = () => {
                       mb: 0.25,
                       borderRadius: '10px',
                       cursor: 'pointer',
-                      background: isActive ? '#E6F7F4' : 'transparent',
+                      background: isActive ? 'var(--tt-chip-teal)' : 'transparent',
                       transition: 'background 0.15s ease',
-                      '&:hover': { background: isActive ? '#E6F7F4' : 'rgba(15, 23, 42, 0.04)' },
+                      '&:hover': { background: isActive ? 'var(--tt-chip-teal)' : 'var(--tt-surface-3)' },
                     }}
                   >
-                    <Icon sx={{ fontSize: 17, color: isActive ? '#0D9488' : '#6B7280' }} />
+                    <Icon sx={{ fontSize: 17, color: isActive ? 'var(--tt-teal)' : 'var(--tt-text-4)' }} />
                     <Typography
                       sx={{
                         fontSize: '13px',
                         fontWeight: isActive ? 600 : 400,
-                        color: isActive ? '#0D9488' : '#374151',
+                        color: isActive ? 'var(--tt-teal)' : 'var(--tt-text-2)',
                       }}
                     >
                       {tr(sec.label)}

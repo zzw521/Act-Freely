@@ -67,11 +67,13 @@ const riskLabel: Record<TerminalAiResult['suggestion']['risk'], string> = {
   unknown: '风险未知',
 };
 
-const riskColor: Record<TerminalAiResult['suggestion']['risk'], string> = {
-  low: '#047857',
-  medium: '#B45309',
-  high: '#B91C1C',
-  unknown: '#6B7280',
+/* 成对的风险徽标色：文字走语义档、底走 chip 档，一起跟皮肤翻；
+   原来是 `${hex}14` 叠浅底，暗色下那层底等于没有，深字直接压深底。 */
+const riskTone: Record<TerminalAiResult['suggestion']['risk'], { fg: string; bg: string }> = {
+  low: { fg: 'var(--tt-success)', bg: 'var(--tt-chip-success)' },
+  medium: { fg: 'var(--tt-warning)', bg: 'var(--tt-chip-warning)' },
+  high: { fg: 'var(--tt-danger)', bg: 'var(--tt-chip-danger)' },
+  unknown: { fg: 'var(--tt-text-3)', bg: 'var(--tt-chip-neutral)' },
 };
 
 interface TerminalPanelProps {
@@ -296,9 +298,8 @@ const TerminalPanel: React.FC<TerminalPanelProps> = ({ embedded = false }) => {
     if (ok) showNotification('已把 AI 建议写入终端（来源已留痕）', 'success');
   };
 
-  const statusColor = ready ? '#047857' : '#B45309';
-  const statusBg = ready ? 'rgba(5, 150, 105, 0.07)' : 'rgba(217, 119, 6, 0.08)';
-  const statusBorder = ready ? '1px solid rgba(5, 150, 105, 0.35)' : '1px solid rgba(217, 119, 6, 0.35)';
+  const statusColor = ready ? 'var(--tt-success)' : 'var(--tt-warning)';
+  const statusBg = ready ? 'var(--tt-chip-success)' : 'var(--tt-chip-warning)';
 
   const terminalHint = useMemo(() => {
     if (!pipeReady) return caps?.reason || '当前通道没有本机 shell 进程';
@@ -317,11 +318,11 @@ const TerminalPanel: React.FC<TerminalPanelProps> = ({ embedded = false }) => {
       }}
     >
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-        <TerminalIcon sx={{ fontSize: 22, color: '#0D9488' }} />
+        <TerminalIcon sx={{ fontSize: 22, color: 'var(--tt-teal)' }} />
         <Typography sx={{ fontSize: '20px', fontWeight: 700, color: 'var(--tt-text-1)' }}>
           终端 AI+
         </Typography>
-        {loading && <CircularProgress size={16} sx={{ color: '#0D9488' }} />}
+        {loading && <CircularProgress size={16} sx={{ color: 'var(--tt-teal)' }} />}
       </Box>
       <Typography sx={{ fontSize: '13px', color: 'var(--tt-text-3)', mt: 0.5 }}>
         在本机工作目录里打开真实 shell；AI 根据最近输出给出命令建议，只有你逐条确认才会写入终端。
@@ -331,27 +332,27 @@ const TerminalPanel: React.FC<TerminalPanelProps> = ({ embedded = false }) => {
         {/* 能力状态：开关、引擎、通道三者都就绪才允许开终端 */}
         <Box
           data-testid="terminal-status"
-          sx={{ p: 1.75, borderRadius: '14px', border: statusBorder, bgcolor: statusBg }}
+          sx={{ p: 1.75, borderRadius: '14px', border: '1px solid var(--tt-border)', bgcolor: statusBg }}
         >
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexWrap: 'wrap' }}>
             {ready ? (
-              <CheckCircleIcon sx={{ fontSize: 18, color: '#059669' }} />
+              <CheckCircleIcon sx={{ fontSize: 18, color: 'var(--tt-success)' }} />
             ) : (
-              <WarningAmberIcon sx={{ fontSize: 18, color: '#D97706' }} />
+              <WarningAmberIcon sx={{ fontSize: 18, color: 'var(--tt-warning)' }} />
             )}
             <Typography sx={{ fontSize: '13.5px', fontWeight: 700, color: statusColor }}>
               {ready ? '终端可用' : '终端不可用'}
             </Typography>
             {caps && (
               <Box sx={{ px: 1, py: 0.2, borderRadius: '6px', bgcolor: 'rgba(107, 114, 128, 0.12)' }}>
-                <Typography sx={{ fontSize: '11px', fontWeight: 600, color: '#6B7280' }}>
+                <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-text-2)' }}>
                   {caps.shell || caps.platform}
                 </Typography>
               </Box>
             )}
             {sessionId && (
               <Box sx={{ px: 1, py: 0.2, borderRadius: '6px', bgcolor: 'rgba(13, 148, 136, 0.12)' }}>
-                <Typography sx={{ fontSize: '11px', fontWeight: 600, color: '#0F766E' }}>
+                <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-teal)' }}>
                   会话 {sessionId.slice(-6)} · {running ? '运行中' : '已退出'}
                 </Typography>
               </Box>
@@ -422,7 +423,7 @@ const TerminalPanel: React.FC<TerminalPanelProps> = ({ embedded = false }) => {
                 startIcon={opening ? <CircularProgress size={14} sx={{ color: '#fff' }} /> : <PlayArrowIcon />}
                 disabled={!ready || opening || !cwd.trim()}
                 onClick={() => void openSession()}
-                sx={{ textTransform: 'none', bgcolor: '#0D9488', '&:hover': { bgcolor: '#0F766E' } }}
+                sx={{ textTransform: 'none', bgcolor: 'var(--tt-teal-fill)', '&:hover': { bgcolor: '#0F766E' } }}
               >
                 {opening ? '正在打开…' : '打开终端'}
               </Button>
@@ -458,7 +459,7 @@ const TerminalPanel: React.FC<TerminalPanelProps> = ({ embedded = false }) => {
               border: '1px solid rgba(217, 119, 6, 0.3)',
             }}
           >
-            <Typography sx={{ fontSize: '12.5px', color: '#92400E' }}>{banner}</Typography>
+            <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-warning)' }}>{banner}</Typography>
           </Box>
         )}
 
@@ -471,19 +472,19 @@ const TerminalPanel: React.FC<TerminalPanelProps> = ({ embedded = false }) => {
             height: 340,
             overflowY: 'auto',
             borderRadius: '14px',
-            bgcolor: '#0B1220',
-            border: '1px solid #1F2937',
+            bgcolor: 'var(--tt-chat-code-bg)',
+            border: '1px solid var(--tt-border)',
             p: 1.5,
             fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
             fontSize: '12.5px',
             lineHeight: 1.55,
-            color: '#E5E7EB',
+            color: 'var(--tt-text-4)',
             whiteSpace: 'pre-wrap',
             wordBreak: 'break-all',
           }}
         >
           {output || (
-            <Typography sx={{ fontSize: '12.5px', color: '#6B7280', fontFamily: 'inherit' }}>
+            <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-2)', fontFamily: 'inherit' }}>
               {sessionId ? '等待输出…' : '打开终端后，shell 输出会显示在这里。'}
             </Typography>
           )}
@@ -517,7 +518,7 @@ const TerminalPanel: React.FC<TerminalPanelProps> = ({ embedded = false }) => {
             variant="contained"
             disabled={!sessionId || sending || !running}
             onClick={() => void submitInput()}
-            sx={{ textTransform: 'none', bgcolor: '#0D9488', '&:hover': { bgcolor: '#0F766E' } }}
+            sx={{ textTransform: 'none', bgcolor: 'var(--tt-teal-fill)', '&:hover': { bgcolor: '#0F766E' } }}
           >
             发送
           </Button>
@@ -537,12 +538,12 @@ const TerminalPanel: React.FC<TerminalPanelProps> = ({ embedded = false }) => {
           }}
         >
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mb: 0.5 }}>
-            <AutoAwesomeIcon sx={{ fontSize: 18, color: '#7C3AED' }} />
+            <AutoAwesomeIcon sx={{ fontSize: 18, color: 'var(--tt-accent-violet)' }} />
             <Typography sx={{ fontSize: '16px', fontWeight: 700, color: 'var(--tt-text-1)' }}>
               AI 命令建议
             </Typography>
             <Box sx={{ px: 1, py: 0.2, borderRadius: '6px', bgcolor: 'rgba(124, 58, 237, 0.1)' }}>
-              <Typography sx={{ fontSize: '11px', fontWeight: 600, color: '#6D28D9' }}>
+              <Typography sx={{ fontSize: '11px', fontWeight: 600, color: 'var(--tt-accent-violet)' }}>
                 只建议，不执行
               </Typography>
             </Box>
@@ -585,7 +586,7 @@ const TerminalPanel: React.FC<TerminalPanelProps> = ({ embedded = false }) => {
             </Typography>
           )}
           {aiError && (
-            <Typography sx={{ fontSize: '12.5px', color: '#B91C1C', mt: 1 }}>{aiError}</Typography>
+            <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-danger)', mt: 1 }}>{aiError}</Typography>
           )}
           {aiResult && (
             <Box sx={{ mt: 1.5 }}>
@@ -598,16 +599,16 @@ const TerminalPanel: React.FC<TerminalPanelProps> = ({ embedded = false }) => {
                     px: 1,
                     py: 0.2,
                     borderRadius: '6px',
-                    bgcolor: `${riskColor[aiResult.suggestion.risk]}14`,
+                    bgcolor: riskTone[aiResult.suggestion.risk].bg,
                   }}
                 >
-                  <Typography sx={{ fontSize: '11px', fontWeight: 600, color: riskColor[aiResult.suggestion.risk] }}>
+                  <Typography sx={{ fontSize: '11px', fontWeight: 600, color: riskTone[aiResult.suggestion.risk].fg }}>
                     {riskLabel[aiResult.suggestion.risk]}
                   </Typography>
                 </Box>
               </Box>
               {aiResult.suggestion.parseError && (
-                <Typography sx={{ fontSize: '12px', color: '#B45309', mt: 0.75 }}>
+                <Typography sx={{ fontSize: '12px', color: 'var(--tt-warning)', mt: 0.75 }}>
                   {aiResult.suggestion.parseError}
                 </Typography>
               )}
@@ -639,8 +640,8 @@ const TerminalPanel: React.FC<TerminalPanelProps> = ({ embedded = false }) => {
                           m: 0,
                           p: 1,
                           borderRadius: '8px',
-                          bgcolor: '#0B1220',
-                          color: '#E5E7EB',
+                          bgcolor: 'var(--tt-chat-code-bg)',
+                          color: 'var(--tt-text-4)',
                           fontSize: '12px',
                           fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
                           whiteSpace: 'pre-wrap',
@@ -733,8 +734,8 @@ const TerminalPanel: React.FC<TerminalPanelProps> = ({ embedded = false }) => {
               m: 0,
               p: 1.25,
               borderRadius: '8px',
-              bgcolor: '#0B1220',
-              color: '#E5E7EB',
+              bgcolor: 'var(--tt-chat-code-bg)',
+              color: 'var(--tt-text-4)',
               fontSize: '12.5px',
               fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
               whiteSpace: 'pre-wrap',

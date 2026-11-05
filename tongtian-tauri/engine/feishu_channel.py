@@ -25,6 +25,10 @@ JSON 而是 protobuf 二进制，所以框架给它开了 `binary_frames` + `dec
   没有可回复的消息_id 时用 POST /open-apis/im/v1/messages?receive_id_type=chat_id
 - 事件正文是 schema 2.0 的回调 JSON，字段名以 SDK 的 P2ImMessageReceiveV1 /
   EventSender / EventMessage / EventHeader 为准，机器人消息只看 im.message.receive_v1
+- 群/单聊与被 @（D-41）：EventMessage.chat_type（p2p/群）与 EventMessage.mentions[]
+  （key、id.open_id、mentioned_type，取自 SDK 的 MentionEvent）；机器人自己的 open_id
+  取 GET /open-apis/bot/v3/info 的 bot.open_id——与官方 SDK channel/bot_identity.py 同一口径
+  （它也把这条查询的存在理由写成「让群里的 @ 判定可用」）
 
 为什么不跑 SDK 的 ws.Client.start()：它在模块导入时就抓住一个全局事件循环，
 `run_until_complete` + `loop.create_task` 的写法和引擎的 uvicorn 循环不能共存，而且自带
@@ -71,6 +75,8 @@ EVENT_MESSAGE_RECEIVE = "im.message.receive_v1"
 # 合包有效期：与 SDK 的 _combine 一致（self._cache.set(msg_id, buf, 5)）
 FRAGMENT_TTL_SECONDS = 5
 REPLY_TARGETS = 64
+# @ 所有人的 mention key（SDK 的 MentionEvent.key 就是这个占位符形状，"@_user_1" 是逐个 @）
+ALL_MENTION_KEY = "@_all"
 MAX_SEEN_EVENTS = 256
 # 服务端没下发 ClientConfig 时的本地默认（SDK 的 ws/client.py 同样是 120）
 DEFAULT_PING_SECONDS = 120.0
@@ -204,6 +210,14 @@ class FeishuChannel(ImChannel):
         ),
     )
 
+    # 飞书的 @ 是有帧字段可查的（message.mentions 里带被 @ 者的 open_id），
+    # 但要拿机器人自己的 open_id 去比——那要一次 /bot/v3/info，绑定与每次重连时现查。
+    mention_note = (
+        "群/单聊取自事件的 chat_type（p2p 是确定单聊，其余按群处理）；「有没有 @ 我」拿事件里的 "
+        "message.mentions[].id.open_id 与机器人自己的 open_id 比对，后者取自 GET /open-apis/bot/v3/info。"
+        "没查到自己是谁、或那条只 @ 了所有人时如实答不出（None），不猜"
+    )
+
     def __init__(self):
         # 合包缓冲：message_id -> (已收到的片, 期望片数, 到期时刻)
         self._fragments: dict[str, tuple[dict[int, bytes], int, float]] = {}
@@ -216,6 +230,9 @@ class FeishuChannel(ImChannel):
         self._service_id = ""
         self._token = ""
         self._token_expire_at = 0.0
+        # 机器人自己的 open_id：群里「@ 的是不是我」要比对这个值才知道（见 _mentioned）
+        self._bot_open_id = ""
+        self._bot_name = ""
 
     @property
     def unsupported_reason(self) -> str:
@@ -237,11 +254,14 @@ class FeishuChannel(ImChannel):
                 "IM_BAD_RESPONSE",
                 "飞书没有返回长连接地址：请在开放平台「事件与回调」把订阅方式改为长连接后重试",
             )
+        await self._fetch_bot_identity(app_id, app_secret)
         return {
             "appId": _mask(app_id),
             "apiBase": domain_base(),
             "subscribeEvent": EVENT_MESSAGE_RECEIVE,
             "pingIntervalSeconds": self._ping_interval,
+            "botName": self._bot_name,
+            "botOpenId": _mask(self._bot_open_id),
         }
 
     def _require(self, creds: dict) -> tuple[str, str]:
@@ -275,6 +295,9 @@ class FeishuChannel(ImChannel):
         query = parse_qs(urlparse(url).query)
         self._service_id = (query.get(sdk["const"].SERVICE_ID) or [""])[0]
         device_id = (query.get(sdk["const"].DEVICE_ID) or [""])[0]
+        # 每次建连都补一次机器人身份：换应用版本、机器人改名或被移出群都会让上次的
+        # open_id 失效。查不到不阻断连接（群消息因此答不出「是不是 @ 我」，比连不上好）
+        await self._fetch_bot_identity(app_id, app_secret)
         return OpenTicket(
             ws_url=url,
             info={
@@ -282,8 +305,39 @@ class FeishuChannel(ImChannel):
                 "apiBase": domain_base(),
                 "pingIntervalSeconds": self._ping_interval,
                 "connectionId": _mask(device_id),
+                "botName": self._bot_name,
+                "botOpenId": _mask(self._bot_open_id),
             },
         )
+
+    # ── ②b 机器人身份：群里「@ 的是不是我」要比对的另一个半边 ────────────
+
+    async def _fetch_bot_identity(self, app_id: str, app_secret: str) -> str:
+        """GET /open-apis/bot/v3/info → bot.open_id（官方 SDK 的 bot_identity 同一口径）
+
+        响应有两种包裹形状（SDK 两种都吃）：`{"bot":{...},"code":0}` 与
+        `{"data":{"bot":{...}}}`；这里照同样顺序取，取不到就留空并由 `_mentioned` 答 None。
+        """
+        try:
+            token = await self._tenant_token(app_id, app_secret)
+            status, _, body = await self.fetch_bytes(
+                f"{domain_base()}/open-apis/bot/v3/info", token=token
+            )
+            if status != 200:
+                return ""
+            payload = json.loads(body.decode("utf-8", "replace"))
+            if not isinstance(payload, dict):
+                return ""
+            bag = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+            bot = bag.get("bot") if isinstance(bag.get("bot"), dict) else bag
+            open_id = str(bot.get("open_id") or bot.get("openid") or "").strip()
+            if not open_id or int(payload.get("code") or 0) != 0:
+                return ""
+            self._bot_open_id = open_id
+            self._bot_name = str(bot.get("app_name") or bot.get("name") or "")
+            return open_id
+        except Exception:  # noqa: BLE001  身份查询失败不该把连接拖进退避
+            return ""
 
     async def _endpoint_discovery(self, app_id: str, app_secret: str) -> dict:
         """POST {domain}/callback/ws/endpoint → {code,msg,data:{URL,ClientConfig}}"""
@@ -493,7 +547,46 @@ class FeishuChannel(ImChannel):
             conversation_id=conversation_id,
             user_id=user_id,
             message_id=message_id,
+            is_group=self._is_group(message),
+            mentioned_me=self._mentioned(message),
+            at_ms=self._at_ms(message),
         )
+
+    # ── D-41：群/单聊与被 @ —— 都只取事件里明写的事实 ──────────────────
+
+    @staticmethod
+    def _is_group(message) -> bool:
+        """chat_type 只有 "p2p" 能确定是单聊；陌生取值按群处理（群策略比单聊严）"""
+        return str(getattr(message, "chat_type", "") or "") != "p2p"
+
+    @staticmethod
+    def _at_ms(message) -> int:
+        """事件的 message.create_time 是毫秒字符串，SDK 的类型表已把它转成 int"""
+        try:
+            return int(getattr(message, "create_time", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _mentioned(self, message) -> bool | None:
+        """mentions[].id.open_id 与机器人自己的 open_id 比对
+
+        None 的两种情形：①还没查到自己是谁（绑定/重连那一次 /bot/v3/info 没成）；
+        ②那条 @ 的是所有人——飞书文档没写死「@ 所有人」算不算 @ 到机器人，
+        把它判成 True 会让每条 @all 都起一个任务，判成 False 会让该回的那条不回，
+        所以按「答不出」处理：策略据此不起任务，台账里写明可执行的改法。
+        """
+        mentions = getattr(message, "mentions", None) or []
+        if not mentions:
+            return False
+        if not self._bot_open_id:
+            return None
+        for mention in mentions:
+            if str(getattr(mention, "key", "") or "") == ALL_MENTION_KEY:
+                return None
+            user_id = getattr(mention, "id", None)
+            if str(getattr(user_id, "open_id", "") or "") == self._bot_open_id:
+                return True
+        return False
 
     def _on_control_frame(self, frame: dict) -> None:
         """pong 的 payload 是服务端下发的 ClientConfig（SDK 也是在这里改保活间隔）"""

@@ -9,7 +9,8 @@
  * 全部来自 `ChannelRuntime.view()`。Slack 与钉钉是 A 族方言（换一次性连接地址、逐帧回执、
  * HTTP 回贴），企业微信是 B 族方言（固定地址、带内订阅、回贴在同一条 socket 上等回执），
  * 飞书是 A 族的二进制变体（同样换地址与逐帧回执，但帧是 protobuf 且一条消息按 sum/seq
- * 拆成多帧），四条通道共用同一个连接循环与台账。本文件锁住六件事：
+ * 拆成多帧），个人微信是长轮询 + 扫码登录（没有长连接），腾讯元宝是固定地址 + 二进制
+ * protobuf + 应用层心跳，六条通道共用同一个连接循环与台账。本文件锁住六件事：
  *   1. 引擎通道清单与错误码、TS 契约三处对齐
  *   2. 三通道（Tauri / 引擎直连 / Mock）都有真实接线，Mock 通道如实拒绝
  *   3. 页面不再出现假承诺，且每个控件都绑定真实动作
@@ -33,10 +34,13 @@ const slackChannel = () => read('../../../engine/slack_channel.py');
 const dingtalkChannel = () => read('../../../engine/dingtalk_channel.py');
 const wecomChannel = () => read('../../../engine/wecom_channel.py');
 const feishuChannel = () => read('../../../engine/feishu_channel.py');
+const wechatChannel = () => read('../../../engine/wechat_channel.py');
+const yuanbaoChannel = () => read('../../../engine/yuanbao_channel.py');
 const server = () => read('../../../engine/server.py');
 const rustIm = () => read('../../../src-tauri/src/bridge/im.rs');
 const rustLib = () => read('../../../src-tauri/src/lib.rs');
 const tauriApi = () => read('../../../src/renderer/lib/tauri-api.ts');
+const engineEndpoint = () => read('../../../src/renderer/lib/engine-endpoint.ts');
 const engineApi = () => read('../../../src/renderer/lib/engine-api.ts');
 const mockApi = () => read('../../../src/renderer/lib/mock-api.ts');
 const alignmentApi = () => read('../../../src/renderer/lib/alignment-api.ts');
@@ -50,7 +54,7 @@ const IM_CODES = Object.values(ErrorCode).filter((c) => c.startsWith('IM_'));
 
 /** 引擎里 raise 出来的全部 IM 错误码 */
 function engineRaisedCodes(): string[] {
-  const src = `${imFramework()}\n${slackChannel()}\n${dingtalkChannel()}\n${wecomChannel()}\n${feishuChannel()}\n${server()}`;
+  const src = `${imFramework()}\n${slackChannel()}\n${dingtalkChannel()}\n${wecomChannel()}\n${feishuChannel()}\n${wechatChannel()}\n${yuanbaoChannel()}\n${server()}`;
   return [...src.matchAll(/"((?:TT_)?IM_[A-Z_]+)"/g)]
     .map((m) => m[1].replace(/^TT_/, ''))
     .filter((c) => c in ErrorCode || (Object.values(ErrorCode) as string[]).includes(c));
@@ -95,15 +99,20 @@ describe('错误码三处对齐（漂移即红）', () => {
 });
 
 describe('引擎通道清单：支持与否只有一个来源', () => {
-  it('已接入的是 Slack、钉钉、企业微信与飞书，其余仍走 Pending 如实拒绝', () => {
+  it('已接入的是 Slack、钉钉、企业微信、飞书、个人微信与腾讯元宝', () => {
     expect(slackChannel()).toContain('supported = True');
     expect(dingtalkChannel()).toContain('supported = SDK_IMPORT_ERROR == ""');
     expect(wecomChannel()).toContain('supported = SDK_IMPORT_ERROR == ""');
     // 飞书看的是「装没装官方 SDK」，不是导入成没成功：启动阶段根本不 import
     expect(feishuChannel()).toContain('supported = SDK_PRESENT');
+    // 个人微信与元宝的协议事实写在自有模块里，不依赖可选 SDK：注册即可用
+    expect(wechatChannel()).toContain('class WeChatILinkChannel(ImChannel)');
+    expect(wechatChannel()).toContain('supported = True');
+    expect(yuanbaoChannel()).toContain('class YuanbaoChannel(ImChannel)');
+    expect(yuanbaoChannel()).toContain('supported = True');
     expect(imFramework()).toContain('class PendingChannel(ImChannel)');
-    expect(imFramework()).toContain('class WeChatChannel(PendingChannel)');
-    // 钉钉、企业微信与飞书不再是占位类：占位清单里不能还留着它们（否则注册表会出现两份）
+    // 已接入的通道不再是占位类：占位清单里不能还留着它们（否则注册表会出现两份）
+    expect(imFramework()).not.toContain('class WeChatChannel(PendingChannel)');
     expect(imFramework()).not.toContain('class DingTalkChannel(PendingChannel)');
     expect(imFramework()).not.toContain('class WeComChannel(PendingChannel)');
     expect(imFramework()).not.toContain('class FeishuChannel(PendingChannel)');
@@ -115,10 +124,14 @@ describe('引擎通道清单：支持与否只有一个来源', () => {
     expect(server()).toContain('import dingtalk_channel');
     expect(server()).toContain('import wecom_channel');
     expect(server()).toContain('import feishu_channel');
+    expect(server()).toContain('import wechat_channel');
+    expect(server()).toContain('import yuanbao_channel');
   });
 
-  it('通道清单顺序由引擎决定：已接入排在未接入之前', () => {
-    expect(imFramework()).toContain('key=lambda r: not r.channel.supported');
+  it('通道清单顺序由引擎决定：已接入排在未接入之前，同类多实例再按类型与标识排', () => {
+    // D-41 之前只有一个「支持/未支持」两级；同类型出现第二个实例后，
+    // 只按 supported 排会让两张卡片在刷新时互换位置，所以补上 kind / channelId 两级。
+    expect(imFramework()).toContain('key=lambda r: (not r.channel.supported, r.channel.kind, r.channel_id)');
   });
 
   it('同构四步在框架里都有实现点（换地址→连 wss→逐帧回执→回贴）', () => {
@@ -133,11 +146,15 @@ describe('引擎通道清单：支持与否只有一个来源', () => {
     expect(slackChannel()).toContain('"envelope_id"');
   });
 
-  it('三族方言共用同一条循环：B 族靠 on_open/on_close/protocol_heartbeat，二进制族靠 binary_frames/decode_frame 接入', () => {
+  it('四类传输共用同一条循环：B 族靠 on_open/on_close/protocol_heartbeat，二进制族靠 binary_frames/decode_frame，个人微信靠 long_poll', () => {
     const src = imFramework();
     expect(src).toContain('A 族（钉钉 / Slack）');
     expect(src).toContain('B 族（企业微信 aibot）');
     expect(src).toContain('A 族的二进制变体（飞书）');
+    // 个人微信没有长连接：框架把长轮询也收进同一个 supervise/退避/台账
+    expect(src).toContain('transport: str = "websocket"');
+    expect(src).toContain('def poll_once');
+    expect(wechatChannel()).toContain('transport = "long_poll"');
     // 带内握手（订阅帧）与握手后要撤掉的保活任务
     expect(src).toContain('async def on_open');
     expect(src).toContain('async def on_close');
@@ -148,12 +165,15 @@ describe('引擎通道清单：支持与否只有一个来源', () => {
     expect(src).toContain('heartbeat=channel.protocol_heartbeat');
     expect(wecomChannel()).toContain('protocol_heartbeat = None');
     expect(feishuChannel()).toContain('protocol_heartbeat = None');
+    expect(yuanbaoChannel()).toContain('protocol_heartbeat = None');
     // 框架不假设帧的形状：二进制通道自己回答「这一帧是什么」，返回 None 表示分片没收齐
     expect(src).toContain('binary_frames: bool = False');
     expect(src).toContain('def decode_frame(self, raw: bytes)');
     expect(src).toContain('frame = channel.decode_frame(msg.data)');
     expect(feishuChannel()).toContain('binary_frames = True');
     expect(feishuChannel()).toContain('def decode_frame(self, raw: bytes) -> dict | None');
+    expect(yuanbaoChannel()).toContain('binary_frames = True');
+    expect(yuanbaoChannel()).toContain('def decode_frame(self, raw: bytes) -> dict | None');
     // 回贴要等的回执正是收帧循环读到的下一帧 → 任务必须并到后台，同会话内串行
     expect(src).toContain('def _spawn(');
     expect(src).toContain('def _conversation_lock(');
@@ -163,7 +183,7 @@ describe('引擎通道清单：支持与否只有一个来源', () => {
     expect(src).toContain('retryable: bool = True');
   });
 
-  it('五个 HTTP 端点齐备，且挂在 FastAPI 生命周期上（启动即自动重连）', () => {
+  it('七个 HTTP 端点齐备，且挂在 FastAPI 生命周期上（启动即自动重连）', () => {
     const src = server();
     for (const route of [
       '@app.get("/api/im/channels")',
@@ -171,6 +191,8 @@ describe('引擎通道清单：支持与否只有一个来源', () => {
       '@app.post("/api/im/{kind}/start")',
       '@app.post("/api/im/{kind}/stop")',
       '@app.post("/api/im/{kind}/forget")',
+      '@app.post("/api/im/{kind}/login/start")',
+      '@app.post("/api/im/{kind}/login/poll")',
     ]) {
       expect(src, `引擎缺端点 ${route}`).toContain(route);
     }
@@ -553,6 +575,134 @@ describe('飞书通道：协议事实来自官方 lark-oapi，且整包 SDK 只�
   });
 });
 
+describe('个人微信通道：官方 iLink 协议 + 扫码登录，不用任何非官方协议', () => {
+  const wx = () => wechatChannel();
+
+  it('扫码、长轮询、回贴三个端点与固定请求头取自官方 iLink 协议', () => {
+    const src = wx();
+    for (const sym of [
+      'https://ilinkai.weixin.qq.com',
+      'ilink/bot/get_bot_qrcode?bot_type=3',
+      'ilink/bot/get_qrcode_status',
+      'ilink/bot/getupdates',
+      'ilink/bot/sendmessage',
+      '"AuthorizationType": "ilink_bot_token"',
+      '"iLink-App-Id": ILINK_APP_ID',
+      'ILINK_APP_ID = "bot"',
+      '"X-WECHAT-UIN": _wechat_uin()',
+      'STALE_TOKEN_ERRCODE = -14',
+      'TEXT_LIMIT = 4000',
+    ]) {
+      expect(src, `个人微信通道缺 ${sym}`).toContain(sym);
+    }
+    // 个人微信没有长连接：框架用 long_poll 复用同一套 supervise/退避/台账
+    expect(src).toContain('transport = "long_poll"');
+    expect(src).toContain('def poll_once');
+    expect(src).toContain('login_mode = "qr"');
+    expect(src).toContain('async def login_start');
+    expect(src).toContain('async def login_poll');
+  });
+
+  it('扫码只在 confirmed 那一帧落盘凭据，其他状态只回状态词', () => {
+    const src = wx();
+    expect(src).toContain('if status == "confirmed"');
+    for (const status of [
+      'wait',
+      'scaned',
+      'need_verifycode',
+      'verify_code_blocked',
+      'expired',
+      'scaned_but_redirect',
+      'binded_redirect',
+    ]) {
+      expect(src, `缺状态 ${status}`).toContain(status);
+    }
+    // 二维码内容原样交给前端渲染，token 不出现在 login_start/login_poll 的响应里
+    expect(src).toContain('qrcode_img_content');
+    expect(src).toContain('"status": "confirmed"');
+  });
+
+  it('官方约束写进实现与文案：只支持单聊、不能主动发起、24 小时窗口', () => {
+    const src = wx();
+    expect(src).toContain('不是网页版微信或任何非官方协议');
+    expect(src).toContain('只支持单聊');
+    expect(src).toContain('24 小时');
+    expect(src).toContain('IM_REPLY_FAILED');
+  });
+
+  it('协议事实只在本机假服务端对拍过，不和真实凭据混为一谈', () => {
+    const src = wx();
+    expect(src).toContain('没有真实微信机器人凭据做过端到端验收');
+    expect(src).toContain('界面文案不得说成「已打通」');
+    expect(read('../../../tests/integration/fake_wechat.py')).toContain('class FakeWeChat');
+    const selftest = read('../../../tests/integration/engine_im_wechat_selftest.py');
+    expect(selftest).toContain('FakeWeChat');
+    expect(selftest).toContain('phase_ab(fake)');
+    // 随包运行时必须能导入并注册这条通道，否则界面会少一张卡片
+    expect(read('../../../scripts/prepare-python.sh')).toContain('wechat_channel.WeChatILinkChannel');
+  });
+});
+
+describe('腾讯元宝通道：官方 sign-token + WebSocket + protobuf', () => {
+  const yb = () => yuanbaoChannel();
+
+  it('签名、长连接地址、业务帧头取自官方元宝机器人协议', () => {
+    const src = yb();
+    for (const sym of [
+      '/api/v5/robotLogic/sign-token',
+      'wss://bot-wss.yuanbao.tencent.com/wss/connection',
+      '"X-AppVersion": APP_VERSION',
+      '"X-Instance-Id": TERMINAL_TYPE_ID',
+      '"X-Bot-Version": BOT_VERSION',
+      'CMD_AUTH = "auth-bind"',
+      'CONN_MODULE = "conn_access"',
+      'BIZ_MODULE = "yuanbao_openclaw_proxy"',
+      'CMD_SEND_C2C = "send_c2c_message"',
+      'CMD_SEND_GROUP = "send_group_message"',
+      'AUTH_ALREADY = 41101',
+      'SIGN_RETRYABLE = 10099',
+      '"TIMTextElem"',
+    ]) {
+      expect(src, `元宝通道缺 ${sym}`).toContain(sym);
+    }
+    // 二进制 protobuf 帧 + 应用层心跳（官方 5 秒 ping，连续两次没回执断开）
+    expect(src).toContain('binary_frames = True');
+    expect(src).toContain('protocol_heartbeat = None');
+    expect(src).toContain('def decode_frame(self, raw: bytes) -> dict | None');
+    expect(src).toContain('_seconds("TT_YUANBAO_HEARTBEAT_SECONDS", 5.0)');
+  });
+
+  it('鉴权错误码分三类：已认证可继续、坏 token 不可重试、服务端繁忙可重试', () => {
+    const src = yb();
+    expect(src).toContain('AUTH_BAD_TOKEN = {41103, 41104, 41108}');
+    expect(src).toContain('AUTH_RETRYABLE = {50400, 50503, 90001, 90003}');
+    expect(src).toContain('IM_CONNECTION_KICKED');
+    expect(src).toContain('IM_CONNECTION_FAILED');
+  });
+
+  it('凭据只做本地签名：appSecret 不进视图、日志或错误详情', () => {
+    const src = yb();
+    expect(src).toContain('hmac.new(');
+    expect(src).toContain('TOKEN_MARGIN_SECONDS = 300');
+    expect(src).not.toContain('logging');
+    expect(src).not.toContain('print(');
+    expect(src).toContain('appSecret 只用于本地签名');
+  });
+
+  it('协议事实只在本机假服务端对拍过，不和真实凭据混为一谈', () => {
+    const src = yb();
+    expect(src).toContain('没有真实元宝机器人凭据做过端到端验收');
+    expect(src).toContain('界面文案不得说成「已打通」');
+    const fake = read('../../../tests/integration/fake_yuanbao.py');
+    expect(fake).toContain('class FakeYuanbao');
+    expect(fake).toContain('handle_sign');
+    const selftest = read('../../../tests/integration/engine_im_yuanbao_selftest.py');
+    expect(selftest).toContain('FakeYuanbao');
+    expect(selftest).toContain('phase_c(fake)');
+    expect(read('../../../scripts/prepare-python.sh')).toContain('yuanbao_channel.YuanbaoChannel');
+  });
+});
+
 describe('三条渲染层通道（Tauri / 引擎直连 / Mock）接线', () => {
   it('IPC 通道常量齐备', () => {
     expect(IPC_CHANNELS.IM_CHANNELS).toBe('im:channels');
@@ -560,6 +710,8 @@ describe('三条渲染层通道（Tauri / 引擎直连 / Mock）接线', () => {
     expect(IPC_CHANNELS.IM_START).toBe('im:start');
     expect(IPC_CHANNELS.IM_STOP).toBe('im:stop');
     expect(IPC_CHANNELS.IM_FORGET).toBe('im:forget');
+    expect(IPC_CHANNELS.IM_LOGIN_START).toBe('im:loginStart');
+    expect(IPC_CHANNELS.IM_LOGIN_POLL).toBe('im:loginPoll');
   });
 
   it('桌面通道映射到 Rust 命令', () => {
@@ -567,15 +719,41 @@ describe('三条渲染层通道（Tauri / 引擎直连 / Mock）接线', () => {
     expect(src).toContain("if (channel === 'im:channels') return invoke('im_channels');");
     expect(src).toContain("if (channel === 'im:configure')");
     expect(src).toContain("return invoke('im_configure', {");
-    for (const cmd of ['im_start', 'im_stop', 'im_forget']) {
+    for (const cmd of ['im_start', 'im_stop', 'im_forget', 'im_login_start', 'im_login_poll']) {
       expect(src, `缺 ${cmd}`).toContain(`invoke('${cmd}'`);
     }
+  });
+
+  it('桌面端能按需拉起引擎：IM 页不靠「先发一条消息」', () => {
+    // 引擎原本只在首次提交任务时惰性启动；打包后直接打开 IM 页会只显示「引擎未运行」
+    expect(IPC_CHANNELS.ENGINE_START).toBe('engine:start');
+    const transport = tauriApi();
+    expect(transport).toContain('if (channel === IPC_CHANNELS.ENGINE_START)');
+    expect(transport).toContain("invoke('agent_start_workspace'");
+
+    // 启动入口只在桌面运行时调用，浏览器直连模式由外部进程托管
+    const endpoint = engineEndpoint();
+    expect(endpoint).toContain('export async function ensureEngineStarted');
+    expect(endpoint).toContain('if (!isTauriRuntime()) return;');
+    expect(endpoint).toContain('IPC_CHANNELS.ENGINE_START, ws)');
+    // 同一 workspace 的并发调用共用一次启动，避免开发态 effect 双跑时起两个引擎进程
+    expect(endpoint).toContain('if (pendingStart && pendingStartWs === ws) return pendingStart;');
+
+    // 页面刷新统一走「先确保引擎、再拉清单」；侧边栏轮询不碰引擎生命周期
+    expect(store()).toContain('if (startWorkspaceId)');
+    expect(store()).toContain('await ensureEngineStarted(startWorkspaceId)');
+    expect(page()).toContain('loadSessionsRaw(getActiveWorkspaceId())');
+    expect(sidebar()).toContain('void loadSessions();');
+
+    // 启动那几秒只提示「正在读取」，不能提前下「引擎没有注册任何通道」的结论
+    expect(page()).toContain('正在读取频道状态；首次打开会先拉起本地引擎');
+    expect(page()).toContain('!loading && !engineDown && loaded && channels.length === 0');
   });
 
   it('浏览器直连问的是引擎同一个接口', () => {
     const src = engineApi();
     expect(src).toContain("if (channel.startsWith('im:')) return handleEngineImChannel(channel, args);");
-    for (const path of ['/api/im/channels', '/api/im/${kind}/config', '/api/im/${kind}/start', '/api/im/${kind}/stop', '/api/im/${kind}/forget']) {
+    for (const path of ['/api/im/channels', '/api/im/${kind}/config', '/api/im/${kind}/start', '/api/im/${kind}/stop', '/api/im/${kind}/forget', '/api/im/${kind}/login/start', '/api/im/${kind}/login/poll']) {
       expect(src, `缺引擎路径 ${path}`).toContain(path);
     }
     // 引擎无响应时报真实码，不返回空数组冒充「没有频道」
@@ -598,7 +776,7 @@ describe('三条渲染层通道（Tauri / 引擎直连 / Mock）接线', () => {
     expect(src.match(/validate_kind\(&kind\)/g)?.length).toBeGreaterThanOrEqual(4);
     expect(src).toContain('/api/im/{kind}/config');
     expect(rustLib()).toContain('bridge::im::im_channels,');
-    for (const cmd of ['im_configure', 'im_start', 'im_stop', 'im_forget']) {
+    for (const cmd of ['im_configure', 'im_start', 'im_stop', 'im_forget', 'im_login_start', 'im_login_poll']) {
       expect(rustLib(), `Rust 未注册 ${cmd}`).toContain(`bridge::im::${cmd},`);
     }
     expect(read('../../../src-tauri/src/bridge/mod.rs')).toContain('pub mod im;');
@@ -631,15 +809,32 @@ describe('页面不再保留假承诺', () => {
   });
 
   /**
-   * 四条已接入通道只在本地假服务端跑过双向对拍，仓库里没有真实企业凭据。
-   * 界面不能把「协议实现」说成「真实打通」，飞书首次绑定的 SDK 冷启动也要提前说明。
+   * 六条已接入通道只在本地假服务端跑过双向对拍，仓库里没有真实企业凭据。
+   * 界面不能把「协议实现」说成「真实打通」，飞书首次绑定的 SDK 冷启动也要提前说明，
+   * 个人微信的官方协议边界（只支持单聊、24 小时窗口）同样要写在明面上。
    */
-  it('如实标注真实凭据未验证、飞书冷启动与个人微信未接入', () => {
+  it('如实标注真实凭据未验证、飞书冷启动与个人微信的协议边界', () => {
     const src = page();
     expect(src).toContain('只在本地假服务端做过双向对拍');
-    expect(src).toContain('尚未用真实企业凭据做端到端验证');
+    expect(src).toContain('尚未用真实凭据做端到端验证');
     expect(src).toContain('8~33 秒');
-    expect(src).toContain('个人微信');
+    expect(src).toContain('腾讯元宝');
+    expect(src).toContain('iLink');
+    expect(src).toContain('只支持单聊');
+    expect(src).toContain('不使用任何非官方微信协议');
+  });
+
+  it('扫码登录：二维码来自引擎，令牌不进界面，状态与验证码都有真实动作', () => {
+    const src = page();
+    expect(src).toContain("import { QRCodeSVG } from 'qrcode.react'");
+    expect(src).toContain("c.loginMode === 'qr'");
+    expect(src).toContain('beginLogin(c)');
+    expect(src).toContain('pollImLogin(');
+    expect(src).toContain('submitVerifyCode');
+    expect(src).toContain('qr.needVerifyCode');
+    expect(src).toContain('重新生成');
+    // 数字验证码只接受数字，且不把用户输入写进任何持久化
+    expect(src).toContain("replace(/\\D/g, '')");
   });
 
   it('清单来自引擎，凭据字段按引擎下发的元数据渲染', () => {
@@ -781,5 +976,133 @@ describe('执行过程偏好：引擎持有、引擎消费', () => {
     // 那个只写库没人读的布尔已彻底移除
     expect(src).not.toContain('imShowToolProcess');
     expect(read('../../../src/shared/contracts.ts')).not.toContain('imShowToolProcess');
+  });
+});
+
+// ── D-41：媒体 / 群策略 / 限流（任务 #146）───────────────────────────
+//
+// 这一族的事实全在引擎里：能力位、@ 判定的证据来源、限流按谁分账、附件目录怎么消毒、
+// 作用域链的实例一级长什么样。界面与 Rust 都不许另存一份判断，否则「今天引擎真的会做什么」
+// 就变成前端的历史记忆。这里用源码契约钉住形状，行为本身由
+// tests/integration/engine_im_*_selftest.py 十一族跑。
+describe('D-41 媒体 / 群策略 / 限流的跨语言事实', () => {
+  const imPolicy = () => read('../../../engine/im_policy.py');
+  const imMedia = () => read('../../../engine/im_media.py');
+  const imRate = () => read('../../../engine/im_ratelimit.py');
+  const connectRoutes = () => read('../../../engine/routes_connect.py');
+
+  it('三条 IM 端点登记在 connect 车道，且都是不被通配吞掉的字面路径', () => {
+    const routes = connectRoutes();
+    for (const path of ['/api/im/policies', '/api/im/capabilities', '/api/im/traffic']) {
+      expect(routes).toContain(`"${path}"`);
+      const segmentCount = path.split('/').length - 1; // /api/im/<名> → 3 段
+      expect(segmentCount).toBe(3);
+      expect(path).not.toContain('{');
+    }
+    expect(routes).toContain('@router.get("/api/im/policies")');
+    expect(routes).toContain('@router.post("/api/im/policies")');
+    expect(routes).toContain('@router.get("/api/im/capabilities")');
+    expect(routes).toContain('@router.get("/api/im/traffic")');
+  });
+
+  it('业务拒绝走 200 + ok=false，意外才走 500（设置页据此说人话）', () => {
+    const routes = connectRoutes();
+    expect(routes).toContain('def _soft_fail(code: str, message: str, **extra: Any) -> JSONResponse:');
+    expect(routes).toContain('status_code=200');
+    expect(routes).toContain('_fail("IM_POLICY_UNREADABLE"');
+    expect(routes).toContain('_fail("IM_POLICY_WRITE_FAILED"');
+    expect(routes).toContain('_fail("IM_TRAFFIC_UNREADABLE"');
+  });
+
+  it('D-41 新增的码全部有用户文案，一条都不许降级成「发生错误（CODE）」', () => {
+    for (const code of [
+      'IM_POLICY_INVALID',
+      'IM_POLICY_UNREADABLE',
+      'IM_POLICY_WRITE_FAILED',
+      'IM_TRAFFIC_UNREADABLE',
+      'IM_MEDIA_BAD_URL',
+      'IM_MEDIA_UNSUPPORTED',
+      'IM_MEDIA_PATH_ESCAPE',
+      'IM_RATE_LIMIT_INVALID',
+      'IM_RATE_LIMITED',
+      'IM_SEND_FAILED',
+      'IM_LOGIN_REQUIRED',
+      'IM_LOGIN_UNSUPPORTED',
+      'IM_LOGIN_EXPIRED',
+      'IM_LOGIN_FAILED',
+    ]) {
+      const text = errorMessageOf(code);
+      expect(text).not.toBe(`发生错误（${code}）`);
+      expect(text).not.toContain(code);
+      // 文案得给出下一步（改哪里 / 去哪儿看），只写「出错了」等于没写
+      expect(/[：:，,]/.test(text) || text.length >= 10).toBe(true);
+    }
+  });
+
+  it('限流按通道实例分账：闸门键与台账键都是 instance_key', () => {
+    const framework = imFramework();
+    expect(framework).toContain('key = f"{self.instance_key}|{ev.conversation_id}"');
+    expect(framework).toContain('self.instance_key = f"{channel.kind}:{self.channel_id}"');
+    expect(framework).toContain(
+      'session_id = f"im-{self.instance_key if self.channel_id else channel.kind}-{ev.conversation_id}"',
+    );
+  });
+
+  it('用户改的额度落到闸门、超时记在闸门账上（不是界面装饰）', () => {
+    const framework = imFramework();
+    const rate = imRate();
+    expect(framework).toContain('self.governor.apply_limits(');
+    expect(framework).toContain('governor=self.governor');
+    expect(rate).toContain('def apply_limits(self, per_minute: Any, burst: Any) -> bool:');
+    expect(rate).toContain('def mark_timeout(self) -> None:');
+    // 平台冷却是对方给的秒数：改本地额度不许把它抹掉
+    expect(rate).toContain('self._buckets.clear()');
+    expect(rate).toContain('self.counters["timeouts"] += 1');
+  });
+
+  it('有界等待只用 asyncio.timeout（常驻连接的约束：不另起计时器）', () => {
+    const rate = imRate();
+    expect(rate).toContain('async with asyncio.timeout(seconds):');
+    expect(rate).not.toContain('asyncio.wait_for(');
+    // 通道自己报的「附件没发出去」必须原样交回，不能吞掉后当作已送达
+    expect(rate).toContain('return str(returned or "")');
+  });
+
+  it('策略作用域链的实例一级与 instance_key 同形（同名不同类型不互相继承）', () => {
+    const policy = imPolicy();
+    expect(policy).toContain('def instance_scope(channel_id: str = "", kind: str = "") -> str:');
+    expect(policy).toContain('return f"{name}:{ident}"');
+    expect(policy).toContain('instance = instance_scope(channel_id, kind)');
+    expect(policy).toContain('"instance_scope"');
+    expect(connectRoutes()).toContain('类型:实例标识');
+  });
+
+  it('附件目录名对文件系统合法，消毒过就带原文指纹（两实例不并目录）', () => {
+    const media = imMedia();
+    expect(media).toContain(String.raw`_FS_ILLEGAL = re.compile(r'[<>:"|?*/\\]')`);
+    expect(media).toContain('if safe != last or len(safe) > MAX_NAME_CHARS:');
+    expect(media).toContain('safe = f"{safe[:keep]}-{digest}"');
+    expect(media).toContain('SLUG_FINGERPRINT_CHARS = 10');
+  });
+
+  it('能力位默认全是「未接入」，且每条 False 都带中文原因（界面据此只能标「仅文本」）', () => {
+    // 原因文案是引擎出的，界面不许自己判「这个平台应该能发图」；
+    // IM 设置页目前还没消费 /api/im/capabilities（渲染层领地），所以今天没有任何地方宣称支持媒体。
+    const framework = imFramework();
+    expect(framework).toContain('supports_media_in: bool = False');
+    expect(framework).toContain('supports_media_out: bool = False');
+    expect(framework).toContain('supports_typing: bool = False');
+    expect(framework).toContain('本通道尚未接入附件下载');
+    expect(framework).toContain('回贴只发文本，附件不会被发出');
+    expect(framework).toContain('本通道未接入「正在输入」状态');
+  });
+
+  it('答不出「有没有 @ 我」时留 None 而不是猜 False，群策略因此拒起任务', () => {
+    const framework = imFramework();
+    expect(framework).toContain('mentioned_me: bool | None = None');
+    expect(framework).toContain('本通道没有可用于判定「是否被 @」的协议字段');
+    // 判定在策略侧做，框架不猜：拒起任务时写的就是「答不出」这个原因
+    expect(imPolicy()).toContain('本通道答不出「这条有没有 @ 我」');
+    expect(imPolicy()).toContain('按「被 @ 才回应」的策略不能凭空判定');
   });
 });

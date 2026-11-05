@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-通天办公 - 本地 Auth 服务（网页验证登录）
+通天办公 - 本地 Auth 服务（网页验证登录）· 已退役
 
-云端 Phase A 尚未立项，本服务作为本地过渡实现：
+**不在任何默认启动链路上。** 账号数据的唯一服务端库是 `tongtian-server` 的
+`data/market.db`（users / sessions 表）；本脚本若被手工拉起，会在同目录再生成
+一个 `auth.db`，形成第二份账号库，与「服务端一个库」的存储归属相悖。
+直接运行会被拒绝；确需复现历史行为（调试旧版本登录页）时显式设置
+`TT_AUTH_LEGACY_OK=1`，并只用临时 `TT_AUTH_DB` 指向的数据文件。
+
+历史背景：云端 Phase A 尚未立项时，本服务作为本地过渡实现——
 - 网页端登录/注册/退出页面（浏览器打开，登录成功回跳桌面端 loopback 回调）
 - REST API：register / login / exchange（code 换 token）/ refresh / logout
 - JWT HS256 手写实现（标准库 hmac/hashlib/base64，不引 PyJWT）：
   access 15min + refresh 30d 轮换（对齐 docs/PRD-任我行.md §4.1）
-- SQLite 持久化 users / sessions（云端切换时仅改客户端 TT_AUTH_SERVER_URL）
 
 用法:
-    python auth-server/server.py [--port 18080]
+    TT_AUTH_LEGACY_OK=1 python auth-server/server.py [--port 18080]
 环境变量:
+    TT_AUTH_LEGACY_OK     退役守卫：未设置时拒绝启动（只接受 1/true/yes/on）
     TT_AUTH_PORT         监听端口（缺省 18080，仅绑 127.0.0.1）
     TT_AUTH_DB           SQLite 路径（缺省脚本同目录 auth.db）
     TT_AUTH_JWT_SECRET   JWT 签名密钥（缺省开发密钥，生产必须覆盖）
@@ -506,9 +512,20 @@ async def api_logout(request: Request):
 
 
 if __name__ == "__main__":
-    # Windows GBK 控制台兼容：强制 UTF-8 输出
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    # Windows GBK 控制台兼容：强制 UTF-8 输出（退役提示也要可读）
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+    # 退役守卫：默认拒绝启动，避免手工运行生成第二份账号库 auth.db。
+    # 账号库只允许存在一份（tongtian-server 的 data/market.db）。
+    if os.environ.get("TT_AUTH_LEGACY_OK", "").strip().lower() not in ("1", "true", "yes", "on"):
+        print("=========================================", file=sys.stderr, flush=True)
+        print("  本地 Auth 服务已退役，不再随任何脚本启动。", file=sys.stderr, flush=True)
+        print("  账号数据请使用综合服务端: bash ../tongtian-server/init.sh（默认 8000）", file=sys.stderr, flush=True)
+        print("  手工运行会在本目录生成第二个账号库 auth.db，破坏「服务端一个库」的归属约定。", file=sys.stderr, flush=True)
+        print("  确需复现历史行为: 设 TT_AUTH_LEGACY_OK=1 且用临时 TT_AUTH_DB 后再运行。", file=sys.stderr, flush=True)
+        print("=========================================", file=sys.stderr, flush=True)
+        raise SystemExit(2)
     parser = argparse.ArgumentParser(description="通天办公本地 Auth 服务")
     parser.add_argument("--port", type=int, default=int(os.environ.get("TT_AUTH_PORT", "18080")))
     args = parser.parse_args()

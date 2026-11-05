@@ -77,6 +77,8 @@ interface TongtianAPI {
   ): Promise<{ taskId: string; cancelled: boolean; status?: string }>;
   /** 附件暂存（交互补设计 §3.1） */
   fileStageAttachment(srcPath: string, taskId?: string, workspaceId?: string): Promise<Record<string, unknown>>;
+  /** 文件夹附件暂存：递归复制受支持的文件，返回逐文件 AttachmentMeta */
+  fileStageFolder(srcPath: string, taskId?: string, workspaceId?: string): Promise<Record<string, unknown>[]>;
   onChatEvent(callback: (event: ChatEvent) => void): () => void;
 
   // Model

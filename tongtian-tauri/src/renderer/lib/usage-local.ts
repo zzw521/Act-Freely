@@ -184,7 +184,7 @@ export function localUsageRows(period: UsagePeriod, nowMs = Date.now()): ModelUs
       tokensUsed: r.tokensUsed,
       calls: r.calls,
       lastUsedAtMs: r.lastUsedAtMs,
-      avgLatencyMs: r.latencySamples ? Math.round(r.latencyMsTotal / r.latencySamples) : null,
+      avgLatencyMs: r.latencySamples ? Math.floor(r.latencyMsTotal / r.latencySamples) : null,
       latencySamples: r.latencySamples,
       costs: r.costs,
       pricedCalls: r.pricedCalls,
@@ -233,7 +233,10 @@ export function totalsOf(rows: ModelUsageRow[]): UsageTotals {
     totals.pricedCalls! += r.pricedCalls ?? 0;
     totals.unpricedCalls! += r.unpricedCalls ?? 0;
   }
-  totals.avgLatencyMs = totals.latencySamples! > 0 ? Math.round(weightedLatency / totals.latencySamples!) : null;
+  // 平均延迟一律向下取整：与 Rust 的 i64 整除、引擎的整数 // 同口径，
+  // 否则同一份台账在三处能差出 1ms，合并视图对不上账
+  totals.avgLatencyMs =
+    totals.latencySamples! > 0 ? Math.floor(weightedLatency / totals.latencySamples!) : null;
   return totals;
 }
 
@@ -287,7 +290,7 @@ export function localDayPoints(period: UsagePeriod, nowMs = Date.now()): UsageDa
       tokensUsed: p.tokensUsed,
       calls: p.calls,
       models: p.names.size,
-      avgLatencyMs: p.latencySamples ? Math.round(p.latencyMsTotal / p.latencySamples) : null,
+      avgLatencyMs: p.latencySamples ? Math.floor(p.latencyMsTotal / p.latencySamples) : null,
       latencySamples: p.latencySamples,
       costs: p.costs,
       pricedCalls: p.pricedCalls,

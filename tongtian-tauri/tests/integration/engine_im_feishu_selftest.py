@@ -6,7 +6,7 @@ IM 频道自测 —— 飞书长连接（官方 lark-oapi SDK 的协议 + 框架
 
 A. HTTP 契约面与「绑定时才加载」：引擎启动不碰官方 SDK（lark_oapi 有 20.3MB/万把文件，
    import 一次实测 8~33 秒，拖在启动上就是整个应用卡住），只有绑定那次才加载；
-   清单里飞书 supported=True 且凭据字段是 App ID/App Secret，微信仍是 IM_UNSUPPORTED；
+   清单里飞书 supported=True 且凭据字段是 App ID/App Secret，六个通道全部 supported；
    App ID 前缀不对、Secret 太短、缺一项各报各的码，格式没过时一个 HTTP 请求都不发出去。
 B. 长连接全链路：假飞书只做官方那几件事（发一次性连接地址与 ClientConfig、按 sum/seq
    推 protobuf 帧、心跳收 ping 回 pong、回贴走 Web API 并校验 Bearer token），验证
@@ -16,10 +16,13 @@ B. 长连接全链路：假飞书只做官方那几件事（发一次性连接�
 C. 飞书方言分支（不联网，直接喂官方 protobuf 帧）：ClientConfig 只取保活间隔且脏值不生效、
    分片没收齐不算事件、过期分片重开、事件正文不是 JSON 如实报错、card 与控制帧一个字节都不
    回执而事件帧回写原帧、pong 的 payload 改保活间隔、SDK 没预热时同步路径不许偷偷加载、
-   缺依赖时 IM_DEPENDENCY_MISSING、文本抽取遇到坏正文只取空文本、账号信息里是掩码。
+   缺依赖时 IM_DEPENDENCY_MISSING、文本抽取遇到坏正文只取空文本、群/单聊只认 chat_type、
+   @ 判定只认 mentions[].id.open_id（@ 别人判 False、@_all 与「不知道自己是谁」判 None）、
+   账号信息里是掩码。
 C+. token 与回贴的真实 HTTP 分支（同一条循环里跑完）：token 被拒映射 IM_AUTH_FAILED 且报错
    不带 App Secret、token 中途失效换一个重发一次、正常回贴复用缓存 token、回贴非 0 报
-   IM_REPLY_FAILED、没有可 reply 的消息改走按 chat_id 主动发。
+   IM_REPLY_FAILED、没有可 reply 的消息改走按 chat_id 主动发、机器人 open_id 真的取自
+   GET /open-apis/bot/v3/info（该接口给不出 bot 字段时判不出 @，不拿别人的 @ 当成 @ 自己）。
    请求形状取自官方在 A/B 段验：AppID/AppSecret + locale + SDK UA 换地址，
    Authorization: Bearer <token> + SDK UA 回贴。
 
@@ -63,11 +66,14 @@ try:
     from fake_feishu import (
         APP_ID,
         APP_SECRET,
+        BOT_OPEN_ID,
         GROUP_CHAT_ID,
+        OTHER_BOT_ID,
         P2P_CHAT_ID,
         SECOND_OPEN_ID,
         SENDER_OPEN_ID,
         FakeFeishu,
+        bot_mention,
         control_frame,
         data_frame,
         message_event,
@@ -126,8 +132,8 @@ def phase_ab(fake: FakeFeishu) -> None:
         channels = {c["kind"]: c for c in body["channels"]}
         supported = [c["kind"] for c in body["channels"] if c["supported"]]
         check(
-            "清单仍是五个通道",
-            {"slack", "dingtalk", "feishu", "wecom", "wechat"} == set(channels),
+            "清单仍是六个通道",
+            {"slack", "dingtalk", "feishu", "wecom", "wechat", "yuanbao"} == set(channels),
             str(sorted(channels)),
         )
         check("已接入的通道全部排在未接入之前", list(channels)[: len(supported)] == supported, str(list(channels)))
@@ -145,11 +151,12 @@ def phase_ab(fake: FakeFeishu) -> None:
             "长连接" in fs["setupNote"] and "加载官方 SDK" in fs["setupNote"],
             fs["setupNote"][:220],
         )
-        wx = channels["wechat"]
         check(
-            "只剩微信未接入且有可读原因",
-            wx["supported"] is False and wx["unsupportedReason"] and not wx["fields"],
-            str(wx)[:160],
+            "个人微信与腾讯元宝都已接入，清单里没有「尚未接入」的通道",
+            channels["wechat"]["supported"] is True
+            and channels["yuanbao"]["supported"] is True
+            and all(c["supported"] for c in channels.values()),
+            str(sorted((k, v["supported"]) for k, v in channels.items())),
         )
         check(
             "引擎启动时没有加载官方 SDK（绑定时才加载）",
@@ -157,8 +164,6 @@ def phase_ab(fake: FakeFeishu) -> None:
             f"lark_oapi.ws in modules={BOOT_HAS_LARK} cache={BOOT_SDK_CACHE}",
         )
 
-        neg = client.post("/api/im/wechat/config", json={"credentials": {"appId": "x"}}).json()
-        check("未接入通道拒绝写凭据（IM_UNSUPPORTED）", neg.get("code") == "IM_UNSUPPORTED", str(neg)[:160])
         start = client.post("/api/im/feishu/start").json()
         check("未配置就启动报 IM_NOT_CONFIGURED", start.get("code") == "IM_NOT_CONFIGURED", str(start)[:160])
 
@@ -267,11 +272,11 @@ def phase_ab(fake: FakeFeishu) -> None:
             fake.sends == [],
             str(fake.sends)[:200],
         )
-        acked = wait_for(lambda: fake.acks if len(fake.acks) >= 6 else None)
+        acked = wait_for(lambda: fake.acks if len(fake.acks) >= 7 else None)
         check(
-            "六个事件帧都按官方形状回执：原帧 id + code:200 + biz_rt",
+            "七个事件帧都按官方形状回执：原帧 id + code:200 + biz_rt",
             acked is not None
-            and len(acked) == 6
+            and len(acked) == 7
             and all(a["code"] == 200 and a["message_id"].startswith("ftf-") and a["biz_rt"] != "" for a in acked)
             and {a["type"] for a in acked} == {"event"},
             str(acked)[:300],
@@ -292,9 +297,17 @@ def phase_ab(fake: FakeFeishu) -> None:
         )
         group_msgs = [m for m in (sessions.get(group_id, {}).get("messages") or []) if m["direction"] == "in"]
         check(
-            "同一 event_id 重投只起一次任务",
-            len(group_msgs) == 1 and group_msgs[0]["text"] == "帮我把季度总结整理成一页",
-            str(group_msgs)[:220],
+            "同一 event_id 重投只起一次任务：群里只有 @ 了的那条进任务",
+            len(group_msgs) == 2
+            and group_msgs[0]["text"] == "帮我把季度总结整理成一页"
+            and "未起任务" in group_msgs[1]["text"]
+            and "群里没有被 @" in group_msgs[1]["text"],
+            str(group_msgs)[:260],
+        )
+        check(
+            "没 @ 的那条如实挡下且不回贴：群会话只有一条出向消息",
+            len([m for m in (sessions.get(group_id, {}).get("messages") or []) if m["direction"] == "out"]) == 1,
+            str([m["direction"] for m in (sessions.get(group_id, {}).get("messages") or [])])[:160],
         )
         p2p_msgs = [m for m in (sessions.get(p2p_id, {}).get("messages") or []) if m["direction"] == "in"]
         check(
@@ -304,8 +317,10 @@ def phase_ab(fake: FakeFeishu) -> None:
         )
         feishu_sessions = [s for s in sessions.values() if s["source"] == "feishu"]
         check(
-            "只这两条事件建了会话，其余（富文本/机器人自发/别的事件类型）一条都没进",
-            len(feishu_sessions) == 2 and all(len(s.get("messages") or []) == 2 for s in feishu_sessions),
+            "只这两条会话建了台账，其余（富文本/机器人自发/别的事件类型）一条都没进",
+            len(feishu_sessions) == 2
+            and len(sessions.get(group_id, {}).get("messages") or []) == 3
+            and len(sessions.get(p2p_id, {}).get("messages") or []) == 2,
             str({k: len(v.get("messages") or []) for k, v in sessions.items()})[:220],
         )
         check(
@@ -532,6 +547,46 @@ def phase_c() -> None:
     check("mentions 里没有 key 时不误伤正文",
           ch._text_of(msg(json.dumps({"text": "正常一句"}, ensure_ascii=False), [SimpleNamespace(key="")])) == "正常一句")
 
+    # 10b) 群/单聊与「有没有 @ 我」：只认事件里明写的 chat_type 与 mentions[].id.open_id
+    def _mention(key, open_id):
+        return SimpleNamespace(key=key, id=SimpleNamespace(open_id=open_id))
+
+    probe = feishu_channel.FeishuChannel()
+    probe._bot_open_id = BOT_OPEN_ID
+    check(
+        "chat_type=p2p 才是单聊；group 与陌生取值都按群处理（群策略比单聊严）",
+        probe._is_group(SimpleNamespace(chat_type="p2p")) is False
+        and probe._is_group(SimpleNamespace(chat_type="group")) is True
+        and probe._is_group(SimpleNamespace(chat_type="")) is True
+        and probe._is_group(SimpleNamespace()) is True,
+    )
+    check("群里没有 mentions：判 False（真的没 @ 我）", probe._mentioned(SimpleNamespace(mentions=[])) is False)
+    check(
+        "群里 @ 的是别的机器人：判 False，不给它起任务",
+        probe._mentioned(SimpleNamespace(mentions=[_mention("@_user_2", OTHER_BOT_ID)])) is False,
+    )
+    check(
+        "群里 @ 的 open_id 正是机器人自己：判 True",
+        probe._mentioned(SimpleNamespace(mentions=[_mention("@_user_1", BOT_OPEN_ID)])) is True,
+    )
+    check(
+        "@_all 判不出：文档没写死算不算 @ 到机器人，既不猜 True 也不猜 False",
+        probe._mentioned(SimpleNamespace(mentions=[_mention(feishu_channel.ALL_MENTION_KEY, "")])) is None,
+    )
+    unknown_bot = feishu_channel.FeishuChannel()
+    check(
+        "还没查到自己是谁时答 None：把「不知道」说成「没被 @」会让该回的那条永远不回",
+        unknown_bot._bot_open_id == ""
+        and unknown_bot._mentioned(SimpleNamespace(mentions=[_mention("@_user_1", BOT_OPEN_ID)])) is None,
+    )
+    check(
+        "mention_note 写明证据字段与答不出的两种情形",
+        "chat_type" in feishu_channel.FeishuChannel.mention_note
+        and "bot/v3/info" in feishu_channel.FeishuChannel.mention_note
+        and "None" in feishu_channel.FeishuChannel.mention_note,
+        feishu_channel.FeishuChannel.mention_note[:160],
+    )
+
     # 11) 掩码：账号信息里不能出现完整 App ID / Secret
     masked = feishu_channel._mask(APP_ID)
     check("掩码后仍能分辨绑的是哪个应用", masked != APP_ID and masked.startswith("cli_") and masked.endswith("01"),
@@ -614,6 +669,40 @@ def phase_c_live() -> None:
                     check("飞书返回非 0 时如实报 IM_REPLY_FAILED",
                           exc.code == "IM_REPLY_FAILED" and "40001" in exc.detail, str(exc)[:200])
                 fake.reply_errcode = 0
+
+                # 机器人身份：判「群里 @ 的是不是我」要比对的另一个半边，来自 GET /open-apis/bot/v3/info
+                calls_before = fake.bot_info_calls
+                identity = await ch_live._fetch_bot_identity(APP_ID, APP_SECRET)
+                check(
+                    "机器人 open_id 取自 /open-apis/bot/v3/info（一次真往返，不是本地编的）",
+                    identity == BOT_OPEN_ID and ch_live._bot_open_id == BOT_OPEN_ID
+                    and fake.bot_info_calls == calls_before + 1,
+                    f"identity={identity!r} calls={fake.bot_info_calls}",
+                )
+                check(
+                    "知道自己是谁之后，@ 机器人的那条才判 True",
+                    ch_live._mentioned(
+                        SimpleNamespace(mentions=[SimpleNamespace(key="@_user_1", id=SimpleNamespace(open_id=BOT_OPEN_ID))])
+                    )
+                    is True,
+                )
+                check("机器人名字进账号信息（界面用它说明绑的是哪个机器人）", ch_live._bot_name == "小通天", ch_live._bot_name)
+
+                # 身份接口给不出 bot 字段：不能拿别人的 @ 当成 @ 自己，也不能猜
+                fake.bot_info_fail = True
+                blind = feishu_channel.FeishuChannel()
+                blind.runtime = ch_live.runtime
+                got = await blind._fetch_bot_identity(APP_ID, APP_SECRET)
+                check(
+                    "身份查不到时留空并由 _mentioned 答 None（宁可拒起任务，不放宽）",
+                    got == "" and blind._bot_open_id == ""
+                    and blind._mentioned(
+                        SimpleNamespace(mentions=[SimpleNamespace(key="@_user_1", id=SimpleNamespace(open_id=BOT_OPEN_ID))])
+                    )
+                    is None,
+                    f"got={got!r}",
+                )
+                fake.bot_info_fail = False
             finally:
                 if runtime._http and not runtime._http.closed:
                     await runtime._http.close()

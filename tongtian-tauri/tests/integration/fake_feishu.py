@@ -57,6 +57,9 @@ P2P_CHAT_ID = "oc_ttfake_p2p_0001"
 GROUP_CHAT_ID = "oc_ttfake_group_0002"
 SENDER_OPEN_ID = "ou_ttfake_zhangsan"
 SECOND_OPEN_ID = "ou_ttfake_lisi"
+# 机器人自己的 open_id：GET /open-apis/bot/v3/info 给的就是它，群里「@ 的是不是我」比这个
+BOT_OPEN_ID = "ou_ttfake_bot"
+OTHER_BOT_ID = "ou_ttfake_otherbot"
 SERVICE_ID = 7
 
 
@@ -108,6 +111,15 @@ def split_data_frames(payload: dict, *, message_id: str) -> list[bytes]:
         data_frame(raw[:mid].decode("utf-8", "ignore"), message_id=message_id, seq=0, total=2),
         data_frame(raw[mid:].decode("utf-8", "ignore"), message_id=message_id, seq=1, total=2),
     ]
+
+
+def bot_mention(key: str = "@_user_1") -> list[dict]:
+    """mentions 数组的形状取自官方 SDK 的 MentionEvent（key/id/name/mentioned_type）"""
+    return [{"key": key, "id": {"open_id": BOT_OPEN_ID}, "name": "小通天", "mentioned_type": "bot"}]
+
+
+def other_mention(key: str = "@_user_2") -> list[dict]:
+    return [{"key": key, "id": {"open_id": OTHER_BOT_ID}, "name": "别家的机器人", "mentioned_type": "bot"}]
 
 
 def message_event(text: str, *, event_id: str, message_id: str, chat_id: str = GROUP_CHAT_ID,
@@ -165,9 +177,11 @@ class FakeFeishu:
         self.pongs_sent = 0
         self.unexpected: list[dict] = []
         self.events_pushed = 0
+        self.bot_info_calls = 0
         self.open_ws: list = []
         # 故障开关
         self.reject_endpoint = False
+        self.bot_info_fail = False
         self.split_event = False
         self.pong_config = False
         self.token_reject = False
@@ -202,6 +216,7 @@ class FakeFeishu:
         app.router.add_post("/open-apis/auth/v3/tenant_access_token/internal", self.handle_token)
         app.router.add_post("/open-apis/im/v1/messages", self.handle_create)
         app.router.add_post("/open-apis/im/v1/messages/{message_id}/reply", self.handle_reply)
+        app.router.add_get("/open-apis/bot/v3/info", self.handle_bot_info)
         app.router.add_get("/ws", self.handle_ws)
         app.router.add_post("/inject", self.handle_inject)
         app.router.add_post("/behavior", self.handle_behavior)
@@ -253,6 +268,31 @@ class FakeFeishu:
             return web.json_response({"code": ws_const.AUTH_FAILED, "msg": "app secret invalid"})
         return web.json_response({"code": ws_const.OK, "msg": "ok", "tenant_access_token": TOKEN,
                                   "expire": 7200})
+
+    async def handle_bot_info(self, request):
+        """GET /open-apis/bot/v3/info：机器人身份（群里判「@ 的是不是我」要比对 open_id）
+
+        响应形状照官方 SDK 的 channel/bot_identity.py：`bot` 与 code/msg 平级。
+        `bot_info_fail` 打开时返回一个没有 bot 字段的正常响应——引擎必须因此答不出，
+        而不是拿别人的 @ 当成 @ 自己。
+        """
+        if not self._token_ok(request):
+            return web.json_response({"code": 401, "msg": "access token invalid"}, status=401)
+        self.bot_info_calls += 1
+        if self.bot_info_fail:
+            return web.json_response({"code": 0, "msg": "ok"})
+        return web.json_response(
+            {
+                "code": 0,
+                "msg": "ok",
+                "bot": {
+                    "open_id": BOT_OPEN_ID,
+                    "app_name": "小通天",
+                    "activate_status": 2,
+                    "app_id": self.app_id,
+                },
+            }
+        )
 
     def _token_ok(self, request) -> bool:
         return request.headers.get("Authorization", "") == f"Bearer {TOKEN}"
@@ -353,12 +393,12 @@ class FakeFeishu:
 
     async def run_script(self, ws) -> None:
         """官方协议里引擎该处理什么、该忽略什么，一次推完"""
-        # 1) 群聊文本：起任务并回执
-        await self.push(ws, message_event("帮我把季度总结整理成一页", event_id="evt-1",
-                                          message_id="om_ttfake_1"))
+        # 1) 群聊 @机器人：起任务并回执（群里没 @ 的飞书不推，见步骤 9）
+        await self.push(ws, message_event("@_user_1 帮我把季度总结整理成一页", event_id="evt-1",
+                                          message_id="om_ttfake_1", mentions=bot_mention()))
         # 2) 同一条事件重投（回执没送出去时飞书会再发一次）：不能再起一个任务
-        await self.push(ws, message_event("帮我把季度总结整理成一页", event_id="evt-1",
-                                          message_id="om_ttfake_1"))
+        await self.push(ws, message_event("@_user_1 帮我把季度总结整理成一页", event_id="evt-1",
+                                          message_id="om_ttfake_1", mentions=bot_mention()))
         # 3) 单聊 + @机器人占位符：会话标识取 chat_id，正文要剥掉 @_user_1
         await self.push(
             ws,
@@ -369,8 +409,7 @@ class FakeFeishu:
                 chat_type="p2p",
                 chat_id=P2P_CHAT_ID,
                 sender_open_id=SECOND_OPEN_ID,
-                mentions=[{"key": "@_user_1", "id": {"open_id": "ou_ttfake_bot"},
-                            "name": "小通天", "mentioned_type": "bot"}],
+                mentions=bot_mention(),
             ),
         )
         # 4) 富文本消息：本通道只把文本当任务，其它形状如实忽略
@@ -388,6 +427,9 @@ class FakeFeishu:
         # 8) card 帧：官方 SDK 对它不回执，本通道也不当任务
         await ws.send_bytes(data_frame({"card": "互动卡片回调"}, message_id="ftf-card",
                                        type_name="card"))
+        # 9) 群里没 @ 机器人的文本：飞书确实会推给订阅了群消息的应用，引擎按群策略不起任务
+        await self.push(ws, message_event("今天例会改到三点", event_id="evt-9",
+                                          message_id="om_ttfake_9"))
 
     async def push(self, ws, event: dict) -> None:
         # 帧头的 message_id 是飞书给这一帧的编号（合包用的 key），和事件正文里那条 IM
@@ -407,16 +449,21 @@ class FakeFeishu:
         if not live:
             return web.json_response({"ok": False, "error": "no_live_socket", "sockets": self.sockets})
         n = len(self.replies) + len(self.sends) + 1
+        at = str(payload.get("at") or "bot")
+        mentions = {"bot": bot_mention(), "other": other_mention(), "none": None,
+                    "all": [{"key": "@_all", "id": {"open_id": ""}, "name": "All", "mentioned_type": "all"}]}[at]
+        prefix = "@_user_1 " if at == "bot" else ("@_user_2 " if at == "other" else ("@_all " if at == "all" else ""))
         await self.push(live[-1], message_event(
-            str(payload.get("text") or "你好"), event_id=f"inject-{int(time.time() * 1000)}",
+            f"{prefix}{payload.get('text') or '你好'}", event_id=f"inject-{self.events_pushed + 1}-{n}",
             message_id=f"om_ttfake_inject_{n}",
             chat_id=str(payload.get("chat_id") or GROUP_CHAT_ID),
+            mentions=mentions,
             chat_type=str(payload.get("chat_type") or "group")))
         return web.json_response({"ok": True, "sockets": self.sockets, "pushed": n})
 
     async def handle_behavior(self, request):
         patch = await request.json()
-        for key in ("reject_endpoint", "split_event", "pong_config", "token_reject", "bad_token_once"):
+        for key in ("reject_endpoint", "split_event", "pong_config", "token_reject", "bad_token_once", "bot_info_fail"):
             if key in patch:
                 setattr(self, key, bool(patch[key]))
         if "reply_errcode" in patch:

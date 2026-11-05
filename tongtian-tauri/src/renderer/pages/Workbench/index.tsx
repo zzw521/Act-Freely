@@ -22,11 +22,14 @@ import Panda from '../../components/Panda';
 import TaskMonitor from '../../components/TaskMonitor';
 import ModeCanvas from '../../components/ModeCanvas';
 import TaskFindBar from '../../components/TaskFindBar';
+import ResumeReplayDialog from '../../components/ResumeReplayDialog';
 import ViewSidebarIcon from '@mui/icons-material/ViewSidebar';
 import { useWorkbenchStore } from '../../store/workbenchStore';
 import { useAppSettings } from '../../lib/use-app-settings';
 import { useWorkMode } from '../../lib/use-work-mode';
+import { resolveFilePermission } from '../../lib/file-permission';
 import { openArtifact } from '../../lib/artifact-open';
+import { clickableProps } from '../../lib/a11y';
 import { MODE_CANVAS_LABELS } from '../../lib/mode-canvas';
 import { systemAPI } from '../../lib/api';
 import { isTauri } from '../../lib/tauri-api';
@@ -35,6 +38,7 @@ import { useAuthStore } from '../../stores/useAuthStore';
 import { useWorkspaceStore } from '../../store/workspaceStore';
 import { useShallow } from 'zustand/react/shallow';
 import { TaskStatus, StepStatus } from '../../../shared/types';
+import { defaultReplayAnchor } from '../../../shared/step-replay';
 import { errorTextOf } from '../../../shared/error-messages';
 import { useI18n } from '../../i18n';
 import coverHomestay from '../../assets/showcase/homestay.webp';
@@ -68,37 +72,37 @@ const StatusBadge: React.FC<{
         size="small"
         icon={<HourglassEmptyIcon sx={{ fontSize: 14 }} />}
         label={tr(taskStatus === TaskStatus.QUEUED ? '排队中' : '进行中')}
-        sx={{ bgcolor: '#FEF3C7', color: '#B45309', fontSize: '12px', '& .MuiChip-icon': { color: '#B45309' } }}
+        sx={{ bgcolor: 'var(--tt-chip-warning)', color: 'var(--tt-warning)', fontSize: '12px', '& .MuiChip-icon': { color: 'var(--tt-warning)' } }}
       />
     );
   }
   switch (taskStatus) {
     case TaskStatus.PENDING_REVIEW:
-      return <Chip size="small" label={tr('待审阅')} sx={{ bgcolor: '#E0F2FE', color: '#0369A1', fontSize: '12px' }} />;
+      return <Chip size="small" label={tr('待审阅')} sx={{ bgcolor: 'var(--tt-chip-info)', color: 'var(--tt-info)', fontSize: '12px' }} />;
     case TaskStatus.BUDGET_PAUSED:
-      return <Chip size="small" label={tr('预算暂停')} sx={{ bgcolor: '#FEE2E2', color: '#B91C1C', fontSize: '12px' }} />;
+      return <Chip size="small" label={tr('预算暂停')} sx={{ bgcolor: 'var(--tt-chip-danger)', color: 'var(--tt-danger)', fontSize: '12px' }} />;
     case TaskStatus.CANCELLED:
       return (
         <Chip
           size="small"
           icon={<CancelOutlinedIcon sx={{ fontSize: 14 }} />}
           label={tr('已取消')}
-          sx={{ bgcolor: '#F3F4F6', color: 'var(--tt-text-3)', fontSize: '12px', '& .MuiChip-icon': { color: 'var(--tt-text-3)' } }}
+          sx={{ bgcolor: 'var(--tt-chip-neutral)', color: 'var(--tt-text-3)', fontSize: '12px', '& .MuiChip-icon': { color: 'var(--tt-text-3)' } }}
         />
       );
     case TaskStatus.FAILED:
-      return <Chip size="small" label={tr('失败')} sx={{ bgcolor: '#FEE2E2', color: '#B91C1C', fontSize: '12px' }} />;
+      return <Chip size="small" label={tr('失败')} sx={{ bgcolor: 'var(--tt-chip-danger)', color: 'var(--tt-danger)', fontSize: '12px' }} />;
     case TaskStatus.DONE:
       return (
         <Chip
           size="small"
           icon={<CheckCircleIcon sx={{ fontSize: 14 }} />}
           label={tr('已完成 {count} 个步骤', { count: doneSteps })}
-          sx={{ bgcolor: '#E6F7F4', color: '#0D9488', fontSize: '12px', '& .MuiChip-icon': { color: '#0D9488' } }}
+          sx={{ bgcolor: 'var(--tt-chip-teal)', color: 'var(--tt-teal)', fontSize: '12px', '& .MuiChip-icon': { color: 'var(--tt-teal)' } }}
         />
       );
     default:
-      return stepCount > 0 ? null : <Chip size="small" label={tr('新任务')} sx={{ bgcolor: '#F3F4F6', color: 'var(--tt-text-3)', fontSize: '12px' }} />;
+      return stepCount > 0 ? null : <Chip size="small" label={tr('新任务')} sx={{ bgcolor: 'var(--tt-chip-neutral)', color: 'var(--tt-text-3)', fontSize: '12px' }} />;
   }
 };
 
@@ -202,9 +206,16 @@ const WelcomeView: React.FC<{
   workDir: string;
   /** 选择工作目录回调 */
   onSelectWorkDir: (dir: string) => void;
+  /** 本轮生效的文件访问档位 */
+  filePermission: import('../../../shared/types').FilePermissionMode;
+  /** 切换文件访问档位（完全访问带确认时刻） */
+  onFilePermissionChange: (
+    mode: import('../../../shared/types').FilePermissionMode,
+    confirmedAtMs?: number,
+  ) => void;
   /** 当前工作台模式：推荐案例与模板只属于「设计」，通用 / 幻灯片不展示 */
   mode: import('../../../shared/types').WorkMode;
-}> = ({ onSend, loading, stoppable, onStop, initialText, workDir, onSelectWorkDir, mode }) => {
+}> = ({ onSend, loading, stoppable, onStop, initialText, workDir, onSelectWorkDir, filePermission, onFilePermissionChange, mode }) => {
   const navigate = useNavigate();
   const { t: tr } = useI18n();
   // 问候语里的称呼取登录态：未登录时不凭空喊一个写死的称呼（原来固定写死一个「张先生」）
@@ -247,6 +258,8 @@ const WelcomeView: React.FC<{
           initialText={initialText}
           workDir={workDir}
           onSelectWorkDir={onSelectWorkDir}
+          filePermission={filePermission}
+          onFilePermissionChange={onFilePermissionChange}
           mascot={<Panda state="idle" size={128} variant="full" ariaLabel={tr('通通')} />}
         />
       </Box>
@@ -261,6 +274,7 @@ const WelcomeView: React.FC<{
           {showcases.map((item) => (
             <Box
               key={item.title}
+              {...clickableProps(() => onSend(tr(item.prompt)), tr(item.title))}
               onClick={() => onSend(tr(item.prompt))}
               sx={{
                 position: 'relative',
@@ -303,8 +317,9 @@ const WelcomeView: React.FC<{
         {/* 换一换：切换下一批模板 */}
         <Box sx={{ display: 'flex', justifyContent: 'flex-end', mt: 1.5 }}>
           <Box
+            {...clickableProps(() => setBatch((b) => (b + 1) % batchCount), tr('换一批推荐案例'))}
             onClick={() => setBatch((b) => (b + 1) % batchCount)}
-            sx={{ display: 'flex', alignItems: 'center', gap: 0.5, cursor: 'pointer', '&:hover .swap-text': { color: '#4F46E5' } }}
+            sx={{ display: 'flex', alignItems: 'center', gap: 0.5, cursor: 'pointer', '&:hover .swap-text': { color: 'var(--tt-accent)' } }}
           >
             <Typography className="swap-text" sx={{ fontSize: '12.5px', color: 'var(--tt-text-3)', transition: 'color 0.15s ease' }}>
               {tr('换一换')}
@@ -316,6 +331,7 @@ const WelcomeView: React.FC<{
 
       {/* 模板引导区：通过模版开启第一个任务 → 打开模板弹窗 */}
       <Box
+        {...clickableProps(() => setTemplatesOpen(true), tr('通过模版开启第一个任务'))}
         onClick={() => setTemplatesOpen(true)}
         sx={{
           mt: 3,
@@ -340,16 +356,16 @@ const WelcomeView: React.FC<{
           <Typography sx={{ fontSize: '12.5px', color: 'var(--tt-text-3)', mt: 0.5 }}>
             {tr('内置 {count} 个任务模板，一键复制，快速发起任务。', { count: SHOWCASE_POOL.length })}
           </Typography>
-          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: '#4F46E5', mt: 1.25 }}>
+          <Typography sx={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--tt-accent)', mt: 1.25 }}>
             {tr('浏览全部模板 →')}
           </Typography>
         </Box>
         {/* 模板卡片堆叠示意 */}
         <Box sx={{ position: 'relative', width: 120, height: 76, flexShrink: 0 }}>
           {[
-            { label: 'W', bg: '#FFFFFF', rotate: '-8deg', left: 0, top: 10 },
-            { label: 'P', bg: '#FFE9D6', rotate: '2deg', left: 28, top: 4 },
-            { label: 'X', bg: '#DCFCE7', rotate: '10deg', left: 58, top: 12 },
+            { label: 'W', bg: 'var(--tt-surface)', rotate: '-8deg', left: 0, top: 10 },
+            { label: 'P', bg: 'var(--tt-chip-warning)', rotate: '2deg', left: 28, top: 4 },
+            { label: 'X', bg: 'var(--tt-chip-success)', rotate: '10deg', left: 58, top: 12 },
           ].map((c) => (
             <Box
               key={c.label}
@@ -369,7 +385,7 @@ const WelcomeView: React.FC<{
                 justifyContent: 'center',
               }}
             >
-              <Typography sx={{ fontSize: '16px', fontWeight: 800, color: '#64748B' }}>{c.label}</Typography>
+              <Typography sx={{ fontSize: '16px', fontWeight: 800, color: 'var(--tt-text-3)' }}>{c.label}</Typography>
             </Box>
           ))}
         </Box>
@@ -394,6 +410,7 @@ const WelcomeView: React.FC<{
             {SHOWCASE_POOL.map((t) => (
               <Box
                 key={t.title}
+                {...clickableProps(() => useTemplate(tr(t.prompt)), tr(t.title))}
                 onClick={() => useTemplate(tr(t.prompt))}
                 sx={{
                   position: 'relative',
@@ -520,13 +537,16 @@ const Workbench: React.FC = () => {
     taskStatus,
     taskId,
     checkpoint,
+    checkpointTurn,
     submitGoal,
     editTurn,
     reviewPlan,
-    resumeTask,
+    resumeTaskFromStep,
     cancelTask,
     loadHistory,
     clearError,
+    filePermission,
+    setFilePermission,
   } = useWorkbenchStore(
     useShallow((s) => ({
       messages: s.messages,
@@ -547,12 +567,19 @@ const Workbench: React.FC = () => {
       submitGoal: s.submitGoal,
       editTurn: s.editTurn,
       reviewPlan: s.reviewPlan,
-      resumeTask: s.resumeTask,
+      checkpointTurn: s.checkpointTurn,
+      resumeTaskFromStep: s.resumeTaskFromStep,
       cancelTask: s.cancelTask,
       loadHistory: s.loadHistory,
       clearError: s.clearError,
+      filePermission: s.filePermission,
+      setFilePermission: s.setFilePermission,
     })),
   );
+  // 输入框显示的是「这一轮真正生效的档位」：会话没表态时按设置页的全局默认显示，
+  // 不能因为 store 里还没写值就把「自动审批」的会话画成「每次询问」
+  const effectiveFilePermission =
+    filePermission ?? resolveFilePermission(activeId, appSettings.filePermissionDefault);
 
   // 外部携带的初始提示词（?prompt=，如专家套件「通过对话创建」），读取后从 URL 清除；
   // 独立任务窗口通过 ?conv= 指定要显示的会话，加载历史后切过去。
@@ -625,6 +652,35 @@ const Workbench: React.FC = () => {
   const canResumeCheckpoint = Boolean(
     checkpoint?.resumable && taskId && checkpoint.taskId === taskId,
   ) && !isLoading;
+  // 检查点记着「中断前那轮是哪台模型跑出来的」：续跑沿用的是该任务记录的模型，
+  // 不是输入框此刻的选择。这句话不说清，用户会以为换了模型就不带旧历史。
+  const inputBoxModelId = useWorkbenchStore((s) => s.chatModelId);
+  const checkpointModelNote = (() => {
+    const producedId = (checkpoint?.producedByModelId ?? '').trim();
+    const producedName = (checkpoint?.producedByModel ?? '').trim();
+    // 老快照没记来源：按「不知道」处理，不编一个模型名出来
+    if (!producedId && !producedName) return '';
+    const label = producedName || producedId;
+    const base = tr(
+      '中断前的 {count} 条对话由「{model}」产出：继续这一轮仍用它，历史原样带上、按端点重新编码',
+      { count: checkpoint?.snapshotMessages ?? 0, model: label },
+    );
+    if (producedId && inputBoxModelId && producedId !== inputBoxModelId) {
+      return `${base}${tr('；输入框现在选的是另一台模型，要换模型请重新提问（续跑不跟随选择框）')}`;
+    }
+    return base;
+  })();
+  // 检查点按执行体分目录：拿到的若不是负责人那一份，就得说清这是谁的进度。
+  // 引擎侧与老快照没有这个键——缺省不显示，不猜一个「leader」出来。
+  const checkpointOwnerNote = (() => {
+    const owner = (checkpoint?.agentScope ?? '').trim();
+    if (!owner || owner === 'leader') return '';
+    return tr('这份检查点属于执行体「{scope}」，与各成员的进度分目录存放', { scope: owner });
+  })();
+  // 头部的整任务续跑与步骤行的单步续跑共用一张重放预览：发起前都要看到将重做的步骤
+  const [resumePreviewOpen, setResumePreviewOpen] = React.useState(false);
+  const checkpointTurnEvents =
+    checkpointTurn == null ? [] : turnEvents[checkpointTurn] ?? [];
   const canCancel = [
     TaskStatus.QUEUED,
     TaskStatus.PLANNING,
@@ -655,7 +711,7 @@ const Workbench: React.FC = () => {
             gap: 1.25,
             px: 3,
             py: 1.5,
-            borderBottom: '1px solid #F3F4F6',
+            borderBottom: '1px solid var(--tt-border)',
           }}
         >
           <Tooltip title={taskTitle}>
@@ -675,7 +731,7 @@ const Workbench: React.FC = () => {
           </Tooltip>
           <StatusBadge taskStatus={taskStatus} isLoading={isLoading} stepCount={steps.length} doneSteps={doneSteps} />
           {hasConversation && (
-            <Typography sx={{ fontSize: '12px', color: '#C0C4CA', display: { xs: 'none', lg: 'block' } }}>{timeStr}</Typography>
+            <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', display: { xs: 'none', lg: 'block' } }}>{timeStr}</Typography>
           )}
           <Box sx={{ flexGrow: 1 }} />
 
@@ -698,7 +754,7 @@ const Workbench: React.FC = () => {
                 height: 28,
                 fontSize: 12,
                 color: 'var(--tt-text-2)',
-                '& .MuiOutlinedInput-notchedOutline': { borderColor: '#E5E7EB' },
+                '& .MuiOutlinedInput-notchedOutline': { borderColor: 'var(--tt-border)' },
                 '& .MuiSelect-select': { py: 0.5, pl: 1.25 },
               }}
             >
@@ -742,23 +798,51 @@ const Workbench: React.FC = () => {
                     </Box>
                   )}
                   <Box component="span" sx={{ display: 'block' }}>
-                    {tr('从最近一次模型调用前的检查点继续，已完成的工具调用不会重复执行')}
+                    {tr('回到最近一次模型调用前的快照：已成功的写入类工具按台账不重做，只读与未登记工具会再执行一次')}
                   </Box>
+                  {!!checkpoint?.pendingToolCalls && (
+                    <Box component="span" sx={{ display: 'block' }}>
+                      {tr(
+                        '中断发生在一轮工具调用里：还欠 {count} 个（{names}），继续时从这儿接上，已拿到结果的那些不重做',
+                        {
+                          count: checkpoint.pendingToolCalls,
+                          names: (checkpoint.pendingTools ?? []).join('、'),
+                        },
+                      )}
+                    </Box>
+                  )}
+                  {!!checkpointModelNote && (
+                    <Box component="span" sx={{ display: 'block' }}>{checkpointModelNote}</Box>
+                  )}
+                  {!!checkpointOwnerNote && (
+                    <Box component="span" sx={{ display: 'block' }}>{checkpointOwnerNote}</Box>
+                  )}
                   <Box component="span" sx={{ display: 'block' }}>
                     {checkpoint?.scope === 'disk'
                       ? tr('检查点已保存到本机磁盘，刷新或引擎重启后仍可继续')
                       : tr('检查点只保存在本次引擎进程内，引擎重启后无法恢复')}
+                  </Box>
+                  {/* 预算暂停的唤回前置条件：不写出来，点了只会收到一句「仍是超预算状态」 */}
+                  {taskStatus === TaskStatus.BUDGET_PAUSED && (
+                    <Box component="span" sx={{ display: 'block' }}>
+                      {tr(
+                        '本任务被「单任务预算」拦停：先在设置 →「模型与用量」调高单任务预算（填 0 为不限），再点这里唤回。上限不会到点自动重置，不调高点了也会被拒。',
+                      )}
+                    </Box>
+                  )}
+                  <Box component="span" sx={{ display: 'block' }}>
+                    {tr('点击后先列出将要重新执行的步骤，含写操作需勾选确认')}
                   </Box>
                 </Box>
               }
             >
               <Box
                 component="button"
-                onClick={() => void resumeTask()}
+                onClick={() => setResumePreviewOpen(true)}
                 style={{
-                  border: '1px solid #C7D2FE',
-                  background: '#EEF2FF',
-                  color: '#4338CA',
+                  border: '1px solid var(--tt-accent)',
+                  background: 'var(--tt-chip-accent)',
+                  color: 'var(--tt-accent)',
                   borderRadius: 999,
                   fontSize: 12,
                   padding: '3px 12px',
@@ -776,9 +860,9 @@ const Workbench: React.FC = () => {
                 component="button"
                 onClick={() => cancelTask()}
                 style={{
-                  border: '1px solid #FCA5A5',
-                  background: '#FEF2F2',
-                  color: '#DC2626',
+                  border: '1px solid var(--tt-danger)',
+                  background: 'var(--tt-chip-danger)',
+                  color: 'var(--tt-danger)',
                   borderRadius: 999,
                   fontSize: 12,
                   padding: '3px 12px',
@@ -794,13 +878,14 @@ const Workbench: React.FC = () => {
             <Tooltip title={tr('展开任务监控')}>
               <IconButton
                 size="small"
+                aria-label={tr('展开任务监控')}
                 onClick={() => setMonitorOpen(true)}
                 sx={{
                   color: 'var(--tt-text-3)',
                   border: '1px solid var(--tt-border)',
                   width: 30,
                   height: 30,
-                  '&:hover': { bgcolor: 'var(--tt-surface-2)', borderColor: '#8B5CF6', color: '#8B5CF6' },
+                  '&:hover': { bgcolor: 'var(--tt-surface-2)', borderColor: 'var(--tt-accent-violet)', color: 'var(--tt-accent-violet)' },
                 }}
               >
                 <ViewSidebarIcon sx={{ fontSize: 17 }} />
@@ -838,11 +923,13 @@ const Workbench: React.FC = () => {
                     await setTurnFeedback(activeId, turnIdx, kind);
                   }}
                   highlightTurn={highlightTurn}
+                  resumeTurn={canResumeCheckpoint ? checkpointTurn : null}
+                  onResumeStep={(turnIdx, stepId) => void resumeTaskFromStep(turnIdx, stepId)}
                   onArtifactOpen={(path) => void handleArtifactOpen(path)}
                 />
               </Box>
             ) : (
-              <WelcomeView onSend={handleSend} loading={isLoading} stoppable={runningTask} onStop={() => void cancelTask()} initialText={initialPrompt} workDir={workDir} onSelectWorkDir={setWorkDir} mode={activeMode} />
+              <WelcomeView onSend={handleSend} loading={isLoading} stoppable={runningTask} onStop={() => void cancelTask()} initialText={initialPrompt} workDir={workDir} onSelectWorkDir={setWorkDir} filePermission={effectiveFilePermission} onFilePermissionChange={setFilePermission} mode={activeMode} />
             )}
           </Box>
         </Box>
@@ -851,7 +938,7 @@ const Workbench: React.FC = () => {
         {hasConversation && (
           <Box sx={{ px: 3, pb: 2, pt: 1 }}>
             <Box sx={{ maxWidth: chatMaxWidth, mx: 'auto' }}>
-              <ChatInput onSend={handleSend} loading={isLoading} stoppable={runningTask} onStop={() => void cancelTask()} workDir={workDir} onSelectWorkDir={setWorkDir} compact />
+              <ChatInput onSend={handleSend} loading={isLoading} stoppable={runningTask} onStop={() => void cancelTask()} workDir={workDir} onSelectWorkDir={setWorkDir} filePermission={effectiveFilePermission} onFilePermissionChange={setFilePermission} compact />
             </Box>
           </Box>
         )}
@@ -876,6 +963,18 @@ const Workbench: React.FC = () => {
           onArtifactOpen={(path) => void handleArtifactOpen(path)}
         />
       )}
+
+      {/* 整任务续跑的重放预览：默认锚点是本轮最后一个失败步骤（没有则最后执行到的步骤） */}
+      <ResumeReplayDialog
+        open={resumePreviewOpen}
+        events={checkpointTurnEvents}
+        anchorStepId={defaultReplayAnchor(checkpointTurnEvents)}
+        onClose={() => setResumePreviewOpen(false)}
+        onConfirm={(anchorStepId) => {
+          setResumePreviewOpen(false);
+          if (checkpointTurn != null) void resumeTaskFromStep(checkpointTurn, anchorStepId);
+        }}
+      />
 
       {/* 错误提示 */}
       <Snackbar

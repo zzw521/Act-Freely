@@ -2,7 +2,7 @@
  * 模式画布的产物选择（纯逻辑，便于单测）
  *
  * 每种模式只认自己那一类交付物：设计看 HTML 原型，幻灯片看 pptx/HTML 稿，
- * 写作看 Markdown/文本。没有匹配产物时画布如实空着，不拿无关文件或假内容填充。
+ * 写作看 Markdown/文本与 Word/Excel 真件。没有匹配产物时画布如实空着，不拿无关文件或假内容填充。
  */
 
 import type { FileOp, WorkMode } from '../../shared/types';
@@ -14,7 +14,9 @@ export type CanvasKind = 'html' | 'markdown' | 'text' | 'external';
 const MODE_CANVAS_EXTS: Record<Exclude<WorkMode, 'general'>, string[]> = {
   design: ['html', 'htm'],
   slides: ['pptx', 'html', 'htm'],
-  writing: ['md', 'markdown', 'txt'],
+  // 写作模式的交付物自 D-33 起不止 Markdown：真件 .docx / .xlsx 也算本类产物。
+  // 它们不是文本，画布按 external 交给系统默认应用打开（见 canvasKindOf）。
+  writing: ['md', 'markdown', 'txt', 'docx', 'xlsx'],
 };
 
 export const MODE_CANVAS_LABELS: Record<WorkMode, string> = {
@@ -27,7 +29,7 @@ export const MODE_CANVAS_LABELS: Record<WorkMode, string> = {
 export const MODE_CANVAS_EMPTY: Record<Exclude<WorkMode, 'general'>, string> = {
   design: '当前会话还没有 HTML 原型。设计模式生成的单文件页面会在这里预览。',
   slides: '当前会话还没有幻灯片产物。生成的 .pptx 或 HTML 稿会在这里出现。',
-  writing: '当前会话还没有 Markdown 文档。写作模式产出的长文会在这里预览。',
+  writing: '当前会话还没有写作产物。生成的 Markdown 长文、.docx 文档或 .xlsx 表格会在这里出现（Office 文件交给系统默认应用打开）。',
 };
 
 function extOf(path: string): string {

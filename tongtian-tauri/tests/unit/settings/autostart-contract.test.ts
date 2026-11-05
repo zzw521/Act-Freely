@@ -125,7 +125,9 @@ describe('契约常量、类型与通道', () => {
     const src = alignmentApi();
     const fn = src.split('export async function getAutostartStatus')[1].split('\n}\n')[0];
     expect(src).toContain('import { localAutostart } from');
-    expect(fn).toContain('throw e instanceof Error ? e :');
+    // D-20：Rust 的 Err(String) 是裸字符串，重新抛出时必须保留 `CODE: 详情`，
+    // 空载荷也要兜住，否则界面只看到 undefined
+    expect(fn).toContain("throw new Error(rawErrorText(e) || 'AUTOSTART_FAILED:");
     // 只有拿不到桌面通道（Mock/引擎直连）才按本地事实推导
     expect(fn).toContain('return localAutostart(await getSettings());');
   });

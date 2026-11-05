@@ -1,0 +1,41 @@
+services:
+  gateway:
+    build: .
+    image: tongtian-gateway:0.1.0
+    restart: unless-stopped
+    # 仅本机可达；对外统一走 TLS 反向代理
+    ports:
+      - "127.0.0.1:8001:8001"
+    env_file:
+      - .env
+    environment:
+      TT_GATEWAY_HOST: 0.0.0.0
+      TT_GATEWAY_PORT: "8001"
+      TT_GATEWAY_DATA_DIR: /data
+      # 默认单 worker；多 worker 时同时设置 TT_GATEWAY_WORKERS 与 .env 里的
+      # TT_GATEWAY_REDIS_URL，并用 `docker compose --profile shared up -d` 启动 Redis。
+      TT_GATEWAY_WORKERS: "${TT_GATEWAY_WORKERS:-1}"
+    volumes:
+      - gateway-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["shared"]
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
+    # Redis 只承载热状态（令牌桶/在途预留/失效通知），仅本机可达
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  gateway-data:

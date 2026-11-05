@@ -137,17 +137,17 @@ const WorkspacePanel: React.FC = () => {
               <Chip
                 size="small"
                 label={`当前后端：${caps.backends.find((b) => b.id === caps.activeBackend)?.label ?? caps.activeBackend}`}
-                sx={{ height: 22, fontSize: 11, bgcolor: '#ECFDF5', color: '#047857' }}
+                sx={{ height: 22, fontSize: 11, bgcolor: 'var(--tt-chip-success)', color: 'var(--tt-success)' }}
               />
               <Chip
                 size="small"
                 label={`数据根来源：${sourceLabel(caps)}`}
-                sx={{ height: 22, fontSize: 11, bgcolor: '#EFF6FF', color: '#1D4ED8' }}
+                sx={{ height: 22, fontSize: 11, bgcolor: 'var(--tt-chip-info)', color: 'var(--tt-info)' }}
               />
               <Chip
                 size="small"
                 label={caps.deleteSupported ? '支持删除' : '不提供删除'}
-                sx={{ height: 22, fontSize: 11, bgcolor: '#FEF2F2', color: '#B91C1C' }}
+                sx={{ height: 22, fontSize: 11, bgcolor: 'var(--tt-chip-danger)', color: 'var(--tt-danger)' }}
               />
             </>
           )}
@@ -165,8 +165,8 @@ const WorkspacePanel: React.FC = () => {
                       height: 20,
                       fontSize: 10.5,
                       flexShrink: 0,
-                      bgcolor: b.supported ? '#ECFDF5' : '#F3F4F6',
-                      color: b.supported ? '#047857' : '#6B7280',
+                      bgcolor: b.supported ? 'var(--tt-chip-success)' : 'var(--tt-chip-neutral)',
+                      color: b.supported ? 'var(--tt-success)' : 'var(--tt-text-3)',
                     }}
                   />
                   <Typography sx={{ fontSize: 12.5, color: 'text.secondary' }}>
@@ -225,7 +225,7 @@ const WorkspacePanel: React.FC = () => {
           startIcon={<AddIcon />}
           onClick={() => void handleCreate()}
           disabled={creating || !newId.trim()}
-          sx={{ textTransform: 'none', borderRadius: '10px', bgcolor: '#111827', '&:hover': { bgcolor: '#1F2937' } }}
+          sx={{ textTransform: 'none', borderRadius: '10px', bgcolor: 'var(--tt-cta-fill)', '&:hover': { bgcolor: 'var(--tt-cta-fill-hover)' } }}
         >
           {creating ? '创建中…' : '创建并切换'}
         </Button>
@@ -272,7 +272,7 @@ const WorkspacePanel: React.FC = () => {
                 }}
               >
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                  <FolderIcon sx={{ fontSize: 20, color: active ? '#8B5CF6' : '#6B7280' }} />
+                  <FolderIcon sx={{ fontSize: 20, color: active ? 'var(--tt-accent-violet)' : 'var(--tt-text-3)' }} />
                   <Typography sx={{ fontSize: 14.5, fontWeight: 700, wordBreak: 'break-all' }}>
                     {w.name || w.id}
                   </Typography>
@@ -281,7 +281,7 @@ const WorkspacePanel: React.FC = () => {
                       size="small"
                       icon={<CheckCircleIcon sx={{ fontSize: 14 }} />}
                       label="当前"
-                      sx={{ height: 22, fontSize: 11, bgcolor: '#F5F3FF', color: '#6D28D9', '& .MuiChip-icon': { color: '#6D28D9' } }}
+                      sx={{ height: 22, fontSize: 11, bgcolor: 'var(--tt-chip-accent)', color: 'var(--tt-accent)', '& .MuiChip-icon': { color: 'var(--tt-accent)' } }}
                     />
                   )}
                   <Box sx={{ flexGrow: 1 }} />
@@ -291,8 +291,8 @@ const WorkspacePanel: React.FC = () => {
                     sx={{
                       height: 22,
                       fontSize: 11,
-                      bgcolor: w.running ? '#ECFDF5' : '#F3F4F6',
-                      color: w.running ? '#047857' : '#6B7280',
+                      bgcolor: w.running ? 'var(--tt-chip-success)' : 'var(--tt-chip-neutral)',
+                      color: w.running ? 'var(--tt-success)' : 'var(--tt-text-3)',
                     }}
                   />
                 </Box>
@@ -318,7 +318,7 @@ const WorkspacePanel: React.FC = () => {
                       fontSize: 12.5,
                       ...(active
                         ? {}
-                        : { bgcolor: '#111827', '&:hover': { bgcolor: '#1F2937' } }),
+                        : { bgcolor: 'var(--tt-cta-fill)', '&:hover': { bgcolor: 'var(--tt-cta-fill-hover)' } }),
                     }}
                   >
                     {active ? '当前工作区' : '切换到此处'}

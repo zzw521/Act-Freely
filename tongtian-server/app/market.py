@@ -12,7 +12,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -21,6 +21,7 @@ from .catalog import TYPE_SPECS, categories_of, normalize_category, type_of_plur
 from .config import settings
 from .db import now_ms, tx
 from .errors import ApiError
+from .idempotency import guarded
 from .packages import CONTROL_RE, inspect_skill_package, inspect_suite_package
 from .security import (
     ENV_KEY_RE,
@@ -1246,6 +1247,8 @@ def api_star(plural: str, item_id: str, user: dict = Depends(require_user)):
 
 @router.post("/api/v1/skills", status_code=201)
 async def api_publish_skill(
+    request: Request,
+    response: Response,
     package: UploadFile = File(...),
     summary: str | None = Form(None),
     description: str | None = Form(None),
@@ -1257,22 +1260,41 @@ async def api_publish_skill(
     version: str | None = Form(None),
     user: dict = Depends(require_user),
 ):
+    """发布技能。带 `Idempotency-Key`（D-19 / #154 刀 B）时重试不会再报 `ITEM_EXISTS`。
+
+    这是全清单里**最需要**重放保护的写操作：响应丢了，客户端唯一安全的做法本来是放弃——
+    重试会撞上「同名技能已存在」（409），而那个同名条目正是它自己上一次没收到回执的那次发布。
+    键的摘要含**包内容的 SHA-256** 与全部表单字段，所以换了包体就是另一件事，不会误重放。
+    """
     data = await _read_package(package)
-    item = publish_package(
-        user,
-        "skill",
-        data,
-        package.filename or "",
-        summary=summary,
-        description=description,
-        category=category,
-        tags=tags,
-        readme=readme,
-        changelog=changelog,
-        icon=icon,
-        version=version,
+    filename = package.filename or ""
+    fields = {
+        "summary": summary,
+        "description": description,
+        "category": category,
+        "tags": tags,
+        "readme": readme,
+        "changelog": changelog,
+        "icon": icon,
+        "version": version,
+    }
+    return guarded(
+        "market.publishSkill",
+        request,
+        response,
+        actor=str(user["uid"]),
+        binding="skills",
+        digest_source={
+            "itemType": "skill",
+            "filename": filename,
+            "packageSha256": sha256_hex(data),
+            "fields": fields,
+        },
+        handler=lambda: {
+            "ok": True,
+            "item": publish_package(user, "skill", data, filename, **fields),
+        },
     )
-    return {"ok": True, "item": item}
 
 
 @router.post("/api/v1/skills/{item_id}/versions", status_code=201)
@@ -1311,6 +1333,8 @@ async def api_publish_skill_version(
 
 @router.post("/api/v1/suites", status_code=201)
 async def api_publish_suite(
+    request: Request,
+    response: Response,
     package: UploadFile = File(...),
     summary: str | None = Form(None),
     description: str | None = Form(None),
@@ -1322,22 +1346,36 @@ async def api_publish_suite(
     version: str | None = Form(None),
     user: dict = Depends(require_user),
 ):
+    """发布专家套件（与技能同一把键机制，`binding` 区分类型 ⇒ 同键不同类不互相重放）。"""
     data = await _read_package(package)
-    item = publish_package(
-        user,
-        "suite",
-        data,
-        package.filename or "",
-        summary=summary,
-        description=description,
-        category=category,
-        tags=tags,
-        readme=readme,
-        changelog=changelog,
-        icon=icon,
-        version=version,
+    filename = package.filename or ""
+    fields = {
+        "summary": summary,
+        "description": description,
+        "category": category,
+        "tags": tags,
+        "readme": readme,
+        "changelog": changelog,
+        "icon": icon,
+        "version": version,
+    }
+    return guarded(
+        "market.publishSuite",
+        request,
+        response,
+        actor=str(user["uid"]),
+        binding="suites",
+        digest_source={
+            "itemType": "suite",
+            "filename": filename,
+            "packageSha256": sha256_hex(data),
+            "fields": fields,
+        },
+        handler=lambda: {
+            "ok": True,
+            "item": publish_package(user, "suite", data, filename, **fields),
+        },
     )
-    return {"ok": True, "item": item}
 
 
 @router.post("/api/v1/suites/{item_id}/versions", status_code=201)

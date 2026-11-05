@@ -39,6 +39,8 @@ import BoltIcon from '@mui/icons-material/Bolt';
 import LinkIcon from '@mui/icons-material/Link';
 import ScheduleIcon from '@mui/icons-material/Schedule';
 import ForumOutlinedIcon from '@mui/icons-material/ForumOutlined';
+import RadarIcon from '@mui/icons-material/Radar';
+import InboxIcon from '@mui/icons-material/Inbox';
 import BusinessIcon from '@mui/icons-material/Business';
 import TuneIcon from '@mui/icons-material/Tune';
 import SettingsIcon from '@mui/icons-material/Settings';
@@ -50,6 +52,7 @@ import ChevronLeftIcon from '@mui/icons-material/ChevronLeft';
 import ArchiveIcon from '@mui/icons-material/Archive';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useWorkbenchStore } from '../../store/workbenchStore';
+import { useWorkspaceStore } from '../../store/workspaceStore';
 import { useImChannelStore, imChannelMeta } from '../../stores/imChannelStore';
 import { useAuthStore } from '../../stores/useAuthStore';
 import { useBrandingStore } from '../../stores/useBrandingStore';
@@ -58,7 +61,9 @@ import { useAppSettings } from '../../lib/use-app-settings';
 import { systemAPI } from '../../lib/api';
 import { useShallow } from 'zustand/react/shallow';
 import { errorTextOf } from '../../../shared/error-messages';
-import { navPalette, type NavPaletteKey } from '../../theme/tokens';
+import { navPalette, withAlpha, type NavPaletteKey } from '../../theme/tokens';
+import { anchorMenuProps, clickableProps, disclosureProps } from '../../lib/a11y';
+import { avatarInk, normalizeAvatarColor } from '../../lib/avatarColors';
 import { useI18n } from '../../i18n';
 import brandLogo from '../../assets/brand-logo.png';
 
@@ -76,7 +81,7 @@ interface NavItem {
 }
 
 // 能力管理子项（专家套件/技能/连接器，定时任务与 IM 频道独立展示）
-// 浏览器 AI+、终端 AI+、电脑操控、远程桌面属于执行能力配置，统一收进「设置 → 执行能力」；
+// 浏览器 AI+、终端 AI+、电脑操控、本机画面属于执行能力配置，统一收进「设置 → 执行能力」；
 // 专家团队作为「专家套件」的一个页签展示，不再单独占导航位。
 const extensionItems: NavItem[] = [
   { id: 'expert-suites', label: '专家套件', path: '/expert-suites', icon: ConstructionIcon, color: 'amber' },
@@ -96,6 +101,13 @@ const userMenuItems = [
 ];
 
 // ── Sidebar 组件 ──────────────────────────────────────────────────────
+
+// 任务/频道页签清单：tablist 的方向键环绕切换与渲染共用同一份来源
+// 亮/暗各一档文字色：中间亮度（#4F46E5）在浅底上只有 4.1:1，压到深色底更是直接看不清
+const SIDEBAR_TABS = [
+  { key: 'tasks', label: '任务', text: '#4338CA', textDark: '#A5B4FC', gradEnd: '#8B5CF6' },
+  { key: 'channels', label: '频道', text: '#0E7490', textDark: '#67E8F9', gradEnd: '#22D3EE' },
+] as const;
 
 const DRAWER_WIDTH = 240;
 const DRAWER_WIDTH_COLLAPSED = 68;
@@ -167,6 +179,15 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
     }
   };
 
+  /** 用户卡片：未登录点击直接触发网页验证登录；已登录打开个人中心菜单（菜单要挂在卡片上） */
+  const openUserCard = (target: HTMLElement) => {
+    if (!loggedIn) {
+      void handleLogin();
+      return;
+    }
+    setUserAnchor(target);
+  };
+
   /** 退出登录（确认后清理登录态；本地任务/会话数据保留） */
   const handleLogoutConfirm = async () => {
     setLogoutConfirmOpen(false);
@@ -205,24 +226,28 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
 
   // 头像色（个人资料设置真实生效）
   const [appSettings] = useAppSettings();
-  const avatarColor = (appSettings.avatarColor as string) ?? '';
+  const avatarColor = normalizeAvatarColor(appSettings.avatarColor as string);
 
   // 对话列表筛选（实验开关）：标题搜索 + 创建时间范围，只影响侧栏展示
   const experiments = (appSettings.experiments as Record<string, boolean> | undefined) ?? {};
   const filterEnabled = Boolean(experiments.filter);
   const [taskQuery, setTaskQuery] = useState('');
   const [taskRange, setTaskRange] = useState<'all' | '7d' | '30d'>('all');
+  // 项目维度：默认全部（存量会话都在 default 工作区），可只看当前项目
+  const [taskScope, setTaskScope] = useState<'all' | 'workspace'>('all');
+  const activeWorkspaceId = useWorkspaceStore((s) => s.activeId);
   const visibleConversations = useMemo(() => {
     if (!filterEnabled) return conversations;
     const q = taskQuery.trim().toLowerCase();
     const since =
       taskRange === 'all' ? 0 : Date.now() - (taskRange === '7d' ? 7 : 30) * 24 * 60 * 60 * 1000;
     return conversations.filter((c) => {
+      if (taskScope === 'workspace' && (c.workspaceId || 'default') !== activeWorkspaceId) return false;
       if (since > 0 && c.createdAt < since) return false;
       if (q && !(c.title || '新任务').toLowerCase().includes(q)) return false;
       return true;
     });
-  }, [conversations, filterEnabled, taskQuery, taskRange]);
+  }, [conversations, filterEnabled, taskQuery, taskRange, taskScope, activeWorkspaceId]);
 
   // 长连接由引擎进程持有，引擎不会往界面推事件，所以「频道」页签的数据只能按固定间隔问。
   // 这里常驻，因此由它统一负责刷新：过渡态（connecting/reconnecting）等状态落定，
@@ -258,6 +283,34 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
 
   const width = open ? (panelWidth ?? DRAWER_WIDTH) : DRAWER_WIDTH_COLLAPSED;
 
+  // ── 导航配色：亮/暗各取自己那一档 ──────────────────────────
+
+  const isDarkNav = theme.palette.mode === 'dark';
+
+  /**
+   * 同一支中间色（#3B82F6 这类）在浅底和深底上不可能同时达标，
+   * 所以亮色走「同色相加深」，暗色走「同色相提亮 + 半透明同色相底」。
+   * 数值由 tests/unit/appearance/theme-contrast-contract.test.ts 逐档验过 4.5 / 3.0。
+   */
+  const navLook = (color: NavPaletteKey, active: boolean) => {
+    const c = navPalette[color];
+    return isDarkNav
+      ? {
+          rowBg: active ? withAlpha(c.main, 0.18) : 'transparent',
+          rowHover: active ? withAlpha(c.main, 0.18) : 'rgba(148, 163, 184, 0.10)',
+          label: active ? c.darkMain : 'var(--tt-text-2)',
+          chipBg: active ? withAlpha(c.main, 0.28) : withAlpha(c.main, 0.16),
+          chipIcon: c.darkMain,
+        }
+      : {
+          rowBg: active ? c.activeBg : 'transparent',
+          rowHover: active ? c.activeBg : 'rgba(99, 102, 241, 0.06)',
+          label: active ? c.text : 'var(--tt-text-2)',
+          chipBg: active ? c.text : c.bg,
+          chipIcon: active ? '#FFFFFF' : c.text,
+        };
+  };
+
   // ── 彩色图标块 ──────────────────────────────────────────
 
   const IconChip: React.FC<{ color: NavPaletteKey; icon: React.ElementType; size?: number; active?: boolean }> = ({
@@ -266,14 +319,14 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
     size = 26,
     active = false,
   }) => {
-    const c = navPalette[color];
+    const look = navLook(color, active);
     return (
       <Box
         sx={{
           width: size,
           height: size,
           borderRadius: '8px',
-          background: active ? c.main : c.bg,
+          background: look.chipBg,
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
@@ -281,7 +334,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
           transition: 'background 0.18s ease, transform 0.18s ease',
         }}
       >
-        <Icon sx={{ fontSize: size * 0.6, color: active ? '#FFFFFF' : c.main, transition: 'color 0.18s ease' }} />
+        <Icon sx={{ fontSize: size * 0.6, color: look.chipIcon, transition: 'color 0.18s ease' }} />
       </Box>
     );
   };
@@ -289,29 +342,35 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
   // ── 导航行渲染 ────────────────────────────────────────────
 
   const renderNavItem = (item: NavItem, active: boolean, indent = false) => {
-    const c = navPalette[item.color];
+    const look = navLook(item.color, active);
+    // 折叠态没有可见文字，名字只能来自 aria-label；展开态名字就是那行文字本身
     const button = (
       <Box
         key={item.id}
+        {...(item.disabled
+          ? { 'aria-disabled': true as const, tabIndex: -1 }
+          : clickableProps(() => handleNavClick(item.path), isCollapsed ? tr(item.label) : undefined))}
+        aria-current={active ? 'page' : undefined}
         onClick={() => !item.disabled && handleNavClick(item.path)}
         sx={{
           display: 'flex',
           alignItems: 'center',
           gap: 1,
           px: 0.75,
-          py: 0.6,
+          // 行高跟着界面密度走，标准档保持原来的 4.8px
+          py: 'calc(var(--tt-row-pad-y) * 0.6)',
           mb: 0.25,
           ml: indent ? 1.5 : 0,
           borderRadius: '10px',
           cursor: item.disabled ? 'not-allowed' : 'pointer',
           opacity: item.disabled ? 0.45 : 1,
           justifyContent: isCollapsed ? 'center' : 'flex-start',
-          background: active ? c.activeBg : 'transparent',
+          background: look.rowBg,
           transition: 'background 0.18s ease, transform 0.12s ease',
           '&:hover': item.disabled
             ? {}
             : {
-                background: active ? c.activeBg : 'rgba(99, 102, 241, 0.06)',
+                background: look.rowHover,
                 '& .nav-icon-chip': { transform: 'scale(1.08)' },
               },
           '& .nav-icon-chip': { transition: 'transform 0.18s ease, background 0.18s ease' },
@@ -325,7 +384,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
             sx={{
               fontSize: '13px',
               fontWeight: active ? 600 : 500,
-              color: active ? c.main : '#3F4756',
+              color: look.label,
               transition: 'color 0.15s ease',
             }}
           >
@@ -410,6 +469,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
         ) : (
           <Box
             sx={{
+              /* 亮色孤岛：品牌 logo 的画稿按白底设计（深色描边、透明底），底板翻暗会让标识本身读不出 */
               width: 28,
               height: 28,
               borderRadius: '9px',
@@ -457,12 +517,18 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                 background: 'linear-gradient(90deg, rgba(139, 92, 246, 0.12), rgba(6, 182, 212, 0.12))',
               }}
             >
-              <Typography sx={{ fontSize: '9px', fontWeight: 700, color: '#7C3AED', letterSpacing: '0.08em' }}>
+              {/* 胶囊底是同色相 12% 的浅渐变，#7C3AED 压在上面实测 4.07:1（9px 小字按普通档要 4.5），取深一档 */}
+              <Typography sx={{ fontSize: '9px', fontWeight: 700, color: isDarkNav ? '#C4B5FD' : '#5B21B6', letterSpacing: '0.08em' }}>
                 BETA
               </Typography>
             </Box>
             <Box sx={{ flexGrow: 1 }} />
-            <IconButton size="small" onClick={onDrawerToggle} sx={{ color: 'var(--tt-text-4)' }}>
+            <IconButton
+              size="small"
+              aria-label={tr('收起侧边栏')}
+              onClick={onDrawerToggle}
+              sx={{ color: 'var(--tt-text-4)' }}
+            >
               <ChevronLeftIcon sx={{ fontSize: 18 }} />
             </IconButton>
           </>
@@ -476,10 +542,18 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
           const active = location.pathname === '/';
           const cta = (
             <Box
+              {...clickableProps(
+                () => {
+                  newConversation();
+                  handleNavClick('/');
+                },
+                isCollapsed ? tr('新任务') : undefined,
+              )}
               onClick={() => {
                 newConversation();
                 handleNavClick('/');
               }}
+              aria-current={active ? 'page' : undefined}
               sx={{
                 display: 'flex',
                 alignItems: 'center',
@@ -491,8 +565,8 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                 cursor: 'pointer',
                 justifyContent: 'center',
                 background: active
-                  ? 'linear-gradient(120deg, #4F46E5 0%, #7C3AED 55%, #0EA5E9 110%)'
-                  : 'linear-gradient(120deg, #6366F1 0%, #8B5CF6 55%, #06B6D4 110%)',
+                  ? 'linear-gradient(120deg, #312E81 0%, #6D28D9 55%, #155E75 110%)'
+                  : 'linear-gradient(120deg, #4338CA 0%, #7C3AED 55%, #0E7490 110%)',
                 boxShadow: '0 4px 14px rgba(99, 102, 241, 0.32)',
                 transition: 'transform 0.15s ease, box-shadow 0.15s ease, filter 0.15s ease',
                 '&:hover': {
@@ -536,6 +610,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
         {/* 能力管理分组（专家套件/技能/连接器） */}
         {!isCollapsed && (
           <Box
+            {...disclosureProps(extExpanded, () => setExtExpanded(!extExpanded), tr('能力管理'))}
             onClick={() => setExtExpanded(!extExpanded)}
             sx={{
               display: 'flex',
@@ -575,20 +650,36 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
           { id: 'im', label: 'IM 频道', path: '/im', icon: ForumOutlinedIcon, color: 'pink' },
           isNavActive('/im'),
         )}
+        {/* Super-agent 主动候选（D-46 影子段）：只记账与研判，这一页没有任何开工入口 */}
+        {renderNavItem(
+          { id: 'superagent', label: '主动候选', path: '/superagent', icon: RadarIcon, color: 'teal' },
+          isNavActive('/superagent'),
+        )}
+        {/* 等你的工单（D-47.5）：跨项目的「等人」视角，人只有回答/验收/改授权/叫停四个动作 */}
+        {renderNavItem(
+          { id: 'tickets', label: '等你的工单', path: '/tickets', icon: InboxIcon, color: 'amber' },
+          isNavActive('/tickets'),
+        )}
 
         {/* 任务/频道并排页签：软件端发起归任务，IM 发起归频道 */}
         {!isCollapsed && (
-          <Box sx={{ display: 'flex', gap: 0.5, px: 0.5, pt: 1.25, pb: 0.25 }}>
-            {(
-              [
-                { key: 'tasks', label: tr('任务'), color: '#4F46E5' },
-                { key: 'channels', label: tr('频道'), color: '#06B6D4' },
-              ] as const
-            ).map((tab) => {
+          <Box role="tablist" aria-label={tr('侧栏列表')} sx={{ display: 'flex', gap: 0.5, px: 0.5, pt: 1.25, pb: 0.25 }}>
+            {SIDEBAR_TABS.map((tab, tabIdx) => {
               const active = activeTab === tab.key;
               return (
                 <Box
                   key={tab.key}
+                  role="tab"
+                  aria-selected={active}
+                  tabIndex={active ? 0 : -1}
+                  onKeyDown={(event) => {
+                    // tablist 的键盘约定是方向键切换，而不是 Tab 键逐个穿过
+                    if (['ArrowLeft', 'ArrowUp', 'ArrowRight', 'ArrowDown'].includes(event.key)) {
+                      event.preventDefault();
+                      const dir = event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 1;
+                      setActiveTab(SIDEBAR_TABS[(tabIdx + dir + SIDEBAR_TABS.length) % SIDEBAR_TABS.length].key);
+                    }
+                  }}
                   onClick={() => setActiveTab(tab.key)}
                   sx={{
                     flex: 1,
@@ -607,11 +698,11 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                     sx={{
                       fontSize: '12.5px',
                       fontWeight: active ? 700 : 500,
-                      color: active ? tab.color : '#9AA3B2',
+                      color: active ? (isDarkNav ? tab.textDark : tab.text) : 'var(--tt-text-3)',
                       transition: 'color 0.15s ease',
                     }}
                   >
-                    {tab.label}
+                    {tr(tab.label)}
                   </Typography>
                   <Box
                     sx={{
@@ -619,7 +710,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                       height: 3,
                       borderRadius: '999px',
                       background: active
-                        ? `linear-gradient(90deg, ${tab.color}, ${tab.key === 'tasks' ? '#8B5CF6' : '#22D3EE'})`
+                        ? `linear-gradient(90deg, ${isDarkNav ? tab.textDark : tab.text}, ${isDarkNav ? tab.textDark : tab.gradEnd})`
                         : 'transparent',
                       transition: 'background 0.2s ease',
                     }}
@@ -666,6 +757,8 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
               ).map((r) => (
                 <Box
                   key={r.key}
+                  {...clickableProps(() => setTaskRange(r.key))}
+                  aria-pressed={taskRange === r.key}
                   onClick={() => setTaskRange(r.key)}
                   sx={{
                     px: 0.75,
@@ -673,9 +766,37 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                     borderRadius: '6px',
                     cursor: 'pointer',
                     fontSize: '11.5px',
-                    color: taskRange === r.key ? '#4338CA' : 'var(--tt-text-4)',
-                    bgcolor: taskRange === r.key ? 'rgba(79, 70, 229, 0.10)' : 'transparent',
+                    color: taskRange === r.key ? (isDarkNav ? '#C7D2FE' : '#4338CA') : 'var(--tt-text-4)',
+                    bgcolor: taskRange === r.key ? (isDarkNav ? 'rgba(129, 140, 248, 0.20)' : 'rgba(79, 70, 229, 0.10)') : 'transparent',
                     fontWeight: taskRange === r.key ? 600 : 400,
+                    transition: 'background 0.15s ease, color 0.15s ease',
+                  }}
+                >
+                  {r.label}
+                </Box>
+              ))}
+            </Box>
+            <Box sx={{ display: 'flex', gap: 0.5, mt: 0.5 }}>
+              {(
+                [
+                  { key: 'all', label: tr('全部项目') },
+                  { key: 'workspace', label: tr('当前项目') },
+                ] as const
+              ).map((r) => (
+                <Box
+                  key={r.key}
+                  {...clickableProps(() => setTaskScope(r.key))}
+                  aria-pressed={taskScope === r.key}
+                  onClick={() => setTaskScope(r.key)}
+                  sx={{
+                    px: 0.75,
+                    py: 0.25,
+                    borderRadius: '6px',
+                    cursor: 'pointer',
+                    fontSize: '11.5px',
+                    color: taskScope === r.key ? (isDarkNav ? '#C7D2FE' : '#4338CA') : 'var(--tt-text-4)',
+                    bgcolor: taskScope === r.key ? (isDarkNav ? 'rgba(129, 140, 248, 0.20)' : 'rgba(79, 70, 229, 0.10)') : 'transparent',
+                    fontWeight: taskScope === r.key ? 600 : 400,
                     transition: 'background 0.15s ease, color 0.15s ease',
                   }}
                 >
@@ -693,6 +814,13 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
             visibleConversations.slice(0, 20).map((t) => (
               <Box
                 key={t.id}
+                {...clickableProps(
+                  () => {
+                    switchConversation(t.id);
+                    handleNavClick('/');
+                  },
+                  t.title || tr('新任务'),
+                )}
                 onClick={() => {
                   switchConversation(t.id);
                   handleNavClick('/');
@@ -700,7 +828,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                 sx={{
                   mt: 0.25,
                   px: 1,
-                  py: 0.65,
+                  py: 'calc(var(--tt-row-pad-y) * 0.6)',
                   borderRadius: '8px',
                   cursor: 'pointer',
                   display: 'flex',
@@ -709,17 +837,19 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                   background: 'transparent',
                   borderLeft: '2px solid transparent',
                   transition: 'background 0.15s ease, border-color 0.15s ease',
+                  // 键盘走到这一行时也要看见归档入口，不能只靠 hover（opacity:0 的东西 Tab 过去了也是空的）
+                  '&:focus-within .conv-archive-btn': { opacity: 1 },
                   '&:hover': {
-                    background: 'rgba(79, 70, 229, 0.06)',
-                    borderLeftColor: '#A5B4FC',
-                    '& .history-title': { color: '#4338CA' },
+                    background: isDarkNav ? 'rgba(129, 140, 248, 0.12)' : 'rgba(79, 70, 229, 0.06)',
+                    borderLeftColor: isDarkNav ? '#818CF8' : '#A5B4FC',
+                    '& .history-title': { color: isDarkNav ? '#C7D2FE' : '#4338CA' },
                     '& .conv-archive-btn': { opacity: 1 },
                   },
                 }}
               >
                 {/* 运行中的会话显示转圈指示 */}
                 {t.isLoading && (
-                  <CircularProgress size={10} sx={{ color: '#22C55E', flexShrink: 0 }} />
+                  <CircularProgress size={10} sx={{ color: isDarkNav ? '#4ADE80' : '#15803D', flexShrink: 0 }} />
                 )}
                 <Typography
                   className="history-title"
@@ -741,6 +871,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                   <IconButton
                     className="conv-archive-btn"
                     size="small"
+                    aria-label={tr('归档 {title}', { title: t.title || tr('新任务') })}
                     onClick={(e) => {
                       e.stopPropagation();
                       void handleArchive(t.id, t.title);
@@ -750,7 +881,8 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                       color: 'var(--tt-text-4)',
                       flexShrink: 0,
                       transition: 'opacity 0.15s ease, color 0.15s ease',
-                      '&:hover': { color: '#4F46E5', bgcolor: 'transparent' },
+                      '&:hover': { color: isDarkNav ? '#C7D2FE' : '#4F46E5', bgcolor: 'transparent' },
+                      '&:focus-visible': { opacity: 1 },
                     }}
                   >
                     <ArchiveIcon sx={{ fontSize: 14 }} />
@@ -760,7 +892,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
             ))
           ) : (
             <Typography sx={{ fontSize: '12px', color: 'var(--tt-text-4)', px: 1, py: 1 }}>
-              {filterEnabled && (taskQuery.trim() !== '' || taskRange !== 'all')
+              {filterEnabled && (taskQuery.trim() !== '' || taskRange !== 'all' || taskScope !== 'all')
                 ? tr('没有符合筛选条件的任务')
                 : tr('暂无任务，点击上方「新任务」开始')}
             </Typography>
@@ -775,11 +907,12 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
               return (
                 <Box
                   key={s.id}
+                  {...clickableProps(() => handleNavClick('/'), meta.label)}
                   onClick={() => handleNavClick('/')}
                   sx={{
                     mt: 0.25,
                     px: 1,
-                    py: 0.65,
+                    py: 'calc(var(--tt-row-pad-y) * 0.6)',
                     borderRadius: '8px',
                     cursor: 'pointer',
                     display: 'flex',
@@ -789,9 +922,9 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                     borderLeft: '2px solid transparent',
                     transition: 'background 0.15s ease, border-color 0.15s ease',
                     '&:hover': {
-                      background: 'rgba(6, 182, 212, 0.06)',
+                      background: isDarkNav ? 'rgba(103, 232, 249, 0.12)' : 'rgba(6, 182, 212, 0.06)',
                       borderLeftColor: '#67E8F9',
-                      '& .history-title': { color: '#0E7490' },
+                      '& .history-title': { color: isDarkNav ? '#67E8F9' : '#0E7490' },
                     },
                   }}
                 >
@@ -835,14 +968,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
       {/* ── 底部用户卡片 ────────────────────────────────── */}
       <Box sx={{ p: isCollapsed ? 1 : 1.5 }}>
         <Box
-          onClick={(e) => {
-            // 未登录：点击直接触发网页验证登录；已登录：打开个人中心菜单
-            if (!loggedIn) {
-              void handleLogin();
-              return;
-            }
-            setUserAnchor(e.currentTarget);
-          }}
+          {...anchorMenuProps(openUserCard, loggedIn ? tr('打开个人中心') : tr('登录'), Boolean(userAnchor))}
           sx={{
             display: 'flex',
             alignItems: 'center',
@@ -868,7 +994,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
               width: 34,
               height: 34,
               borderRadius: '50%',
-              background: avatarColor || 'linear-gradient(135deg, #6366F1 0%, #A855F7 100%)',
+              background: avatarColor || 'linear-gradient(135deg, #4338CA 0%, #6D28D9 100%)',
               boxShadow: avatarColor ? '0 2px 8px rgba(15, 23, 42, 0.2)' : '0 2px 8px rgba(139, 92, 246, 0.3)',
               display: 'flex',
               alignItems: 'center',
@@ -876,7 +1002,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
               flexShrink: 0,
             }}
           >
-            <Typography sx={{ color: '#fff', fontSize: '14px', fontWeight: 700 }}>
+            <Typography sx={{ color: avatarInk(avatarColor), fontSize: '14px', fontWeight: 700 }}>
               {loggedIn ? profile?.nickname?.charAt(0) || tr('客') : tr('客')}
             </Typography>
           </Box>
@@ -898,7 +1024,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                     background: loggedIn ? 'rgba(16, 185, 129, 0.10)' : 'rgba(99, 102, 241, 0.10)',
                   }}
                 >
-                  <Typography component="span" sx={{ fontSize: '10px', fontWeight: 600, color: loggedIn ? '#059669' : '#4F46E5', lineHeight: 1.7 }}>
+                  <Typography component="span" sx={{ fontSize: '10px', fontWeight: 600, color: loggedIn ? (isDarkNav ? '#6EE7B7' : '#059669') : isDarkNav ? '#A5B4FC' : '#4F46E5', lineHeight: 1.7 }}>
                     {loggedIn ? profile?.plan ?? tr('个人免费版') : authBusy ? tr('登录中…') : tr('点击登录网页验证')}
                   </Typography>
                 </Box>
@@ -959,9 +1085,27 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
           const Icon = item.icon;
           const isLogout = item.id === 'logout';
           const c = navPalette[item.color];
+          const iconColor = isLogout ? (isDarkNav ? '#FCA5A5' : '#DC2626') : isDarkNav ? c.darkMain : c.text;
+          const chipBg = isLogout
+            ? withAlpha(isDarkNav ? '#EF4444' : '#DC2626', isDarkNav ? 0.18 : 0.1)
+            : isDarkNav
+              ? withAlpha(c.main, 0.16)
+              : c.bg;
           return (
             <Box
               key={item.id}
+              {...clickableProps(() => {
+                setUserAnchor(null);
+                if (item.id === 'logout') {
+                  setLogoutConfirmOpen(true);
+                  return;
+                }
+                if (item.id === 'login') {
+                  void handleLogin();
+                  return;
+                }
+                if (item.path) navigate(item.path);
+              })}
               onClick={() => {
                 setUserAnchor(null);
                 if (item.id === 'logout') {
@@ -993,19 +1137,19 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
                   width: 24,
                   height: 24,
                   borderRadius: '7px',
-                  background: isLogout ? 'rgba(239, 68, 68, 0.10)' : c.bg,
+                  background: chipBg,
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
                 }}
               >
-                <Icon sx={{ fontSize: 14, color: isLogout ? '#EF4444' : c.main }} />
+                <Icon sx={{ fontSize: 14, color: iconColor }} />
               </Box>
               <Typography
                 sx={{
                   fontSize: '13px',
                   fontWeight: 500,
-                  color: isLogout ? '#EF4444' : '#3F4756',
+                  color: isLogout ? (isDarkNav ? '#FCA5A5' : '#DC2626') : 'var(--tt-text-2)',
                   flexGrow: 1,
                 }}
               >
@@ -1036,7 +1180,8 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onDrawerToggle, panelWidth }) =
             onClick={() => void handleLogoutConfirm()}
             disabled={authBusy}
             variant="contained"
-            sx={{ fontSize: '13px', bgcolor: '#EF4444', '&:hover': { bgcolor: '#DC2626' } }}
+            color="error"
+            sx={{ fontSize: '13px' }}
           >
             {tr('退出登录')}
           </Button>

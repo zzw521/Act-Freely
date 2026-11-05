@@ -305,6 +305,15 @@ export type WorkMode = 'general' | 'design' | 'slides' | 'writing';
 /** 出站脱敏档位：off 原样发送；mask 掩码后发送；block 命中即中止 */
 export type PiiOutboundMode = 'off' | 'mask' | 'block';
 
+/**
+ * 文件访问档位（真实目录里的创建/更新/删除，纯文件系统轴）：
+ * - ask_every_time 每次询问：每次写删都走已有的逐工具审批网关；
+ * - auto_approve   自动审批：只在会话绑定的工作目录内自动放行，越出目录仍拒绝；
+ * - full_access    完全访问：可越出绑定目录（家目录/系统目录等仍硬拒），且只有这一档允许删除。
+ * 与「计划免审阅」（workbenchStore.autoApproveTasks）无关，别混用术语。
+ */
+export type FilePermissionMode = 'ask_every_time' | 'auto_approve' | 'full_access';
+
 /** 幻灯片模板载荷：浏览器直连没有 Rust 台账，只带内置主题 */
 import type { PptxTemplatesPayload } from './pptx-templates';
 export type { PptxTemplatesPayload } from './pptx-templates';
@@ -333,6 +342,11 @@ export interface ChatSubmitReq {
   attachments?: AttachmentMeta[];
   /** 工作目录：会话内容与产出物按对话时间建子目录存放于此 */
   workDir?: string;
+  /**
+   * 文件访问档位（作用于上面的 workDir 所在的真实目录）。缺省按 ask_every_time 处理，
+   * 即未表态就是最保守档；桌面端与浏览器直连都走同一字段，Rust/引擎各自再归一一次。
+   */
+  filePermission?: FilePermissionMode;
   /** 此前轮次对话历史（保障连续对话上下文） */
   history?: Array<{ role: 'user' | 'assistant'; content: string }>;
   /**
@@ -340,6 +354,12 @@ export interface ChatSubmitReq {
    * 端点与密钥由持有数据源的后端解析，渲染层不再携带 apiKey。
    */
   modelId?: string;
+  /**
+   * 本线程上一轮实际使用的模型 id（同会话内换模型时由渲染层从 turnModels 取出后下发）。
+   * 只用于「历史带着走」这句可见说明：后端据此解析上一轮画像，比对上下文窗口与压缩阈值。
+   * 缺省或指向已删除的模型都不影响提交，只是不再播报换模型。
+   */
+  previousModelId?: string;
   /**
    * 安全工作环境开关。桌面端由 Rust 从设置读取后下发，此处仅服务于浏览器直连引擎通道；
    * 开启且未自选 workDir 时，任务执行落在 {workDir}/environment/{taskId} 隔离目录。
@@ -384,7 +404,16 @@ export interface ChatStepPreview {
  */
 export type ChatEvent =
   | { type: 'plan'; planId: string; steps: ChatStepPreview[]; seq?: number; taskId?: string }
-  | { type: 'step_start'; stepId: string; stepType: StepType; description: string; seq?: number; taskId?: string }
+  | {
+      type: 'step_start';
+      stepId: string;
+      stepType: StepType;
+      description: string;
+      /** 引擎直连通道随事件带出的工具名；Rust 转发只留 stepId+description，界面需从描述兜底解析 */
+      tool?: string;
+      seq?: number;
+      taskId?: string;
+    }
   | { type: 'step_progress'; stepId: string; progress: number; message: string; seq?: number; taskId?: string }
   | { type: 'step_done'; stepId: string; output: string; usage?: { promptTokens?: number; completionTokens?: number }; seq?: number; taskId?: string }
   | { type: 'step_failed'; stepId: string; error: string; seq?: number; taskId?: string }
@@ -401,7 +430,7 @@ export type ChatEvent =
   | { type: 'error'; code: string; message: string; seq?: number; taskId?: string }
   // ── 三层架构演进新增事件 ──
   | { type: 'status_change'; taskId: string; status: TaskStatus; waitReason?: WaitReason; statusReasonCode?: string; queuePosition?: number; seq?: number }
-  | { type: 'quota_warning'; level: '70' | '85' | '95' | '100'; action: 'notify' | 'degrade' | 'queue' | 'block'; usedTokens: number; quotaTokens: number; seq?: number }
+  | { type: 'quota_warning'; level: '70' | '85' | '95' | '100'; action: 'notify' | 'degrade' | 'queue' | 'block'; usedTokens: number; quotaTokens: number; seq?: number; /** 预警归属：日额度（缺省）或单任务预算，见缺陷 D-14.1 */ scope?: 'daily' | 'task'; taskId?: string }
   | {
       type: 'checkpoint';
       taskId: string;
@@ -424,6 +453,20 @@ export type ChatEvent =
       mediaOmitted?: number;
       droppedMessages?: number;
       captureError?: string;
+      /** 本地 harness：中断发生在一轮工具调用中间时，还没拿到结果的调用数 */
+      pendingToolCalls?: number;
+      /** 待继续的工具名（只报名字，不带参数）：续跑入口据此说明「从哪一步接着走」 */
+      pendingTools?: string[];
+      /** 快照由哪个模型产出（显示名）：换模型续跑时用它说明「历史仍是中断前那一份」 */
+      producedByModel?: string;
+      /** 产出该快照的模型 id：与本轮所选 id 不同才算真的换了模型（老快照没有此键） */
+      producedByModelId?: string;
+      /**
+       * 这份快照属于哪个执行体（本地 harness：leader / leader-<专家> / member-<成员>）。
+       * 与上面的 `scope`（disk / same-process，指持久化程度）是两回事。
+       * 引擎侧与非负责人运行还没有这个键；缺省不显示，也不要当成「负责人」。
+       */
+      agentScope?: string;
       seq?: number;
     }
   | { type: 'heartbeat'; seq?: number };
@@ -453,6 +496,8 @@ export interface SandboxPolicy {
   /** 受控命令执行：默认关闭；开启后仅白名单裸命令名可运行（不经 shell） */
   execEnabled: boolean;
   execAllowlist: string[];
+  /** 通用 shell：默认关闭，依赖 execEnabled；开启后可执行任意命令（含管道/重定向） */
+  shellEnabled: boolean;
   /** 受控联网获取：默认关闭；开启后仅白名单公网主机可访问 */
   networkEnabled: boolean;
   networkAllowlist: string[];

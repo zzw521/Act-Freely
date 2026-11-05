@@ -45,6 +45,10 @@ pub const ACTION_BROWSER_SESSION: &str = "browser_session";
 pub const ACTION_BROWSER_ACTION: &str = "browser_action";
 /// 在线市场安装（resource 记条目标识，details 记来源主机与版本；不记下载地址查询串）
 pub const ACTION_MARKET_INSTALL: &str = "market_install";
+/// 在线市场撤销生效（resource 记条目标识，details 记版本与撤销原因，不记下载地址）
+pub const ACTION_MARKET_REVOKE: &str = "market_revoke";
+/// 在线市场升级生效（resource 记条目标识，details 记新旧版本、来源主机与旧版本回收路径）
+pub const ACTION_MARKET_UPGRADE: &str = "market_upgrade";
 /// MCP 连接器 OAuth 授权/撤销（resource 记连接器标识，details 不记令牌与授权码）
 pub const ACTION_CONNECTOR_AUTH: &str = "connector_auth";
 /// 逐工具审批（放行/拒绝；resource 记工具名，details 记入参摘要与结果，不含正文与密钥）
@@ -55,7 +59,7 @@ pub const ACTION_TERMINAL_INPUT: &str = "terminal_input";
 pub const ACTION_TERMINAL_AI: &str = "terminal_ai";
 /// ACP 委派：配置变更写桌面审计，协议级明细由引擎写 {home}/acp/audit.jsonl
 pub const ACTION_ACP_CONFIG: &str = "acp_config";
-/// 远程桌面：只记会话开始/结束/到期与帧数，画面内容不入库
+/// 本机画面：只记会话开始/结束/到期与帧数，画面内容不入库
 pub const ACTION_REMOTE_SESSION: &str = "remote_session";
 
 pub const SEV_INFO: &str = "info";

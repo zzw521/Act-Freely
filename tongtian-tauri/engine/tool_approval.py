@@ -25,6 +25,11 @@ import urllib.parse
 from dataclasses import dataclass, field
 
 import privacy_guard as pg
+import side_effect_registry as ser  # #164：副作用/敏感名单的唯一落表处
+import write_staging_runtime as wsr  # D-03.5：哪些写入工具被写暂存接管，名单只有一个来源
+
+#: 被写暂存接管的工具（= `write_staging_runtime.STAGED_TOOLS` 的别名，不重抄一遍）
+STAGED_WRITE_TOOLS = wsr.STAGED_TOOLS
 
 MODES = ("off", "sensitive", "all")
 DEFAULT_MODE = "off"
@@ -35,16 +40,13 @@ MODE_LABELS = {
 }
 
 # 默认就需要审批的副作用/外部工具；未登记的 MCP 工具也按敏感处理
-SENSITIVE_TOOLS = frozenset({
-    "write_text_file",
-    "insert_text_file",
-    "generate_pptx",
-    "run_command",
-    "fetch_url",
-    "spawn_subagents",
-})
+# 成员本体在 engine/side_effect_registry.py：本表比沙箱写盘面与检查点台账都宽，
+# 多出的 run_command / run_shell / fetch_url 是「执行前先问一次人」的那一类。
+SENSITIVE_TOOLS = ser.view("approval_sensitive")
 READ_ONLY_TOOLS = frozenset({
+    "list_directory",
     "view_text_file",
+    "read_document",
     "use_skill",
     "search_knowledge",
     "read_knowledge_document",
@@ -98,6 +100,11 @@ def _summary_value(value: object, limit: int = 120) -> str:
 def summarize_input(name: str, payload: object) -> str:
     """给用户看的入参摘要：路径/命令/主机等关键信息保留，正文只给长度。"""
     data = payload if isinstance(payload, dict) else {}
+    if name == "delete_text_file":
+        return (
+            f"删除：{_summary_value(data.get('file_path') or data.get('filePath'))}"
+            f"；原因：{_summary_value(data.get('reason'), 60)}"
+        )
     if name in ("write_text_file", "insert_text_file"):
         content = data.get("content")
         length = len(content) if isinstance(content, str) else 0
@@ -108,8 +115,24 @@ def summarize_input(name: str, payload: object) -> str:
             f"演示文稿：{_summary_value(data.get('file_path') or data.get('filePath'))}"
             f"；标题：{_summary_value(data.get('title'), 60)}"
         )
+    if name in ("generate_xlsx", "generate_docx"):
+        # 内容参数是一整段 JSON，摘要只报体积：审批卡片要让人认出「往哪儿写哪份文件」，
+        # 不是把几十 KB 表格正文糊进弹窗。没给标题就不硬撑出「标题：」空尾巴。
+        body_key = "sheets_json" if name == "generate_xlsx" else "blocks_json"
+        raw_body = data.get(body_key)
+        length = len(raw_body) if isinstance(raw_body, str) else 0
+        extra = f"（内容 {length} 字）" if length else ""
+        head = "工作簿" if name == "generate_xlsx" else "文档"
+        summary = (
+            f"{head}：{_summary_value(data.get('file_path') or data.get('filePath'))}{extra}"
+        )
+        title = _summary_value(data.get("title"), 60)
+        return summary + (f"；标题：{title}" if title else "")
     if name == "run_command":
         return f"命令：{_summary_value(data.get('command'), 200)}"
+    if name == "run_shell":
+        # 这是高风险操作：给用户的摘要保留完整命令便于判断，但审计侧只存哈希
+        return f"shell 命令：{_summary_value(data.get('command'), 360)}"
     if name == "fetch_url":
         raw = str(data.get("url") or "").strip()
         try:
@@ -135,7 +158,21 @@ class ToolApproval:
     error: str = ""
     runtime_present: bool = False
     unavailable_reason: str = ""
+    #: D-03.5 合并口径：写暂存开启时，文件写入的「批准」由暂存面板的 diff 审批承担，
+    #: 这一层不再为同一次写入弹第二个确认框（一次写入两个弹窗不是更严，是让人猜哪个算数）。
+    #: 由装配现场按同一份 runtime 设置，缺省 False = 行为与改造前逐字相同。
+    staged_writes: bool = False
     _down: str = field(default="", init=False, repr=False)
+
+    def prompts_for(self, name: str) -> bool:
+        """这一次调用到底弹不弹窗：档位说该弹，且没被写暂存接管。
+
+        只有**进暂存的那两个工具**被接管：`delete_text_file` / `generate_*` 仍在直接写盘，
+        它们照旧逐次确认——把接管扩到没暂存的工具上等于凭空少一道审批。
+        """
+        if self.staged_writes and name in STAGED_WRITE_TOOLS:
+            return False
+        return needs_approval(name, self.mode)
 
     @classmethod
     def from_runtime(cls, runtime: dict | None) -> "ToolApproval":
@@ -182,11 +219,20 @@ class ToolApproval:
             return []
         if self.error:
             return [f"工具审批已开启，但本机确认网关不可用：{self.error}"]
-        return [
+        lines = [
             f"工具审批已开启（{MODE_LABELS.get(self.mode, self.mode)}）："
             "写文件/命令/联网/连接器/子 Agent 等工具在真正执行前会弹系统确认框；"
             "浏览器与电脑操控已有逐操作确认，不重复弹窗。"
         ]
+        if self.staged_writes:
+            # 少弹一次框是看得见的行为变化，必须说清是谁替它把的关，否则用户以为审批失效了
+            lines.append(
+                "本轮写暂存已开启："
+                + "、".join(STAGED_WRITE_TOOLS)
+                + " 不再弹逐工具确认框，内容先进暂存区、由界面看过 diff 后批准合并"
+                "（一次写入只有一次批准，批准的那一步才真的写盘）"
+            )
+        return lines
 
     def install(self, toolkit, emit=None, task_id: str = "") -> str | None:
         if not self.ready:
@@ -204,7 +250,9 @@ class ToolApproval:
 
             tool_call = kwargs.get("tool_call") or {}
             name = str(tool_call.get("name") or "")
-            if not needs_approval(name, self.mode):
+            # D-03.5 合并口径：写暂存开着时，那两件文本写入由「看过 diff 再批准」的面板接管，
+            # 这里不再为同一次写入弹第二个框；其余工具（含 delete_text_file 与 generate_*）照旧。
+            if not self.prompts_for(name):
                 async for chunk in await next_handler(**kwargs):
                     yield chunk
                 return

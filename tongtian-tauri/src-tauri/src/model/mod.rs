@@ -3,3 +3,4 @@
 pub mod local;
 pub mod service;
 pub mod usage;
+pub mod usage_upload;

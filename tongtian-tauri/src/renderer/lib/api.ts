@@ -21,7 +21,26 @@ import type {
 import { isTauri } from './tauri-api';
 import { resolveEngineBaseUrl } from './engine-endpoint';
 import { engineFetch } from './engine-http';
+import { getSettings } from './alignment-api';
+import { readBudgetVerdict } from './budget-gate';
+import { budgetBlockMessage, budgetUnreadableNote } from '../../shared/quota-gate';
+import { useAppStore } from '../stores/useAppStore';
 import type {
+  AgentAssignment,
+  AgentAssignmentClaimIn,
+  AgentAssignmentEndStatus,
+  AgentAttention,
+  AgentMandate,
+  AgentMyTicketsResp,
+  AgentReport,
+  AgentReportIn,
+  AgentSubscription,
+  AgentTicketCreateIn,
+  AgentTicketCreateResp,
+  AgentTicketDetailResp,
+  AgentTicketListResp,
+  AgentTicketStage,
+  AgentTicketView,
   AuthLoginResp,
   AuthServerProbe,
   AuthStatus,
@@ -31,6 +50,11 @@ import type {
   CollabProjectListResp,
   CollabRole,
   CollabSnapshot,
+  CollabEvent,
+  CollabWatchStartResp,
+  CollabWatchStateEvent,
+  CollabWatchStatusResp,
+  CollabWatchStopResp,
   CollabStatus,
   CollabTaskPatch,
   CollabTaskResp,
@@ -53,6 +77,10 @@ import type {
   MarketSuiteItem,
   MarketTrustAddReq,
   MarketTrustList,
+  MarketUpdateReport,
+  MarketUpgradeReport,
+  MarketUpgradeResult,
+  MarketInstalledList,
   MarketTrustRemoveReq,
   MCPTool,
   McpAddReq,
@@ -60,6 +88,18 @@ import type {
   ModelUsageView,
   SandboxEnvClearResult,
   SandboxEnvUsage,
+  SuperagentAssessSummary,
+  SuperagentCandidate,
+  SuperagentDecision,
+  SuperagentExportResult,
+  SuperagentPumpSummary,
+  SuperagentPolicyDoc,
+  SuperagentPolicyVersion,
+  SuperagentPolicyView,
+  SuperagentSavePolicyResp,
+  SuperagentSource,
+  SuperagentStats,
+  SuperagentTrigger,
   SystemSandboxView,
   SkillInstallReq,
   SkillRootInfo,
@@ -71,6 +111,7 @@ import type {
   UsagePeriod,
   UsageReport,
   UsageStats,
+  UsageUploadResult,
   WorkspaceCapabilities,
   WorkspaceInfo,
 } from '../../shared/contracts';
@@ -88,9 +129,26 @@ function getAPI() {
 
 // ── Chat API ─────────────────────────────────────────────────
 
+/**
+ * 提交前预算闸门（缺陷 D-14）：某档预算用满（100% 档）时拒绝新任务，
+ * 把「哪一档、用了多少、还剩多少、怎么恢复」用中文一次说清。
+ *
+ * fail-open 口径：用量台账读不到时不拦（引擎本身不可用会让提交报出更真实的原因），
+ * 但必须把「这一档没判成」作为可见提示推给用户，不能静默当成还有余量。
+ */
+async function guardSubmitBudget(): Promise<void> {
+  const settings = await getSettings().catch(() => null);
+  const read = await readBudgetVerdict((period) => usageAPI.stats(period), settings);
+  if (read.verdict.unreadable.length > 0) {
+    useAppStore.getState().showNotification(budgetUnreadableNote(read.verdict.unreadable), 'warning');
+  }
+  if (read.verdict.blocked) throw new Error(budgetBlockMessage(read.verdict));
+}
+
 export const chatAPI = {
-  /** 提交对话目标，启动 Agent 流程 */
-  submit(req: ChatSubmitReq): Promise<{ taskId: string }> {
+  /** 提交对话目标，启动 Agent 流程（先过预算闸门，被拦时抛出中文原因） */
+  async submit(req: ChatSubmitReq): Promise<{ taskId: string }> {
+    await guardSubmitBudget();
     return getAPI().chatSubmit(req) as Promise<{ taskId: string }>;
   },
 
@@ -142,7 +200,13 @@ export const chatAPI = {
     const apiObj = (window as unknown as {
       tongtianAPI?: { chatFileUpload?: (r: { fileName: string; dataBase64: string; mime?: string }) => Promise<AttachmentMeta> };
     }).tongtianAPI;
-    if (apiObj?.chatFileUpload) return apiObj.chatFileUpload(req);
+    // 只有 Tauri 容器里的 chatFileUpload 才是真实 Rust command。浏览器直连模式下
+    // window.tongtianAPI 是引擎 API 的兜底 Proxy，任何未实现属性都会返回一个
+    // 「调用即抛 IPC_CHANNEL_UNHANDLED」的函数，用 `if (apiObj?.chatFileUpload)`
+    // 探测会把「不存在」误判成「可用」，上传必然失败。
+    if (isTauri() && typeof apiObj?.chatFileUpload === 'function') {
+      return apiObj.chatFileUpload(req);
+    }
 
     const sizeBytes = Math.floor(req.dataBase64.length * 0.75);
     try {
@@ -387,15 +451,19 @@ export const knowledgeAPI = {
     return getAPI().invoke(IPC_CHANNELS.KNOWLEDGE_LIST) as Promise<KnowledgeBase[]>;
   },
 
-  /** 新建知识库（重名拒绝，不覆盖已有库） */
-  create(name: string, description = ''): Promise<KnowledgeBase> {
-    return getAPI().invoke(IPC_CHANNELS.KNOWLEDGE_CREATE, { name, description }) as Promise<KnowledgeBase>;
+  /** 新建知识库（重名拒绝，不覆盖已有库）；scope 缺省为所有项目共享 */
+  create(name: string, description = '', scope?: string): Promise<KnowledgeBase> {
+    return getAPI().invoke(IPC_CHANNELS.KNOWLEDGE_CREATE, {
+      name,
+      description,
+      scope: scope ?? null,
+    }) as Promise<KnowledgeBase>;
   },
 
-  /** 改名/改描述/启停（只动元信息，不动文档） */
+  /** 改名/改描述/启停/改归属（只动元信息，不动文档） */
   update(
     kbId: string,
-    patch: { name?: string; description?: string; enabled?: boolean },
+    patch: { name?: string; description?: string; enabled?: boolean; scope?: string },
   ): Promise<KnowledgeBase> {
     return getAPI().invoke(IPC_CHANNELS.KNOWLEDGE_UPDATE, { kbId, ...patch }) as Promise<KnowledgeBase>;
   },
@@ -511,6 +579,17 @@ export const marketAPI = {
     return getAPI().invoke(IPC_CHANNELS.MARKET_SKILL_INSTALL, { itemId }) as Promise<InstalledSkill>;
   },
 
+  /**
+   * 升级技能：校验链与安装完全一样（撤销闸门、HTTPS/公网、SHA-256、验签一道不少），
+   * 差别只在落盘——旧版本移进回收目录，新版本原子替换，失败时旧版本放回。
+   * 只有已安装的条目能升，未安装时 Rust 返回 SKILL_NOT_FOUND，不会顺手装一个新的。
+   */
+  upgradeSkill(itemId: string): Promise<MarketUpgradeResult<InstalledSkill>> {
+    return getAPI().invoke(IPC_CHANNELS.MARKET_SKILL_UPGRADE, { itemId }) as Promise<
+      MarketUpgradeResult<InstalledSkill>
+    >;
+  },
+
   /** 拉取套件市场索引（未配置返回 configured=false） */
   listSuites(): Promise<MarketList<MarketSuiteItem>> {
     return getAPI().invoke(IPC_CHANNELS.MARKET_SUITE_LIST) as Promise<MarketList<MarketSuiteItem>>;
@@ -519,6 +598,13 @@ export const marketAPI = {
   /** 安装套件：下载、SHA-256 校验后走本地套件安装（zip 路径安全与回收目录语义不变） */
   installSuite(itemId: string): Promise<InstalledSuite> {
     return getAPI().invoke(IPC_CHANNELS.MARKET_SUITE_INSTALL, { itemId }) as Promise<InstalledSuite>;
+  },
+
+  /** 升级套件：整包先校验再落位，旧目录进 suites_removed，包内路径不安全则原样不动 */
+  upgradeSuite(itemId: string): Promise<MarketUpgradeResult<InstalledSuite>> {
+    return getAPI().invoke(IPC_CHANNELS.MARKET_SUITE_UPGRADE, { itemId }) as Promise<
+      MarketUpgradeResult<InstalledSuite>
+    >;
   },
 
   /** 读取本机信任的发布者公钥（信任锚只在桌面端本机） */
@@ -534,6 +620,24 @@ export const marketAPI = {
   /** 移除发布者信任（幂等；不存在时原样返回当前列表） */
   trustRemove(req: MarketTrustRemoveReq): Promise<MarketTrustList> {
     return getAPI().invoke(IPC_CHANNELS.MARKET_TRUST_REMOVE, req) as Promise<MarketTrustList>;
+  },
+
+  /** 检查更新并应用撤销：命中撤销的条目转禁用，且不再进入执行面 */
+  updateCheck(): Promise<MarketUpdateReport> {
+    return getAPI().invoke(IPC_CHANNELS.MARKET_UPDATE_CHECK) as Promise<MarketUpdateReport>;
+  },
+
+  /**
+   * 一键升级：先跑一遍检查更新，只处理判定为 updateAvailable 的条目；
+   * 逐条独立，某一条失败（哈希不符、包内路径不安全……）不牵连其余，失败原因原样回传
+   */
+  upgradeAll(): Promise<MarketUpgradeReport> {
+    return getAPI().invoke(IPC_CHANNELS.MARKET_UPGRADE_ALL) as Promise<MarketUpgradeReport>;
+  },
+
+  /** 本机已安装清单（不联网；撤销/禁用状态读本机标记，离线也看得见） */
+  installedList(): Promise<MarketInstalledList> {
+    return getAPI().invoke(IPC_CHANNELS.MARKET_INSTALLED_LIST) as Promise<MarketInstalledList>;
   },
 };
 
@@ -642,6 +746,11 @@ export const usageAPI = {
   /** 周期报表（按日趋势 + 每模型明细 + 汇总，可复制成文本） */
   report(period: UsagePeriod = 'monthly'): Promise<UsageReport> {
     return getAPI().invoke(IPC_CHANNELS.USAGE_REPORT, period) as Promise<UsageReport>;
+  },
+
+  /** 把桌面台账上报到服务端合并视图（未登录会返回明确错误） */
+  upload(): Promise<UsageUploadResult> {
+    return getAPI().invoke(IPC_CHANNELS.USAGE_UPLOAD) as Promise<UsageUploadResult>;
   },
 };
 
@@ -766,6 +875,386 @@ export const collabAPI = {
   }): Promise<CollabTaskResp> {
     return getAPI().invoke(IPC_CHANNELS.COLLAB_REPORT_RESULT, input) as Promise<CollabTaskResp>;
   },
+
+  // ── 项目事件订阅（缺陷 D-06：实时推送，替掉 10 秒轮询） ──────
+
+  /**
+   * 订阅一个项目的事件流。`sinceSeq` 传页面当前快照的 seq：快照之后的变更都从流里来，
+   * 不会出现「快照比流旧一格」的空窗。拿不到账号服务凭据的通道会拒绝，界面退回轮询。
+   */
+  watch(projectId: string, sinceSeq: number): Promise<CollabWatchStartResp> {
+    return getAPI().invoke(IPC_CHANNELS.COLLAB_WATCH_START, {
+      projectId,
+      sinceSeq,
+    }) as Promise<CollabWatchStartResp>;
+  },
+
+  /** 停止订阅（切换项目 / 离开页面时调用） */
+  unwatch(projectId: string): Promise<CollabWatchStopResp> {
+    return getAPI().invoke(IPC_CHANNELS.COLLAB_WATCH_STOP, { projectId }) as Promise<CollabWatchStopResp>;
+  },
+
+  /** 本机订阅台账（只读，不发起网络请求） */
+  watchStatus(): Promise<CollabWatchStatusResp> {
+    return getAPI().invoke(IPC_CHANNELS.COLLAB_WATCH_STATUS) as Promise<CollabWatchStatusResp>;
+  },
+
+  /**
+   * 订阅 Rust 侧转发的项目事件。
+   * 只有桌面通道有这条 watch；其它通道如实返回「无事件可订阅」（空取消函数），
+   * 由界面继续轮询，不假装自己是实时的。
+   */
+  onEvent(callback: (event: CollabEvent) => void): () => void {
+    const apiObj = window.tongtianAPI as unknown as
+      | { onCollabEvent?: (cb: (event: CollabEvent) => void) => () => void }
+      | undefined;
+    if (!isTauri() || typeof apiObj?.onCollabEvent !== 'function') return () => {};
+    return apiObj.onCollabEvent(callback);
+  },
+
+  /** 订阅状态变更（streaming / degraded / closed / stopped…），界面据此标注实时还是降级 */
+  onWatchState(callback: (event: CollabWatchStateEvent) => void): () => void {
+    const apiObj = window.tongtianAPI as unknown as
+      | { onCollabWatchState?: (cb: (event: CollabWatchStateEvent) => void) => () => void }
+      | undefined;
+    if (!isTauri() || typeof apiObj?.onCollabWatchState !== 'function') return () => {};
+    return apiObj.onCollabWatchState(callback);
+  },
+
+  // ── 工单层（缺陷 D-47 · 无授权工作单元与待人工状态机） ──────
+  // 全部经 Rust 桥接（collab/tickets.rs）；本地授权校验与错误文案的源头都在那一层，
+  // 这里只做参数透传与类型标注，不重复实现第二套判定。
+
+  /** 跨项目「等你处理」的工单：needsHuman 缺省 true，只要答案或验收的 */
+  ticketMyTickets(input?: {
+    needsHuman?: boolean;
+    limit?: number;
+  }): Promise<AgentMyTicketsResp> {
+    return getAPI().invoke(IPC_CHANNELS.COLLAB_TICKET_MY, input ?? {}) as Promise<AgentMyTicketsResp>;
+  },
+
+  /** 单项目工单列表，可按阶段过滤 */
+  ticketList(input: {
+    projectId: string;
+    stage?: AgentTicketStage | null;
+    limit?: number;
+  }): Promise<AgentTicketListResp> {
+    return getAPI().invoke(IPC_CHANNELS.COLLAB_TICKET_LIST, input) as Promise<AgentTicketListResp>;
+  },
+
+  /** 工单详情：授权链、绑定、报告、待办问题 + 扇出上下文（只给上下文，不给授权） */
+  ticketDetail(input: { projectId: string; ticketId: string }): Promise<AgentTicketDetailResp> {
+    return getAPI().invoke(IPC_CHANNELS.COLLAB_TICKET_DETAIL, input) as Promise<AgentTicketDetailResp>;
+  },
+
+  /** 开工单（title+brief 必填；intensity=inferred 必须带 sourceRef，与服务端同规） */
+  ticketCreate(input: { projectId: string; ticket: AgentTicketCreateIn }): Promise<AgentTicketCreateResp> {
+    return getAPI().invoke(IPC_CHANNELS.COLLAB_TICKET_CREATE, {
+      projectId: input.projectId,
+      input: input.ticket,
+    }) as Promise<AgentTicketCreateResp>;
+  },
+
+  /** 订阅工单进展（把上下文扇出给 task/conversation 等目标） */
+  ticketSubscribe(input: {
+    projectId: string;
+    ticketId: string;
+    targetRef: string;
+    targetKind?: string;
+  }): Promise<{ ok: true; subscription: AgentSubscription }> {
+    return getAPI().invoke(IPC_CHANNELS.COLLAB_TICKET_SUBSCRIBE, input) as Promise<{
+      ok: true;
+      subscription: AgentSubscription;
+    }>;
+  },
+
+  /** 绑定开工（worker 领单干活；mandateId 来自当前生效授权） */
+  ticketClaim(input: {
+    projectId: string;
+    ticketId: string;
+    assignment: AgentAssignmentClaimIn;
+  }): Promise<{ ok: true; assignment: AgentAssignment; ticket: AgentTicketView }> {
+    return getAPI().invoke(IPC_CHANNELS.COLLAB_TICKET_CLAIM, {
+      projectId: input.projectId,
+      ticketId: input.ticketId,
+      input: input.assignment,
+    }) as Promise<{ ok: true; assignment: AgentAssignment; ticket: AgentTicketView }>;
+  },
+
+  /** 结束一次绑定：finished / dropped / lost（重复结束幂等回 alreadyEnded） */
+  ticketEndAssignment(input: {
+    projectId: string;
+    ticketId: string;
+    assignmentId: string;
+    status: AgentAssignmentEndStatus;
+    exitReason?: string;
+  }): Promise<{
+    ok: true;
+    assignment: AgentAssignment;
+    ticket?: AgentTicketView;
+    alreadyEnded?: true;
+  }> {
+    return getAPI().invoke(IPC_CHANNELS.COLLAB_TICKET_END_ASSIGNMENT, input) as Promise<{
+      ok: true;
+      assignment: AgentAssignment;
+      ticket?: AgentTicketView;
+      alreadyEnded?: true;
+    }>;
+  },
+
+  /** 回一份报告（六态；waiting 必须带 question，与服务端同规） */
+  ticketReport(input: { projectId: string; ticketId: string; report: AgentReportIn }): Promise<{
+    ok: true;
+    report: AgentReport;
+    ticket: AgentTicketView;
+    attentionId: string | null;
+  }> {
+    return getAPI().invoke(IPC_CHANNELS.COLLAB_TICKET_REPORT, {
+      projectId: input.projectId,
+      ticketId: input.ticketId,
+      input: input.report,
+    }) as Promise<{
+      ok: true;
+      report: AgentReport;
+      ticket: AgentTicketView;
+      attentionId: string | null;
+    }>;
+  },
+
+  /** 交回工单：reason 与 requested（希望扩大的范围）都必填 */
+  ticketHandback(input: {
+    projectId: string;
+    ticketId: string;
+    assignmentId: string;
+    reason: string;
+    requested: string;
+  }): Promise<{
+    ok: true;
+    ticket: AgentTicketView;
+    reportId: string;
+    attentionId: string | null;
+  }> {
+    return getAPI().invoke(IPC_CHANNELS.COLLAB_TICKET_HANDBACK, input) as Promise<{
+      ok: true;
+      ticket: AgentTicketView;
+      reportId: string;
+      attentionId: string | null;
+    }>;
+  },
+
+  /** 回答「等你的答案」：只有 answer 这一条路，答完工单回到 working */
+  ticketAnswer(input: {
+    projectId: string;
+    ticketId: string;
+    attentionId: string;
+    answer: string;
+  }): Promise<{ ok: true; attention: AgentAttention; ticket: AgentTicketView }> {
+    return getAPI().invoke(IPC_CHANNELS.COLLAB_TICKET_ANSWER, input) as Promise<{
+      ok: true;
+      attention: AgentAttention;
+      ticket: AgentTicketView;
+    }>;
+  },
+
+  /** 验收：accept=false 不关单，退回排队重做（授权不变） */
+  ticketAccept(input: {
+    projectId: string;
+    ticketId: string;
+    accept: boolean;
+    note?: string;
+  }): Promise<{ ok: true; ticket: AgentTicketView }> {
+    return getAPI().invoke(IPC_CHANNELS.COLLAB_TICKET_ACCEPT, input) as Promise<{
+      ok: true;
+      ticket: AgentTicketView;
+    }>;
+  },
+
+  /** 修订授权（追加式：旧 mandate 保留，新的生效，活着的执行体被结束退回排队） */
+  ticketAmend(input: {
+    projectId: string;
+    ticketId: string;
+    brief: string;
+    scope?: string;
+    outOfScope?: string;
+    reason?: string;
+  }): Promise<{ ok: true; mandate: AgentMandate; ticket: AgentTicketView }> {
+    return getAPI().invoke(IPC_CHANNELS.COLLAB_TICKET_AMEND, input) as Promise<{
+      ok: true;
+      mandate: AgentMandate;
+      ticket: AgentTicketView;
+    }>;
+  },
+
+  /** 叫停：全系统唯一吊销 mandate 的动作 */
+  ticketStop(input: {
+    projectId: string;
+    ticketId: string;
+    reason?: string;
+  }): Promise<{ ok: true; ticket: AgentTicketView; seq: number }> {
+    return getAPI().invoke(IPC_CHANNELS.COLLAB_TICKET_STOP, input) as Promise<{
+      ok: true;
+      ticket: AgentTicketView;
+      seq: number;
+    }>;
+  },
+
+  /** 已读落账：worker 声明读到第 eventSeq 号事件，恢复续跑的依据 */
+  ticketMarkRead(input: {
+    projectId: string;
+    ticketId: string;
+    assignmentId: string;
+    eventSeq: number;
+  }): Promise<{ ok: true; assignment: AgentAssignment; already: boolean }> {
+    return getAPI().invoke(IPC_CHANNELS.COLLAB_TICKET_MARK_READ, input) as Promise<{
+      ok: true;
+      assignment: AgentAssignment;
+      already: boolean;
+    }>;
+  },
+};
+
+// ── Super-agent API（缺陷 D-46 · 影子段：读账本 + 配授权，没有任何开工通道） ──
+
+/**
+ * 主动候选这一层的唯一前端入口。
+ *
+ * 三条纪律在这里落地：
+ * - **只读与授权**：这里没有「采纳候选并开工」的方法。影子模式的产物就是清单本身，
+ *   要开工由人在会话里正常发起（D-47 工单层落地前也不会有这个口子）。
+ *   `assessNow` 看着像动作，但它只问模型「值不值得开工」并记进判定行——不建任务、不起工作区。
+ * - **显示名不自己翻**：`kindLabel` / `strengthLabel` / `modeLabel` / `statusLabel` 由 Rust 给，
+ *   与判定理由同源；前端只挑要不要显示，不生产新的翻译。
+ * - **未登记通道显式失败**：所有调用都走 `invoke`，Mock/浏览器通道由 `superagent-local.ts`
+ *   如实拒绝（`SUPERAGENT_DESKTOP_ONLY`），不返回空清单冒充「本机确实没事件」。
+ */
+export const superagentAPI = {
+  /** 台账概览：档位、策略版本、今日研判数、入口/事件/候选计数（数字全部来自本机账本） */
+  stats(): Promise<SuperagentStats> {
+    return getAPI().invoke(IPC_CHANNELS.SUPERAGENT_STATS) as Promise<SuperagentStats>;
+  },
+
+  /** 事件入口列表（游标、是否在读、最近一次失败原因） */
+  listSources(): Promise<SuperagentSource[]> {
+    return getAPI().invoke(IPC_CHANNELS.SUPERAGENT_LIST_SOURCES) as Promise<SuperagentSource[]>;
+  },
+
+  /**
+   * 登记一个入口实例。登记不等于开跑：新行一律 `enabled = false`，
+   * 还要 `setSourceEnabled` 打开读取、策略里有这一入口的授权，三者齐了才会产生候选。
+   */
+  registerSource(input: {
+    kind: string;
+    instance: string;
+    label?: string;
+    config?: Record<string, unknown>;
+  }): Promise<SuperagentSource> {
+    return getAPI().invoke(IPC_CHANNELS.SUPERAGENT_REGISTER_SOURCE, input) as Promise<SuperagentSource>;
+  },
+
+  /** 开/关某个入口的**读取**（运维动作）。取消授权要改策略，两件事各自要做一次。 */
+  setSourceEnabled(sourceId: string, enabled: boolean): Promise<SuperagentSource> {
+    return getAPI().invoke(
+      IPC_CHANNELS.SUPERAGENT_SET_SOURCE_ENABLED,
+      { sourceId, enabled },
+    ) as Promise<SuperagentSource>;
+  },
+
+  /** 主动候选清单（影子模式的唯一产出） */
+  listCandidates(limit?: number): Promise<SuperagentCandidate[]> {
+    return getAPI().invoke(IPC_CHANNELS.SUPERAGENT_LIST_CANDIDATES, limit) as Promise<
+      SuperagentCandidate[]
+    >;
+  },
+
+  /** 判定留痕（含阴性：为什么没做也看得见） */
+  listDecisions(limit?: number): Promise<SuperagentDecision[]> {
+    return getAPI().invoke(IPC_CHANNELS.SUPERAGENT_LIST_DECISIONS, limit) as Promise<
+      SuperagentDecision[]
+    >;
+  },
+
+  /** 事件账本（最近若干条） */
+  listTriggers(limit?: number): Promise<SuperagentTrigger[]> {
+    return getAPI().invoke(IPC_CHANNELS.SUPERAGENT_LIST_TRIGGERS, limit) as Promise<
+      SuperagentTrigger[]
+    >;
+  },
+
+  /** 单条事件详情（候选点进去看的那一行；账本里没有时如实报 SUPERAGENT_TRIGGER_NOT_FOUND） */
+  getTrigger(triggerId: string): Promise<SuperagentTrigger> {
+    return getAPI().invoke(IPC_CHANNELS.SUPERAGENT_GET_TRIGGER, triggerId) as Promise<
+      SuperagentTrigger
+    >;
+  },
+
+  /** 当前生效策略与可选项（`autoAvailable` 为假时界面不该给出能选它的开关） */
+  getPolicy(): Promise<SuperagentPolicyView> {
+    return getAPI().invoke(IPC_CHANNELS.SUPERAGENT_GET_POLICY) as Promise<SuperagentPolicyView>;
+  },
+
+  /**
+   * 保存策略：内容没变不新增版本；改成 `auto` 会被 Rust 拒绝并给出中文原因。
+   *
+   * 每次保存 Rust 都会按当前生效版本重排一次「还没研判」的阳性候选，并把条数带回来
+   * （`requeued` / `requeueNote`）。这一步是幂等的：已经在当前队列的一条也不动，所以内容没变
+   * 时正常是 0 条，只有真升了版、或者候选的队列键落后于当前版本（上次保存重排失败、V17 时代
+   * 留下的）才会有数。这是这一改的真实后果，不是提示文案：已研判的结论留着，在跑的那一次按
+   * 旧版本问出来的结论会作废。这里不参与任何统计，界面只转述。
+   */
+  savePolicy(doc: SuperagentPolicyDoc): Promise<SuperagentSavePolicyResp> {
+    return getAPI().invoke(IPC_CHANNELS.SUPERAGENT_SAVE_POLICY, doc) as Promise<
+      SuperagentSavePolicyResp
+    >;
+  },
+
+  /** 策略版本历史（判定留痕按版本可追溯） */
+  listPolicyVersions(limit?: number): Promise<SuperagentPolicyVersion[]> {
+    return getAPI().invoke(IPC_CHANNELS.SUPERAGENT_POLICY_VERSIONS, limit) as Promise<
+      SuperagentPolicyVersion[]
+    >;
+  },
+
+  /** 立即巡检一轮：与后台循环共用同一条代码路径，返回同一份摘要 */
+  pumpNow(): Promise<SuperagentPumpSummary> {
+    return getAPI().invoke(IPC_CHANNELS.SUPERAGENT_PUMP_NOW) as Promise<SuperagentPumpSummary>;
+  },
+
+  /**
+   * 立刻对存量候选补一轮模型研判（第二层，D-46.4）。
+   *
+   * 花模型的钱，但不开工：结果只有「值得 / 不值得 / 拿不准」加一句理由，写回判定行。
+   * 预算与闸门都在 Rust 侧（策略的 `assessMaxPerDay` + 当日 token 配额），这里传不动它们：
+   * `limit` 只表示「这一轮最多判几条」，且一定不超过剩余预算。
+   */
+  assessNow(limit?: number): Promise<SuperagentAssessSummary> {
+    return getAPI().invoke(IPC_CHANNELS.SUPERAGENT_ASSESS_NOW, limit) as Promise<
+      SuperagentAssessSummary
+    >;
+  },
+
+  /**
+   * 导出当前候选清单（验收项③「能导出候选清单与理由」）。
+   * 文件落在本机运行时目录的 exports 下，一次一个新文件不覆盖；
+   * 内容只来自账本里已有的行与 Rust 给的显示名，不重读工作区、不二次研判。
+   */
+  exportCandidates(format: 'json' | 'csv' = 'json'): Promise<SuperagentExportResult> {
+    return getAPI().invoke(IPC_CHANNELS.SUPERAGENT_EXPORT_CANDIDATES, format) as Promise<
+      SuperagentExportResult
+    >;
+  },
+
+  /**
+   * 订阅后台巡检摘要（superagent-event）。
+   * 只有桌面通道有这条流；其它通道如实返回「无事件可订阅」（空取消函数），
+   * 由界面用「立即巡检」按钮补齐，不假装自己是常驻的。
+   */
+  onPump(callback: (summary: SuperagentPumpSummary) => void): () => void {
+    const apiObj = window.tongtianAPI as unknown as
+      | { onSuperagentEvent?: (cb: (summary: SuperagentPumpSummary) => void) => () => void }
+      | undefined;
+    if (!isTauri() || typeof apiObj?.onSuperagentEvent !== 'function') return () => {};
+    return apiObj.onSuperagentEvent(callback);
+  },
 };
 
 // ── System API ───────────────────────────────────────────────
@@ -851,6 +1340,7 @@ export const api = {
   usage: usageAPI,
   auth: authAPI,
   collab: collabAPI,
+  superagent: superagentAPI,
   system: systemAPI,
   p0: p0API,
   experts: expertsAPI,
